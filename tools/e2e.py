@@ -564,11 +564,11 @@ def text_checks(stack):
 # media jobs
 # --------------------------------------------------------------------------
 
-MEDIA_PORTS = [9101, 9102, 9103, 9104, 9105, 9106, 9107, 9108]
+MEDIA_PORTS = [9101, 9102, 9103, 9104, 9105, 9106, 9107, 9108, 9109]
 MEDIA_MOCK_ARGS = []
 MOCK = {name: f"http://127.0.0.1:{port}" for name, port in [
     ("replicate", 9101), ("replicate_broken", 9102), ("fal", 9103), ("openai_images", 9104),
-    ("elevenlabs", 9105), ("s3", 9106), ("webhooks", 9107), ("gemini", 9108)]}
+    ("elevenlabs", 9105), ("s3", 9106), ("webhooks", 9107), ("gemini", 9108), ("xai_video", 9109)]}
 TERMINAL = ("succeeded", "failed", "canceled")
 
 
@@ -597,6 +597,7 @@ def media_config(work, storage="local"):
             up("openai-images", "openai_images", MOCK["openai_images"]),
             up("elevenlabs", "elevenlabs", MOCK["elevenlabs"]),
             up("gemini", "gemini", MOCK["gemini"]),
+            up("xai-video", "xai_video", MOCK["xai_video"]),
         ],
         "routes": [
             {"model": "image", "targets": [
@@ -606,6 +607,8 @@ def media_config(work, storage="local"):
                 {"upstream": "fal", "model": "mock/video/text-to-video", "price": {"per_second_usd": 0.1}}]},
             {"model": "image-sync", "targets": [
                 {"upstream": "openai-images", "model": "mock-image-1", "price": {"per_output_usd": 0.05}}]},
+            {"model": "grok-video", "timeout_s": 60, "targets": [
+                {"upstream": "xai-video", "model": "mock-imagine-video", "price": {"per_second_usd": 0.05}}]},
             {"model": "gemini-image", "targets": [
                 {"upstream": "gemini", "model": "mock-flash-image", "price": {"per_output_usd": 0.02}}]},
             {"model": "gemini-speech", "targets": [
@@ -727,7 +730,17 @@ def media_checks(stack):
     gblk = wait_job(gblk.get("id", "missing"))
     check("a refused prompt fails the job with the reason and no charge",
           gblk.get("status") == "failed" and "SAFETY" in json.dumps(gblk.get("attempts")) and close(gblk.get("cost_usd") or 0.0, 0.0), gblk)
-    gemini_cost = 0.02 + len(phrase) * 0.00001
+    _, _, gvid = create_job({"model": "grok-video", "input": {"prompt": "a wave", "duration": 4}})
+    gvid = wait_job(gvid.get("id", "missing"))
+    data = call("GET", gvid["outputs"][0]["url"])[2] if gvid.get("outputs") else b""
+    check("request-id video provider (xAI shape) is polled to completion and billed per second",
+          gvid.get("status") == "succeeded" and close(gvid.get("cost_usd"), 0.2) and data[4:8] == b"ftyp"
+          and gvid["outputs"][0]["content_type"] == "video/mp4", gvid)
+    _, _, gvf = create_job({"model": "grok-video", "input": {"prompt": "please fail", "duration": 4}})
+    gvf = wait_job(gvf.get("id", "missing"))
+    check("... and a generation the provider reports as failed fails the job unbilled",
+          gvf.get("status") == "failed" and "mock generation failed" in json.dumps(gvf.get("attempts")) and close(gvf.get("cost_usd") or 0.0, 0.0), gvf)
+    gemini_cost = 0.02 + len(phrase) * 0.00001 + 0.2
 
     text = "Your order has shipped and will arrive on Thursday."
     calls_before = stats("elevenlabs")["calls"]

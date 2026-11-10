@@ -64,6 +64,7 @@ PORTS = {
     "s3": 9106,
     "webhooks": 9107,
     "gemini": 9108,
+    "xai_video": 9109,
 }
 
 # Placeholder shared with config/omnigate.dev.json. Not a real secret.
@@ -667,6 +668,51 @@ class Gemini(Base):
         })
 
 
+# --------------------------------------------------------------------------
+# xAI-style video generation (submit, then poll by request id)
+# --------------------------------------------------------------------------
+
+class XaiVideo(Base):
+    stats = {"submits": 0, "polls": 0, "downloads": 0}
+    requests: dict = {}
+
+    def do_POST(self):
+        req = self.json_body()
+        if not self.bearer("Bearer"):
+            return
+        if self.path.split("?")[0] != "/v1/videos/generations":
+            return self.send(404, {"error": "not found"})
+        if not isinstance(req.get("prompt"), str) or not req.get("model"):
+            return self.send(400, {"error": "prompt and model are required"})
+        self.bump("submits")
+        rid = "vid_" + hashlib.sha256(("%s%f" % (req["prompt"], time.time())).encode()).hexdigest()[:20]
+        with LOCK:
+            self.requests[rid] = {"ready_at": time.time() + float(req.get("mock_delay_s", 1.0)), "req": req}
+        self.send(200, {"request_id": rid})
+
+    def do_GET(self):
+        if self.maybe_stats():
+            return
+        path = self.path.split("?")[0]
+        if path.startswith("/files/"):
+            self.bump("downloads")
+            return self.send(200, fake_mp4(path), "video/mp4")
+        if not self.bearer("Bearer"):
+            return
+        with LOCK:
+            r = self.requests.get(path[len("/v1/videos/"):]) if path.startswith("/v1/videos/") else None
+        if r is None:
+            return self.send(404, {"error": "unknown request id"})
+        self.bump("polls")
+        if time.time() < r["ready_at"]:
+            return self.send(200, {"status": "pending"})
+        if "fail" in r["req"]["prompt"]:
+            return self.send(200, {"status": "failed", "error": "mock generation failed"})
+        rid = path[len("/v1/videos/"):]
+        self.send(200, {"status": "done", "model": r["req"]["model"],
+                        "video": {"url": "%s/files/%s.mp4" % (self.base_url(), rid), "duration": r["req"].get("duration", 5)}})
+
+
 def main():
     servers = [
         ("replicate_ok", replicate_handler(False)),
@@ -677,6 +723,7 @@ def main():
         ("s3", S3),
         ("webhooks", Webhooks),
         ("gemini", Gemini),
+        ("xai_video", XaiVideo),
     ]
     for name, handler in servers:
         httpd = ThreadingHTTPServer((BIND, PORTS[name]), handler)

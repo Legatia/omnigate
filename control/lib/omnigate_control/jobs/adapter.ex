@@ -35,9 +35,10 @@ defmodule OmnigateControl.Jobs.Adapter do
   def for_kind("openai_images"), do: Adapters.OpenAIImages
   def for_kind("elevenlabs"), do: Adapters.ElevenLabs
   def for_kind("gemini"), do: Adapters.Gemini
+  def for_kind("xai_video"), do: Adapters.XaiVideo
   def for_kind(_), do: nil
 
-  def kinds, do: ~w(replicate fal openai_images elevenlabs gemini)
+  def kinds, do: ~w(replicate fal openai_images elevenlabs gemini xai_video)
 
   # -- helpers shared by adapters -------------------------------------------
 

@@ -184,6 +184,20 @@ defmodule OmnigateControl.MediaUnitTest do
                Gemini.outputs(%{"candidates" => [%{"content" => %{"parts" => []}, "finishReason" => "IMAGE_SAFETY"}]})
     end
 
+    test "xai video adapter: poll responses" do
+      alias OmnigateControl.Jobs.Adapters.XaiVideo
+
+      assert :pending = XaiVideo.interpret(%{"status" => "pending"})
+      assert :pending = XaiVideo.interpret(%{})
+      assert {:done, [{:url, "https://x/v.mp4"}]} = XaiVideo.interpret(%{"status" => "done", "video" => %{"url" => "https://x/v.mp4", "duration" => 5}})
+      # Some answers carry the file without repeating the status.
+      assert {:done, [{:url, "https://x/v.mp4"}]} = XaiVideo.interpret(%{"video" => %{"url" => "https://x/v.mp4"}})
+      assert {:error, "provider_failed: boom"} = XaiVideo.interpret(%{"status" => "failed", "error" => "boom"})
+      assert {:error, "provider_failed: nope"} = XaiVideo.interpret(%{"status" => "failed", "error" => %{"message" => "nope"}})
+      assert {:error, "provider_expired" <> _} = XaiVideo.interpret(%{"status" => "expired"})
+      assert {:error, _} = XaiVideo.interpret(%{"status" => "done"})
+    end
+
     test "s3 storage: private by default, key prefix always ends in a slash" do
       storage = fn extra ->
         base = %{"kind" => "s3", "endpoint" => "http://s3", "bucket" => "b", "access_key_env" => "A", "secret_key_env" => "S"}

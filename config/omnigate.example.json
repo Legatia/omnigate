@@ -98,6 +98,12 @@
         "kind": "gemini",
         "base_url": "https://generativelanguage.googleapis.com",
         "api_key_env": "GEMINI_API_KEY"
+      },
+      {
+        "name": "xai-video",
+        "kind": "xai_video",
+        "base_url": "https://api.x.ai",
+        "api_key_env": "XAI_API_KEY"
       }
     ],
     "routes": [
@@ -180,6 +186,19 @@
             "model": "<gemini tts model id>",
             "price": {
               "per_input_char_usd": 0.0
+            }
+          }
+        ]
+      },
+      {
+        "model": "grok-video",
+        "timeout_s": 900,
+        "targets": [
+          {
+            "upstream": "xai-video",
+            "model": "<xai video model id>",
+            "price": {
+              "per_second_usd": 0.0
             }
           }
         ]

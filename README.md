@@ -229,16 +229,19 @@ What you get:
 - **State** (ledger, jobs, stored outputs, usage spool, config cache) lives in named volumes and survives restarts.
 - **The internal API** between the two is reachable only on the private Docker network; the proxy answers 404 for `/internal/*`.
 
-`python3 tools/container_test.py` builds both images, starts them with mock
-providers behind the proxy, and runs 22 checks through TLS: certificate
+`python3 tools/container_test.py --compose` brings up this Compose file (with
+mock providers added and a throwaway config) and runs 22 checks through TLS: certificate
 verification, failover, incremental streaming through the proxy, translation,
 a media job with a signed `https` download and a retried webhook, dashboard
 login with a `Secure` cookie, and restarts with the control plane down.
 
-Tested with Docker 29 on Ubuntu 24.04 (x86-64, under WSL 2). Not tested: the
-Compose file itself (the test drives the same images and Caddyfile with plain
-`docker` commands, because Compose was not installed there), ARM, Let's
-Encrypt issuance with a real domain, and Kubernetes.
+Without `--compose` the same test runs with plain `docker` commands, for
+machines that have no Compose plugin.
+
+Tested with Docker 29 and Compose 2.40 on Ubuntu 24.04 (x86-64, under WSL 2),
+both ways. The test publishes one local port instead of 80 and 443 and uses
+its own env file and config. Not tested: ARM, Let's Encrypt issuance with a
+real domain, and Kubernetes.
 
 Without containers, the same rules apply: set both tokens, keep the control
 plane on a private address (`OMNIGATE_CONTROL_BIND`), and put TLS in front of
@@ -335,7 +338,7 @@ Through the gateway, over TLS, with real keys:
 ## Next
 
 1. Run the Replicate and fal adapters and S3 storage against the real services; test with the official SDKs as clients
-2. Test the Compose file, ARM images and a real-domain certificate
+2. Test ARM images and a real-domain certificate
 3. Cluster-wide budgets and rate limits across control-plane nodes
 4. Retention: expire jobs, files and ledger ids
 5. More provider shapes (Veo, Kling, Runway, BFL), then transcoding

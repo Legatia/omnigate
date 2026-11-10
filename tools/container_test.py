@@ -3,10 +3,14 @@
     python3 tools/container_test.py            # build, run, check, clean up
     python3 tools/container_test.py --no-build # reuse images built earlier
     python3 tools/container_test.py --keep     # leave the containers running
+    python3 tools/container_test.py --compose  # start it with compose.yaml instead
 
 Needs a Linux Docker daemon (Docker Desktop, or Docker inside WSL) and
-Python 3.9+. Uses plain `docker` commands, so the Compose plugin is not
-required. It starts, on a private Docker network:
+Python 3.9+. By default it uses plain `docker` commands, so the Compose plugin
+is not required. With --compose it runs the repository's compose.yaml (plus a
+small override that adds the mock providers, moves the published port and
+points at a throwaway config), which is how the file itself gets tested.
+Either way it starts, on a private Docker network:
 
     mocks      tools/mock_upstream.py + tools/mock_media.py (fake providers)
     control    the control-plane image
@@ -39,6 +43,18 @@ INTERNAL, ADMIN = "container-internal-token-0123456789", "container-admin-token-
 KEY, OTHER = "og-container-main", "og-container-other"
 HOOK_SECRET = "container-webhook-secret"
 IMAGES = {"dataplane": f"{P}-dataplane", "control": f"{P}-control"}
+COMPOSE = False                          # set by --compose
+NO_BUILD = False                         # set by --no-build
+COMPOSE_FILES = []                       # -f arguments, once the override exists
+
+
+def cname(service):
+    """Container name of a service: Compose appends an instance number."""
+    return f"{P}-{service}-1" if COMPOSE else f"{P}-{service}"
+
+
+def compose(*args, check_rc=True):
+    return docker("compose", "-p", P, "--project-directory", ROOT, *COMPOSE_FILES, *args, check_rc=check_rc)
 
 results = []
 
@@ -171,13 +187,17 @@ def config():
 
 
 def names():
-    return [f"{P}-{n}" for n in ("mocks", "control", "dataplane", "proxy")]
+    return [cname(n) for n in ("mocks", "control", "dataplane", "proxy")]
 
 
 def cleanup():
-    docker("rm", "-f", *names(), check_rc=False)
-    docker("volume", "rm", "-f", f"{P}-control-data", f"{P}-dataplane-data", f"{P}-caddy-data", check_rc=False)
-    docker("network", "rm", NET, check_rc=False)
+    if COMPOSE and COMPOSE_FILES:
+        compose("down", "-v", "--remove-orphans", check_rc=False)
+    # Leftovers of either mode, e.g. from an interrupted earlier run.
+    services = ("mocks", "control", "dataplane", "proxy")
+    docker("rm", "-f", *[f"{P}-{n}" for n in services], *[f"{P}-{n}-1" for n in services], check_rc=False)
+    docker("volume", "rm", "-f", *[f"{P}{sep}{v}" for sep in ("-", "_") for v in ("control-data", "dataplane-data", "caddy-data", "caddy-config")], check_rc=False)
+    docker("network", "rm", NET, f"{P}_default", check_rc=False)
 
 
 def run(name, image, *args, cmd=()):
@@ -189,6 +209,9 @@ def start(work):
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(config(), f, indent=2)
     os.chmod(cfg_path, 0o644)
+
+    if COMPOSE:
+        return start_compose(work, cfg_path)
 
     docker("network", "create", NET)
     run("mocks", "python:3.12-alpine", "-v", f"{ROOT}/tools:/tools:ro",
@@ -203,18 +226,56 @@ def start(work):
         "-v", f"{ROOT}/deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "-v", f"{P}-caddy-data:/data")
 
 
+def start_compose(work, cfg_path):
+    """Bring up the repository's compose.yaml, changed only where a test must differ."""
+    env_path = os.path.join(work, "test.env")
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(f"OMNIGATE_INTERNAL_TOKEN={INTERNAL}\nOMNIGATE_ADMIN_TOKEN={ADMIN}\nMOCK_API_KEY=mock-secret\n")
+    override = os.path.join(work, "compose.test.yaml")
+    with open(override, "w", encoding="utf-8") as f:
+        f.write(f"""\
+services:
+  control:
+    env_file: !override ["{env_path}"]
+    volumes: !override
+      - "{cfg_path}:/config/omnigate.json:ro"
+      - control-data:/data
+  dataplane:
+    env_file: !override ["{env_path}"]
+    environment:
+      OMNIGATE_POLL_MS: "300"
+      OMNIGATE_FLUSH_MS: "200"
+  proxy:
+    ports: !override ["127.0.0.1:{PORT}:443"]
+  mocks:
+    image: python:3.12-alpine
+    volumes: ["{ROOT}/tools:/tools:ro"]
+    environment:
+      MOCK_BIND: 0.0.0.0
+      MOCK_PUBLIC_HOST: mocks
+      MOCK_WEBHOOK_SECRET: {HOOK_SECRET}
+      PYTHONUNBUFFERED: "1"
+    command: ["sh", "-c", "python /tools/mock_upstream.py & exec python /tools/mock_media.py"]
+""")
+    COMPOSE_FILES[:] = ["-f", os.path.join(ROOT, "compose.yaml"), "-f", override]
+    # Compose names its images <project>-<service>, the same names the plain
+    # mode uses, so --no-build reuses whatever either mode built earlier.
+    print("docker compose up" + ("" if NO_BUILD else " --build") + " ...", flush=True)
+    compose("up", "-d", "--no-build" if NO_BUILD else "--build")
+
+
 def load_ca(work):
     """Trust exactly the proxy's local CA, nothing else."""
     global CTX
     ca = os.path.join(work, "caddy-root.crt")
-    ok = wait_until(lambda: docker("cp", f"{P}-proxy:/data/caddy/pki/authorities/local/root.crt", ca, check_rc=False, quiet=False).returncode == 0, 30)
+    ok = wait_until(lambda: docker("cp", f"{cname('proxy')}:/data/caddy/pki/authorities/local/root.crt", ca, check_rc=False, quiet=False).returncode == 0, 30)
     if not ok:
-        raise SystemExit("the proxy never created its local CA:\n" + docker("logs", "--tail", "20", f"{P}-proxy", check_rc=False))
+        raise SystemExit("the proxy never created its local CA:\n" + docker("logs", "--tail", "20", cname("proxy"), check_rc=False))
     CTX = ssl.create_default_context(cafile=ca)
 
 
 def logs(name, lines=25):
-    r = docker("logs", "--tail", str(lines), f"{P}-{name}", check_rc=False, quiet=False)
+    r = docker("logs", "--tail", str(lines), cname(name), check_rc=False, quiet=False)
     return (r.stdout + r.stderr).strip()
 
 
@@ -284,32 +345,38 @@ def checks():
     check("usage reached the ledger", row.get("requests", 0) - row.get("jobs", 0) == calls and row.get("jobs") == 1 and row.get("cost_usd", 0) > 0, row)
 
     section("restarts and persistence")
-    docker("stop", f"{P}-control")
+    docker("stop", cname("control"))
     codes = [chat()[0] for _ in range(2)]
     calls += 2
     check("the gateway keeps serving with the control plane stopped", codes == [200, 200], codes)
-    docker("restart", f"{P}-dataplane")
+    docker("restart", cname("dataplane"))
     ok = wait_until(lambda: chat()[0] == 200, 20)
     calls += 1
     check("a restarted gateway container serves from its cached config (volume)", bool(ok), logs("dataplane", 8))
-    docker("start", f"{P}-control")
+    docker("start", cname("control"))
     row = wait_until(lambda: (lambda r: r if r.get("requests", 0) - r.get("jobs", 0) == calls else None)(usage("main")), 40, 0.5) or {}
     check("ledger survived the control-plane restart and the outage calls were billed once",
           row.get("requests", 0) - row.get("jobs", 0) == calls and row.get("jobs") == 1, (row, calls))
     s, _, again = jreq("GET", API_HOST, f"/v1/jobs/{jid}", key=KEY)
     check("the job and its file survived too", s == 200 and again.get("status") == "succeeded"
           and req("GET", API_HOST, again["outputs"][0]["url"].split(f":{PORT}", 1)[-1])[0] == 200, (s, again.get("status")))
-    health = wait_until(lambda: docker("inspect", f"{P}-control", "--format", "{{.State.Health.Status}}") == "healthy", 40, 1.0)
-    check("the control-plane container reports healthy", bool(health), docker("inspect", f"{P}-control", "--format", "{{.State.Health.Status}}"))
+    health = wait_until(lambda: docker("inspect", cname("control"), "--format", "{{.State.Health.Status}}") == "healthy", 40, 1.0)
+    check("the control-plane container reports healthy", bool(health), docker("inspect", cname("control"), "--format", "{{.State.Health.Status}}"))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--compose", action="store_true", help="start the stack with compose.yaml (needs the Compose plugin)")
     args = ap.parse_args()
 
-    if not args.no_build:
+    global COMPOSE, NO_BUILD
+    COMPOSE, NO_BUILD = args.compose, args.no_build
+    if COMPOSE and docker("compose", "version", check_rc=False, quiet=False).returncode != 0:
+        raise SystemExit("--compose needs the Docker Compose plugin (`docker compose version` failed)")
+
+    if not args.no_build and not COMPOSE:
         for name, image in IMAGES.items():
             print(f"building {image} ...", flush=True)
             r = subprocess.run(["docker", "build", "-q", "-t", image, os.path.join(ROOT, name)], capture_output=True, text=True)
@@ -339,7 +406,8 @@ def main():
             cleanup()
 
     failed = [n for n, ok in results if not ok]
-    print(f"\n{len(results) - len(failed)}/{len(results)} container checks passed in {time.time() - started:.0f}s")
+    mode = "compose.yaml" if COMPOSE else "plain docker"
+    print(f"\n{len(results) - len(failed)}/{len(results)} container checks passed in {time.time() - started:.0f}s ({mode})")
     for n in failed:
         print("  failed:", n)
     sys.exit(1 if failed else 0)

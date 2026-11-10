@@ -17,3 +17,6 @@ erl_crash.dump
 # Data plane config cache
 *.cache.json
 *.cache.json.tmp
+
+# Your own deployment config (copied from the example)
+config/omnigate.json

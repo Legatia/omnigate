@@ -1,4 +1,4 @@
-# CI for omnigate. Six jobs, all on Linux:
+# CI for omnigate. Seven jobs, all on Linux:
 #
 #   dataplane   Zig unit tests and a build of the data plane. Zig is installed
 #               the way dataplane/Dockerfile installs it: downloaded from
@@ -20,9 +20,16 @@
 #               (the job log prints which); they are the only third-party
 #               Python packages any job installs. Runs only if the two
 #               unit-test jobs pass.
+#   hostile     tools/malformed_test.py: the same local stack as e2e, started
+#               by the tool itself through the harness in tools/e2e.py, and
+#               sent malformed, ambiguous and smuggling requests over raw
+#               sockets; the gateway must answer /healthz after every one.
+#               It then checks that a client which hangs up mid-stream is
+#               still billed. Runs only if the two unit-test jobs pass.
 #   containers  tools/container_test.py --compose: builds both images, starts
 #               compose.yaml (plus mock providers) and checks it through the
-#               TLS proxy.
+#               TLS proxy, including malformed requests and odd spellings of
+#               guarded paths sent byte for byte through the proxy.
 #
 # None of the jobs needs a secret or an API key: every provider is a mock.
 
@@ -252,6 +259,73 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  hostile:
+    name: Hostile input (mock providers)
+    needs: [dataplane, control]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-zig
+
+      # tools/malformed_test.py uses the harness in tools/e2e.py, which runs
+      # dataplane/zig-out/bin/omnigate-dp. An unoptimized build on purpose,
+      # as in the e2e job: it keeps every safety check, so an out-of-bounds
+      # index or a failed assertion is a crash the test sees.
+      - name: Build the data plane
+        working-directory: dataplane
+        run: zig build
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      # Same key as the e2e and sdk jobs: all three compile the control plane
+      # in the dev environment, so any job's cache serves the others.
+      - name: Cache dependencies and their build
+        uses: actions/cache@v6
+        with:
+          path: |
+            control/deps
+            control/_build
+          key: mix-dev-${{ runner.os }}-otp-${{ steps.beam.outputs.otp-version }}-elixir-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('control/mix.lock') }}
+
+      # The harness starts the control plane with `mix run --no-halt` and
+      # waits for its port; compiling first keeps that wait short.
+      - name: Fetch and compile the control plane
+        working-directory: control
+        run: |
+          mix deps.get
+          mix compile
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Without --gateway the tool starts its own stack and stops it again.
+      # Listens on 127.0.0.1 only: 9001-9005 (text mocks), 14000 (control
+      # plane), 18080 (gateway). State and logs go to a directory named
+      # omnigate-malformed-* under TMPDIR; it is kept when a case fails.
+      # The generated cases use the tool's default seed and count, so a
+      # failure here can be replayed locally with the same command (the seed
+      # is printed).
+      - name: Hostile-input test
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python tools/malformed_test.py
+
+      - name: Upload logs and state
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hostile-logs
+          path: ${{ runner.temp }}/omnigate-malformed-*
+          if-no-files-found: ignore
+          retention-days: 7
+
   containers:
     name: Containers (Compose, TLS proxy)
     runs-on: ubuntu-24.04
@@ -265,7 +339,8 @@ jobs:
           docker compose version
 
       # Builds both images (the data-plane build also runs the Zig unit
-      # tests), publishes one port on 127.0.0.1:18443, and removes everything
+      # tests), publishes two ports on 127.0.0.1 (18443, and 18444 for a
+      # second proxy with a closed admin allow-list), and removes everything
       # it created when it is done. It prints container logs itself when a
       # check fails.
       - name: Container test

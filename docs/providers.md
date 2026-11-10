@@ -208,7 +208,19 @@ Clients use all of them through the same [Jobs API](api.md#jobs-api); only
 the contents of `input` differ per adapter. Common behaviour:
 
 - Each output is downloaded (or decoded) and stored in your storage; the job
-  carries your URLs. Output downloads send no provider credentials.
+  carries your URLs. Output downloads send no provider credentials. An
+  output URL is fetched only if it, and every redirect on the way (at most
+  five), resolves to a public address; otherwise the attempt fails with
+  `output_fetch_failed: blocked: ...`. `media.webhooks.allow_private` lifts
+  that for local development.
+- A stored output is served as a download, with its content type kept only
+  when it is a common image, video or audio type
+  ([API](api.md#file-urls)).
+- Per-character and per-second prices are applied to what the adapter
+  sends to the provider, as listed per adapter in
+  [Configuration](configuration.md#mediaroutes). `duration`, `seconds`,
+  `n`, `num_outputs` and `num_images` in a job's `input` must not be
+  negative, whatever the adapter.
 - Targets in a route are tried in order. A failed submit, a provider-side
   failure, a timeout (`timeout_s`) or an answer with no outputs moves on to
   the next target.
@@ -284,7 +296,11 @@ under the configured `base_url`.
 curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer <gateway key>" -d '{"model":"video","input":{"prompt":"waves","duration":5}}'
 ```
 
-With `per_second_usd`, the price is multiplied by `input.duration`.
+With `per_second_usd`, the price is multiplied by the larger of
+`input.duration` and `input.seconds`. With `per_input_char_usd`, the
+characters of `input.prompt`, `input.text` and `input.input` are added
+together, because the whole `input` is sent. The same holds for the
+Replicate and xAI video adapters.
 
 Status: **not verified.** The fal adapter has only run against a mock
 written from public documentation; expect details to differ.
@@ -483,8 +499,10 @@ mock).
 curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer <gateway key>" -d '{"model":"grok-video","input":{"prompt":"a wave breaking","duration":4}}'
 ```
 
-Price it with `per_second_usd`, which is multiplied by `input.duration`. If
-the client leaves `duration` out, that part of the price is zero.
+Price it with `per_second_usd`, which is multiplied by `input.duration`
+(or `input.seconds`, whichever is larger). If the client leaves both out,
+that part of the price is zero, whatever length the provider then
+generates; a negative value is refused when the job is created.
 
 Status: verified with `grok-imagine-video-1.5-lite`: a one-second clip
 submitted, polled to completion, copied off xAI and downloaded from the

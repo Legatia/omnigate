@@ -20,6 +20,7 @@ exercised against a mock, or not at all, the page says so.
 | Use the dashboard, create and revoke gateway keys, set budgets, read the audit log | [Admin](admin.md) |
 | Connect OpenAI, Anthropic, Gemini, xAI or a media provider | [Providers](providers.md) |
 | Put it on a server with TLS | [Deployment](deployment.md) |
+| Harden a deployment: what to expose, where each credential lives, the admin allow-list, backups, logs | [Security hardening](security.md) |
 | Monitor it, understand limits and timeouts, read its logs, or debug an error | [Operations](operations.md) |
 | Understand how the two processes divide the work | [Architecture](architecture.md) |
 | Convert a LiteLLM proxy config | [Migrating from LiteLLM](migrating-from-litellm.md) |
@@ -31,7 +32,8 @@ exercised against a mock, or not at all, the page says so.
 - [`config/omnigate.dev.json`](../config/omnigate.dev.json): the config the quickstart uses, with mock providers.
 - [`config/omnigate.example.json`](../config/omnigate.example.json): a template for real providers.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md): building, tests, code layout.
-- [`SECURITY.md`](../SECURITY.md): reporting a vulnerability, security model, past advisories.
+- [`SECURITY.md`](../SECURITY.md): reporting a vulnerability, security model, known limits, past advisories.
+- `.env.example`, `.env.control.example`, `.env.dataplane.example`: the three environment files of the Compose deployment.
 - [`CHANGELOG.md`](../CHANGELOG.md): what changed.
 
 ## Status in one paragraph
@@ -53,15 +55,28 @@ The official OpenAI and Anthropic Python SDKs are run through the gateway
 against the mock providers (`tools/sdk_compat.py`); no run against real
 providers is recorded.
 
+The same holds for the security fixes of November 2026: strict request
+heads and paths, bounded JSON nesting, billing of abandoned streams,
+media cost computed from what an adapter sends, address checks on provider
+output downloads, throttling of wrong admin tokens, and the admin
+allow-list in the proxy. They are covered by unit and fuzz tests, by
+`tools/malformed_test.py` and by the container test. No external security
+test has been done.
+
 ## If you are upgrading from an earlier commit
 
-Three things changed in ways an existing installation or client can notice.
-Each is described where it belongs; this is the list of where to look.
+Several things changed in ways an existing installation or client can
+notice. Each is described where it belongs; this is the list of where to
+look.
 
 | Change | Read |
 |---|---|
-| An authentication bypass on the control plane was fixed in commit 97cf396. If your control plane or dashboard host was reachable by anyone you do not trust, there are things to check. | [SECURITY.md](../SECURITY.md#past-advisories) |
-| The reason of a gateway error moved from `error.type` to `error.code`, errors now have the shape of the client's protocol, and a provider's 429 reaches the client as 429 instead of 502. | [API: Errors](api.md#errors) |
+| Three security commits (97cf396, fde530c, 3a0b147) fixed an authentication bypass on the control plane, remote crashes and request smuggling on the data plane, ways to avoid being billed, and a request-forgery path through provider outputs. Update both processes; if your control plane or dashboard host was reachable by anyone you do not trust, there are things to rotate and check. | [SECURITY.md](../SECURITY.md#past-advisories) |
+| The Compose deployment now reads `.env.control` and `.env.dataplane` instead of one `.env`, and will not start without them. An admin token shorter than 16 characters, or a release build without `OMNIGATE_CONFIG`, stops the control plane from starting. | [Deployment: coming from a commit before 3a0b147](deployment.md#coming-from-a-commit-before-3a0b147) |
+| The gateway is stricter about requests: one spelling per path, no percent-encoding, a small character set in query strings, bounded JSON nesting, `411` for a body without a length. | [API: request heads, paths and queries](api.md#request-heads-paths-and-queries) |
+| Bills can change: an abandoned stream is billed (by estimate if need be), media jobs are priced from what is sent to the provider, and job creation has a second rate limit and a cap on unfinished jobs. | [Operations: streams that end early](operations.md#streams-that-end-early), [Configuration: media routes](configuration.md#mediaroutes) |
+| `retention.ledger_ids_days` now defaults to 14 days. | [Operations: retention](operations.md#retention) |
+| The reason of a gateway error moved from `error.type` to `error.code`, and errors now have the shape of the client's protocol. Since commit 10bc009 the control plane's errors (jobs API, file downloads, admin API) have that same envelope too. A provider's 429 reaches the client as 429 instead of 502 whenever no target succeeded. | [API: Errors](api.md#errors) |
 | The ledger is now several files (segments and snapshots) instead of one. Nothing needs migrating, but backups must take all of them. | [Deployment: Backups](deployment.md#backups) |
 
 ## How these pages relate to the README

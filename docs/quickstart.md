@@ -50,6 +50,12 @@ If you have the official OpenAI and Anthropic Python SDKs installed,
 `python tools/sdk_compat.py` runs the same local stack through them; see
 [Using the official SDKs](api.md#using-the-official-sdks).
 
+A third tool, `python tools/malformed_test.py`, starts the same kind of
+stack and sends it malformed and hostile requests; the gateway must
+survive all of them. And `python tools/check.py` runs every suite a change
+should pass (builds, unit tests, formatting, these three) with one command;
+`--quick` runs only the unit tests and formatting checks.
+
 ## 3. Run the pieces by hand
 
 Four terminals, all starting in the repository root.
@@ -94,10 +100,17 @@ cd dataplane && OMNIGATE_INTERNAL_TOKEN=dev-internal-token MOCK_API_KEY=mock-sec
 ```
 
 With no `OMNIGATE_CONFIG` set, the control plane loads
-`config/omnigate.dev.json`. Both processes must be given the same
-`OMNIGATE_INTERNAL_TOKEN`; neither starts without it. `MOCK_API_KEY` is the
+`config/omnigate.dev.json`. That fallback exists only in a development
+build such as this `mix run`; a release build refuses to start without the
+variable. Both processes must be given the same
+`OMNIGATE_INTERNAL_TOKEN`; neither starts without it. The admin token must
+be at least 16 characters long, or the control plane refuses to start
+(leave it unset and one is generated and logged). `MOCK_API_KEY` is the
 variable the dev config's upstreams name in `api_key_env`; the mocks only
 insist that it is not empty.
+
+These tokens, and the keys in the dev config, are published in this
+repository. They are for a trial on your own machine and nothing else.
 
 The data plane prints one access-log line per request, with the key's name,
 the route, the upstream that answered, tokens and latency. Stop it with
@@ -153,6 +166,17 @@ curl http://127.0.0.1:8080/v1/jobs/JOB_ID -H "Authorization: Bearer og-unlimited
 Dashboard: <http://127.0.0.1:4000/>. Sign in with the admin token set above
 (`dev-admin-token-change-me`). The calls you just made are under "Recent
 requests" and "Recent media jobs".
+
+Paths are taken literally: `/v1/jobs`, not `/v1/jobs/`. The gateway
+answers `400` to a trailing slash, a percent-encoded character or a dot
+segment in a path ([API](api.md#request-heads-paths-and-queries)).
+
+To throw malformed requests at the gateway you just started, instead of
+letting the tool start its own (it must survive all of them):
+
+```bash
+python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key --model demo-direct --rpm-key og-ratelimited-key
+```
 
 ### Create a key without editing the config
 
@@ -304,4 +328,5 @@ restart is needed.
 - [Configuration](configuration.md) for every field and variable.
 - [Admin](admin.md) for the dashboard, managed keys, budgets and the audit log.
 - [Providers](providers.md) to add Anthropic, Gemini, xAI and media providers.
-- [Deployment](deployment.md) before exposing it to anything but localhost.
+- [Deployment](deployment.md) and [Security hardening](security.md) before
+  exposing it to anything but localhost.

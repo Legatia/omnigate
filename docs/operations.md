@@ -7,12 +7,18 @@
 - [Budgets](#budgets)
 - [Rate limits](#rate-limits)
 - [Timeouts, failover and cooldowns](#timeouts-failover-and-cooldowns)
+- [Streams that end early](#streams-that-end-early)
 - [Connection limits and shutdown](#connection-limits-and-shutdown)
 - [Retention](#retention)
 - [When the control plane is down](#when-the-control-plane-is-down)
 - [Logs](#logs)
 - [Load testing](#load-testing)
+- [Hostile-input testing](#hostile-input-testing)
 - [Troubleshooting](#troubleshooting)
+
+Hardening a deployment (what to expose, where each credential lives, the
+admin allow-list, log hygiene) has its own page:
+[Security hardening](security.md).
 
 ## Dashboard and admin API
 
@@ -143,6 +149,16 @@ Those requests reached the failover loop, so they are in the ledger (and in
 known key (no key, an unknown key, or a connection refused before anything
 was read).
 
+`invalid_request` covers everything the gateway refuses for the shape of
+the request rather than its content: a malformed or ambiguous request head
+(answered 400, 411, 417 or 431), a path that is not in canonical form, a
+query string or forwarded header with characters outside the allowed sets
+([API](api.md#request-heads-paths-and-queries)). A request refused for its
+head is counted under the key `-`, since the key was never read. A steady
+trickle of these from the internet is normal; a rise from one of your own
+applications means its HTTP client builds requests the gateway will not
+take.
+
 Limits, all by design:
 
 - **Best effort.** The counts are not written to disk anywhere. A data
@@ -163,7 +179,8 @@ current budget period reaches the budget.
 
 - **Spend** is the sum of the cost of the key's ledger events: text calls
   priced by the target's token prices, and media jobs priced by the target's
-  `price`.
+  `price`, applied to what the adapter sent to the provider
+  ([Configuration](configuration.md#mediaroutes)).
 - **The period is set per key** with `budget_period`: `total` (the default:
   everything the key ever spent, nothing resets it), `monthly` (the current
   UTC calendar month) or `daily` (the current UTC day). A monthly or daily
@@ -248,11 +265,33 @@ minute (a token bucket).
   `Retry-After` header in whole seconds.
 - State is in memory in each data-plane process. A restart forgives the
   last minute; several data planes each allow the full limit.
+- **Job creation is counted a second time, in the control plane**, with the
+  same `rpm` but in fixed one-minute windows (no burst carried over). It is
+  the handler that creates the job that counts, so the limit holds however
+  a request reached it, and across several data planes. Over it, the
+  control plane answers 429 `rate_limit_exceeded` with `Retry-After` (the
+  seconds left in the minute), which the data plane passes on. This state
+  is in memory too; a control-plane restart forgives the current minute.
 - Changing a key's `rpm` in the config starts it with a full bucket.
 - The `x-ratelimit-*` and `anthropic-ratelimit-*` headers a client may see
   on a response are the provider's, passed through
   ([API](api.md#response)). They describe your provider key's limits, not
   this `rpm`.
+
+**Unfinished jobs per key.** Separately from the rate, a key may have at
+most `max_open_jobs` media jobs queued or running at once: the key's own
+setting, else `media.max_open_jobs`, 100 by default, `0` for no limit.
+
+- One job more is refused with 429 `too_many_open_jobs` and
+  `Retry-After: 10`. The slot comes back when a job reaches a final status,
+  or is cancelled.
+- Jobs created under the key's earlier secrets count, so a rotation does
+  not reset it. A replay by `Idempotency-Key` returns the existing job and
+  is never refused.
+- It bounds what a single key can leave running at your providers, and
+  what it can make the control plane hold: each job's `input` and
+  `metadata` (at most `media.max_input_bytes` together, 1 MiB by default)
+  stay in memory and in the job file for as long as the job does.
 
 ## Timeouts, failover and cooldowns
 
@@ -262,7 +301,7 @@ Three timeouts, all on the data plane:
 |---|---|---|---|
 | Upstream | `OMNIGATE_UPSTREAM_TIMEOUT_MS` (10 minutes), or the upstream's `timeout_ms` | Waiting for a provider's response headers | The target is abandoned (`UpstreamTimeout`) and the next one is tried. |
 | Client | `OMNIGATE_CLIENT_TIMEOUT_MS` (30 seconds) | A client sending its request head and body, and an idle keep-alive connection between requests | The connection is closed. No response is sent (there is no 408). |
-| Stream idle | `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (5 minutes) | A response in progress: the upstream sending nothing, or the client reading nothing | The connection is closed, and what was metered so far is billed with status 499. |
+| Stream idle | `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (5 minutes) | A response in progress: the upstream sending nothing, or the client reading nothing. Also the gateway's own answer on its way to a client that has stopped reading (a large file download, for example). | The connection is closed, and the call is billed with status 499: what was metered, or an estimate ([below](#streams-that-end-early)). |
 
 Each can be turned off with `0`. Notes:
 
@@ -286,8 +325,8 @@ Each can be turned off with `0`. Notes:
 Failover and cooldowns:
 - **Failover** to the next target happens on connection errors, timeouts,
   429 and 5xx, and only before any byte has reached the client. When no
-  target is left, the client gets 429 if the last one tried answered 429
-  (with its `retry-after`), and 502 otherwise. A connection
+  target is left, the client gets 429 if any of them answered 429 (with
+  the longest `retry-after` those sent), and 502 otherwise. A connection
   error is first retried once on a fresh connection, in case a pooled
   connection had gone stale (timeouts and refused connections are not
   retried this way).
@@ -300,6 +339,44 @@ Failover and cooldowns:
 To see what happened to a request, look at `x-omnigate-attempts` and
 `x-omnigate-upstream` on the response, at the attempts column in the
 dashboard, or at the request's line in the access log.
+
+## Streams that end early
+
+A response that stops before its end is still paid for at the provider, so
+the gateway bills it. What it bills depends on whether the provider's
+closing usage figures were seen.
+
+| What happened | What the data plane does | What is billed |
+|---|---|---|
+| The client disconnected mid-response | Keeps reading the upstream for up to `OMNIGATE_ABORT_DRAIN_MS` (5 seconds; one allowance for the whole wait, and at most 8 MiB) | The provider's real figures if they arrive in that time; otherwise an estimate. |
+| The client stopped reading, or the upstream went silent, until the idle timeout | Closes both sides | The real figures if they had already been seen; otherwise an estimate. |
+| The upstream broke the connection mid-response | Closes the client's side | The same. |
+
+- **The estimate** is never less than what was metered. Missing input is
+  taken as the request body's bytes divided by 4, missing output as one
+  token per server-sent event received (the response's bytes divided by 4
+  when it was not an event stream). It is meant to be near what the
+  provider charged, and errs high for the request.
+- **How to tell.** The usage event carries `"estimated": true`, which is
+  written to the ledger segment with the rest of the event and shown per
+  request in `GET /admin/overview` (`requests[].estimated`, for the newest
+  requests only). In the data plane's text access log the line has
+  `usage=estimated`, status 499 and `aborted=ClientDisconnected` (or
+  `StreamIdleTimeout`). The JSON access log, the dashboard page and
+  `/metrics` do not show the mark; to count estimated calls over time,
+  search the ledger segments or the text log.
+- **`OMNIGATE_ABORT_DRAIN_MS=0`** skips the wait: a client that leaves
+  before the closing figures is billed the estimate at once. A larger
+  value makes the bill exact more often and holds the upstream connection
+  (and its thread) that much longer after the client has gone.
+- OpenAI-style providers send the usage as the last event of a stream, so
+  for them almost every abandoned stream needs the drain. Anthropic-style
+  providers report input at the start and output near the end.
+- Only metered endpoints produce a usage event at all
+  ([API](api.md#text-endpoints)).
+
+Earlier commits billed only what had been metered when the client left,
+which for an OpenAI-style stream was usually nothing.
 
 ## Connection limits and shutdown
 
@@ -326,26 +403,41 @@ the console on Windows) the data plane:
    says how many events.
 
 In a container this is what makes `docker stop` end the data plane cleanly
-instead of waiting to kill it. Docker and Compose wait 10 seconds by
-default before killing a container, which is the same as the default
-grace; if you raise `OMNIGATE_SHUTDOWN_GRACE_MS`, raise the container's
-stop timeout (`stop_grace_period` in Compose) above it. The container test
-checks that the data-plane container exits with status 0 on SIGTERM.
+instead of waiting to kill it. Docker waits 10 seconds by default before
+killing a container, which is the same as the default grace, so
+`compose.yaml` gives the data plane `stop_grace_period: 20s`; if you raise
+`OMNIGATE_SHUTDOWN_GRACE_MS`, raise that above it. The container test
+checks that the data-plane container exits with status 0 on SIGTERM, and
+that both services have their stop timeouts.
+
+**Exit codes of the data plane.** `0` after a clean stop, `1` for a startup
+error (a missing token, a bad setting), and `70` after a panic. Request
+input is validated so that it cannot reach a panic, but if one happens
+anyway the whole process ends, so an optimized build logs one line
+(`error(panic): <message>`, or a JSON line with `"scope":"panic"`) and
+exits with 70 for the supervisor to restart it. Usage events already
+queued are in the spool and are delivered after the restart; requests in
+flight, and refusal counts not yet reported, are lost. Debug builds keep
+the standard handler and its stack trace instead. Treat an exit with 70 as
+a bug to report.
 
 A restart still drops the state the data plane keeps only in memory:
 rate-limit buckets, cooldowns, round-robin counters, learned model quirks,
 the response cache, and refusal counts not yet reported.
 
-The control plane has no drain step of its own; what a restart of it means
-for jobs is in [Deployment](deployment.md#upgrades).
+The control plane has no drain step for requests; at a clean stop it
+writes a ledger snapshot, for which `compose.yaml` gives it
+`stop_grace_period: 30s`. What a restart of it means for jobs is in
+[Deployment](deployment.md#upgrades).
 
 ## Retention
 
-Off by default: nothing is deleted unless the config has a `retention`
-section.
+Jobs, files and ledger segments are kept for ever unless the config has a
+`retention` section that says otherwise. The ledger's duplicate-detection
+ids are the one thing with a finite default: 14 days.
 
 ```json
-"retention": { "jobs_days": 30, "ledger_ids_days": 7, "ledger_days": 90, "delete_bucket_objects": true }
+"retention": { "jobs_days": 30, "ledger_ids_days": 14, "ledger_days": 90, "delete_bucket_objects": true }
 ```
 
 One sweep runs a few seconds after the control plane starts and then every
@@ -378,12 +470,19 @@ their outputs are deleted: files on local disk, and objects in the bucket.
   deletion.
 
 **`ledger_ids_days`.** The ledger forgets the event ids it uses to reject
-duplicates once they are older than this.
+duplicates once they are older than this. The default is 14 days, also
+when there is no `retention` section at all; `0` keeps them for ever, which
+is what earlier commits did.
 
-- Spend totals and the ledger's segments are untouched.
+- Spend totals and the ledger's segments are untouched. What shrinks is
+  the set held in memory and written into every snapshot, which otherwise
+  grows with every request ever served.
 - A usage event that a data plane resends after its id was forgotten would
-  be counted twice. Keep this well above the longest outage a data plane
-  might spool through.
+  be counted twice. An id only matters while a data plane might still
+  resend its event, which is normally minutes; keep this well above the
+  longest outage a data plane might spool through, and raise it if a data
+  plane could be cut off from the control plane for more than two weeks
+  with usage in its spool.
 
 **`ledger_days`.** Sealed ledger segments (the files
 `ledger.NNNNNN.jsonl`) whose last write is older than this are deleted.
@@ -396,9 +495,12 @@ duplicates once they are older than this.
   those totals.** Back up the whole data directory, snapshots included; see
   [Deployment](deployment.md#backups).
 - A segment is deleted only when both snapshots cover it, and the newest
-  sealed segment always stays. A control plane also deletes nothing until
-  it has written a snapshot of its own since it started, so a sweep right
-  after a restart may remove no segments.
+  sealed segment always stays. After a restart only the snapshot the
+  control plane started from is vouched for, so the sweep writes a new one
+  first (the one it started from becomes the spare) and then deletes what
+  both cover. A quiet installation that records nothing after a restart
+  therefore still gets rid of due segments; until commit 10bc009 it did
+  not.
 - The active segment is sealed at 64 MiB or after the UTC day turns, so
   with steady traffic there is about one segment per day and `ledger_days`
   is accurate to about a day. An installation with no traffic seals nothing
@@ -466,12 +568,20 @@ info(access): POST /v1/chat/completions 200 key=my-app model=claude upstream=ant
 | `key=` | The gateway key's **name**. The key itself and its hash are never logged. Absent when the request had no known key. |
 | `model=` | The route name the client asked for. |
 | `upstream=`, `attempts=` | The upstream that answered and how many were tried. Absent when none answered. |
+| `usage=estimated` | The token counts on this line are an estimate: the response ended before the provider's closing figures arrived. See [Streams that end early](#streams-that-end-early). |
 | `in=`, `out=` | Uncached input tokens and output tokens. Present when either is not zero. |
 | `cached_in=` | Input tokens the provider read from or wrote to its prompt cache, when there were any. |
 | `cache=hit` | The answer came from the gateway's response cache. |
 | `Nms` | From the request head being read to the end of the response. |
 | `id=` | The request id (`x-omnigate-request-id`, and the usage event's id in the ledger). |
-| `aborted=` | Why the request ended without a normal response, if it did: `ClientTimeout`, `StreamIdleTimeout`, or the name of the I/O error. |
+| `aborted=` | Why the request ended without a normal response, if it did: `ClientTimeout`, `StreamIdleTimeout`, `ClientDisconnected`, or the name of the I/O error. |
+
+Text that came from a client (the path, the model name) cannot break out of
+its line: in the text format a control byte is written as `\xNN` and a
+space as `_`, so a line break in a model name cannot start a forged log
+line. A request whose head was refused leaves no access-log line; it is
+counted among the [refused requests](#refused-requests) and logged at
+`debug` level.
 
 With `OMNIGATE_LOG_FORMAT=json` every line is one JSON object. Ordinary log
 lines look like
@@ -492,7 +602,11 @@ members instead of a message:
 `aborted` are present only when they apply; `method`, `path`, `status`,
 `input_tokens`, `output_tokens` and `latency_ms` always are. A message
 longer than about 2,000 bytes is cut off, and a path longer than 160
-bytes is shortened.
+bytes is shortened. The JSON form has no member for an estimated count;
+only the text form marks it.
+
+The query string of a request is never logged, in either format: for a
+signed file URL it is the credential.
 
 (The values in these examples are made up; the field names and order are
 the code's.)
@@ -507,6 +621,9 @@ Control plane:
 | Line | Meaning |
 |---|---|
 | `OMNIGATE_INTERNAL_TOKEN is not set (or is empty). ...` | The control plane refused to start. Set the same value for both processes. |
+| `OMNIGATE_ADMIN_TOKEN is shorter than 16 characters. ...` | The control plane refused to start. Set a long random value, or leave it unset to have one generated. |
+| `OMNIGATE_CONFIG is not set. Point it at your config file ...` | A release build of the control plane refused to start: only a development build falls back to the development config. |
+| `OMNIGATE_CONTROL_PORT is not a whole number: ...`, `OMNIGATE_CONTROL_PORT must be between 1 and 65535, got ...`, `OMNIGATE_AUDIT_MAX_MB is not a number: ...`, `OMNIGATE_AUDIT_MAX_MB must not be negative, got ...`, `OMNIGATE_CONTROL_BIND is not an IP address: ...` | The control plane refused to start over a setting it could not read. Nothing is replaced by a default. |
 | `loaded config <path>: N routes, N keys` | Startup. |
 | `loaded N managed keys from <path>` | Startup, when the keys file has keys. |
 | `cannot write <path>: ...` | A key change could not be saved and was not applied. |
@@ -537,7 +654,7 @@ Data plane:
 | Line | Meaning |
 |---|---|
 | `OMNIGATE_INTERNAL_TOKEN is not set` | The data plane exited at startup. An empty value counts as not set. |
-| `bad OMNIGATE_LOG_LEVEL or OMNIGATE_LOG_FORMAT: ...`, `<VARIABLE> is not a valid number: ...` | The data plane exited at startup over a bad setting. The second line names the variable for the timeout, connection, grace and cache settings; a bad value in one of the older numeric variables (`OMNIGATE_POLL_MS`, `OMNIGATE_FLUSH_MS`, `OMNIGATE_UPSTREAM_TIMEOUT_MS`, the cooldown pair) stops it with a parse error that does not name it. |
+| `bad OMNIGATE_LOG_LEVEL or OMNIGATE_LOG_FORMAT: ...`, `<VARIABLE> is not a valid number: "<value>" (expected a whole number from <min> to <max>)`, `OMNIGATE_LISTEN must be host:port, got ...`, `OMNIGATE_LISTEN has no valid port: ...` | The data plane exited at startup over a bad setting. Every numeric variable is read strictly (digits only) and named in the message. |
 | `omnigate data plane listening on <address> (control plane <url>)` | Startup. |
 | `installed config version <id> (N routes, N keys)` | A new config snapshot is in force. |
 | `initial config sync failed (...)` | The control plane was unreachable at startup; the line says whether a cached config is being served. |
@@ -549,7 +666,8 @@ Data plane:
 | `usage delivery failed (...); spooling, N events queued` | Logged once per outage. `usage delivery resumed` ends it. |
 | `reloaded N undelivered usage events from spool` | Startup after an outage or crash. |
 | `<upstream>/<model> rejects sampling parameters; retrying without them` | A learned model quirk. |
-| `control plane request <path> failed: ...` | A jobs or files request got 503 `control_plane_unavailable`. |
+| `control plane request <path> failed: ...` | A jobs or files request got 503 `control_plane_unavailable`. The line has the path only, never the query string. |
+| `error(panic): ...` | The data plane hit an internal error and exited with status 70. See [Connection limits and shutdown](#connection-limits-and-shutdown). |
 | `stopping: N connection(s) open, waiting up to N ms for requests in flight` | A stop signal arrived. |
 | `N request(s) still running after the grace period; cutting them off` | The grace period was too short for them. |
 | `stopped cleanly` | Exit with all usage delivered. |
@@ -587,12 +705,70 @@ connections. `tools/mock_upstream.py` takes `MOCK_PORT_OFFSET` to shift its
 ports (9001-9005 by default), so that a second copy can run next to one
 that is already in use.
 
+## Hostile-input testing
+
+`tools/malformed_test.py` is the counterpart of the load test for requests
+that are wrong on purpose. It drives a gateway over raw sockets with:
+
+- the requests that used to end the process (a header line without a
+  colon, a `POST` with no length, JSON nested hundreds of levels deep);
+- request-smuggling and header-injection attempts (a second request hidden
+  behind bare line feeds, two lengths, a length with chunked encoding, a
+  body on a `GET`, an unread body after an early error);
+- every non-canonical spelling of a path (`/v1/jobs/`, `//v1/jobs`,
+  `/%76%31/jobs`, dot segments);
+- a few hundred generated variations of broken request heads. They are
+  seeded: `--seed` replays a run, `--count` sets how many.
+
+After every case it asks `/healthz` on a fresh connection. Staying up is
+the property under test; where a case has one right answer (400, 411, 417,
+413) that is checked too, and no case may produce a 500. It exits 0 only if
+the gateway survived everything and every expected status matched.
+
+**By itself**, with a built data plane and `mix` available, it starts the
+mock providers, the control plane and the gateway through the end-to-end
+harness (on that harness's ports, with state in a temp directory) and stops
+them at the end:
+
+```bash
+python tools/malformed_test.py
+```
+
+Run this way it also checks that **a client which hangs up mid-stream is
+still billed**: once with a normal stream (the provider's real figures must
+arrive in the ledger), once with a stream that never reports usage and
+once with a stream that goes silent (each must be billed an estimate,
+marked as one). It reads the result through `GET /admin/overview`.
+`--thorough` runs 1,500 generated cases instead of 250 and takes several
+minutes. It cannot run at the same time as the end-to-end or SDK suites,
+which use the same ports; when a case fails it keeps the logs and says
+where.
+
+**Against a gateway you started yourself**, name it, with a valid key and a
+text route that key may use:
+
+```bash
+python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key --model demo-direct --rpm-key og-ratelimited-key
+```
+
+`--rpm-key` adds the check that the trailing-slash spelling cannot be used
+to create jobs past a rate limit. The billing checks then run only if you
+give it `--events-url` (a URL that lists the usage events received) and
+the routes for `--drip-model` and `--stall-model`. Point it at a test
+instance, never at production: it sends several megabytes of junk and
+deliberately trips refusal counters. Standard library only.
+
+CI runs it in its own job, in the first form
+(`.github/workflows/ci.yml`), and `python tools/check.py` includes it. The
+container test sends a smaller set of malformed requests through the TLS
+proxy as well ([Deployment](deployment.md#testing-the-compose-file)).
+
 ## Troubleshooting
 
-By the reason in the gateway's answer: `error.code` when the data plane
-raised the error, `error.type` when the control plane did (the jobs API's
-own errors and everything on the control plane's port; see
-[API](api.md#errors)). An answer that has an `x-omnigate-upstream` header
+By the reason in the gateway's answer, which is always `error.code`,
+whichever of the two processes raised the error (see
+[API](api.md#errors); until commit 10bc009 the control plane put it in
+`error.type`). An answer that has an `x-omnigate-upstream` header
 came from a provider, not from the gateway; see the last rows. A gateway
 error carries `x-omnigate-request-id`, which is the `id=` of the request's
 line in the data plane's access log.
@@ -607,11 +783,18 @@ line in the data plane's access log.
 | `model_not_allowed` (403) | The key has a `models` list without this route. | Add the route name to the list. |
 | `model_not_found` (404) | No route with this name. Text endpoints only know `routes[]`; the jobs API only knows `media.routes[]`. | Check the name, and that you are calling the right API for it. |
 | `not_found` (404) | The path or method is not one the gateway serves. | See the endpoint list in [API](api.md#text-endpoints). |
-| `invalid_json`, `missing_model` (400) | The body is not a JSON object, or has no `"model"` string. | Fix the request. |
+| `invalid_json`, `missing_model` (400) | The body is not a JSON object, is nested deeper than 64 levels, or has no `"model"` string. | Fix the request. |
+| `invalid_request` (400): `the request path is not in canonical form` | The path has a trailing slash, an empty, `.` or `..` segment, a percent-encoded character, or another character outside letters, digits and `-._~:@`. | Send the path plain: `/v1/jobs`, not `/v1/jobs/`. Look for a base URL that ends in a slash, or a client that encodes path segments. |
+| `invalid_request` (400): `the query string contains unsupported characters` | A `%`, `/`, space or other character outside the allowed set in the query string. | Remove the parameter; the gateway uses none beyond `limit`, `exp` and `sig`. |
+| `invalid_request` (400): `invalid idempotency-key header ...`, `invalid anthropic-version header`, `invalid anthropic-beta header` | The header's value has characters the gateway will not forward. | Use letters, digits and `-._` (plus `:` in an idempotency key, commas and spaces in `anthropic-beta`). |
+| `invalid_request` (400, 411 or 417) with no request id, or a bare 400 or 431 | The request head itself was refused: malformed, ambiguous about its body, without a length on a `POST`, with an `Expect` other than `100-continue`, or larger than 16 KiB. | Fix the client. A proxy in front that re-chunks or rewrites requests can also cause this. See [API](api.md#request-heads-paths-and-queries). |
 | `payload_too_large` (413) | Body over 8 MiB. | Send less; the limit is not configurable. |
-| `rate_limit_exceeded` (429) | Over the key's `rpm`. | Wait `Retry-After` seconds, or raise `rpm`. |
-| `all_upstreams_failed` (502) | Every target failed, and the last one tried did not answer 429. | Read `error.attempts`: `http_429` / `http_5xx` are provider answers; `UpstreamTimeout` means no headers within the timeout; `ConnectionRefused` and similar are network errors; `unknown_upstream` means a target names an upstream that is not in `upstreams[]`; `protocol_mismatch` means that target speaks the other protocol and the endpoint is not translated; `untranslatable_request` means the request has audio or file parts and that target speaks the other protocol. |
-| `upstream_rate_limited` (429) | Every target failed, and the last one tried answered 429. | Wait for the `retry-after` the response carries (the provider's), or add a target at another provider to the route. This is your provider key's limit, not the gateway key's `rpm`. |
+| `rate_limit_exceeded` (429) | Over the key's `rpm`. For `POST /v1/jobs` the control plane counts as well, and can be the one that answers. | Wait `Retry-After` seconds, or raise `rpm`. |
+| `too_many_open_jobs` (429) | The key already has `max_open_jobs` jobs queued or running. | Wait for jobs to finish (the answer suggests 10 seconds in `Retry-After`), cancel some, or raise the key's `max_open_jobs` (or `media.max_open_jobs`). |
+| `payload_too_large` (413) on `POST /v1/jobs`, from the control plane | `input` and `metadata` together exceed `media.max_input_bytes`. | Send less, pass large inputs by URL, or raise the setting. |
+| `invalid_request` (400) on `POST /v1/jobs`: `"input.duration" must be a number of seconds, 0 or more` (or the same for `seconds`, `n`, `num_outputs`, `num_images`) | A field that feeds the price is negative or not a number. | Fix the request. |
+| `all_upstreams_failed` (502) | Every target failed, and none of them answered 429. | Read `error.attempts`: `http_429` / `http_5xx` are provider answers; `UpstreamTimeout` means no headers within the timeout; `ConnectionRefused` and similar are network errors; `unknown_upstream` means a target names an upstream that is not in `upstreams[]`; `protocol_mismatch` means that target speaks the other protocol and the endpoint is not translated; `untranslatable_request` means the request has audio or file parts and that target speaks the other protocol. |
+| `upstream_rate_limited` (429) | No target succeeded, and at least one answered 429. | Wait for the `retry-after` the response carries (the longest any rate-limited provider asked for), or add a target at another provider to the route. This is your provider key's limit, not the gateway key's `rpm`. |
 | `endpoint_not_supported` (400) | An untranslated endpoint (embeddings, responses, completions, count_tokens) was called on a route whose upstreams all speak the other protocol. | Call a route that has an upstream of the endpoint's own protocol, or add one to this route. |
 | `untranslatable_request` (400) | The request has audio or file parts, and every target of the route would need it translated. | Use a route with an upstream of the client's own protocol. |
 | `control_plane_unavailable` (503) | A jobs or files request could not reach the control plane within 30 seconds. | Check the control plane; text endpoints are unaffected. |
@@ -620,6 +803,7 @@ line in the data plane's access log.
 | `idempotency_conflict` (409) | The `Idempotency-Key` was used before with a different body. | Use a new key for a new request. |
 | `job_not_found`, `file_not_found` (404) | Wrong id, a job of another key, a job removed by retention, or a job of a key that was deleted and created again under the same name. | |
 | `unauthorized` (401, control plane) | No valid admin token or session on `/admin/*` or `/metrics`. | Send `Authorization: Bearer <admin token>`. A gateway key or the internal token is not accepted here. |
+| `too_many_attempts` (429, control plane) | 20 wrong bearer tokens from this address within a minute. Until the minute is over the right token is refused too. | Find what is sending the wrong token (an old token in a script or a scrape job), then wait a minute. Behind a proxy without `OMNIGATE_TRUST_FORWARDED`, everyone shares the proxy's address. See [Admin](admin.md#two-ways-in). |
 | `csrf_failed` (403, control plane) | A change sent with a session cookie but without the session's CSRF token. | From a script, use the bearer token instead. In the dashboard, reload the page. See [Admin](admin.md#csrf-scripts-and-browsers). |
 | `read_only_key` (409, control plane) | The key is defined in the config file. | Edit the file. |
 | `key_exists` (409), `key_not_found` (404), `invalid_request` (400, control plane) | See [Admin](admin.md#errors). | |
@@ -640,7 +824,7 @@ A media job that ends `failed`:
 | `invalid_input: ...` | The adapter needs a field the job's `input` lacks; see [Providers](providers.md#media-providers). |
 | `timeout` | The target did not finish within the route's `timeout_s`. |
 | `no_outputs`, `no_output: ...` | The provider finished without a file (for Gemini: a blocked prompt or an early stop). |
-| `output_fetch_failed: ...` | The output could not be downloaded: an HTTP error, more than `max_output_bytes`, or a stalled download. |
+| `output_fetch_failed: ...` | The output could not be downloaded: an HTTP error, more than `max_output_bytes`, or a stalled download. `output_fetch_failed: blocked: output url resolves to a private or loopback address` means the URL the provider returned, or one it redirected to, does not point at a public address; the control plane refuses to fetch it unless `media.webhooks.allow_private` is set. `too many redirects` means more than five. |
 | `storage_error` | Outputs could not be stored: bucket endpoint, credentials or permissions. The control log has the detail. |
 | `route_removed` | The media route was deleted from the config while the job was unfinished. |
 
@@ -656,18 +840,24 @@ Other symptoms:
 
 | Symptom | Likely cause |
 |---|---|
-| Dashboard login answers 429 | Five failed logins from one address within a minute. Behind a reverse proxy all clients share the proxy's address. Wait a minute. |
+| Dashboard login answers 429 | Five failed logins from one address within a minute. Behind a reverse proxy all clients share the proxy's address unless `OMNIGATE_TRUST_FORWARDED=1` is set (as `compose.yaml` does). Wait a minute. |
+| The dashboard host answers 403 to everything | The request comes from outside `OMNIGATE_ADMIN_ALLOW`. Remember that the proxy judges the address it sees, which behind another proxy is that proxy's. |
+| The data-plane container restarts with exit code 70 | A panic. The line `error(panic): ...` in its log says where. Report it. |
+| A file URL downloads instead of displaying in the browser | Intended: stored outputs are served as attachments. Fetch the file and use it from your own origin. |
+| A call the client cancelled shows up with tokens and cost | Intended: an abandoned stream is billed, exactly when the provider's figures arrive in time and by estimate otherwise. See [Streams that end early](#streams-that-end-early). |
 | Signed out of the dashboard after changing the admin token | Expected: sessions are signed with a key derived from the token. |
 | Output URLs point at `127.0.0.1:8080` | `media.public_base_url` is still the default. |
 | A webhook never arrives | Look at `webhook.last_status` and `webhook.last_error` in the job. The receiver must answer 2xx; a redirect counts as a failure. |
 | Streamed tokens arrive in one burst through your proxy | The proxy is buffering. In Caddy: `flush_interval -1`. |
 | Spend shows $0 | The route's targets have no prices. Or the answers came from the response cache, which costs nothing. |
-| The control plane exits at once, or its container keeps restarting | `OMNIGATE_INTERNAL_TOKEN` is unset or empty (the log says so), the config file is invalid, or the keys file exists but cannot be read. |
+| The control plane exits at once, or its container keeps restarting | `OMNIGATE_INTERNAL_TOKEN` is unset or empty, `OMNIGATE_ADMIN_TOKEN` is set but shorter than 16 characters, a release build has no `OMNIGATE_CONFIG`, `OMNIGATE_CONTROL_PORT`, `OMNIGATE_AUDIT_MAX_MB` or `OMNIGATE_CONTROL_BIND` has a value it cannot read (the log names each of these), the config file is invalid (a negative media price or a bad `max_open_jobs` included), or the keys file exists but cannot be read. |
+| The data plane exits at once | A setting it cannot read: the log names the variable. Numeric settings take digits only (`2000`, not `2s`, `2_000` or `+2000`). |
+| `docker compose up` fails with a missing `env_file` | `.env.control` or `.env.dataplane` does not exist. Copy the `.example` files; see [Deployment](deployment.md#compose-with-tls). |
 | The control container is `unhealthy` | `GET /readyz` is failing. Call it (`docker compose exec control wget -q -O - http://127.0.0.1:4000/readyz`) and read `reason`; a refused connection means the control plane is still loading its ledger or is not running. |
 | A managed key stopped working after a config edit | The config file now defines a key with the same name, which shadows the managed one. `GET /admin/keys` shows it with `"state": "shadowed"`. |
 | An application reports a rate limit although its key has no `rpm` | `429 upstream_rate_limited`: the provider's limit on your provider key, passed on. |
 | A connection the client kept open was closed by the gateway | It was idle for `OMNIGATE_CLIENT_TIMEOUT_MS` (30 seconds by default). Most HTTP clients retry on a fresh connection by themselves. |
-| A long streamed answer was cut off | The upstream sent nothing, or the client read nothing, for `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`. The ledger has the request with status 499. |
+| A long streamed answer was cut off | The upstream sent nothing, or the client read nothing, for `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`. The ledger has the request with status 499, with estimated token counts if the provider's own had not arrived. |
 | A changed answer keeps coming back unchanged | The route has `cache_ttl_s` and the response carries `x-omnigate-cache: hit`. |
 | A new key works on one data plane and not yet on another | Each data plane polls the config by itself; wait one poll interval. |
 | A blocked monthly key is still blocked after midnight UTC on the first | The data plane learns of the change with its next poll; if the control plane is unreachable it cannot learn of it at all. |

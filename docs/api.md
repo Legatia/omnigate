@@ -74,13 +74,31 @@ Earlier commits put the reason in `error.type` and used one shape for both
 protocols. A client that matched on `error.type` must now match on
 `error.code`.
 
+**One shape, whichever process refuses.** The jobs API and file downloads
+are answered by the control plane, and so is everything on its own port
+(the admin API, `/metrics`, `/internal/*`). Its errors have the same
+OpenAI-style envelope as the data plane's:
+
+```json
+{"error": {"message": "no such job", "type": "invalid_request_error", "param": null, "code": "job_not_found"}}
+```
+
+The reason is in `error.code` and the category in `error.type`, taken from
+the same table as the OpenAI column below (reasons that are not in it get
+their category from the status). A client of `/v1/jobs` therefore cannot
+tell, and need not care, which of the two processes said no. The control
+plane always answers in the OpenAI shape; the jobs API has no Anthropic
+form. Until commit 10bc009 the control plane used a shape of its own,
+`{"error": {"type": "<reason>", "message": "..."}}`: a client that read a
+job error's reason from `error.type` must read `error.code` now.
+
 ### Reasons
 
 | Status | `error.code` | OpenAI `error.type` | Anthropic `error.type` | When |
 |---|---|---|---|---|
-| 400 | `invalid_json` | `invalid_request_error` | `invalid_request_error` | The body is not a JSON object. |
+| 400 | `invalid_json` | `invalid_request_error` | `invalid_request_error` | The body is not a JSON object, or its arrays and objects are nested deeper than 64 levels. |
 | 400 | `missing_model` | `invalid_request_error` | `invalid_request_error` | No `"model"` string in the body. |
-| 400 | `invalid_request` | `invalid_request_error` | `invalid_request_error` | A jobs or files path that cannot be turned into a request to the control plane. |
+| 400 | `invalid_request` | `invalid_request_error` | `invalid_request_error` | The request head is malformed or ambiguous, the path is not in canonical form, the query string has characters outside the allowed set, or an `anthropic-version`, `anthropic-beta` or `Idempotency-Key` header has a value the gateway will not forward. See [Request heads, paths and queries](#request-heads-paths-and-queries). |
 | 400 | `endpoint_not_supported` | `invalid_request_error` | `invalid_request_error` | The route exists, but every one of its upstreams speaks the other protocol and this endpoint is not translated (only chat completions and messages are). Nothing was sent to a provider. |
 | 400 | `untranslatable_request` | `invalid_request_error` | `invalid_request_error` | No target could be sent the request: it would have to be translated and uses something that cannot be (audio or file parts). Nothing was sent to a provider. |
 | 401 | `missing_api_key` | `invalid_request_error` | `authentication_error` | No key was sent. |
@@ -90,10 +108,13 @@ protocols. A client that matched on `error.type` must now match on
 | 404 | `not_found` | `invalid_request_error` | `not_found_error` | The path is not an endpoint the gateway serves. |
 | 404 | `model_not_found` | `invalid_request_error` | `not_found_error` | No route has this name; or, on `GET /v1/models/{id}`, the model does not exist or the key may not use it. |
 | 405 | `method_not_allowed` | `invalid_request_error` | `invalid_request_error` | A method other than GET or POST on `/v1/jobs*` or `/v1/files/*`. |
-| 413 | `payload_too_large` | `invalid_request_error` | `request_too_large` | The request body exceeds 8 MiB. |
+| 411 | `invalid_request` | `invalid_request_error` | (always the OpenAI shape) | A `POST`, `PUT` or `PATCH` with neither `Content-Length` nor `Transfer-Encoding: chunked`. |
+| 413 | `payload_too_large` | `invalid_request_error` | `request_too_large` | The request body exceeds 8 MiB; for `POST /v1/jobs`, 8,000,000 bytes (the size the control plane's parser reads). |
+| 417 | `invalid_request` | `invalid_request_error` | (always the OpenAI shape) | An `Expect` header other than `100-continue`. |
 | 429 | `rate_limit_exceeded` | `rate_limit_error` | `rate_limit_error` | The key is over its `rpm`. The response has a `Retry-After` header in seconds. |
-| 429 | `upstream_rate_limited` | `rate_limit_error` | `rate_limit_error` | Every target failed and the last one tried answered 429. The error has `attempts`, and the response carries that upstream's `retry-after` if it sent one. |
-| 502 | `all_upstreams_failed` | `server_error` | `api_error` | Every target failed and the last one tried did not answer 429. The error has `attempts`. |
+| 429 | `upstream_rate_limited` | `rate_limit_error` | `rate_limit_error` | No target succeeded and at least one answered 429. The error has `attempts`, and the response carries the longest `retry-after` any of the rate-limited targets sent. |
+| 431 | none | | | The request head is larger than 16 KiB. The answer has no body. |
+| 502 | `all_upstreams_failed` | `server_error` | `api_error` | Every target failed and none of them answered 429. The error has `attempts`. |
 | 503 | `gateway_not_ready` | `server_error` | `api_error` | The data plane has no config yet (the control plane has never answered and there is no cached config). |
 | 503 | `control_plane_unavailable` | `server_error` | `api_error` | A jobs or files request could not reach the control plane. |
 | 503 | `overloaded` | `server_error` | `overloaded_error` | The data plane is already serving `OMNIGATE_MAX_CONNECTIONS` connections. Sent at once, without reading the request, with `retry-after: 1` and `connection: close`. Because the request was not read, this answer is always in the OpenAI shape and has no request id. |
@@ -104,18 +125,80 @@ function's table would get its category from the status alone: 401, 403,
 404 and 429 as in the rows above, 400 and 405 to 428
 `invalid_request_error`, anything else `server_error` / `api_error`.
 
-**The jobs API has two sources of errors.** The reasons above are raised by
-the data plane and look as described here. Errors raised by the control
-plane, which owns the jobs (`job_not_found`, `idempotency_conflict` and the
-others [listed below](#job-errors)), are passed through unchanged in the
-control plane's own shape, `{"error": {"type": "<reason>", "message": "..."}}`:
-the reason is in `error.type` and there is no `code`. A client of the jobs
-API should read `error.code` and fall back to `error.type` when there is
-none.
+**The jobs API has more reasons.** The ones above are raised by the data
+plane. The control plane, which owns the jobs, adds `job_not_found`,
+`idempotency_conflict` and the others [listed below](#job-errors), in the
+same shape.
 
 There is no 408. A client that takes longer than
 `OMNIGATE_CLIENT_TIMEOUT_MS` to send its request, or leaves a keep-alive
 connection idle that long, has its connection closed without a response.
+
+### Request heads, paths and queries
+
+The gateway is strict about the bytes of a request before it looks at what
+the request asks for. Anything two HTTP implementations could read
+differently is refused, because that disagreement is what request smuggling
+is made of, and nothing a client sends is copied into a request of the
+gateway's own unless it is plain. Ordinary requests, and the ones the
+official SDKs send in `tools/sdk_compat.py`, are not expected to run into
+these rules; a hand-built request, or a client with unusual header values,
+can.
+
+**The head.** Checked first, before the key. A refusal at this stage is
+always in the OpenAI shape, has no request-id headers, is counted as a
+[refused request](operations.md#refused-requests) under the key `-` and the
+reason `invalid_request`, leaves no access-log line, and closes the
+connection.
+
+| Answer | When |
+|---|---|
+| `400 invalid_request` | A header line without a colon or with an empty name; a character in a header name that is not a token character; a control character in a header value; a bare CR or LF; a NUL byte; more than 100 header lines; a request line that is not `METHOD /path HTTP/1.x`; a request target that does not start with `/`, or contains a space, a control character or a byte outside ASCII; a `Content-Length` that is not a plain decimal number; two `Content-Length` headers with different values; `Content-Length` together with `Transfer-Encoding`; a `Transfer-Encoding` other than exactly `chunked`; a body (a length above 0, or chunked) on a method that has none, such as `GET`. |
+| `411 invalid_request` | A method that carries a body (`POST`, `PUT`, `PATCH`) with neither `Content-Length` nor `Transfer-Encoding: chunked`. |
+| `417 invalid_request` | An `Expect` header other than `100-continue`. |
+| `400` with no body | A head the HTTP parser itself rejects. |
+| `431` with no body | A head larger than 16 KiB. |
+
+**The path** must be in its one canonical form, on every endpoint except
+`GET /healthz`: it starts with `/`, has no trailing slash, no empty segment
+(`//`), no `.` or `..` segment, and every segment consists only of letters,
+digits and `-` `.` `_` `~` `:` `@`. A percent sign is not in that set, so
+**a percent-encoded path is refused**, as are a backslash and a `;`.
+`/v1/jobs/` is not `/v1/jobs`: it answers `400`, where earlier commits
+forwarded it as a job creation that the rate limit did not count.
+
+**The query string** may be at most 2,048 characters of letters, digits and
+`-` `.` `_` `~` `=` `&` `+` `,` `:`. A `%`, a `/`, a space or a quote
+answers `400`. The signed file URLs the gateway hands out, and `limit=N` on
+the job list, fit.
+
+**Forwarded headers.** Three request headers are copied into requests the
+gateway makes, and each must be plain or the request answers `400`. The
+check is made whenever the header is present, on every endpoint, also
+where the header is not used (an `Idempotency-Key` holding base64 with `+`,
+`/` or `=` is refused on a chat completion as well):
+
+| Header | Allowed |
+|---|---|
+| `anthropic-version` | Up to 32 letters, digits, `-`, `.` and `_`. |
+| `anthropic-beta` | Up to 512 letters, digits, `-`, `.`, `_`, commas and spaces. |
+| `Idempotency-Key` | 1 to 255 letters, digits, `-`, `.`, `_` and `:`. |
+
+**The body** of a text or job request may nest arrays and objects at most
+64 levels deep; deeper answers `400 invalid_json`. JSON inside a tool
+call's `arguments` string that is nested deeper than that is not refused:
+in a translated request it is handled like arguments that are not a JSON
+object, and travels on as a string instead of being parsed.
+
+When the gateway answers before it has read a request's body (a bad key on
+a `POST`, for example), the response says `connection: close`, and the
+gateway reads and discards what the client is still sending for a short
+time before it closes, so the client sees the answer rather than a reset
+connection. The unread body is never parsed as a second request.
+
+`tools/malformed_test.py` sends these cases, and a few hundred generated
+variations, at a running gateway; see
+[Operations](operations.md#hostile-input-testing).
 
 ### When every target fails
 
@@ -138,19 +221,21 @@ connection idle that long, has its connection closed without a response.
 `untranslatable_request`, `stream_aborted`, or the name of the network error
 (`UpstreamTimeout`, `ConnectionRefused` and so on).
 
-The answer depends on the **last target that was tried**:
+The answer depends on whether **any target answered 429**:
 
-- It answered 429: the client gets `429 upstream_rate_limited`, with that
-  upstream's `retry-after` header when it sent one, so that an SDK backs off
-  as it would at the provider. Earlier commits answered 502 here.
-- Anything else (a 5xx, a timeout, a connection error): `502
-  all_upstreams_failed`. If that last target answered with a `retry-after`
-  header, the 502 carries it.
+- At least one did: the client gets `429 upstream_rate_limited`, so that an
+  SDK backs off as it would at the provider. The response carries the
+  longest `retry-after` that any of the rate-limited targets sent (a value
+  in plain seconds wins over an HTTP date, which cannot be compared).
+- None did (only 5xx answers, timeouts, connection errors): `502
+  all_upstreams_failed`. If the last target that answered sent a
+  `retry-after` header, the 502 carries it.
 
 A route whose first target is rate limited and whose second target is down
-therefore answers 502, not 429. On a metered endpoint both answers are
-written to the ledger as a
-request with that status and no tokens.
+therefore answers 429: a later target that was merely down does not make
+the rate limit go away. (Until commit 10bc009 only the last target tried
+decided, and that route answered 502.) On a metered endpoint both answers
+are written to the ledger as a request with that status and no tokens.
 
 **Provider errors are not rewritten.** When a provider answers with a status
 that is not 429 or 5xx (a 400 for a bad parameter, a 401 for a bad provider
@@ -159,9 +244,12 @@ was translated, the error body is converted to the client's protocol. A 429
 or 5xx from a provider triggers failover instead; the client sees the
 outcome only when every target has failed, as described above.
 
-The gateway checks a text request in this order: config present, key
-present and known, budget, endpoint, body size, JSON, `model`, model limits,
-rate limit, route, and then the response cache if the route has one.
+The gateway checks a text request in this order: the request head, the
+path, the query string and the forwarded headers
+([above](#request-heads-paths-and-queries)), config present, key present
+and known, budget, endpoint, body size, nesting depth, JSON, `model`, model
+limits, rate limit, route, and then the response cache if the route has
+one.
 
 ### What an over-budget key can still do
 
@@ -223,7 +311,9 @@ Request headers the gateway acts on:
 | `anthropic-beta` | Forwarded to `anthropic` upstreams. |
 | `Idempotency-Key` | Jobs API only. |
 
-Other request headers are not forwarded to the provider.
+Other request headers are not forwarded to the provider. The values of
+these three are restricted to plain characters, on every endpoint; see
+[Request heads, paths and queries](#request-heads-paths-and-queries).
 
 ### Response
 
@@ -234,19 +324,21 @@ The provider's response, streamed as it arrives, with these headers added:
 | `x-omnigate-upstream` | Name of the upstream that answered. |
 | `x-omnigate-attempts` | How many upstreams the request was sent to, this one included. |
 | `x-omnigate-request-id` | Id of this request (32 hex characters); also the id of its usage event in the ledger. |
-| `x-request-id`, `request-id` | The request id where the OpenAI and the Anthropic SDK look for it. Each of the two is the provider's own value when the provider sent that header, and the gateway's id (the value of `x-omnigate-request-id`) otherwise. |
+| `x-request-id`, `request-id` | The request id where the OpenAI and the Anthropic SDK look for it. The provider's own id is preferred, so that a support ticket can quote it: when the provider sent both headers each keeps its value, when it sent only one of them that id goes into both, and when it sent neither both carry the gateway's id (the value of `x-omnigate-request-id`). |
 | `x-omnigate-cache` | Only on routes with `cache_ttl_s`, for non-streaming requests: `hit` or `miss`. See [Response cache](#response-cache). |
 
-**Request ids are on every answer the gateway produces, with two
+**Request ids are on every answer the gateway produces, with three
 exceptions**: provider responses, the gateway's own errors, the model
 endpoints, cache hits, and the jobs and files API all have them. On those
 that involve no provider, all three headers carry the gateway's id. The
-exceptions are `GET /healthz`, and the `503 overloaded` that is sent
-without reading the request.
+exceptions are `GET /healthz`, the `503 overloaded` that is sent without
+reading the request, and a request whose head was refused (the `400`,
+`411`, `417` and `431` of
+[Request heads, paths and queries](#request-heads-paths-and-queries)).
 
 A `429 upstream_rate_limited` or `502 all_upstreams_failed` carries the
-three id headers, and `retry-after` when the last upstream that answered
-sent one ([When every target fails](#when-every-target-fails)).
+three id headers, and `retry-after` when an upstream sent one
+([When every target fails](#when-every-target-fails) says whose).
 
 **Provider headers.** The provider's `content-type` is kept (and
 `content-length`, when the body is passed through untouched), and the
@@ -290,13 +382,35 @@ report token usage on a stream only when asked. If the client did not set
 removes the extra usage chunk from what the client receives.
 
 Failover happens only before the first byte of a response reaches the
-client. If a stream breaks after that, the connection is closed and what was
-metered so far is recorded (with status 499 in the ledger).
+client. If a stream breaks after that, the connection is closed and the
+call is recorded with status 499 in the ledger.
 
 A stream that goes silent is cut off the same way: when the upstream sends
 nothing, or the client reads nothing, for `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`
 (five minutes by default), the gateway closes the connection and records
-what was metered so far, also with status 499.
+the call, also with status 499.
+
+**A response that ends early is still billed.** Hanging up on a stream does
+not make it free: the provider charges for what it generated.
+
+- When the client disconnects, the gateway keeps reading the upstream for
+  up to `OMNIGATE_ABORT_DRAIN_MS` (5 seconds by default, and at most 8 MiB)
+  to catch the provider's closing usage figures. If they arrive, the call
+  is billed exactly those.
+- Whenever a response on a metered endpoint ends early without those
+  closing figures (the client left and they did not arrive in time, the
+  idle timeout fired, or the upstream broke off), the call is billed an
+  **estimate**, and its usage event is marked `"estimated": true`. The
+  estimate is never below what was actually metered. Input that was not
+  reported is taken as the request body's size in bytes divided by 4;
+  output as one token per server-sent event received (or the response's
+  bytes divided by 4, when it was not an event stream).
+- The estimate errs on the high side for the request and is rough for the
+  response. It exists so that an abandoned stream costs something close to
+  what the provider charged, not so that the two agree.
+
+How to see which calls were estimated is in
+[Operations](operations.md#streams-that-end-early).
 
 ### Response cache
 
@@ -354,9 +468,11 @@ the route name in `model`, in the client's protocol.
   `400 untranslatable_request`.
 - When a translated request is refused because the model rejects
   `temperature`, `top_p` or `top_k`, the gateway retries without them and
-  remembers that for the model. The same applies to models that demand a
-  thought signature on earlier tool calls (Gemini 3 and later). Requests in
-  the provider's own protocol are not touched and get the provider's error.
+  remembers that for the model, for the gateway key that ran into it (not
+  for other keys, so one client cannot change how another's requests are
+  sent). The same applies to models that demand a thought signature on
+  earlier tool calls (Gemini 3 and later). Requests in the provider's own
+  protocol are not touched and get the provider's error.
 
 The README lists what has not been verified against real providers here:
 images in translated requests, long conversations, large payloads and
@@ -416,6 +532,12 @@ always sends one) gets Anthropic's:
   `404 model_not_found`, so the reply does not reveal which other models
   exist. Errors from both endpoints are in the same protocol's shape as the
   list would have been.
+- The id is part of the path, so it falls under the
+  [path rule](#request-heads-paths-and-queries): a route whose name has a
+  character outside letters, digits and `-` `.` `_` `~` `:` `@` (a space or
+  a `+`, say) is listed and can be used in a request body, but
+  `GET /v1/models/{id}` answers `400 invalid_request` for it. A `/` in a
+  name is fine.
 
 ### `GET /healthz`
 
@@ -522,6 +644,7 @@ Differences from the real APIs that an SDK user can still see:
 | Paging of `models.list()` | There is one page; paging parameters are ignored. |
 | The error body on Anthropic-style endpoints | `error` has one member more than `type` and `message`: `code`, the gateway's reason. |
 | Endpoints the gateway does not serve (files, batches, audio, images and so on) | `404 not_found`. Media goes through the [jobs API](#jobs-api), which the SDKs do not know. |
+| Request paths, query strings and JSON nesting | Stricter than the providers: no percent-encoding, a small character set, at most 64 levels of nesting ([above](#request-heads-paths-and-queries)). Neither SDK sends anything else in the cases the suite covers. |
 
 ## Jobs API
 
@@ -540,6 +663,26 @@ Only `POST /v1/jobs` counts against the key's rate limit. A key sees only its
 own jobs; another key's job id answers 404. A managed key keeps its jobs
 when its secret is rotated ([Admin](admin.md#rotate)).
 
+Creating jobs is limited in three ways:
+
+- **The key's `rpm`, twice.** The data plane charges its token bucket, as
+  for a text request. The control plane then counts the creation again by
+  itself, in fixed one-minute windows, so that the limit on work that costs
+  money does not depend on the data plane recognising the request. Either
+  can answer `429 rate_limit_exceeded`.
+- **Unfinished jobs per key.** A key may have at most `max_open_jobs` jobs
+  that are queued or running (100 unless the key or `media.max_open_jobs`
+  says otherwise; `0` means no limit). One more answers
+  `429 too_many_open_jobs`. Jobs made under the key's earlier secrets count
+  too, and a replay by `Idempotency-Key` is never refused for this.
+- **Size.** `input` and `metadata` together may be at most
+  `media.max_input_bytes` (1 MiB by default) as JSON; more answers
+  `413 payload_too_large`.
+
+Every one of these 429 answers carries `Retry-After`: the data plane's own,
+and the control plane's two (the seconds left in the minute, and 10 for
+`too_many_open_jobs`), which the data plane passes on.
+
 A key over its budget cannot create a job (`402 budget_exceeded`) but can
 still fetch, list and cancel its jobs and download their files.
 
@@ -555,7 +698,13 @@ Request body:
 | `metadata` | object | no | Stored with the job and returned unchanged. |
 | `cache` | boolean | no | `true` allows reuse of a stored output; `false` forbids it. See [Caching](#caching). |
 
-Optional header: `Idempotency-Key` (1 to 255 bytes).
+Optional header: `Idempotency-Key` (1 to 255 characters: letters, digits,
+`-`, `.`, `_` and `:`).
+
+Some members of `input` are checked whatever the adapter, because they feed
+the price: `duration` and `seconds` must be a number of 0 or more (or a
+string that is one), and `n`, `num_outputs` and `num_images` a whole number
+of 0 or more. Anything else answers `400 invalid_request`.
 
 ```bash
 curl -i http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer og-unlimited-key" -H "Idempotency-Key: order-A-17" -d '{"model":"demo-image","input":{"prompt":"a lighthouse at dusk"},"metadata":{"order":"A-17"}}'
@@ -637,7 +786,7 @@ Fields:
 | `status` | `queued`, `running`, `succeeded`, `failed` or `canceled`. The last three are final. |
 | `outputs[]` | One entry per stored file: `url`, `content_type`, `bytes`, `sha256`. The URL is generated fresh on every fetch. |
 | `error` | `null`, or `{"type", "message"}` for a failed job. |
-| `cost_usd` | The configured price of the target that delivered. `0` until the job succeeds, and for failed, canceled and cached jobs. |
+| `cost_usd` | The configured price of the target that delivered, applied to what its adapter sent to the provider ([Configuration](configuration.md#mediaroutes)). `0` until the job succeeds, and for failed, canceled and cached jobs. |
 | `cached` | `true` when the outputs were reused from an earlier identical job. |
 | `upstream`, `target_model` | Which target delivered. |
 | `attempts[]` | Each target tried, with its `outcome` (`ok`, `cache_hit`, `timeout`, `no_outputs`, or the reason it failed). |
@@ -710,23 +859,24 @@ cacheable jobs submitted at the same moment both run.
 
 ### Job errors
 
-In addition to the [general errors](#errors), which the data plane raises
-in the OpenAI shape with the reason in `error.code`, the control plane
-raises the ones below. They arrive in the control plane's shape,
-`{"error": {"type": "<reason>", "message": "..."}}`, with the reason in
-`error.type` (see [Shape](#shape)). `budget_exceeded` and
-`payload_too_large` can come from either side, in that side's shape; for
-jobs, `model_not_allowed` and `model_not_found` come from the control
-plane.
+In addition to the [general errors](#errors), which the data plane raises,
+the control plane raises the ones below. They have the same OpenAI-style
+shape, with the reason in `error.code` (see [Shape](#shape)), and the same
+`x-request-id` as any other answer. `budget_exceeded`,
+`rate_limit_exceeded`, `invalid_request`, `invalid_json` and
+`payload_too_large` can come from either side; for jobs,
+`model_not_allowed` and `model_not_found` come from the control plane.
 
-| Status | `error.type` | When |
+| Status | `error.code` | When |
 |---|---|---|
 | 400 | `missing_model` | `"model"` is not a string. |
 | 400 | `invalid_json` | The body is not valid JSON. |
-| 400 | `invalid_request` | `input` is missing or not an object; `metadata` is not an object; the `Idempotency-Key` is empty or longer than 255 bytes; or the request path contains a percent-encoded character (job ids and file names never need one). |
+| 400 | `invalid_request` | `input` is missing or not an object; `metadata` is not an object; `input.duration` or `input.seconds` is negative or not numeric; `input.n`, `input.num_outputs` or `input.num_images` is not a whole number of 0 or more; the `Idempotency-Key` is empty or longer than 255 bytes; or the request path contains a percent-encoded character (job ids and file names never need one). The data plane refuses most odd paths and idempotency keys before the control plane sees them. |
 | 401 | `invalid_api_key` | The control plane no longer knows the key the data plane accepted: it was deleted, disabled or rotated within the last poll interval. |
-| 413 | `payload_too_large` | The body is larger than the control plane's JSON parser reads (8,000,000 bytes, a little under the data plane's 8 MiB). |
-| 500 | `internal_error` | The control plane failed while handling the request. The error carries a `request_id` that is also in the control plane's log; nothing else about the failure is disclosed. |
+| 413 | `payload_too_large` | `input` and `metadata` together are larger than `media.max_input_bytes` (1 MiB by default); or the whole body is larger than 8,000,000 bytes, the limit of the control plane's JSON parser, which the data plane applies to job requests itself so that both give the same answer. |
+| 429 | `rate_limit_exceeded` | Create only: the control plane's own count of the key's `rpm` (fixed one-minute windows) is used up. |
+| 429 | `too_many_open_jobs` | Create only: the key already has its limit of unfinished jobs. Wait for some to finish, or cancel some. |
+| 500 | `internal_error` | The control plane failed while handling the request. The error carries a `request_id` that is also in the control plane's log, and is the id in the response's `x-omnigate-request-id`; nothing else about the failure is disclosed. |
 | 400 | `webhook_not_configured` | `webhook_url` was given but no signing secret is configured for this key. |
 | 400 | `invalid_webhook_url` | The URL is not http(s), has no host, contains credentials, does not resolve, or resolves to a private or loopback address. |
 | 402 | `budget_exceeded` | Create only: the key has spent its budget for the current period. The control plane checks this itself, without waiting for the data plane's next config poll. |
@@ -757,13 +907,37 @@ the job:
 curl -O http://127.0.0.1:8080/v1/files/job_5f0c2a9e4b7d81c3a6e2f490/out-0.png -H "Authorization: Bearer og-unlimited-key"
 ```
 
-The file is served with its stored `content-type`,
-`x-content-type-options: nosniff` and `cache-control: private, max-age=3600`.
+**How a stored file is served.** The bytes, and the type they were
+declared with, came from a provider, so they are never served as something
+a browser would render as a page on the gateway's origin.
+
+- **Content type.** The stored type is kept only when it is one of
+  `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `video/mp4`,
+  `video/webm`, `video/quicktime`, `audio/mpeg`, `audio/wav`,
+  `audio/x-wav`, `audio/ogg`, `audio/flac`, `audio/pcm` or
+  `application/json`. Anything else (`text/html`, `image/svg+xml`, XML,
+  unknown types) is served as `application/octet-stream`. The job object
+  still reports the stored type in `outputs[].content_type`.
+- **Download, not display.** The control plane sends the file with
+  `content-disposition: attachment; filename="<name>"`,
+  `x-content-type-options: nosniff`,
+  `content-security-policy: sandbox; default-src 'none'` and
+  `cache-control: private, max-age=3600`.
+- **What reaches the client.** The data plane passes these four headers
+  on, with the status, content type, length and body, so a client gets
+  them from the gateway itself, with or without a proxy in front. (For a
+  short while, between commits 3a0b147 and 10bc009, it did not, and the
+  included proxy added them; that rule is gone from `deploy/Caddyfile`.)
+
+To show an output in a web page, fetch it and use it from your own origin
+(or use bucket storage); do not point a page at the gateway URL and expect
+it to render inline.
 
 **Bucket storage.** `outputs[].url` is a presigned GET URL on your bucket
 (or a plain `public_base_url` URL, if you configured one), not a gateway
 URL. A request to the gateway's `/v1/files/...` path for such an output
-answers `302` with that URL in `Location`.
+answers `302` with that URL in `Location`. (Earlier commits dropped the
+`Location` header on the way through the data plane.)
 
 | Status | Reason | When |
 |---|---|---|
@@ -773,9 +947,9 @@ answers `302` with that URL in `Location`.
 | 404 | `file_not_found` | No such file, or the job belongs to another key. |
 
 `missing_api_key` is raised by the data plane when the request has neither
-a key nor a `sig` parameter (OpenAI shape, the reason in `error.code`). The
-others, and `missing_api_key` for a URL with `sig` but no `exp`, are raised
-by the control plane (the reason in `error.type`).
+a key nor a `sig` parameter. The others, and `missing_api_key` for a URL
+with `sig` but no `exp`, are raised by the control plane. Both use the same
+shape, with the reason in `error.code`.
 
 ## Webhooks
 
@@ -789,7 +963,7 @@ The request follows [Standard Webhooks](https://www.standardwebhooks.com/):
 ```
 POST <webhook_url>
 content-type: application/json
-user-agent: omnigate-webhooks/0.1
+user-agent: omnigate-webhooks/0.1.0
 webhook-id: msg_job_5f0c2a9e4b7d81c3a6e2f490
 webhook-timestamp: 1794312003
 webhook-signature: v1,<base64 HMAC-SHA256>
@@ -895,23 +1069,29 @@ probe gets a refused connection rather than a 503.
 
 ### Errors and request paths
 
-Control-plane errors have one shape, with the reason in `error.type`:
+Control-plane errors have the same shape as the gateway's OpenAI-style
+errors: the reason in `error.code`, a broader category in `error.type`:
 
 ```json
-{"error": {"type": "unauthorized", "message": "send Authorization: Bearer <admin token>"}}
+{"error": {"message": "send Authorization: Bearer <admin token>", "type": "invalid_request_error", "param": null, "code": "unauthorized"}}
 ```
 
-(The data plane moved its reason to `error.code`; the control plane did
-not.) Besides the errors of each endpoint, any request can get:
+(Until commit 10bc009 the control plane's errors were
+`{"error": {"type": "<reason>", "message": "..."}}`. A script that matched
+on `error.type` must match on `error.code`.) Every response from the
+control plane, errors included, carries an `x-request-id` header: the
+gateway's id for a request that the data plane relayed, a fresh one
+otherwise. Besides the errors of each endpoint, any request can get:
 
-| Status | `error.type` | When |
+| Status | `error.code` | When |
 |---|---|---|
 | 400 | `invalid_request` | The request path contains a percent-encoded character (any `%`), a backslash, a NUL byte, or a `.` or `..` segment. No route needs one: key names, job ids and file names are all plain. Also: a body that is not valid UTF-8. |
 | 400 | `invalid_json` | A body that is not valid JSON. |
 | 401 | `unauthorized` | `/admin/*` or `/metrics` without the admin token or a session; `/internal/*` without the internal token. |
 | 404 | `not_found` | No such endpoint. |
-| 413 | `payload_too_large` | A body larger than 8,000,000 bytes. |
-| 500 | `internal_error` | An unexpected failure. The error has a `request_id` that is also in the control plane's log line for it; the cause is only in the log. |
+| 413 | `payload_too_large` | A body larger than 8,000,000 bytes. On `POST /login` and `POST /logout`, the only endpoints that take a body without a credential: a body declared larger than 4,096 bytes, or sent with chunked encoding instead of a declared length. |
+| 429 | `too_many_attempts` | `/admin/*` or `/metrics`: this address has sent 20 wrong admin tokens within a minute. Every bearer token from it is refused until that minute is over, the right one included; the answer has `retry-after: 60`. See [Admin](admin.md#two-ways-in). |
+| 500 | `internal_error` | An unexpected failure. The error has a `request_id` (the same value as the `x-request-id` header) that is also in the control plane's log line for it; the cause is only in the log. |
 
 A request is handled in this order: the path check above, then the
 credential for the path's first segment, then the body, then the CSRF
@@ -924,7 +1104,15 @@ check, then the endpoint.
 - **Authentication comes before body parsing**, so a caller without
   credentials cannot make the control plane read and parse a large body on
   `/admin/*` or `/internal/*`. The sign-in form (`POST /login`) is the one
-  public endpoint that takes a body.
+  public endpoint that takes a body, and that body is limited to 4,096
+  bytes by its declared length.
+- **Wrong credentials are counted.** Five failed logins, or 20 wrong bearer
+  tokens, from one address within a minute lock that address out of that
+  way in until the minute is over. A request with no `Authorization` header
+  at all is not a guess and is not counted, and a signed-in browser session
+  is not affected by a bearer lockout.
+- **HTTP/1.1 only.** The control plane's listener has HTTP/2 and WebSocket
+  upgrades switched off; nothing it serves needs them.
 - The path check is the fix for an authentication bypass in earlier
   commits, where `/%61dmin/keys` reached the admin API without a token; see
   [SECURITY.md](../SECURITY.md#past-advisories).
@@ -935,7 +1123,7 @@ check, then the endpoint.
 |---|---|
 | `GET /admin/keys` | Every gateway key, from the config file and managed, with its usage. |
 | `POST /admin/keys` | Create a managed key. The answer is the only one that contains the key itself. |
-| `PATCH /admin/keys/{name}` | Change a managed key's budget, period, rate limit, models, webhook secret or disabled flag. |
+| `PATCH /admin/keys/{name}` | Change a managed key's budget, period, rate limit, models, open-job limit, webhook secret or disabled flag. |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
@@ -962,6 +1150,7 @@ curl http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-
       "period_resets_at": null,
       "rpm": 0,
       "models": null,
+      "max_open_jobs": 100,
       "disabled": false,
       "blocked": true,
       "state": "blocked",
@@ -987,8 +1176,9 @@ curl http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-
 |---|---|
 | `source` | `file` (written in the config file, read-only here) or `managed` (created through this API). |
 | `state` | `active`, `blocked` (budget spent for the current period), `disabled`, or `shadowed`. `blocked`, `disabled` and `shadowed` are also given as booleans. |
-| `shadowed` | `true` for a managed key that is out of use because the config file defines a key with the same name. Such a key is listed after all the others; its secret answers `401` until one of the two is removed. See [Admin](admin.md#gateway-keys-two-sources). |
+| `shadowed` | `true` for a managed key that is out of use because the config file defines a key with the same name. Such a key is listed after all the others, here, in `GET /admin/overview` and in the dashboard; its secret answers `401` until one of the two is removed. See [Admin](admin.md#gateway-keys-two-sources). |
 | `budget_period`, `period_spend_usd`, `period_resets_at` | What the budget covers, the spend that counts against it, and when that starts over (`null` for a total budget). |
+| `max_open_jobs` | The limit on unfinished media jobs in force for the key: its own setting, or `media.max_open_jobs` when it has none. `0` means no limit. |
 | `requests` | Text calls and media jobs recorded in the ledger. `jobs` counts the media jobs among them. |
 | `errors` | Ledger events with a status of 400 or above, which includes failed and canceled jobs. |
 | `input_tokens` | Input tokens that were not served from a provider's prompt cache. |
@@ -1003,8 +1193,12 @@ Without a valid token or session the answer is `401`, with a
 `WWW-Authenticate: Bearer` header:
 
 ```json
-{"error": {"type": "unauthorized", "message": "send Authorization: Bearer <admin token>"}}
+{"error": {"message": "send Authorization: Bearer <admin token>", "type": "invalid_request_error", "param": null, "code": "unauthorized"}}
 ```
+
+After 20 wrong tokens from one address within a minute, the answer to any
+bearer token from that address is `429 too_many_attempts` with
+`retry-after: 60`, until the minute is over.
 
 A change (`POST`, `PATCH`, `DELETE`) authenticated by a session cookie
 instead of the bearer token must also carry the session's CSRF token, or
@@ -1053,7 +1247,7 @@ config and caveats.
 |---|---|
 | `GET /` | The dashboard: totals, keys (with create, disable, rotate and delete for managed keys), recent requests and media jobs, refused requests, admin activity, and a read-only view of the configuration. Redirects to `/login` without a session. See [Admin](admin.md#the-dashboard). |
 | `GET /login` | The sign-in form. |
-| `POST /login` | Form field `password` = the admin token. Sets the `omnigate_session` cookie (12 hours, `HttpOnly`, `SameSite=Strict`) and redirects to `/`. A wrong token answers 401; after five failures from one address, 429 for a minute. |
+| `POST /login` | Form field `password` = the admin token. Sets the `omnigate_session` cookie (12 hours, `HttpOnly`, `SameSite=Strict`) and redirects to `/`. A wrong token answers 401; after five failures from one address, 429 for a minute. The body may be at most 4,096 bytes, declared in `Content-Length` (413 otherwise). |
 | `POST /logout` | Clears the cookie. From a session it needs the CSRF token, which the dashboard's sign-out button sends. |
 
 A valid session cookie is accepted wherever the admin token is, so
@@ -1071,4 +1265,8 @@ Used by data planes only, with the internal token in the
 `POST /internal/usage/batch`, `POST /internal/counters` (counts of refused
 requests), and the jobs and files API under `/internal/v1/`. It is not a
 public interface. The Compose proxy answers 404 for these paths from
-outside.
+outside, and the control plane itself refuses any percent-encoded spelling
+of them. The data plane builds the address of such a call from its own
+configuration and sets the client's path and query, which it has validated
+character by character, as separate components; a client cannot make it
+call anything but `/internal/v1/jobs*` and `/internal/v1/files/*`.

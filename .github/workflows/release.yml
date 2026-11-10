@@ -197,7 +197,7 @@ jobs:
           set -euo pipefail
           for target in $TARGETS; do
             echo "::group::$target"
-            zig build -Dtarget="$target" -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/out/$target"
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe -Dstrip=true --prefix "$RUNNER_TEMP/out/$target"
             ls -l "$RUNNER_TEMP/out/$target/bin"
             echo "::endgroup::"
           done

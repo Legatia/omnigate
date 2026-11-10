@@ -2,8 +2,10 @@
 
 Everything on this page happens on the **control plane's** port (4000 by
 default) and uses the **admin token** (`OMNIGATE_ADMIN_TOKEN`), never a
-gateway key. Keep that port private; see
-[Deployment](deployment.md#what-to-keep-private).
+gateway key. Keep that port private, and let only operators' addresses
+reach it where you can; see
+[Deployment](deployment.md#what-to-keep-private) and
+[Security hardening](security.md).
 
 - [Two ways in](#two-ways-in)
 - [The dashboard](#the-dashboard)
@@ -27,9 +29,33 @@ providers; nothing here has run under production load.
 | Session | `POST /login` with the token as the form field `password`; the answer sets the `omnigate_session` cookie (12 hours, `HttpOnly`, `SameSite=Strict`, `Secure` behind TLS) | The dashboard in a browser |
 
 Both open the same things: the dashboard page, `/admin/*` and `/metrics`.
-Five failed logins from one address lock that address out for a minute.
 There is one admin token and no user accounts; changing the token ends
-every session.
+every session. The token must be at least 16 characters long, or the
+control plane does not start.
+
+**Guessing is throttled, per client address, for both ways in.**
+
+| | Limit | Then |
+|---|---|---|
+| Sign-in form | 5 wrong passwords within a minute | `429` on `POST /login` until the minute is over. A correct sign-in clears the count. |
+| Bearer token | 20 wrong tokens on `/admin/*` or `/metrics` within a minute | `429 too_many_attempts` with `retry-after: 60` for **every** bearer token from that address, the right one included, until the minute is over. |
+
+- The minute starts with the first failure. A request with no
+  `Authorization` header at all is answered `401` and is not counted.
+- The bearer limit is the higher one on purpose: scripts share an address
+  more often than people do, and a lockout also stops your own automation
+  (a Prometheus scrape from the same address, for example) for that minute.
+- A signed-in browser session keeps working during a bearer lockout.
+- The counts are in memory, per control-plane process. IPv6 addresses are
+  counted by their /64.
+- **Which address counts.** By default it is the address of the
+  connection. Behind a reverse proxy that is the proxy's address for
+  everyone, so one person guessing locks everybody out. With
+  `OMNIGATE_TRUST_FORWARDED=1` the last hop of `X-Forwarded-For` is used
+  instead, which is right when the proxy is the only way in and writes that
+  header itself; `compose.yaml` sets it. Do not set it when clients can
+  reach the control plane directly: they could then choose the address
+  they are counted under.
 
 ## The dashboard
 
@@ -54,7 +80,7 @@ the figure for today (the current UTC day).
 | Column | Shows |
 |---|---|
 | Key | The name, tagged `file` or `managed` (see [below](#gateway-keys-two-sources)). |
-| State | `active`, `blocked` (budget spent for the current period) or `disabled` (switched off by an operator). A shadowed managed key (see [below](#gateway-keys-two-sources)) is not in this table at all; it is listed by `GET /admin/keys` only. |
+| State | `active`, `blocked` (budget spent for the current period), `disabled` (switched off by an operator) or `shadowed` (a managed key that a config-file key of the same name has put out of use; see [below](#gateway-keys-two-sources)). Shadowed keys are listed last, so that you can see why such a key stopped working. |
 | Spend | Without a budget: total spend. With one: spend against the budget with a progress bar; for a monthly or daily budget that is this period's spend, with the all-time total beneath. |
 | Requests, Errors, Tokens in / out, Jobs | Totals from the ledger. Prompt-cache reads and writes are noted next to the tokens when there are any. |
 | Per min | The key's `rpm`, or a dash for no limit. |
@@ -68,6 +94,8 @@ at once.
 Below the table is the **Create a key** form: name, optional budget in US
 dollars, what the budget covers (everything, each calendar month, each day),
 optional requests per minute, and an optional comma-separated model list.
+(A key's limit on unfinished media jobs, `max_open_jobs`, is not in the
+form or the table; set it with the API.)
 After creating or rotating a key the page shows the key itself in a panel
 with a Copy button. **That is the only time the key is shown**; only its
 SHA-256 is stored.
@@ -122,10 +150,10 @@ to the config under the name of an existing managed key. The file wins.
 - The control plane logs a warning once, when the key becomes shadowed
   (`key "<name>" is defined in the config file and also exists as a managed
   key: ...`).
-- `GET /admin/keys` and `GET /admin/usage` list the shadowed key after all
-  the others, with `"state": "shadowed"` and `"shadowed": true`. The
-  dashboard's key table and `GET /admin/overview` show only the keys in
-  use, so the shadowed one does not appear there.
+- `GET /admin/keys`, `GET /admin/usage`, `GET /admin/overview` and the
+  dashboard's key table all list the shadowed key after all the others,
+  with `"state": "shadowed"` and `"shadowed": true`. (Until commit 10bc009
+  the dashboard and the overview left it out.)
 - The two keys have different secrets, and usage is recorded per secret, so
   the file key starts with its own spend; the managed key's spend stays
   with the managed key.
@@ -179,6 +207,7 @@ curl -X POST http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admi
   "period_resets_at": "2026-12-01T00:00:00Z",
   "rpm": 600,
   "models": ["demo-chat", "demo-claude"],
+  "max_open_jobs": 100,
   "disabled": false,
   "blocked": false,
   "state": "active",
@@ -204,6 +233,7 @@ Save `key` now: no later call returns it. Only `name` is required.
 | `budget_period` | `"total"`, `"monthly"` or `"daily"` | `"total"` | What the budget covers. |
 | `rpm` | whole number, 0 or more | `0` (no limit) | Requests per minute, per data-plane process. |
 | `models` | list of route names, or `null` | `null` (all) | Text and media routes the key may use. |
+| `max_open_jobs` | whole number, 0 or more, or `null` | `null` (the config's `media.max_open_jobs`, 100 unless set) | Media jobs the key may have unfinished at one time; `0` for no limit. Listings show the limit in force, so a key without its own shows the default. |
 | `webhook_secret` | string up to 256 characters, or `null` | `null` | Signing secret for this key's job webhooks. `""` also clears it. Never returned; listings show `has_webhook_secret`. |
 | `disabled` | boolean | `false` | A disabled key is refused. |
 
@@ -273,12 +303,20 @@ does not bring them back: the new key has a new secret and a new hash.
 
 ### Errors
 
-Admin API errors have the control plane's shape,
-`{"error": {"type": "...", "message": "..."}}`, with the reason in
-`error.type`. (The data plane's errors moved their reason to `error.code`;
-the control plane's did not.)
+Admin API errors have the same shape as every other error of the gateway:
 
-| Status | `error.type` | When |
+```json
+{"error": {"message": "a key named \"my-app\" already exists", "type": "invalid_request_error", "param": null, "code": "key_exists"}}
+```
+
+The reason is in `error.code`; `error.type` is a broader, OpenAI-style
+category. (Until commit 10bc009 the control plane answered
+`{"error": {"type": "<reason>", "message": "..."}}`; a script that matched
+on `error.type` must match on `error.code` now.) The message texts are for
+people and may change. Every response also carries an `x-request-id`
+header.
+
+| Status | `error.code` | When |
 |---|---|---|
 | 400 | `invalid_request` | A missing or malformed `name`, or a field with a bad value. Also any request whose path contains a percent-encoded character: `/admin/keys/my%2Dapp` is refused, `/admin/keys/my-app` is the only spelling. Key names never need encoding. |
 | 400 | `invalid_json` | The body is not valid JSON. |
@@ -287,8 +325,9 @@ the control plane's did not.)
 | 404 | `key_not_found` | No key has this name. |
 | 409 | `key_exists` | Create: the name is taken, by a managed or a file key. |
 | 409 | `read_only_key` | Change, rotate or delete of a key that is defined in the config file. |
+| 429 | `too_many_attempts` | Too many wrong bearer tokens from this address within a minute; see [Two ways in](#two-ways-in). |
 | 500 | `storage_error` | The keys file could not be written; nothing was changed. |
-| 500 | `internal_error` | An unexpected failure. The error has a `request_id` that is also in the control plane's log. |
+| 500 | `internal_error` | An unexpected failure. The error has a `request_id` (the value of the `x-request-id` header) that is also in the control plane's log. |
 
 An unknown path under `/admin` answers `401` without the admin token and
 `404 not_found` with it. The errors every control-plane request can get are
@@ -340,17 +379,18 @@ sent.
 | `action` | `key.create`, `key.update`, `key.rotate`, `key.delete`, `login`, `logout`. |
 | `target` | The key name, or `null`. |
 | `auth` | How the caller was authenticated: `token` (bearer), `session` (dashboard), `password` (a login attempt) or `none`. A key action can no longer be recorded with `none`: the admin API is not reachable without a credential. An older entry that says so was made through the bypass described in [SECURITY.md](../SECURITY.md#past-advisories). |
-| `address` | The peer address of the connection. Behind a reverse proxy that is the proxy. |
+| `address` | The peer address of the connection. Behind a reverse proxy that is the proxy, also when `OMNIGATE_TRUST_FORWARDED` is set: that setting changes which address the lockouts count, not what is recorded here. |
 | `forwarded_for` | Present when the request had an `X-Forwarded-For` header: its value, cut to 200 characters. A direct caller can fake it, so it is recorded, not trusted. |
-| `outcome` | `ok`, or the error type (`invalid_request`, `key_exists`, `read_only_key`, `key_not_found`, ...). For logins: `ok`, `denied` or `throttled`. |
+| `outcome` | `ok`, or the error's reason, its `error.code` (`invalid_request`, `key_exists`, `read_only_key`, `key_not_found`, ...). For logins: `ok`, `denied` or `throttled`. |
 | `fields` | For `key.update`: the names of the fields that were sent, never their values. |
 
 What is and is not recorded:
 
-- Failed attempts are recorded too (a refused create, a wrong password).
+- Failed attempts are recorded too (a refused create, a wrong password, a
+  sign-in refused by the lockout).
   Requests refused before they reach a handler are not: a change without a
-  valid admin token (`401`) or without the CSRF token (`403`) leaves no
-  line.
+  valid admin token (`401`), one refused by the bearer-token lockout
+  (`429`) or one without the CSRF token (`403`) leaves no line.
 - A logout is recorded only when it ends a session.
 - Reads (`GET`) are not recorded.
 - Never a key, a token, a password or a webhook secret.
@@ -408,7 +448,7 @@ All on the control plane's port, all behind the admin token or a session.
 |---|---|
 | `GET /admin/keys` | Every key with its usage. |
 | `POST /admin/keys` | Create a managed key. `201`, with the key itself. |
-| `PATCH /admin/keys/{name}` | Change a managed key. |
+| `PATCH /admin/keys/{name}` | Change a managed key: `budget_usd`, `budget_period`, `rpm`, `models`, `max_open_jobs`, `webhook_secret`, `disabled`. |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. `200`, with the new key. |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
@@ -422,8 +462,8 @@ All on the control plane's port, all behind the admin token or a session.
 |---|---|
 | `generated_at` | UTC time the document was built. |
 | `totals`, `today` | `requests`, `errors`, `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `cached_responses`, `jobs`, `cost_usd`; over the whole ledger, and for the current UTC day. |
-| `keys` | As `GET /admin/keys`, without shadowed keys. |
-| `requests` | Up to 25 text requests, taken from the 50 newest ledger events. |
+| `keys` | As `GET /admin/keys`, shadowed keys included. |
+| `requests` | Up to 25 text requests, taken from the 50 newest ledger events. Each has the request's `id` (the `x-omnigate-request-id` the client was given) and `estimated`, which is `true` when its token counts are an estimate because the response ended before the provider's final usage arrived. |
 | `jobs` | The 25 newest media jobs, with output URLs and webhook state. |
 | `rejected` | Up to 50 `{key, reason, count}` series of refused requests, largest first. |
 | `audit` | The 10 newest audit entries. |

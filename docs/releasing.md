@@ -64,8 +64,9 @@ started once to see that they run. The arm64 image is started under
 emulation, as a warning-only check. The Windows, macOS and arm64 Linux
 binaries are cross-compiled and never executed. The README lists macOS and
 ARM as untried platforms; a release does not change that. CI on `main`
-(unit, end-to-end, SDK and container suites) is the real test of a commit,
-which is why a tag should only go on a commit whose CI is green.
+(unit, end-to-end, SDK, hostile-input and container suites) is the real
+test of a commit, which is why a tag should only go on a commit whose CI
+is green.
 
 ## Before the first release
 
@@ -103,11 +104,10 @@ One-time things to settle. None of them is done by the workflow.
      `omnigate_build_info{version=...}` reports.
    - `dataplane/build.zig.zon`: `.version = "<version>"`.
 
-   Two more places carry a short version as plain text and are not checked:
-   the data plane's outbound `user-agent` (`omnigate/0.1`, in
-   `dataplane/src/proxy.zig`) and the webhook `user-agent`
-   (`omnigate-webhooks/0.1`, documented in [API](api.md#webhooks)). Change
-   them when the minor version changes, if you want them to follow.
+   These are the only two places. The data plane's outbound `user-agent`
+   (`omnigate/<version>`) and the webhook `user-agent`
+   (`omnigate-webhooks/<version>`, documented in [API](api.md#webhooks))
+   are derived from them at build time.
 
 3. **Update `CHANGELOG.md`.** Rename the `## [Unreleased]` heading to
    `## [<version>] - <YYYY-MM-DD>` and add a new empty `## [Unreleased]`
@@ -120,8 +120,9 @@ One-time things to settle. None of them is done by the workflow.
    carries no counts of test checks, on purpose: they change too often.
 
 5. **Commit, push to `main`, and wait for CI to pass** on that commit. The
-   release workflow does not run the end-to-end, SDK or container suites,
-   and it does not check that the tagged commit is on `main`.
+   release workflow does not run the end-to-end, SDK, hostile-input or
+   container suites, and it does not check that the tagged commit is on
+   `main`.
 
 6. **Tag that commit and push the tag.**
 
@@ -328,9 +329,12 @@ first.
 - The macOS binaries are not signed with a developer identity or notarized,
   and the Windows binary is not code-signed.
 - The Linux binaries are not stripped: they carry debug information and
-  are about 10 MB each at the commit this page was written against
-  (`dataplane/build.zig` has no strip option). The Windows debug file
-  (`.pdb`) is not shipped.
+  were about 10 MB each when this page was first written.
+  `dataplane/build.zig` has a `-Dstrip=true` option since commit 10bc009,
+  and `dataplane/Dockerfile` uses it for a locally built image, but the
+  release workflow does not pass it, so release binaries, and the release
+  images built from them, are unchanged. The Windows debug file (`.pdb`) is
+  not shipped.
 - No packages for package managers, no Helm chart, and no archive of the
   control plane.
 - No license file in the archives or images, because the repository has

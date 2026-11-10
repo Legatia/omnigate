@@ -40,6 +40,12 @@ The binary is `dataplane/zig-out/bin/omnigate-dp`. For an optimized build
 cd dataplane && zig build -Doptimize=ReleaseSafe
 ```
 
+Add `-Dstrip=true` to leave the debug information out, as
+`dataplane/Dockerfile` does; a panic still names itself in one log line.
+The version the binary reports (in its `user-agent`) comes from
+`dataplane/build.zig.zon`, and the control plane's from `control/mix.exs`;
+nowhere else.
+
 Control plane:
 
 ```bash
@@ -51,9 +57,25 @@ To run both by hand against the mock providers, follow the
 
 ## Tests
 
-There are six suites and a formatting check. CI
+There are seven suites and a formatting check. CI
 (`.github/workflows/ci.yml`) runs all of them on Linux for every push and
 pull request to `main`.
+
+One command runs everything except the container test, in order, with each
+step's output in a log file and a summary at the end:
+
+```bash
+python tools/check.py
+```
+
+`--quick` runs only the builds, unit tests and formatting checks (about a
+minute); `--only e2e sdk` and `--skip malformed` choose steps; `--list`
+shows them. Its steps are `build`, `zig-test`, `zig-fmt`
+(`zig fmt --check`, which CI does not run), `mix-format`, `mix-test`,
+`importer`, `e2e`, `sdk` (skipped when the two SDKs are not installed) and
+`malformed`. It needs `zig` and `mix` on `PATH` (on Windows it adds the
+default install folders of Erlang and Elixir itself; set `ZIG` to the
+compiler's path if it is elsewhere). The suites one by one:
 
 Data plane unit tests:
 
@@ -120,16 +142,50 @@ red by itself. To move to newer SDKs, run the suite locally with them, fix
 what they notice, and change the two numbers in the workflow and on this
 page in the same pull request. The job log prints the versions it ran.
 
+Hostile-input test, from the repository root with a built data plane:
+
+```bash
+python tools/malformed_test.py
+```
+
+It starts the mock providers, the control plane and the gateway through
+the end-to-end harness (so it cannot run at the same time as the
+end-to-end or SDK suites) and sends, over raw sockets, the requests that
+used to crash the data plane or slip past a check (a header line without a
+colon, a `POST` without a length, deeply nested JSON, smuggling attempts,
+non-canonical paths) and 250 generated variations of broken request heads,
+asking `/healthz` after every one. Then it checks that a client which
+hangs up mid-stream is still billed: the provider's real figures when they
+arrive, an estimate marked as one when they never do. It passes only if
+the gateway survived all of it and every case with one right answer got
+that answer. The generated cases are seeded: a failure prints the seed,
+and `--seed` replays it; `--count` sets how many, and `--thorough` runs
+1,500. When a case fails the logs are kept and their directory printed.
+
+To test a gateway you started yourself instead (as in the
+[Quickstart](docs/quickstart.md#3-run-the-pieces-by-hand)):
+
+```bash
+python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key --model demo-direct --rpm-key og-ratelimited-key
+```
+
+The billing checks then run only with `--events-url`, `--drip-model` and
+`--stall-model`. Never point it at a production gateway.
+
 Container test (needs a Linux Docker daemon):
 
 ```bash
 python3 tools/container_test.py --compose
 ```
 
-It builds both images, brings up `compose.yaml` with mock providers added,
-and runs its checks through the TLS proxy on `127.0.0.1:18443`. Without
-`--compose` it uses plain `docker` commands; `--no-build` reuses images
-built earlier; `--keep` leaves the containers running.
+It builds both images, brings up `compose.yaml` with mock providers added
+and one environment file per container, and runs its checks through the
+TLS proxy on `127.0.0.1:18443` (a second proxy with a closed admin
+allow-list listens on `127.0.0.1:18444`). The checks include requests sent
+byte for byte through the proxy: odd spellings of guarded paths, malformed
+and oversized requests, and that the data-plane container holds no admin
+token. Without `--compose` it uses plain `docker` commands; `--no-build`
+reuses images built earlier; `--keep` leaves the containers running.
 
 No test needs an API key. Checks against real providers were done by hand
 and are recorded in the README.
@@ -144,40 +200,46 @@ python tools/load_test.py --gateway http://127.0.0.1:8080 --key og-unlimited-key
 
 Run it when you touch connection handling, timeouts, the usage queue or
 shutdown in the data plane; that is where it found the bugs it was written
-for.
+for. Run the hostile-input test as well when you touch request parsing,
+path handling or anything that forwards client bytes.
 
 ## Layout
 
 ```
 dataplane/            Zig data plane: the public port
   build.zig, build.zig.zon
-  src/main.zig        startup, environment variables, the accept loop, stop signals and shutdown
+  src/main.zig        startup, environment variables (read strictly), the accept loop, stop signals and shutdown
   src/proxy.zig       request handling: auth, limits, routing, failover, streaming, job passthrough
+  src/guard.zig       checks on bytes from the network before anything else reads them: request heads, paths, JSON depth
   src/translate.zig   OpenAI chat completions <-> Anthropic messages (pure functions)
   src/errors.zig      the gateway's own errors in each protocol's shape; reason -> category table
   src/models.zig      GET /v1/models and /v1/models/{id} in each protocol's shape
   src/config.zig      the config snapshot and its lookups
   src/control.zig     talks to the control plane: config pull, usage and counter push, config cache
   src/reporter.zig    the usage spool and its delivery loop
-  src/usage.zig       token counting from the response stream, prompt-cache tokens included
+  src/usage.zig       token counting from the response stream (a small JSON reader), prompt-cache tokens, estimates
   src/cache.zig       the exact-match response cache
-  src/headers.zig     which provider response headers reach the client
+  src/headers.zig     which provider and control-plane response headers reach the client
   src/counters.zig    counts of requests refused before routing
   src/watchdog.zig    deadlines for client connections and streams
   src/logging.zig     log level, JSON lines, the access log
   src/ratelimit.zig   per-key token buckets
   src/health.zig      upstream cooldowns
   src/balance.zig     target ordering: failover, round_robin, weighted
-  src/quirks.zig      learned provider quirks (sampling parameters, thought signatures)
+  src/quirks.zig      learned provider quirks (sampling parameters, thought signatures), per gateway key
   Dockerfile
 
 control/              Elixir control plane
   mix.exs, config/config.exs, .formatter.exs
   lib/omnigate_control/
-    application.ex    supervision tree, paths, bind address
+    application.ex    supervision tree, paths, bind address, startup checks
+    env.ex            numeric environment variables, read strictly
+    errors.ex         the one error envelope and its category table
     config_store.ex   loads, normalizes and hot-reloads the config file
     router.ex         every HTTP route: /internal, /admin, /metrics, dashboard, login
-    admin_auth.ex     admin token, sessions, CSRF tokens, failed-login throttle
+    admin_auth.ex     admin token, sessions, CSRF tokens, the throttles for failed logins and wrong tokens
+    rate_limit.ex     per-key requests per minute for job creation
+    net_guard.ex      which addresses may be called when the URL came from a client or a provider
     keys.ex           managed gateway keys and the keys file
     admin.ex          what operators see: key listings, the overview document
     dashboard.ex      the dashboard page (HTML, CSS and script in one module)
@@ -190,7 +252,7 @@ control/              Elixir control plane
     jobs.ex           the job API's logic: create, cancel, cost, cache, resume
     jobs/store.ex     durable job state
     jobs/runner.ex    runs one job: submit, poll, re-host, fail over
-    jobs/adapter.ex   the adapter behaviour and the kind -> module table
+    jobs/adapter.ex   the adapter behaviour (submit, poll, cancel, billable) and the kind -> module table
     jobs/adapters/    one module per provider shape
     storage.ex, storage/local.ex, storage/s3.ex, sigv4.ex, url_signer.ex
     webhooks.ex       signing, delivery, retries
@@ -206,15 +268,19 @@ tools/                Python, standard library only (sdk_compat.py excepted)
   mock_upstream.py, mock_media.py   mock providers, object store, webhook receiver
   e2e.py, container_test.py         the two system tests
   sdk_compat.py                     the official OpenAI and Anthropic SDKs as clients
+  malformed_test.py                 hostile input against a gateway it starts (or one you name)
+  check.py                          runs every suite but the container test, with a summary
   load_test.py                      load and soak test against a running gateway
   bench.py                          latency measurement
   import_litellm.py, test_import_litellm.py
 
-compose.yaml, deploy/Caddyfile, .env.example   the Compose deployment
+compose.yaml, deploy/Caddyfile                 the Compose deployment
+.env.example                                   host names and the admin allow-list (read by Compose)
+.env.control.example, .env.dataplane.example   one environment file per container
 docs/                                          documentation
 
 .github/
-  workflows/ci.yml                  CI: six jobs
+  workflows/ci.yml                  CI: seven jobs
   workflows/release.yml             release on a version tag (docs/releasing.md)
   actions/setup-zig/                installs the Zig version pinned in dataplane/Dockerfile
   release/dataplane.Dockerfile      release image built from cross-compiled binaries
@@ -242,21 +308,28 @@ not to, and say the reason in the commit.
   them: a dev placeholder with a real secret's prefix has triggered secret
   scanning before. Provider keys are only ever named by environment
   variable.
+- **Each process gets only its own secrets.** A new variable goes into the
+  example file of the container that reads it (`.env.control.example` or
+  `.env.dataplane.example`), never into both for convenience, and nothing
+  the data plane does not read goes into its file.
 - **Dependencies are a cost.** The data plane uses only the Zig standard
   library, the control plane has two direct Hex packages (Bandit and Plug),
   and the tools use only the Python standard library (`tools/sdk_compat.py`
   imports the two SDKs it tests, inside a function, so that nothing else
   gains the dependency). Adding one needs a reason.
-- **Error answers follow two rules, one per process.**
+- **Error answers have one shape, written in two places.** The gateway's
+  reason (`<snake_case>`) is `error.code`; `error.type` is the provider's
+  broader category for it.
   - Data plane: every error goes through `errors.zig`, which writes it in
-    the shape of the client's protocol. The gateway's reason
-    (`<snake_case>`) is `error.code`, and it is also the `reason` a refusal
-    is counted under, so it shows up as a metric label. `error.type` is the
-    provider's category for it. A new reason needs a row in `typesFor` (or
-    a deliberate decision to let the status decide) and a line in the test
-    that lists every reason.
-  - Control plane: `{"error": {"type": "<snake_case>", "message": "<plain
-    sentence>"}}` through `send_error`, with the reason in `error.type`.
+    the shape of the client's protocol. The reason is also what a refusal
+    is counted under, so it shows up as a metric label. A new reason needs
+    a row in `typesFor` (or a deliberate decision to let the status decide)
+    and a line in the test that lists every reason.
+  - Control plane: every error goes through `send_error` in `router.ex`,
+    which builds the OpenAI-style envelope with
+    `OmnigateControl.Errors.body/4`. `errors.ex` holds a copy of the OpenAI
+    column of `typesFor`; change the two tables together, so that a client
+    of `/v1/jobs` cannot tell which process refused it.
   - Either way a new reason is part of the API: add it to `docs/api.md` (or
     `docs/admin.md` for the admin API) and to the troubleshooting table in
     `docs/operations.md`.
@@ -279,6 +352,13 @@ not to, and say the reason in the commit.
 - Nothing on the request path may wait on a peer without a deadline. A
   connection task arms its `watchdog.Conn` before it may block on the
   client or the upstream and re-arms it whenever bytes move.
+- No input may reach code that asserts on its shape: a panic in one
+  connection's task ends the process for all of them. Bytes from a client
+  or an upstream go through `guard.zig` first (request heads, paths, JSON
+  depth), headers are iterated with `guard.HeaderIterator`, not the
+  standard library's, and anything a client sent is copied into a request
+  of the gateway's own only after it has been checked character by
+  character. A new parser of peer input needs a test that feeds it garbage.
 - Decision logic is written as pure functions where possible so it can be
   tested exhaustively (`balance.order`, the translation functions).
 - Fields added to the config snapshot must be optional with a default, and
@@ -296,6 +376,10 @@ not to, and say the reason in the commit.
   loaded or replayed at start.
 - Jobs and ledger events are JSON-shaped maps with string keys, as stored.
   The normalized config uses atom keys.
+- Numeric environment variables go through `OmnigateControl.Env` (and
+  `envInt` in the data plane's `main.zig`): a value is a well-formed number
+  in range or a startup error that names the variable, never a silent
+  default. A new one is added to `Env.check_all/0`.
 - Config values are validated in `ConfigStore.normalize/1`. A missing
   required field or an invalid value raises, which stops a start and makes a
   reload keep the previous config; the newer checks (`models`, `strategy`,
@@ -308,6 +392,13 @@ not to, and say the reason in the commit.
   segment answers 404 until that segment is added to the guard in
   `router.ex`, with a decision about which credential it needs; say which
   in the commit. No route may need a percent-encoded character in its path.
+- A URL that came from a client or a provider is never fetched directly.
+  It goes through `NetGuard.target/2`, and the request is made to the
+  address that returned (`connect_to:`), with redirects followed by our
+  own code one checked hop at a time.
+- What a media job costs comes from the adapter's `billable/1`, which must
+  describe the request the adapter actually builds. An adapter that sends
+  a new text or duration field has to count it there.
 - The code is formatted with `mix format`; `control/.formatter.exs` sets
   `line_length: 160`. CI runs `mix format --check-formatted` and fails on a
   file that is not formatted, so run `mix format` before committing.
@@ -319,9 +410,12 @@ not to, and say the reason in the commit.
 The existing adapters all followed the same steps:
 
 1. A module in `control/lib/omnigate_control/jobs/adapters/` implementing
-   the `OmnigateControl.Jobs.Adapter` behaviour (`submit/4`, and `poll/5` /
-   `cancel/5` for async providers). Its `@moduledoc` documents the provider
-   calls, the job `input` it accepts, and what was verified.
+   the `OmnigateControl.Jobs.Adapter` behaviour (`submit/4`, `billable/1`,
+   and `poll/5` / `cancel/5` for async providers). `billable/1` returns the
+   characters of text and the seconds of media in the request `submit/4`
+   builds; it is what per-character and per-second prices are applied to.
+   Its `@moduledoc` documents the provider calls, the job `input` it
+   accepts, and what was verified.
 2. An entry in `Adapter.for_kind/1` and `Adapter.kinds/0`.
 3. A mock of the provider in `tools/mock_media.py` and checks in
    `tools/e2e.py`.
@@ -346,17 +440,22 @@ README status and example config change in the same commit as the feature.
 
 ## Pull requests
 
-- Run the unit suites, `mix format --check-formatted` and `tools/e2e.py`
-  before opening one. Run `tools/sdk_compat.py` if you touched request or
-  response handling, translation or error answers. Run the container test
-  if you touched a Dockerfile, `compose.yaml`, `deploy/Caddyfile` or the
-  mocks.
+- Run `python tools/check.py` before opening one: the unit suites, the
+  formatting checks, `tools/e2e.py`, `tools/malformed_test.py` and, when
+  the two SDKs are installed, `tools/sdk_compat.py`. Install the SDKs and
+  let that step run if you touched request or response handling,
+  translation or error answers. Run the container test, which `check.py`
+  leaves out, if you touched a Dockerfile, `compose.yaml`,
+  `deploy/Caddyfile`, an `.env*.example` file or the mocks.
 - If you change the final stage of `dataplane/Dockerfile` (user, volume,
   environment, entry point), make the same change in
   `.github/release/dataplane.Dockerfile`; the release workflow fails when
   the two differ.
 - Add an entry under "Unreleased" in [CHANGELOG.md](CHANGELOG.md).
 - Update `docs/` when behaviour, configuration or an error type changes.
+- A fix for a vulnerability gets an entry under "Security" in the
+  changelog and an advisory in [SECURITY.md](SECURITY.md#past-advisories)
+  that says what was wrong, who was affected and what to do.
 
 ## Releases
 

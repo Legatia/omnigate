@@ -77,8 +77,9 @@ listed before the managed keys created through it
 | `key_sha256` | string | | Lowercase hex SHA-256 of the key. If both fields are present, this one is used. |
 | `budget_usd` | number | none (no budget) | The key is blocked once its recorded spend in the current budget period reaches this amount. See [Operations](operations.md#budgets). |
 | `budget_period` | string | `total` | What the budget covers: `total` (everything, never resets), `monthly` (the current UTC calendar month) or `daily` (the current UTC day). Any other value is rejected when the file is loaded. |
-| `rpm` | integer | `0` (unlimited) | Requests per minute, enforced by each data-plane process. |
+| `rpm` | integer | `0` (unlimited) | Requests per minute, enforced by each data-plane process. Job creation is counted a second time by the control plane; see [Operations](operations.md#rate-limits). |
 | `models` | list of strings | absent (all models) | Route names, text or media, the key may use. An empty list allows none. Anything other than a list of strings is rejected when the file is loaded. |
+| `max_open_jobs` | whole number, 0 or more | absent (the value of `media.max_open_jobs`) | Media jobs the key may have unfinished (queued or running) at one time. `0` means no limit. Anything else is rejected when the file is loaded. See [Operations](operations.md#rate-limits). |
 | `disabled` | boolean | `false` | `true` switches the key off without removing it: the gateway answers it with 401, and its usage stays in the ledger. |
 | `webhook_secret` | string | none | Signing secret for this key's job webhooks. |
 | `webhook_secret_env` | string | none | Name of an environment variable (read by the control plane) holding that secret. Used when `webhook_secret` is absent. |
@@ -108,6 +109,7 @@ Example:
   "budget_usd": 25.0,
   "budget_period": "monthly",
   "rpm": 600,
+  "max_open_jobs": 20,
   "models": ["claude", "gpt", "gemini", "image"],
   "webhook_secret_env": "MY_APP_WEBHOOK_SECRET"
 }
@@ -241,17 +243,22 @@ control plane and is shared across keys.
 ### Retention
 
 ```json
-"retention": { "jobs_days": 30, "ledger_ids_days": 7, "ledger_days": 90, "delete_bucket_objects": true }
+"retention": { "jobs_days": 30, "ledger_ids_days": 14, "ledger_days": 90, "delete_bucket_objects": true }
 ```
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `jobs_days` | number, fractions allowed | `0` (keep forever) | Finished jobs older than this are removed, with their output files: on local disk, and in the bucket unless `delete_bucket_objects` is `false`. |
-| `ledger_ids_days` | number, fractions allowed | `0` (keep forever) | The ledger forgets duplicate-detection ids recorded longer ago than this. |
+| `ledger_ids_days` | number, fractions allowed | `14` | The ledger forgets duplicate-detection ids recorded longer ago than this. An explicit `0` keeps them for ever. |
 | `ledger_days` | number, fractions allowed | `0` (keep forever) | Sealed ledger segments (the history of usage events) last written longer ago than this are deleted. Spend totals are not affected: they are carried in the ledger's snapshots. |
 | `delete_bucket_objects` | boolean | `true` | Whether a removed job's objects are also deleted from an S3-compatible bucket. Only has an effect when `jobs_days` is set. Anything but `true` or `false` is rejected when the file is loaded. |
 
-Nothing is deleted unless you set these. A negative number, or a value that
+No job, file or ledger segment is deleted unless you set these. The one
+setting with a default is `ledger_ids_days`: with no `retention` section at
+all, duplicate-detection ids older than 14 days are dropped from memory and
+from the snapshots (earlier commits kept them for ever). That touches no
+total and no file of events; what it costs is described in
+[Operations](operations.md#retention). A negative number, or a value that
 is not a number, for one of the three `_days` fields is rejected when the
 file is loaded. Details and caveats are in
 [Operations](operations.md#retention); read the one about `ledger_days` and
@@ -266,6 +273,8 @@ The `media` section configures async jobs. It never leaves the control plane.
 | `public_base_url` | string | `http://127.0.0.1:8080` | The address clients use to reach the gateway. Output URLs for locally stored files start with it. |
 | `poll_interval_ms` | integer | `2000` | How often a running job polls its provider. |
 | `max_output_bytes` | integer | `536870912` (512 MiB) | Largest single output file the gateway will download and store. |
+| `max_input_bytes` | integer | `1048576` (1 MiB) | Largest `input` and `metadata` of one job, measured together as JSON. A larger request is refused with `413 payload_too_large`. Both are kept in memory and on disk for as long as the job is. |
+| `max_open_jobs` | whole number, 0 or more | `100` | Unfinished jobs (queued or running) one gateway key may have at a time; a key can set its own `max_open_jobs`. `0` means no limit. One job more is refused with `429 too_many_open_jobs`. Anything but a whole number of 0 or more is rejected when the file is loaded. |
 | `upstreams` | list | `[]` | Media providers. |
 | `routes` | list | `[]` | Media models. |
 | `storage` | object | local disk | Where outputs are stored. |
@@ -295,14 +304,35 @@ the next target.
 | `targets` | list | required | Tried in order. |
 
 Each target has `upstream`, `model` (the provider's model id) and an optional
-`price` object. All four price fields default to `0` and are added together:
+`price` object. All four price fields default to `0` and are added together.
+A price that is negative, or not a number, is rejected when the file is
+loaded.
 
 | `price` field | Charged |
 |---|---|
 | `per_job_usd` | Once per successful job. |
-| `per_output_usd` | Per output file. |
-| `per_second_usd` | Times `input.duration` (or `input.seconds`). |
-| `per_input_char_usd` | Times the length of the first of `input.text`, `input.prompt`, `input.input` that is a string. |
+| `per_output_usd` | Per output file stored. |
+| `per_second_usd` | Times the seconds the adapter asks the provider for. |
+| `per_input_char_usd` | Times the characters of text the adapter sends to the provider. |
+
+Seconds and characters are counted from **what the adapter sends**, not
+from one field the client chose to fill in, so a request cannot lower its
+own price by moving its text or its duration into another field:
+
+| Adapter (`kind`) | Characters counted | Seconds counted |
+|---|---|---|
+| `replicate`, `fal`, `xai_video` | `input.prompt`, `input.text` and `input.input`, each when it is a string, added together (the whole `input` goes to the provider) | The larger of `input.duration` and `input.seconds` (a number, or a string that is one) |
+| `openai_images` | `input.prompt` | none |
+| `elevenlabs` | `input.text` | none |
+| `gemini` | Every `text` part of the request's `contents` and `systemInstruction`, whether it came from the short form (`prompt`, else `text`) or from a native body | none |
+| `gemini_interactions` | The request's `input` (a string, or every `text` inside it) and `system_instruction` | none |
+
+`per_second_usd` therefore only has an effect on `replicate`, `fal` and
+`xai_video` targets. Each of the four parts is at least zero by itself. A job
+whose `input.duration` or `input.seconds` is negative or not numeric, or
+whose `input.n`, `input.num_outputs` or `input.num_images` is not a whole
+number of 0 or more, is refused with `400 invalid_request` when it is
+created ([API](api.md#job-errors)).
 
 Cost is the configured price of the target that delivered. A failed or
 canceled job costs nothing in the ledger, and a cache hit costs nothing.
@@ -344,7 +374,7 @@ services, Amazon S3 included, have only met the mock.
 | `retry_schedule_ms` | list of integers | `[5000, 30000, 120000, 600000, 1800000, 7200000, 21600000]` | Delay before each retry. |
 | `max_attempts` | integer | length of the schedule plus 1 | Total deliveries tried before giving up. |
 | `timeout_ms` | integer | `10000` | How long the receiver gets to answer. |
-| `allow_private` | boolean | `false` | Allow webhook URLs that resolve to loopback, private or link-local addresses. For local development. |
+| `allow_private` | boolean | `false` | Allow addresses that are not public: loopback, private, link-local and the other special-purpose ranges. It applies to webhook URLs **and** to the output URLs a provider returns, which the control plane downloads under the same rule. For local development, where the providers and receivers are mocks on the same machine. |
 
 The secret used for a job is the first one that exists: the key's own
 (`webhook_secret` / `webhook_secret_env`), then `media.webhooks.secret` /
@@ -370,8 +400,9 @@ that asks for a webhook when none of these is set is refused
 | `OMNIGATE_FLUSH_MS` | `500` | How often queued usage, and the counts of refused requests, are sent. |
 | `OMNIGATE_UPSTREAM_TIMEOUT_MS` | `600000` | Maximum wait for upstream response headers. `0` means no limit. An upstream's `timeout_ms` overrides it. |
 | `OMNIGATE_CLIENT_TIMEOUT_MS` | `30000` | How long a client may take to send a request (head and body), and how long an idle keep-alive connection is kept open. `0` means no limit. |
-| `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` | `300000` | A response in progress is cut off when the upstream sends nothing, or the client reads nothing, for this long. What was metered up to then is still billed. `0` means no limit. |
+| `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` | `300000` | A response in progress is cut off when the upstream sends nothing, or the client reads nothing, for this long. The call is still billed: what was metered up to then, or an estimate when the provider's final usage had not arrived. `0` means no limit. |
 | `OMNIGATE_MAX_CONNECTIONS` | `4096` | Client connections served at once. Further connections get an immediate `503` (`overloaded`) and are closed. |
+| `OMNIGATE_ABORT_DRAIN_MS` | `5000` | When a client disconnects in the middle of a response: how long the data plane keeps reading the upstream (at most 8 MiB more) to learn the provider's final token usage. If it arrives in time the call is billed those figures, otherwise an estimate. `0` bills the estimate at once. See [Operations](operations.md#streams-that-end-early). |
 | `OMNIGATE_SHUTDOWN_GRACE_MS` | `10000` | After SIGINT or SIGTERM (Ctrl-C or Ctrl-Break on Windows): how long requests in flight may take to finish before they are cut off and the process exits. |
 | `OMNIGATE_CACHE_MAX_MB` | `64` | Memory for the [response cache](#response-cache) of routes that set `cache_ttl_s`. `0` turns it off. |
 | `OMNIGATE_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (`warning` and `err` are accepted too; case does not matter). |
@@ -383,24 +414,32 @@ that asks for a webhook when none of these is set is refused
 | the names in `upstreams[].api_key_env` | none | Provider keys for text upstreams. |
 
 The spool and the config cache are relative to the data plane's working
-directory unless given as absolute paths. A numeric variable that does not
-parse, or a log level or format that is not one of the values above, stops
-the data plane at startup.
+directory unless given as absolute paths.
+
+**Numeric variables are read strictly.** A value must be a whole number
+written in digits only, within the variable's range (the millisecond and
+count settings go up to at least two billion; no sign, no `_`, no unit, no
+decimal point). Anything else stops the data plane at startup with a
+message that names the variable, as does a log level or format that is not
+one of the values above, or an `OMNIGATE_LISTEN` without a valid port. A
+numeric variable that is set but empty counts as unset. A typo never
+quietly becomes a default.
 
 ### Control plane
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OMNIGATE_ADMIN_TOKEN` | generated and logged at startup | Dashboard password, and bearer token for `/admin/*` and `/metrics`. A warning is logged if it is shorter than 16 characters. |
-| `OMNIGATE_CONTROL_BIND` | `127.0.0.1` | IP address to listen on. Set an address such as `0.0.0.0` to accept connections from other machines. Must be an IP address, not a host name. |
-| `OMNIGATE_CONTROL_PORT` | `4000` | Port to listen on. |
+| `OMNIGATE_ADMIN_TOKEN` | generated and logged at startup | Dashboard password, and bearer token for `/admin/*` and `/metrics`. A value that is set but shorter than 16 characters stops the control plane from starting, with a log line that says so (earlier commits only warned). Unset or empty, a random one is generated for the run. |
+| `OMNIGATE_TRUST_FORWARDED` | unset | `1` or `true`: failed logins and wrong admin tokens are counted against the address in the last hop of `X-Forwarded-For` instead of the address of the connection. Set it only when every request arrives through a proxy that writes that header itself, as in `compose.yaml`; a client that can reach the control plane directly could otherwise choose the address it is counted under. It changes nothing else: the audit log still records the connection's address. |
+| `OMNIGATE_CONTROL_BIND` | `127.0.0.1` | IP address to listen on. Set an address such as `0.0.0.0` to accept connections from other machines. Must be an IP address, not a host name; anything else stops the start. |
+| `OMNIGATE_CONTROL_PORT` | `4000` | Port to listen on: a whole number from 1 to 65535. Anything else stops the start, with a message that names the variable. |
 | `OMNIGATE_COOKIE_SECURE` | unset | `1` always marks the session cookie `Secure`. This is automatic when the request arrives with `X-Forwarded-Proto: https`. |
-| `OMNIGATE_CONFIG` | `../config/omnigate.dev.json` | Path of the config file. |
+| `OMNIGATE_CONFIG` | `../config/omnigate.dev.json` in a development build; required in a release build | Path of the config file. The development config, whose keys and webhook secret are published in this repository, stands in only when the control plane was compiled in the `dev` or `test` environment (`mix run`, as in the quickstart). A release (`MIX_ENV=prod`, which is what the container image builds) refuses to start without the variable, or with an empty one. |
 | `OMNIGATE_LEDGER` | `data/ledger.jsonl` | The usage ledger's active segment. Sealed segments (`ledger.000001.jsonl`, ...) and the snapshots (`ledger.snapshot`, `ledger.snapshot.prev`) are written next to it and named after it. See [Architecture](architecture.md#ledger-files-segments-and-snapshots). |
 | `OMNIGATE_JOBS` | `data/jobs.jsonl` | Job state. |
 | `OMNIGATE_KEYS` | `data/keys.json` | Gateway keys created through the admin API or the dashboard: hashes, limits, and a key's webhook secret if it has one. See [Admin](admin.md#gateway-keys-two-sources). |
 | `OMNIGATE_AUDIT_LOG` | `data/audit.jsonl` | The admin audit log. Rotated files (`.1` to `.3`) are kept next to it. See [Admin](admin.md#the-audit-log). |
-| `OMNIGATE_AUDIT_MAX_MB` | `50` | Size, in megabytes (fractions allowed), at which the audit log is rotated. `0` turns rotation off. A negative value, or one that is not a number, is replaced by the default without a message. |
+| `OMNIGATE_AUDIT_MAX_MB` | `50` | Size, in megabytes (fractions allowed), at which the audit log is rotated. `0` turns rotation off. A negative value, or one that is not a number (`50MB`, say), stops the start with a message that names the variable; earlier commits replaced it by the default without a word. |
 | `OMNIGATE_MEDIA_DIR` | `data/media` | Where local output storage keeps files, unless the config names a `dir`. |
 | `OMNIGATE_SIGNING_SECRET` | derived from `OMNIGATE_INTERNAL_TOKEN` | Signs the download URLs of locally stored files. |
 | `OMNIGATE_WEBHOOK_SECRET` | none | Last-resort webhook signing secret. |
@@ -413,6 +452,14 @@ directory. When it is started from `control/` as in the quickstart, the
 config default is the repository's `config/omnigate.dev.json` and state goes
 to `control/data/`.
 
+The control plane checks these before it opens its port, and logs the
+reason and stops if one fails: `OMNIGATE_INTERNAL_TOKEN` is set, the
+numeric variables (`OMNIGATE_CONTROL_PORT`, `OMNIGATE_AUDIT_MAX_MB`) and
+the bind address can be read, a config path is known (see
+`OMNIGATE_CONFIG`), and an admin token that was set is at least 16
+characters long. A token, a config path or a numeric variable that is set
+but empty counts as unset.
+
 Not configurable through the environment: when the ledger seals a segment
 (at 64 MiB, or after the UTC day turns) and how often it writes a snapshot
 (every 50,000 events, and every five minutes while there is something new).
@@ -422,10 +469,29 @@ The container images set some of these differently; see
 
 ### Compose only
 
+Read by Compose from `.env` and handed to the proxy container; neither
+process reads them.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `OMNIGATE_API_HOST` | `localhost` | Host name the proxy serves the gateway on. |
 | `OMNIGATE_ADMIN_HOST` | `admin.localhost` | Host name the proxy serves the dashboard and admin API on. |
+| `OMNIGATE_ADMIN_ALLOW` | `0.0.0.0/0 ::/0` (everyone) | Source ranges that may reach the dashboard host at all, as CIDR ranges separated by spaces. Everyone else gets `403` from the proxy before the control plane sees the request. See [Security hardening](security.md#limit-who-can-reach-the-admin-host). |
+
+### Which file a variable goes in (Compose)
+
+`compose.yaml` gives each container its own environment file, so that the
+process that faces the internet holds as little as possible:
+
+| File | Read by | Holds |
+|---|---|---|
+| `.env` | Compose itself, for the proxy | `OMNIGATE_API_HOST`, `OMNIGATE_ADMIN_HOST`, `OMNIGATE_ADMIN_ALLOW`. No secrets. |
+| `.env.control` | the control plane | `OMNIGATE_INTERNAL_TOKEN`, `OMNIGATE_ADMIN_TOKEN`, media provider keys, webhook secrets, bucket credentials, and any other control-plane variable from the table above. |
+| `.env.dataplane` | the data plane | `OMNIGATE_INTERNAL_TOKEN` (the same value), the text provider keys, and any data-plane variable from the table above (timeouts, the connection cap, logging). Never the admin token, media keys, webhook secrets or bucket credentials. |
+
+Each has an `.example` file next to it. `compose.yaml` itself sets
+`OMNIGATE_TRUST_FORWARDED=1` for the control plane. The steps are in
+[Deployment](deployment.md#compose-with-tls).
 
 ## What the data plane receives
 

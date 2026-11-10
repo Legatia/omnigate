@@ -19,29 +19,105 @@ only met a mock, is tracked in the README's
 
 ### Security
 
-- **Authentication bypass on the control plane, fixed in commit 97cf396.**
-  A request whose first path segment was percent-encoded (`/%61dmin/keys`,
-  `/%69nternal/config`, `/%6Detrics`) skipped the admin-token, internal-token
-  and CSRF checks and still reached its handler, because the checks looked
-  at the path as sent while the router matched the decoded one.
-  - **Who was affected:** anyone running an earlier commit with the control
-    plane's port, or the dashboard's host name behind the Compose proxy,
-    reachable by someone they do not trust. Such a caller needed no
+Three commits (97cf396, fde530c, 3a0b147) fix what an independent review
+of the code found in November 2026. Everything was found by reading the
+code and small proofs of concept; **nothing is known to have been
+exploited.** The full advisories, one per class, are in
+[SECURITY.md](SECURITY.md#past-advisories).
+
+**What to do, for everyone who ran an earlier commit:**
+
+1. Update **both** processes to 3a0b147 or later. The fixes are on both
+   sides.
+2. If the control plane's port, or the dashboard's host name behind the
+   Compose proxy, could be reached by anyone you do not trust: set a new
+   admin token, delete managed gateway keys you did not create, rotate the
+   gateway keys that were created or rotated in that time, and look in the
+   audit log for key actions with `"auth": "none"`.
+3. Compose users: split `.env` into `.env.control` and `.env.dataplane`
+   (Compose will not start without them), and make sure the admin token is
+   at least 16 characters long. See
+   [docs/deployment.md](docs/deployment.md#coming-from-a-commit-before-3a0b147).
+4. If you bill or budget from the ledger and hand gateway keys to parties
+   you do not fully trust, compare the period before the update with your
+   providers' invoices.
+
+**What was wrong:**
+
+- **Authentication bypass on the control plane (97cf396).** A request whose
+  first path segment was percent-encoded (`/%61dmin/keys`,
+  `/%69nternal/config`, `/%6Detrics`) skipped the admin-token,
+  internal-token and CSRF checks and still reached its handler, because the
+  checks looked at the path as sent while the router matched the decoded
+  one.
+  - *Who was affected:* anyone whose control plane, or dashboard host name,
+    was reachable by someone they do not trust. Such a caller needed no
     credential to use the whole admin API (including creating, rotating and
-    deleting gateway keys), to read `/metrics`, and to use `/internal/*`
-    (the config snapshot with key hashes, usage intake, the jobs API as any
-    key). The admin token, the internal token and provider keys were not
-    revealed. A control plane reachable only from a trusted network was not
-    exposed.
-  - **What to do:** update the control plane; delete managed keys you did
-    not create and rotate the ones created or rotated while it was exposed;
-    look in the audit log for key actions with `"auth": "none"`, which only
-    this bypass could produce. The full advisory is in
-    [SECURITY.md](SECURITY.md#past-advisories).
-  - **The fix:** a request path with any encoded character is refused with
-    400 before routing; an unknown first path segment is a 404 at the check
-    instead of being passed on; credentials are checked before the body is
-    parsed. Found by an independent review of the code.
+    deleting gateway keys), to read `/metrics`, and to use `/internal/*`.
+    The admin token, the internal token and provider keys were not
+    revealed.
+  - *The fix:* a path with any encoded character is refused with 400 before
+    routing; an unknown first path segment is a 404 at the check; and
+    credentials are checked before the body is parsed.
+- **Remote crashes of the data plane (fde530c).** A header line without a
+  colon, or a `POST` without a length, ended the gateway process with one
+  unauthenticated request; JSON nested 256 levels deep did the same with a
+  valid key. One process serves every connection, so each crash dropped
+  every request in flight.
+  - *Who was affected:* every deployment; the data plane is the public
+    port. Nothing was disclosed.
+  - *The fix:* request heads and JSON nesting are validated before any code
+    that asserts on their shape; a panic, should one still happen, logs one
+    line and exits with status 70.
+- **Request smuggling into the internal API (fde530c).** The data plane
+  pasted the client's request target into the URL of its call to the
+  control plane and copied `Idempotency-Key` unchecked. A request line or
+  header value with bare line feeds could carry a second request, or extra
+  headers, which the gateway then sent to `/internal/*` with its own
+  internal token.
+  - *Who was affected:* deployments whose data plane was reachable by
+    parties they do not trust. The path the regression test replays uses a
+    valid gateway key; assume the keyless one (signed file URLs) was open
+    too. Usage events could have been written under any key.
+  - *The fix:* strict request heads, one canonical spelling per path, a
+    small character set for query strings and copied headers, and a URL
+    built from parsed parts.
+- **Billing evasion (fde530c, 3a0b147).** A client that disconnected
+  mid-stream was billed only what had been metered, usually nothing for an
+  OpenAI-style stream. The usage scanner matched token-count keys anywhere
+  in a response, including in text a client could get echoed. Media jobs
+  were priced from the client's own `duration` and text fields, a negative
+  duration lowered the price, and `POST /v1/jobs/` (with a trailing slash)
+  created jobs without being rate limited.
+  - *Who was affected:* operators who give gateway keys to parties they do
+    not fully trust. A key holder could use provider capacity the ledger
+    did not record.
+  - *The fix:* abandoned streams are billed (real figures within
+    `OMNIGATE_ABORT_DRAIN_MS`, an estimate otherwise); usage is read only
+    from real usage objects; media cost follows what the adapter sent, with
+    every part clamped at zero; job creation is rate-limited and capped in
+    the control plane.
+- **Server-side request forgery through provider outputs (3a0b147).** The
+  control plane downloaded job outputs from whatever URL a provider's
+  answer named, following redirects, with no check on the address. A
+  steered answer could make it fetch an internal address and store the
+  response as a downloadable job output. The private-address list used for
+  webhooks also missed several IPv6 forms and special-purpose ranges.
+  - *Who was affected:* deployments with media routes whose control plane
+    can reach internal HTTP services, where job creators or a provider are
+    not fully trusted.
+  - *The fix:* output URLs go through the same guard as webhook URLs
+    (resolve once, check every address, connect to the checked address),
+    redirects are followed one checked hop at a time, at most five, and the
+    list of refused ranges follows the IANA registries.
+- **Other hardening from the same review (fde530c, 3a0b147).** Stored
+  outputs are served as downloads with `nosniff` and a sandboxing
+  `Content-Security-Policy` instead of inline with a provider-declared
+  type; wrong admin bearer tokens are throttled; a short admin token stops
+  the start; each container gets only its own secrets; a release build
+  refuses to start without `OMNIGATE_CONFIG` instead of using the
+  development config; learned provider quirks are per gateway key; log
+  lines escape control bytes; the control plane speaks HTTP/1.1 only.
 
 ### Added
 
@@ -117,6 +193,13 @@ only met a mock, is tracked in the README's
   `{"type": "json_object"}` becomes an instruction in the system prompt.
   Covered against the mock providers; the Anthropic side has not been
   verified against the live API.
+- `OMNIGATE_ABORT_DRAIN_MS` (5 s): after a client disconnects mid-response
+  the data plane keeps reading the upstream this long, and at most 8 MiB,
+  for the provider's final usage. `0` bills an estimate at once.
+- Usage events carry `"estimated": true` when their token counts are an
+  estimate, and the text access log marks such a line `usage=estimated`.
+- Exit status 70 after a panic, with one log line (`error(panic): ...`), so
+  a supervisor can tell it from a clean stop and from a startup error.
 
 **Control plane**
 
@@ -189,6 +272,20 @@ only met a mock, is tracked in the README's
   reason otherwise. No credentials.
 - The audit log is rotated by size (`OMNIGATE_AUDIT_MAX_MB`, 50; three older
   files are kept; `0` turns rotation off).
+- `media.max_open_jobs` (100) and a per-key `max_open_jobs`: the number of
+  unfinished media jobs a key may have at once. One more answers 429
+  `too_many_open_jobs`. Settable in the config file and through
+  `/admin/keys`; listings show the limit in force.
+- `media.max_input_bytes` (1 MiB): the largest `input` and `metadata` of a
+  job together; more answers 413.
+- Job creation is rate-limited in the control plane as well, with the
+  key's `rpm` in fixed one-minute windows (429 `rate_limit_exceeded`).
+- `OMNIGATE_TRUST_FORWARDED`: count failed logins and wrong admin tokens
+  per address in `X-Forwarded-For` instead of per connection, for a control
+  plane that is only reachable through a proxy.
+- Wrong admin bearer tokens are throttled: 20 from one address within a
+  minute, then 429 `too_many_attempts` for that address until the minute
+  is over.
 
 **Packaging and tools**
 
@@ -230,6 +327,35 @@ only met a mock, is tracked in the README's
 - `tools/mock_upstream.py`: models that always answer 429 with
   `retry-after`, that send a provider request id, and answers that follow a
   requested JSON schema.
+- `tools/malformed_test.py`: a hostile-input suite. It replays the requests
+  that used to crash the data plane or slip past a check, plus a few
+  hundred generated (seeded) malformed request heads, asks `/healthz`
+  after every one, and checks that a client which hangs up mid-stream is
+  still billed. By default it starts its own stack through the end-to-end
+  harness; `--gateway` points it at a running one, `--thorough` runs many
+  more generated cases. CI runs it in a job of its own.
+- `tools/check.py`: runs every check a change should pass (builds, unit
+  tests, `zig fmt --check`, `mix format --check-formatted`, the importer
+  tests, the end-to-end, SDK and hostile-input suites) with one command and
+  a summary; `--quick` for unit tests and formatting only.
+- `-Dstrip=true` for the data-plane build, used by `dataplane/Dockerfile`:
+  the binary leaves its debug information out.
+- An `x-request-id` header on every response of the control plane. A data
+  plane relaying a client's request sends its own id along, so one id
+  follows the request through both processes and is the `request_id` of a
+  500 from either.
+- `GET /admin/overview`: each recent request has its `id` and an
+  `estimated` flag.
+- `tools/container_test.py` also sends requests byte for byte through the
+  TLS proxy: odd spellings of `/admin` and `/internal` paths, malformed and
+  oversized requests to both hosts, the admin allow-list (a second proxy on
+  port 18444), and that the data-plane container holds no admin token.
+- `OMNIGATE_ADMIN_ALLOW` for the Compose proxy: CIDR ranges that may reach
+  the dashboard host; everyone else gets 403. Open by default.
+- `.env.control.example` and `.env.dataplane.example`, and
+  `stop_grace_period` for both services in `compose.yaml`.
+- `docs/security.md`, an operator's hardening guide, and one advisory per
+  class of fixed vulnerability in `SECURITY.md`.
 
 ### Changed
 
@@ -276,11 +402,20 @@ only met a mock, is tracked in the README's
   "request_id"}`. `type` is now the provider's category
   (`invalid_request_error`, `rate_limit_error`, `not_found_error`, ...). A
   client that matched on `error.type` must match on `error.code` instead.
-  Errors the control plane raises for the jobs API, and on its own port,
-  keep the reason in `error.type`. The mapping is in `docs/api.md`.
-- When every target of a route failed and the last one tried answered 429,
-  the client gets 429 `upstream_rate_limited` with that upstream's
-  `retry-after`. It used to get 502 `all_upstreams_failed`.
+  The mapping is in `docs/api.md`.
+- **One error shape everywhere.** Errors the control plane raises (for the
+  jobs API and file downloads, and on its own port for the admin API,
+  `/metrics` and `/internal/*`) have the same OpenAI-style envelope:
+  `{"error": {"message", "type", "param", "code"}}`, with the reason in
+  `error.code` and an OpenAI-style category in `error.type`. They used to
+  be `{"error": {"type": "<reason>", "message"}}`. A client of the jobs API
+  or a script against the admin API that read the reason from `error.type`
+  must read `error.code`.
+- When no target of a route succeeded and any of them answered 429, the
+  client gets 429 `upstream_rate_limited` with the longest `retry-after`
+  those targets sent. It used to get 502 `all_upstreams_failed` (and, for
+  a few commits, 429 only when the last target tried was the rate-limited
+  one).
 - An endpoint that none of a route's upstreams can serve (embeddings on a
   route with only Anthropic-style upstreams, for example) answers 400
   `endpoint_not_supported`, and a request that no target can be sent
@@ -306,6 +441,90 @@ only met a mock, is tracked in the README's
 - The README was rewritten as a shorter landing page: the environment
   table and the config field lists now live only in
   `docs/configuration.md`, and it no longer states counts of test checks.
+- **Compose: secrets are split per container.** `compose.yaml` reads
+  `.env.control` and `.env.dataplane` instead of giving one `.env` to both
+  containers; `.env` now holds only the host names and
+  `OMNIGATE_ADMIN_ALLOW`. An existing deployment must create the two files
+  before it will start. Compose also sets `OMNIGATE_TRUST_FORWARDED=1` for
+  the control plane.
+- **An admin token shorter than 16 characters stops the control plane from
+  starting.** It used to log a warning.
+- **A release build of the control plane refuses to start without
+  `OMNIGATE_CONFIG`.** Only development and test builds fall back to
+  `config/omnigate.dev.json`.
+- **The gateway refuses requests it used to accept.** A path must be in one
+  canonical form (no percent-encoding, no trailing slash, no empty or dot
+  segments) and a query string may only use a small character set, or the
+  answer is 400 `invalid_request`. A malformed or ambiguous request head is
+  400, a body without a length 411, an `Expect` other than `100-continue`
+  417, a head over 16 KiB 431. JSON nested deeper than 64 levels is 400
+  `invalid_json`. `Idempotency-Key`, `anthropic-version` and
+  `anthropic-beta` values are limited to plain characters.
+- **A response that ends early is billed.** A client that disconnects
+  mid-stream is billed the provider's real usage when it arrives within
+  `OMNIGATE_ABORT_DRAIN_MS`, and otherwise an estimate; so is a stream cut
+  off by the idle timeout or by the upstream before its final usage.
+  Earlier commits billed only what had been metered up to that point.
+- **Media job cost is computed from what the adapter sent to the
+  provider.** Per-character prices count the text fields the adapter
+  forwards (for the adapters that forward the whole input: `prompt`, `text`
+  and `input` added together), per-second prices the larger of `duration`
+  and `seconds`, and only for the adapters that send a duration. A job with
+  a negative or non-numeric duration or count is refused with 400, and a
+  negative media price stops the config from loading.
+- `retention.ledger_ids_days` defaults to 14 instead of keeping
+  duplicate-detection ids for ever; an explicit `0` keeps the old
+  behaviour.
+- Stored outputs are served as attachments, with
+  `x-content-type-options: nosniff` and a sandboxing
+  `content-security-policy`, and with their stored content type only when
+  it is on a short list of media types (`application/octet-stream`
+  otherwise).
+- The data plane passes on six headers of a control-plane answer by name:
+  `content-disposition`, `x-content-type-options`,
+  `content-security-policy` and `cache-control` on a stored file,
+  `location` on the redirect to a bucket-stored file, and `retry-after` on
+  a 429. It used to pass on none of them, so the redirect had no target and
+  a job-creation 429 from the control plane no `Retry-After`.
+- Numeric environment variables are read strictly in both processes:
+  digits only for the data plane's settings, a well-formed number in range
+  for `OMNIGATE_CONTROL_PORT` and `OMNIGATE_AUDIT_MAX_MB`. A bad value
+  stops the process at startup with a message that names the variable; it
+  used to be half-read, or replaced by a default without a word. A variable
+  that is set but empty counts as unset.
+- The data plane refuses a job request body over 8,000,000 bytes itself,
+  with the answer the control plane would give, instead of sending it
+  across first.
+- `x-request-id` and `request-id` never disagree: when a provider sent
+  only one of the two, that id goes into both.
+- `retention.ledger_days` also takes effect on an installation that records
+  nothing after a restart: the sweep writes the second snapshot generation
+  itself instead of waiting for one.
+- A managed key shadowed by a config-file key of the same name is listed
+  in the dashboard and in `GET /admin/overview`, with the state `shadowed`.
+- The control image's health check has a start period of 120 seconds
+  instead of 20, for a first start that replays a large ledger.
+- The outbound `user-agent` of both processes carries the version from
+  `dataplane/build.zig.zon` and `control/mix.exs` (`omnigate/0.1.0`,
+  `omnigate-webhooks/0.1.0`) instead of a hand-written `0.1`.
+- Provider output downloads resolve the host once, refuse non-public
+  addresses and connect to the checked address, like webhooks; redirects
+  are followed by the control plane itself, at most five.
+  `media.webhooks.allow_private` now governs these downloads too.
+- `jobs.jsonl`: a job's later changes are appended as patch lines with only
+  the changed fields, instead of full copies of the job. Older files are
+  read as before; older code cannot read the new lines.
+- Learned provider quirks (refused sampling parameters, thought
+  signatures) are remembered per gateway key, not shared across keys.
+- The usage scanner reads token counts only from usage objects at the
+  places the protocols define, not from matching text anywhere in a
+  response.
+- `POST /login` and `POST /logout` accept a body of at most 4,096 bytes,
+  and the control plane's listener speaks HTTP/1.1 only.
+- The data plane's text log escapes control bytes in client-supplied text
+  and never logs a query string.
+- CI has a seventh job, `hostile`, for `tools/malformed_test.py`, and the
+  container test uses a second local port (18444).
 
 ### Fixed
 
@@ -326,3 +545,12 @@ only met a mock, is tracked in the README's
   now one reused buffer. Found with the load test.
 - As PID 1 in a container the data plane ignored SIGTERM, so `docker stop`
   waited for its kill timeout. It now drains and exits with status 0.
+- A client that was refused before its request body had been read (a bad
+  key on a `POST`, for example) could see a reset connection instead of the
+  answer. The data plane now finishes its side, reads and discards what
+  the client is still sending for a short time, and then closes.
+- A connection whose answer said `connection: close` was held open until
+  the client timeout. It is closed at once.
+- A client that requested a large stored file and then stopped reading
+  held its connection for ever; the stream idle timeout now covers the
+  gateway's own answers and file downloads.

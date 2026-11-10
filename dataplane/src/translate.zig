@@ -13,6 +13,7 @@
 //! be represented at all (audio parts, documents) is `error.Untranslatable`.
 
 const std = @import("std");
+const guard = @import("guard.zig");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const json = std.json;
@@ -76,16 +77,23 @@ fn getInt(o: ObjectMap, key: []const u8) ?i64 {
     };
 }
 
+/// A token count from a provider: never negative, and capped so that sums of
+/// several of them, and the casts back to JSON integers, cannot overflow.
 fn getCount(o: ObjectMap, key: []const u8) u64 {
     const i = getInt(o, key) orelse return 0;
-    return if (i < 0) 0 else @intCast(i);
+    return if (i < 0) 0 else @min(@as(u64, @intCast(i)), max_token_count);
 }
+
+const max_token_count: u64 = 1 << 40;
 
 fn isNumber(v: Value) bool {
     return v == .integer or v == .float or v == .number_string;
 }
 
 fn parseObject(a: Allocator, body: []const u8) error{ OutOfMemory, InvalidJson }!ObjectMap {
+    // Everything parsed here is serialised again, and the serialiser indexes
+    // past a fixed stack on values nested deeper than 256.
+    if (!guard.jsonDepthOk(body, guard.max_upstream_json_depth)) return error.InvalidJson;
     const v = json.parseFromSliceLeaky(Value, a, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidJson,
@@ -395,10 +403,15 @@ fn imageBlockFromUrl(a: Allocator, url: []const u8) !Value {
 fn parseToolInput(a: Allocator, arguments: []const u8) !Value {
     const trimmed = std.mem.trim(u8, arguments, " \t\r\n");
     if (trimmed.len == 0) return .{ .object = .empty };
-    const parsed: ?Value = json.parseFromSliceLeaky(Value, a, trimmed, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => null,
-    };
+    // JSON inside a string is not covered by the depth check on the body it
+    // came in; too deep, and it is kept as the string it arrived as.
+    const parsed: ?Value = if (!guard.jsonDepthOk(trimmed, guard.max_client_json_depth))
+        null
+    else
+        json.parseFromSliceLeaky(Value, a, trimmed, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
     if (parsed) |v| if (v == .object) return v;
     var o: ObjectMap = .empty;
     try o.put(a, "_raw_arguments", S(arguments));
@@ -2449,4 +2462,224 @@ test "stream: oversized event is rejected, memory stays bounded per event" {
         };
     }
     try testing.expect(failed);
+}
+
+// --- nothing a peer sends may panic ------------------------------------------
+//
+// Every byte translated here comes from a client or a provider, and a panic
+// ends the whole process. These tests take well-formed samples and replace
+// parts of them with values of the wrong type, missing keys, absurd numbers
+// and deep nesting, many thousands of times. Errors are fine; a panic fails
+// the test run.
+
+fn fuzzJunk(a: Allocator, random: std.Random, depth: usize) Allocator.Error!Value {
+    return switch (random.uintLessThan(u8, 16)) {
+        0 => .null,
+        1 => .{ .bool = random.boolean() },
+        2 => .{ .integer = 0 },
+        3 => .{ .integer = -1 },
+        4 => .{ .integer = std.math.maxInt(i64) },
+        5 => .{ .integer = std.math.minInt(i64) },
+        6 => .{ .float = 1e300 },
+        7 => .{ .float = -0.5 },
+        8 => S(""),
+        9 => S(([_][]const u8{ "text", "tool_use", "tool_result", "function", "image_url", "assistant", "user", "tool", "stop", "end_turn", "data:;base64,", "{\"a\":[" })[random.uintLessThan(usize, 12)]),
+        10 => .{ .array = Array.init(a) },
+        11 => .{ .object = .empty },
+        12 => .{ .number_string = "123456789012345678901234567890" },
+        else => blk: {
+            if (depth > 3) break :blk .null;
+            if (random.boolean()) {
+                var arr = Array.init(a);
+                for (0..random.uintLessThan(usize, 3)) |_| try arr.append(try fuzzJunk(a, random, depth + 1));
+                break :blk .{ .array = arr };
+            }
+            var o: ObjectMap = .empty;
+            for ([_][]const u8{ "type", "text", "id", "index", "function", "content", "usage", "delta" }) |k| {
+                if (random.boolean()) try o.put(a, k, try fuzzJunk(a, random, depth + 1));
+            }
+            break :blk .{ .object = o };
+        },
+    };
+}
+
+fn fuzzMutate(a: Allocator, random: std.Random, v: Value, depth: usize) Allocator.Error!Value {
+    if (random.uintLessThan(u8, 100) < 9) return fuzzJunk(a, random, depth);
+    switch (v) {
+        .object => |o| {
+            var out: ObjectMap = .empty;
+            var it = o.iterator();
+            while (it.next()) |e| {
+                if (random.uintLessThan(u8, 100) < 4) continue; // key missing
+                try out.put(a, e.key_ptr.*, try fuzzMutate(a, random, e.value_ptr.*, depth + 1));
+            }
+            return .{ .object = out };
+        },
+        .array => |arr| {
+            var out = Array.init(a);
+            for (arr.items) |item| {
+                const roll = random.uintLessThan(u8, 100);
+                if (roll < 4) continue;
+                try out.append(try fuzzMutate(a, random, item, depth + 1));
+                if (roll > 96) try out.append(try fuzzMutate(a, random, item, depth + 1)); // repeated
+            }
+            return .{ .array = out };
+        },
+        else => return v,
+    }
+}
+
+const fuzz_openai_request =
+    \\{"model":"m","max_tokens":50,"temperature":0.2,"top_p":0.9,"stop":["x"],"stream":true,"stream_options":{"include_usage":true},
+    \\"response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object","properties":{"a":{"type":"string"}}}}},
+    \\"messages":[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"hi"},
+    \\{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]},
+    \\{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{\"city\":\"Paris\"}"}}]},
+    \\{"role":"tool","tool_call_id":"c1","content":"21C"}],
+    \\"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],
+    \\"tool_choice":{"type":"function","function":{"name":"f"}},"parallel_tool_calls":false,"user":"u"}
+;
+const fuzz_anthropic_request =
+    \\{"model":"m","max_tokens":50,"temperature":0.2,"stop_sequences":["x"],"stream":true,"system":[{"type":"text","text":"be brief"}],
+    \\"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}},"metadata":{"user_id":"u"},
+    \\"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]},
+    \\{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"t1","name":"f","input":{"city":"Paris"}}]},
+    \\{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"21C"}]}]}],
+    \\"tools":[{"name":"f","description":"d","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],
+    \\"tool_choice":{"type":"tool","name":"f","disable_parallel_tool_use":true}}
+;
+const fuzz_openai_response =
+    \\{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hello",
+    \\"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":"tool_calls"}],
+    \\"usage":{"prompt_tokens":11,"completion_tokens":6,"total_tokens":17,"prompt_tokens_details":{"cached_tokens":3}}}
+;
+const fuzz_anthropic_response =
+    \\{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"thinking","thinking":"..."},{"type":"text","text":"hello"},
+    \\{"type":"tool_use","id":"t1","name":"f","input":{"city":"Paris"}}],"stop_reason":"tool_use","stop_sequence":null,
+    \\"usage":{"input_tokens":11,"output_tokens":6,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}
+;
+const fuzz_error_bodies = [_][]const u8{
+    \\{"error":{"message":"bad","type":"invalid_request_error","param":"x","code":"c"}}
+    ,
+    \\{"type":"error","error":{"type":"overloaded_error","message":"busy"},"request_id":"r"}
+    ,
+};
+
+fn fuzzOnce(a: Allocator, random: std.Random, sample: []const u8) ![]u8 {
+    const v = try json.parseFromSliceLeaky(Value, a, sample, .{});
+    return json.Stringify.valueAlloc(a, try fuzzMutate(a, random, v, 0), .{});
+}
+
+test "fuzz: malformed requests and responses are errors, never panics" {
+    var prng: std.Random.DefaultPrng = .init(0x6a756e6b);
+    const random = prng.random();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    for (0..6000) |i| {
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+
+        const o_req = try fuzzOnce(a, random, fuzz_openai_request);
+        _ = translateRequest(a, .openai_to_anthropic, o_req, "target") catch {};
+        const a_req = try fuzzOnce(a, random, fuzz_anthropic_request);
+        _ = translateRequest(a, .anthropic_to_openai, a_req, "target") catch {};
+
+        // Responses come from the upstream, i.e. in the OTHER protocol.
+        const status: u16 = ([_]u16{ 200, 200, 200, 400, 429, 500 })[i % 6];
+        const a_resp = try fuzzOnce(a, random, fuzz_anthropic_response);
+        _ = translateResponseAt(a, .openai_to_anthropic, status, a_resp, "route", 1) catch {};
+        const o_resp = try fuzzOnce(a, random, fuzz_openai_response);
+        _ = translateResponseAt(a, .anthropic_to_openai, status, o_resp, "route", 1) catch {};
+
+        const err_body = try fuzzOnce(a, random, fuzz_error_bodies[i % 2]);
+        _ = translateError(a, .openai_to_anthropic, status, err_body) catch {};
+        _ = translateError(a, .anthropic_to_openai, status, err_body) catch {};
+        // And things that are not JSON at all.
+        _ = translateResponseAt(a, .openai_to_anthropic, status, o_req[0 .. o_req.len / 2], "route", 1) catch {};
+        _ = translateRequest(a, .anthropic_to_openai, "[1,2,3]", "target") catch {};
+    }
+}
+
+/// Rewrite every `data:` line of an SSE stream with a mutated JSON payload.
+fn fuzzStream(a: Allocator, random: std.Random, stream: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, stream, '\n');
+    while (lines.next()) |line| {
+        const roll = random.uintLessThan(u8, 100);
+        if (roll < 2) continue; // a line lost
+        if (std.mem.startsWith(u8, line, "data: {") and roll < 70) {
+            const mutated = fuzzOnce(a, random, line["data: ".len..]) catch line["data: ".len..];
+            try out.appendSlice(a, "data: ");
+            try out.appendSlice(a, mutated);
+        } else if (roll > 97) {
+            try out.appendSlice(a, "data: {\"type\":");
+        } else {
+            try out.appendSlice(a, line);
+        }
+        try out.append(a, '\n');
+    }
+    // Sometimes the stream just stops.
+    if (random.uintLessThan(u8, 100) < 15) out.shrinkRetainingCapacity(random.uintLessThan(usize, out.items.len + 1));
+    return out.items;
+}
+
+test "fuzz: malformed event streams are errors, never panics" {
+    var prng: std.Random.DefaultPrng = .init(0x73747265);
+    const random = prng.random();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    for (0..3000) |i| {
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        const from_anthropic = i % 2 == 0;
+        const text = try fuzzStream(a, random, if (from_anthropic) anthropic_stream else openai_stream);
+
+        var out: Writer.Allocating = .init(a);
+        var tr = StreamTranslator.init(a, if (from_anthropic) .openai_to_anthropic else .anthropic_to_openai, "route", .{ .include_usage = random.boolean(), .created = 1 });
+        const step = 1 + random.uintLessThan(usize, 200);
+        var pos: usize = 0;
+        var failed = false;
+        while (pos < text.len) : (pos += step) {
+            tr.feed(text[pos..@min(text.len, pos + step)], &out.writer) catch {
+                failed = true;
+                break;
+            };
+        }
+        if (!failed) tr.finish(&out.writer) catch {};
+    }
+}
+
+test "deeply nested JSON is refused before it can reach the serialiser" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // 300 levels: beyond what std.json.Stringify can represent.
+    var deep: std.ArrayList(u8) = .empty;
+    try deep.appendSlice(a, "{\"model\":\"m\",\"max_tokens\":5,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"x\":");
+    try deep.appendNTimes(a, '[', 300);
+    try deep.appendNTimes(a, ']', 300);
+    try deep.append(a, '}');
+    try testing.expectError(error.InvalidJson, translateRequest(a, .anthropic_to_openai, deep.items, "t"));
+    try testing.expectError(error.InvalidJson, translateRequest(a, .openai_to_anthropic, deep.items, "t"));
+    try testing.expectError(error.InvalidJson, translateResponseAt(a, .openai_to_anthropic, 200, deep.items, "r", 1));
+
+    // Tool-call arguments are JSON inside a string: too deep, they stay a string.
+    var args: std.ArrayList(u8) = .empty;
+    try args.appendNTimes(a, '[', 300);
+    try args.appendNTimes(a, ']', 300);
+    const body = try json.Stringify.valueAlloc(a, .{
+        .model = "m",
+        .messages = .{.{ .role = "assistant", .tool_calls = .{.{ .id = "c", .type = "function", .function = .{ .name = "f", .arguments = args.items } }} }},
+    }, .{});
+    const translated = try translateRequest(a, .openai_to_anthropic, body, "t");
+    try testing.expect(std.mem.find(u8, translated, "_raw_arguments") != null);
+
+    // Token counts are capped, so absurd ones cannot overflow sums or casts.
+    const huge = "{\"type\":\"message\",\"content\":[{\"type\":\"text\",\"text\":\"x\"}],\"stop_reason\":\"end_turn\"," ++
+        "\"usage\":{\"input_tokens\":9223372036854775807,\"output_tokens\":9223372036854775807," ++
+        "\"cache_read_input_tokens\":9223372036854775807,\"cache_creation_input_tokens\":9223372036854775807}}";
+    _ = try translateResponseAt(a, .openai_to_anthropic, 200, huge, "r", 1);
 }

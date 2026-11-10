@@ -331,9 +331,21 @@ class Slow(OpenAIOk):
 
 class Stall(Base):
     def do_POST(self):
-        self.read_json()
+        body = self.read_json()
         self.start_sse()
         self.sse('data: {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "Hel"}}]}\n\n')
+        if isinstance(body, dict) and str(body.get("model", "")).startswith("drip"):
+            # Keep talking, never report usage: what a provider does when the
+            # gateway's client has left and nobody asked it to stop.
+            deadline = time.time() + 60
+            try:
+                while time.time() < deadline:
+                    time.sleep(0.2)
+                    self.sse('data: {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "lo "}}]}\n\n')
+            except OSError:
+                pass
+            self.close_connection = True
+            return
         # Say nothing more; give up after a minute or when the peer goes away.
         deadline = time.time() + 60
         try:

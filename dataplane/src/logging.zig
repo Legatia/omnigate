@@ -85,6 +85,9 @@ pub const Access = struct {
     cached_input_tokens: u64 = 0,
     /// Answered from the gateway's own response cache, without an upstream.
     cache_hit: bool = false,
+    /// The token counts are an estimate (the response was cut off before the
+    /// provider's own figures arrived).
+    estimated: bool = false,
     /// The error `type` the gateway answered with when it refused the request
     /// itself. Not printed here (the status says it); proxy.zig counts these.
     rejected: ?[]const u8 = null,
@@ -127,11 +130,38 @@ pub fn access(a: *const Access, level: std.log.Level) void {
     }
 }
 
+/// Text that came from a client, made safe for a one-line log: a line break
+/// in a model name must not be able to start a forged log line.
+fn writeClean(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
+    for (text) |c| {
+        if (c < 0x20 or c == 0x7f) {
+            try w.print("\\x{x:0>2}", .{c});
+        } else if (c == ' ') {
+            try w.writeByte('_');
+        } else {
+            try w.writeByte(c);
+        }
+    }
+}
+
 fn writeAccessText(w: *Io.Writer, a: *const Access) Io.Writer.Error!void {
-    try w.print("{s} {s} {d}", .{ a.method, a.path.get(), a.status });
-    if (a.key.len > 0) try w.print(" key={s}", .{a.key.get()});
-    if (a.model.len > 0) try w.print(" model={s}", .{a.model.get()});
-    if (a.upstream.len > 0) try w.print(" upstream={s} attempts={d}", .{ a.upstream.get(), a.attempts });
+    try w.print("{s} ", .{a.method});
+    try writeClean(w, a.path.get());
+    try w.print(" {d}", .{a.status});
+    if (a.key.len > 0) {
+        try w.writeAll(" key=");
+        try writeClean(w, a.key.get());
+    }
+    if (a.model.len > 0) {
+        try w.writeAll(" model=");
+        try writeClean(w, a.model.get());
+    }
+    if (a.upstream.len > 0) {
+        try w.writeAll(" upstream=");
+        try writeClean(w, a.upstream.get());
+        try w.print(" attempts={d}", .{a.attempts});
+    }
+    if (a.estimated) try w.writeAll(" usage=estimated");
     if (a.input_tokens != 0 or a.output_tokens != 0) try w.print(" in={d} out={d}", .{ a.input_tokens, a.output_tokens });
     if (a.cached_input_tokens != 0) try w.print(" cached_in={d}", .{a.cached_input_tokens});
     if (a.cache_hit) try w.writeAll(" cache=hit");
@@ -181,6 +211,24 @@ fn levelName(level: std.log.Level) []const u8 {
         .info => "info",
         .debug => "debug",
     };
+}
+
+/// The one line a panic leaves behind, in the configured format. Called from
+/// the panic handler: no allocation, and nothing that can fail loudly.
+pub fn panicLine(msg: []const u8) void {
+    var buf: [768]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    if (json) {
+        writeLinePrefix(&w, .err, "panic") catch {};
+        w.writeAll(",\"msg\":") catch {};
+        std.json.Stringify.value(msg[0..@min(msg.len, 400)], .{}, &w) catch {};
+        w.writeAll("}\n") catch {};
+    } else {
+        w.writeAll("error(panic): ") catch {};
+        writeClean(&w, msg[0..@min(msg.len, 400)]) catch {};
+        w.writeAll("\n") catch {};
+    }
+    emit(w.buffered());
 }
 
 fn emit(bytes: []const u8) void {
@@ -236,4 +284,18 @@ test "a long path is cut, not overflowed" {
     long[0] = '/';
     a.path.set(&long);
     try std.testing.expectEqual(@as(usize, 160), a.path.get().len);
+}
+
+test "client text cannot break out of its log line" {
+    var a: Access = .{};
+    a.method = "POST";
+    a.path.set("/v1/chat/completions");
+    a.status = 404;
+    a.model.set("x\n2026-01-01 info(access): GET /admin 200 key=root\r\x00 y");
+    var buf: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try writeAccessText(&w, &a);
+    const line = w.buffered();
+    try std.testing.expect(std.mem.findAny(u8, line, "\r\n\x00") == null);
+    try std.testing.expect(std.mem.find(u8, line, "model=x\\x0a2026-01-01_info(access):_GET_/admin_200_key=root\\x0d\\x00_y") != null);
 }

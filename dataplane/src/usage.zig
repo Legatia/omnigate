@@ -1,10 +1,25 @@
 //! Streaming token-usage extractor.
 //!
-//! Scans response bytes as they flow through the proxy (JSON or SSE, OpenAI or
-//! Anthropic shape) without buffering or parsing the whole body. Keys may be
-//! split across network chunks, so a small tail of the previous chunk is kept.
+//! Reads response bytes as they flow through the proxy (a JSON document or an
+//! SSE stream of JSON documents, OpenAI or Anthropic shape) without buffering
+//! them. It is a small JSON tokenizer that only tracks where it is: a number
+//! counts as usage only at the places the protocols put usage,
+//!
+//!     usage.<field>                         chat completions, embeddings,
+//!                                           Anthropic messages and message_delta
+//!     usage.<details>.cached_tokens         OpenAI prompt cache
+//!     message.usage.<field>                 Anthropic message_start
+//!     response.usage.<field>                Responses API stream
+//!     response.usage.<details>.cached_tokens
+//!
+//! and never anywhere else. An earlier version searched the raw bytes for
+//! `"prompt_tokens":`, so text a client could get echoed into a response (a
+//! tool schema, a tool's JSON arguments) could change its own bill. Strings
+//! are skipped as strings here, and a key only matters at the exact path.
+//!
 //! Values are max-merged: Anthropic reports cumulative `output_tokens` in
-//! `message_delta`, OpenAI reports one final `usage` object.
+//! `message_delta`, OpenAI reports one final `usage` object. Being a byte at
+//! a time state machine, it does not care where network reads split the data.
 //!
 //! The scanner records what the provider said, in the provider's own terms.
 //! The two protocols disagree about prompt caching, so `normalized` turns
@@ -16,31 +31,56 @@
 //!     `prompt_tokens_details` / `input_tokens_details`.
 //!   * Anthropic style: `input_tokens` EXCLUDES the cache; reads are
 //!     `cache_read_input_tokens` and writes `cache_creation_input_tokens`.
-//!
-//! The quoted needles cannot match inside each other: `"input_tokens":` does
-//! not occur in `"cache_read_input_tokens":` (the character before `input`
-//! is `_`, not `"`), nor in `"input_tokens_details":`.
 
 const std = @import("std");
 const Kind = @import("config.zig").Kind;
 
+/// No count is believed beyond this (about a trillion tokens), so nothing
+/// derived from provider numbers can overflow.
+pub const max_count: u64 = 1 << 40;
+
+/// Bytes of request or response text taken as one token when a count has to
+/// be estimated (see `estimated`). Four is the usual rule of thumb for
+/// English; JSON framing makes real text denser than that, so for a request
+/// body this errs on the high side.
+pub const estimate_bytes_per_token = 4;
+
 const Field = enum { input, output, cached, cache_read, cache_write };
 
-const Pattern = struct { needle: []const u8, field: Field };
+const KeyId = enum {
+    none,
+    other,
+    usage,
+    message,
+    response,
+    prompt_tokens,
+    input_tokens,
+    completion_tokens,
+    output_tokens,
+    prompt_tokens_details,
+    input_tokens_details,
+    cached_tokens,
+    cache_read_input_tokens,
+    cache_creation_input_tokens,
 
-const patterns = [_]Pattern{
-    .{ .needle = "\"prompt_tokens\":", .field = .input },
-    .{ .needle = "\"input_tokens\":", .field = .input },
-    .{ .needle = "\"completion_tokens\":", .field = .output },
-    .{ .needle = "\"output_tokens\":", .field = .output },
-    .{ .needle = "\"cached_tokens\":", .field = .cached },
-    .{ .needle = "\"cache_read_input_tokens\":", .field = .cache_read },
-    .{ .needle = "\"cache_creation_input_tokens\":", .field = .cache_write },
+    fn of(name: []const u8) KeyId {
+        return std.meta.stringToEnum(KeyId, name) orelse .other;
+    }
+
+    fn tokenField(k: KeyId) ?Field {
+        return switch (k) {
+            .prompt_tokens, .input_tokens => .input,
+            .completion_tokens, .output_tokens => .output,
+            .cache_read_input_tokens => .cache_read,
+            .cache_creation_input_tokens => .cache_write,
+            else => null,
+        };
+    }
+
+    fn isDetails(k: KeyId) bool {
+        return k == .prompt_tokens_details or k == .input_tokens_details;
+    }
 };
-
-/// Longest needle (30 bytes) plus a generous number, so a key and its value
-/// split across two reads are always seen whole in the joined region.
-const tail_cap = 64;
 
 /// Token counts with one meaning whatever the provider: `input_tokens` is the
 /// input NOT served from a prompt cache; cache reads and writes are separate.
@@ -60,8 +100,34 @@ pub const Usage = struct {
     /// Anthropic style.
     cache_read_input_tokens: u64 = 0,
     cache_creation_input_tokens: u64 = 0,
-    tail: [tail_cap]u8 = undefined,
-    tail_len: usize = 0,
+    /// The provider's closing figures were seen: a top-level `usage` with an
+    /// output count (a whole JSON answer, OpenAI's last stream chunk,
+    /// Anthropic's `message_delta`), or the Responses API's `response.usage`.
+    final_seen: bool = false,
+    /// Bytes fed, and SSE `data:` lines among them.
+    bytes: u64 = 0,
+    events: u64 = 0,
+
+    // --- where the reader is -------------------------------------------
+    framing: enum { unknown, json, sse } = .unknown,
+    line: enum { start, data, skip } = .start,
+    prefix: u8 = 0,
+    state: enum { idle, key, string, number } = .idle,
+    escaped: bool = false,
+    /// Open arrays and objects. Only the first `tracked` levels are described.
+    depth: u32 = 0,
+    is_object: [tracked]bool = @splat(false),
+    want_key: [tracked]bool = @splat(false),
+    keys: [tracked]KeyId = @splat(.none),
+    key_buf: [32]u8 = undefined,
+    key_len: u8 = 0,
+    key_plain: bool = true,
+    number: u64 = 0,
+    number_plain: bool = true,
+    number_field: ?Field = null,
+    number_final: bool = false,
+
+    const tracked = 4;
 
     /// The counts in gateway terms. `kind` is the protocol of the UPSTREAM
     /// that produced the bytes, which for a translated request is not the
@@ -83,53 +149,205 @@ pub const Usage = struct {
         };
     }
 
+    /// What to bill for a response that was cut off before its closing usage
+    /// arrived (the client left, or the upstream died, mid-stream). The
+    /// provider still charges the operator for what it generated, so billing
+    /// nothing would make every aborted stream free.
+    ///
+    /// Never less than what was actually metered. Missing input is estimated
+    /// from the size of the request; missing output from what came back: one
+    /// token per SSE event (providers send roughly a token per event), or the
+    /// body size for anything that was not a stream.
+    pub fn estimated(u: *const Usage, kind: Kind, request_bytes: usize) Normalized {
+        var n = u.normalized(kind);
+        const input_known = n.input_tokens + n.cached_input_tokens + n.cache_write_input_tokens;
+        if (input_known == 0) n.input_tokens = @min(max_count, request_bytes / estimate_bytes_per_token);
+        const produced = if (u.framing == .sse) u.events else u.bytes / estimate_bytes_per_token;
+        n.output_tokens = @min(max_count, @max(n.output_tokens, produced));
+        return n;
+    }
+
     pub fn feed(u: *Usage, chunk: []const u8) void {
-        if (chunk.len == 0) return;
-
-        // Region spanning the previous tail and the start of this chunk.
-        if (u.tail_len > 0) {
-            var joined: [tail_cap * 2]u8 = undefined;
-            const head_len = @min(chunk.len, tail_cap);
-            @memcpy(joined[0..u.tail_len], u.tail[0..u.tail_len]);
-            @memcpy(joined[u.tail_len..][0..head_len], chunk[0..head_len]);
-            u.scan(joined[0 .. u.tail_len + head_len]);
-        }
-        u.scan(chunk);
-
-        // Keep the last `tail_cap` bytes of (tail ++ chunk).
-        if (chunk.len >= tail_cap) {
-            @memcpy(u.tail[0..tail_cap], chunk[chunk.len - tail_cap ..]);
-            u.tail_len = tail_cap;
-        } else {
-            const keep_old = @min(u.tail_len, tail_cap - chunk.len);
-            std.mem.copyForwards(u8, u.tail[0..keep_old], u.tail[u.tail_len - keep_old .. u.tail_len]);
-            @memcpy(u.tail[keep_old..][0..chunk.len], chunk);
-            u.tail_len = keep_old + chunk.len;
+        u.bytes +|= chunk.len;
+        for (chunk) |c| {
+            switch (u.framing) {
+                .json => u.jsonByte(c),
+                .sse => u.sseByte(c),
+                .unknown => {
+                    if (std.ascii.isWhitespace(c)) continue;
+                    // A JSON document starts with a brace; an event stream
+                    // with a field name or a comment.
+                    if (c == '{' or c == '[') {
+                        u.framing = .json;
+                        u.jsonByte(c);
+                    } else {
+                        u.framing = .sse;
+                        u.sseByte(c);
+                    }
+                },
+            }
         }
     }
 
-    fn scan(u: *Usage, buf: []const u8) void {
-        for (patterns) |p| {
-            var pos: usize = 0;
-            while (std.mem.findPos(u8, buf, pos, p.needle)) |idx| {
-                pos = idx + p.needle.len;
-                var i = pos;
-                while (i < buf.len and (buf[i] == ' ' or buf[i] == '\t')) i += 1;
-                const start = i;
-                while (i < buf.len and std.ascii.isDigit(buf[i])) i += 1;
-                // A number that runs to the end of the buffer may be truncated;
-                // it will be seen whole in the joined region next time.
-                if (i == start) continue;
-                const n = std.fmt.parseInt(u64, buf[start..i], 10) catch continue;
-                switch (p.field) {
-                    .input => u.input_tokens = @max(u.input_tokens, n),
-                    .output => u.output_tokens = @max(u.output_tokens, n),
-                    .cached => u.cached_tokens = @max(u.cached_tokens, n),
-                    .cache_read => u.cache_read_input_tokens = @max(u.cache_read_input_tokens, n),
-                    .cache_write => u.cache_creation_input_tokens = @max(u.cache_creation_input_tokens, n),
+    /// SSE: only what follows `data:` on a line is JSON; every such line is a
+    /// document of its own.
+    fn sseByte(u: *Usage, c: u8) void {
+        switch (u.line) {
+            .start => {
+                const want = "data:";
+                if (c == want[u.prefix]) {
+                    u.prefix += 1;
+                    if (u.prefix == want.len) {
+                        u.prefix = 0;
+                        u.line = .data;
+                        u.events +|= 1;
+                        u.resetDocument();
+                    }
+                } else {
+                    u.prefix = 0;
+                    if (c != '\n') u.line = .skip;
                 }
-            }
+            },
+            .data => {
+                // The line break ends a number that ran up to it.
+                u.jsonByte(c);
+                if (c == '\n') u.line = .start;
+            },
+            .skip => if (c == '\n') {
+                u.line = .start;
+            },
         }
+    }
+
+    fn resetDocument(u: *Usage) void {
+        u.state = .idle;
+        u.escaped = false;
+        u.depth = 0;
+    }
+
+    fn jsonByte(u: *Usage, c: u8) void {
+        switch (u.state) {
+            .key, .string => {
+                if (u.escaped) {
+                    u.escaped = false;
+                    // None of the names we look for needs an escape.
+                    u.key_plain = false;
+                } else if (c == '\\') {
+                    u.escaped = true;
+                } else if (c == '"') {
+                    if (u.state == .key) {
+                        u.keys[u.depth - 1] = if (u.key_plain) KeyId.of(u.key_buf[0..u.key_len]) else .other;
+                    }
+                    u.state = .idle;
+                } else if (u.state == .key) {
+                    if (u.key_len < u.key_buf.len) {
+                        u.key_buf[u.key_len] = c;
+                        u.key_len += 1;
+                    } else {
+                        u.key_plain = false;
+                    }
+                }
+                return;
+            },
+            .number => {
+                if (std.ascii.isDigit(c)) {
+                    u.number = @min(max_count, u.number *| 10 +| (c - '0'));
+                    return;
+                }
+                if (c == '.' or c == 'e' or c == 'E' or c == '+' or c == '-') {
+                    // Not a plain non-negative integer: not a token count.
+                    u.number_plain = false;
+                    return;
+                }
+                u.commitNumber();
+                u.state = .idle;
+                // Fall through: this byte ends the number and means something itself.
+            },
+            .idle => {},
+        }
+
+        const level: ?usize = if (u.depth >= 1 and u.depth <= tracked) u.depth - 1 else null;
+        switch (c) {
+            '"' => {
+                if (level != null and u.is_object[level.?] and u.want_key[level.?]) {
+                    u.state = .key;
+                    u.key_len = 0;
+                    u.key_plain = true;
+                } else {
+                    u.state = .string;
+                }
+            },
+            ':' => if (level) |l| {
+                u.want_key[l] = false;
+            },
+            ',' => if (level) |l| {
+                if (u.is_object[l]) {
+                    u.want_key[l] = true;
+                    u.keys[l] = .none;
+                }
+            },
+            '{', '[' => {
+                u.depth +|= 1;
+                if (u.depth <= tracked) {
+                    u.is_object[u.depth - 1] = c == '{';
+                    u.want_key[u.depth - 1] = c == '{';
+                    u.keys[u.depth - 1] = .none;
+                }
+            },
+            '}', ']' => u.depth -|= 1,
+            '0'...'9', '-' => {
+                u.state = .number;
+                u.number = if (c == '-') 0 else c - '0';
+                u.number_plain = c != '-';
+                u.number_field = u.fieldHere();
+            },
+            else => {},
+        }
+    }
+
+    /// Which count a number starting here is, if this is one of the places
+    /// usage lives. Sets `number_final` for the provider's closing figures.
+    fn fieldHere(u: *Usage) ?Field {
+        u.number_final = false;
+        if (u.depth < 2 or u.depth > tracked) return null;
+        for (u.is_object[0..u.depth]) |is_obj| if (!is_obj) return null;
+        const k = u.keys;
+        switch (u.depth) {
+            2 => {
+                if (k[0] != .usage) return null;
+                const f = k[1].tokenField() orelse return null;
+                u.number_final = f == .output;
+                return f;
+            },
+            3 => {
+                if (k[0] == .usage and k[1].isDetails() and k[2] == .cached_tokens) return .cached;
+                if ((k[0] == .message or k[0] == .response) and k[1] == .usage) {
+                    const f = k[2].tokenField() orelse return null;
+                    u.number_final = k[0] == .response and f == .output;
+                    return f;
+                }
+                return null;
+            },
+            4 => {
+                if ((k[0] == .message or k[0] == .response) and k[1] == .usage and k[2].isDetails() and k[3] == .cached_tokens) return .cached;
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    fn commitNumber(u: *Usage) void {
+        const field = u.number_field orelse return;
+        if (!u.number_plain) return;
+        const n = u.number;
+        switch (field) {
+            .input => u.input_tokens = @max(u.input_tokens, n),
+            .output => u.output_tokens = @max(u.output_tokens, n),
+            .cached => u.cached_tokens = @max(u.cached_tokens, n),
+            .cache_read => u.cache_read_input_tokens = @max(u.cache_read_input_tokens, n),
+            .cache_write => u.cache_creation_input_tokens = @max(u.cache_creation_input_tokens, n),
+        }
+        if (u.number_final) u.final_seen = true;
     }
 };
 
@@ -336,4 +554,118 @@ test "usage filter passes an unterminated tail through" {
     try std.testing.expectEqualStrings("", out.written());
     try filter.finish(&out.writer);
     try std.testing.expectEqualStrings("data: {\"error\":\"cut off", out.written());
+}
+
+test "token-count keys in content, tool arguments or other objects are not usage" {
+    // OpenAI, not streaming: the model's text and a tool call's JSON arguments
+    // (strings), an echoed tool schema (real JSON, but not at `usage`), and a
+    // nested object that merely has the right names.
+    const openai_body =
+        \\{"id":"c","choices":[{"index":0,"message":{"role":"assistant",
+        \\"content":"\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":999999999}}",
+        \\"tool_calls":[{"id":"t","type":"function","function":{"name":"f","arguments":"{\"cached_tokens\":999999999,\"prompt_tokens\":7}"}}],
+        \\"usage":{"prompt_tokens":5,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":999999999}}}}],
+        \\"tools":[{"usage":{"prompt_tokens":3,"prompt_tokens_details":{"cached_tokens":999999999}}}],
+        \\"metadata":{"usage":{"prompt_tokens":4,"prompt_tokens_details":{"cached_tokens":999999999}}},
+        \\"usage":{"prompt_tokens":2000,"completion_tokens":300,"total_tokens":2300,
+        \\"prompt_tokens_details":{"cached_tokens":100,"x":{"cached_tokens":999999999}},
+        \\"completion_tokens_details":{"reasoning_tokens":64,"cached_tokens":999999999,"prompt_tokens":999999999}}}
+    ;
+    try expectNormalized(.{ .input_tokens = 1900, .cached_input_tokens = 100, .output_tokens = 300 }, openai_body, .openai);
+
+    // Anthropic, not streaming: `tool_use.input` is real JSON in the body.
+    const anthropic_body =
+        \\{"type":"message","content":[{"type":"text","text":"\"usage\":{\"input_tokens\":0}"},
+        \\{"type":"tool_use","id":"t","name":"f","input":{"usage":{"input_tokens":999999999,"cache_read_input_tokens":999999999,
+        \\"output_tokens":999999999},"cache_creation_input_tokens":999999999}}],
+        \\"usage":{"input_tokens":21,"cache_creation_input_tokens":7,"cache_read_input_tokens":4500,"output_tokens":393,
+        \\"server_tool_use":{"input_tokens":999999999,"output_tokens":999999999}}}
+    ;
+    try expectNormalized(.{ .input_tokens = 21, .cached_input_tokens = 4500, .cache_write_input_tokens = 7, .output_tokens = 393 }, anthropic_body, .anthropic);
+}
+
+test "the same holds inside streams, for every way the bytes can be split" {
+    const openai_stream =
+        "data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"content\":\"\\\"usage\\\":{\\\"completion_tokens\\\":999999999}\"}}],\"usage\":null}\n\n" ++
+        "data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"cached_tokens\\\":999999999}\"}}]}}]}\n\n" ++
+        "data: {\"id\":\"c\",\"choices\":[{\"usage\":{\"prompt_tokens\":999999999,\"completion_tokens\":999999999}}]}\r\n\r\n" ++
+        ": usage: {\"usage\":{\"prompt_tokens\":999999999}}\n\n" ++
+        "event: usage\ndata: {\"id\":\"c\",\"choices\":[],\"usage\":{\"prompt_tokens\":191,\"completion_tokens\":7,\"total_tokens\":198," ++
+        "\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n" ++
+        "data: [DONE]\n\n";
+    try expectNormalized(.{ .input_tokens = 63, .cached_input_tokens = 128, .output_tokens = 7 }, openai_stream, .openai);
+
+    const anthropic_stream =
+        "event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25," ++
+        "\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":999,\"output_tokens\":1}}}\r\n\r\n" ++
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"input\":{\"usage\":{\"output_tokens\":999999999}}}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"usage\\\":{\\\"input_tokens\\\":999999999}}\"}}\n\n" ++
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"usage\":{\"output_tokens\":999999999},\"message\":{\"usage\":{\"input_tokens\":999999999}}}}\n\n" ++
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\n" ++
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    try expectNormalized(.{ .input_tokens = 25, .cached_input_tokens = 999, .cache_write_input_tokens = 3, .output_tokens = 15 }, anthropic_stream, .anthropic);
+
+    // The Responses API reports usage inside `response` on its last event.
+    const responses_stream =
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\\\"usage\\\":{\\\"output_tokens\\\":999999999}\"}\n\n" ++
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"usage\":{\"output_tokens\":999999999}}]," ++
+        "\"usage\":{\"input_tokens\":328,\"input_tokens_details\":{\"cached_tokens\":200},\"output_tokens\":52}}}\n\n";
+    try expectNormalized(.{ .input_tokens = 128, .cached_input_tokens = 200, .output_tokens = 52 }, responses_stream, .openai);
+}
+
+test "only plain non-negative integers count, and absurd ones are capped" {
+    var u: Usage = .{};
+    u.feed("{\"usage\":{\"prompt_tokens\":-5,\"completion_tokens\":1.5e9,\"input_tokens\":\"12\",\"output_tokens\":true}}");
+    try std.testing.expectEqual(Normalized{}, u.normalized(.openai));
+
+    var big: Usage = .{};
+    big.feed("{\"usage\":{\"input_tokens\":18446744073709551616,\"cache_read_input_tokens\":99999999999999999999999999," ++
+        "\"cache_creation_input_tokens\":18446744073709551615,\"output_tokens\":18446744073709551615}}");
+    const n = big.normalized(.anthropic);
+    try std.testing.expectEqual(max_count, n.input_tokens);
+    try std.testing.expectEqual(max_count, n.cached_input_tokens);
+    try std.testing.expectEqual(max_count, n.cache_write_input_tokens);
+    try std.testing.expectEqual(max_count, n.output_tokens);
+    // Sums of these cannot overflow.
+    _ = n.input_tokens + n.cached_input_tokens + n.cache_write_input_tokens + n.output_tokens;
+}
+
+test "arbitrary bytes never upset the reader" {
+    var prng: std.Random.DefaultPrng = .init(0x0519);
+    const random = prng.random();
+    const alphabet = "{}[]\":,\\0123456789-.eE \r\ndata:usage_tokensprompt_cached";
+    var buf: [512]u8 = undefined;
+    for (0..4000) |_| {
+        var u: Usage = .{};
+        const len = random.uintLessThan(usize, buf.len);
+        for (buf[0..len]) |*b| b.* = if (random.boolean()) alphabet[random.uintLessThan(usize, alphabet.len)] else random.int(u8);
+        feedSplit(&u, buf[0..len], 1 + random.uintLessThan(usize, 40));
+        _ = u.normalized(.openai);
+        _ = u.estimated(.anthropic, len);
+    }
+}
+
+test "a cut-off stream is billed by estimate, never below what was metered" {
+    // OpenAI: nothing metered before the last chunk, which never came.
+    var u: Usage = .{};
+    for (0..40) |_| u.feed("data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"content\":\"word\"}}]}\n\n");
+    try std.testing.expect(!u.final_seen);
+    try std.testing.expectEqual(Normalized{}, u.normalized(.openai));
+    try std.testing.expectEqual(Normalized{ .input_tokens = 250, .output_tokens = 40 }, u.estimated(.openai, 1000));
+
+    // Anthropic: the input side is known from message_start and is kept.
+    var a: Usage = .{};
+    a.feed("event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":25,\"cache_read_input_tokens\":999,\"output_tokens\":1}}}\n\n");
+    for (0..9) |_| a.feed("event: content_block_delta\ndata: {\"delta\":{\"text\":\"word\"}}\n\n");
+    try std.testing.expect(!a.final_seen);
+    try std.testing.expectEqual(Normalized{ .input_tokens = 25, .cached_input_tokens = 999, .output_tokens = 10 }, a.estimated(.anthropic, 100_000));
+
+    // Once the closing figures arrive they are final, and an estimate adds nothing below them.
+    a.feed("event: message_delta\ndata: {\"usage\":{\"output_tokens\":500}}\n\n");
+    try std.testing.expect(a.final_seen);
+    try std.testing.expectEqual(@as(u64, 500), a.estimated(.anthropic, 0).output_tokens);
+
+    var whole: Usage = .{};
+    whole.feed("{\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":6}}");
+    try std.testing.expect(whole.final_seen);
 }

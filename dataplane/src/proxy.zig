@@ -17,6 +17,7 @@ const cache = @import("cache.zig");
 const config = @import("config.zig");
 const control = @import("control.zig");
 const errors = @import("errors.zig");
+const guard_mod = @import("guard.zig");
 const headers_mod = @import("headers.zig");
 const models = @import("models.zig");
 const logging = @import("logging.zig");
@@ -35,6 +36,13 @@ const default_anthropic_version = "2023-06-01";
 const control_timeout_ms = 30_000;
 /// Cap on an upstream response that must be buffered to be translated.
 const max_translated_body = 64 * 1024 * 1024;
+/// After the client has gone, at most this much more of the upstream's
+/// answer is read to find the final usage.
+const max_abort_drain_bytes = 8 * 1024 * 1024;
+/// How long, and how much, to keep reading from a client after answering it
+/// early and before closing (see `lingerClose`).
+const linger_ms = 2_000;
+const max_linger_bytes = 16 * 1024 * 1024;
 
 pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
     // `guard` lets the watchdog cancel this task when the client (or, during
@@ -52,6 +60,11 @@ pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
     var stream_writer = stream.writer(app.io, &send_buf);
     var server = http.Server.init(&stream_reader.interface, &stream_writer.interface);
 
+    // Set when the connection is being closed by us right after an answer.
+    // (Declared after `defer stream.close`, so this runs before the close.)
+    var linger = false;
+    defer if (linger) lingerClose(app, guard, stream, &stream_reader.interface);
+
     while (true) {
         // Between requests nothing is lost by closing: mark the connection
         // idle before looking at the shutdown flag, so that shutdown either
@@ -64,6 +77,19 @@ pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
             error.HttpConnectionClosing => return,
             else => {
                 log.debug("receiveHead: {t}", .{err});
+                // std refused the head before any of it could be looked at.
+                // Say so (best effort) instead of just hanging up.
+                const answer: ?[]const u8 = switch (err) {
+                    error.HttpHeadersInvalid => "HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                    error.HttpHeadersOversize => "HTTP/1.1 431 Request Header Fields Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                    else => null,
+                };
+                if (answer) |bytes| {
+                    app.counters.count(app.gpa, app.io, "-", "invalid_request");
+                    stream_writer.interface.writeAll(bytes) catch return;
+                    stream_writer.interface.flush() catch return;
+                    linger = true;
+                }
                 return;
             },
         };
@@ -71,13 +97,27 @@ pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
         // The rest of the request (its body) gets a fresh allowance.
         guard.arm(app.io, app.client_timeout_ms);
 
+        // Before anything reads the head: std accepts some heads that its own
+        // header iterator and body handling then assert on, and an assert in
+        // one connection's task ends the process for all of them.
+        const head_check = guard_mod.checkRequestHead(request.head_buffer, request.head.method.requestHasBody());
+        if (head_check != .ok) {
+            linger = true;
+            switch (head_check) {
+                .ok => unreachable, // checked on the line above
+                .bad => |why| return refuseHead(app, &request, .bad_request, "invalid_request", why),
+                .length_required => return refuseHead(app, &request, .length_required, "invalid_request", "a request with a body needs a content-length"),
+                .expectation_failed => return refuseHead(app, &request, .expectation_failed, "invalid_request", "the only supported expectation is 100-continue"),
+            }
+        }
+
         var acc: logging.Access = .{};
         const started = Io.Timestamp.now(app.io, .awake);
         const outcome = handleRequest(app, &request, guard, &acc);
         acc.latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds();
         if (outcome) |_| {} else |err| {
             // The watchdog cancels the task; say what that meant.
-            acc.aborted = if (!guard.timedOut()) err else if (acc.status == 0) error.ClientTimeout else error.StreamIdleTimeout;
+            acc.aborted = if (err == error.ClientDisconnected or !guard.timedOut()) err else if (acc.status == 0) error.ClientTimeout else error.StreamIdleTimeout;
             if (acc.status == 0 and guard.timedOut()) acc.status = 408;
         }
         // Requests the gateway refused itself never become usage events;
@@ -91,7 +131,63 @@ pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
         logging.access(&acc, if (is_probe) .debug else .info);
         outcome catch return;
         guard.disarm();
+        // The answer said `connection: close` (the client asked for it, or the
+        // request was not fully read): close now, not at the next timeout.
+        if (server.reader.state == .closing) {
+            linger = true;
+            return;
+        }
     }
+}
+
+/// Close politely after answering a request that was not read to its end
+/// (a refusal sent ahead of the body, typically a bad key on a POST).
+///
+/// Closing a socket that still has unread input makes the kernel send a
+/// reset, and a reset can overtake the answer: the client then reports a
+/// broken connection instead of the 401 it was sent. So: finish our side,
+/// then read and drop what the client is still sending until it closes,
+/// for a short, bounded time and amount. The watchdog ends the wait.
+fn lingerClose(app: *App, guard: *watchdog.Conn, stream: anytype, reader: *Io.Reader) void {
+    stream.shutdown(app.io, .send) catch return;
+    guard.arm(app.io, linger_ms);
+    var total: usize = 0;
+    while (total < max_linger_bytes) {
+        const n = reader.discard(.limited(64 * 1024)) catch return; // closed, reset, or time is up
+        if (n == 0) return;
+        total += n;
+    }
+}
+
+/// Answer a request whose head was refused, and close: nothing about the
+/// rest of the connection can be trusted. The answer is a fixed, small
+/// OpenAI-shaped error; the request was never parsed far enough to know more.
+fn refuseHead(app: *App, request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) void {
+    app.counters.count(app.gpa, app.io, "-", code);
+    log.debug("refused a request head: {s}", .{message});
+    var buf: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    errors.write(&w, .openai, .{ .status = @backingInt(status), .reason = code, .message = message, .request_id = "" }) catch {};
+    // No body will be read, so there is nothing to say "continue" to; and with
+    // any other expectation still set, std would refuse to answer at all.
+    request.head.expect = null;
+    request.respond(w.buffered(), .{
+        .status = status,
+        .keep_alive = false,
+        .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+    }) catch {};
+}
+
+/// May the connection be reused after answering now? Only when nothing of
+/// this request is left unread: a body the server never consumed would be
+/// parsed as the next request, which behind a proxy that pools connections
+/// is another client's request.
+fn reusable(request: *http.Server.Request) bool {
+    return switch (request.server.reader.state) {
+        .ready => true,
+        .received_head => !request.head.method.requestHasBody(),
+        else => false,
+    };
 }
 
 const ClientHeaders = struct {
@@ -121,12 +217,14 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     app.io.random(&raw_id);
     const req_id = std.fmt.bytesToHex(raw_id, .lower);
     acc.request_id.set(&req_id);
-    // Nothing more to wait for from a request without a body.
-    if (!method.requestHasBody()) guard.disarm();
+    // A request without a body is complete. From here the deadline is on our
+    // answer reaching the client (it is lifted while waiting for an upstream,
+    // which has its own timeout).
+    if (!method.requestHasBody()) guard.arm(app.io, app.stream_idle_timeout_ms);
 
     // Header strings are invalidated once the body reader is created; copy now.
     var hdrs: ClientHeaders = .{};
-    var it = request.iterateHeaders();
+    var it = guard_mod.HeaderIterator.init(request.head_buffer);
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
             const v = std.mem.trim(u8, h.value, " ");
@@ -156,6 +254,20 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         return request.respond("ok\n", .{ .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }} });
     }
 
+    // One spelling per path, so that what a request is taken for here and
+    // what is forwarded can never differ; and nothing a client sent is copied
+    // into a request of ours unless it is plain.
+    if (!guard_mod.canonicalPath(path))
+        return respondError(acc, request, .bad_request, "invalid_request", "the request path is not in canonical form");
+    if (!guard_mod.safeQuery(query))
+        return respondError(acc, request, .bad_request, "invalid_request", "the query string contains unsupported characters");
+    if (hdrs.anthropic_version) |v| if (!guard_mod.safeHeaderValue(v, "-._", 32))
+        return respondError(acc, request, .bad_request, "invalid_request", "invalid anthropic-version header");
+    if (hdrs.anthropic_beta) |v| if (!guard_mod.safeHeaderValue(v, "-._, ", 512))
+        return respondError(acc, request, .bad_request, "invalid_request", "invalid anthropic-beta header");
+    if (hdrs.idempotency_key) |v| if (!guard_mod.safeHeaderValue(v, "-._:", 255))
+        return respondError(acc, request, .bad_request, "invalid_request", "invalid idempotency-key header: use up to 255 letters, digits, '-', '.', '_' or ':'");
+
     const snapshot = app.store.get(app.io) orelse
         return respondError(acc, request, .service_unavailable, "gateway_not_ready", "no config from control plane yet");
 
@@ -164,7 +276,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
 
     // A signed output URL carries its own proof; the control plane checks it.
     if (is_files and method == .GET and hdrs.api_key == null and hasQueryParam(query, "sig")) {
-        return forwardToControl(app, acc, arena, request, method, target, null, hdrs, null);
+        return forwardToControl(app, acc, arena, request, guard, method, path, query, null, hdrs, null);
     }
 
     // --- authentication -------------------------------------------------
@@ -206,7 +318,10 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 return respondError(acc, request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB")
         else
             null;
-        return forwardToControl(app, acc, arena, request, method, target, job_body, hdrs, &key_hash);
+        guard.arm(app.io, app.stream_idle_timeout_ms);
+        if (job_body) |b| if (!guard_mod.jsonDepthOk(b, guard_mod.max_client_json_depth))
+            return respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply");
+        return forwardToControl(app, acc, arena, request, guard, method, path, query, job_body, hdrs, &key_hash);
     }
 
     const ep = endpoint orelse
@@ -216,6 +331,12 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     // --- body -------------------------------------------------------------
     const body = (try readBody(arena, request, guard)) orelse
         return respondError(acc, request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB");
+    guard.arm(app.io, app.stream_idle_timeout_ms);
+
+    // Bounded nesting, before anything parses it: the serialiser this body
+    // goes through again indexes past a fixed stack beyond 256 levels.
+    if (!guard_mod.jsonDepthOk(body, guard_mod.max_client_json_depth))
+        return respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply");
 
     var parsed = std.json.parseFromSlice(std.json.Value, arena, body, .{}) catch
         return respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON");
@@ -279,6 +400,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             });
             return request.respond(hit.body, .{
                 .status = @fromBackingInt(@intCast(hit.status)),
+                .keep_alive = reusable(request),
                 .extra_headers = &.{
                     .{ .name = "content-type", .value = hit.content_type },
                     .{ .name = "x-omnigate-cache", .value = "hit" },
@@ -386,11 +508,11 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
 
         // A model already known to reject sampling parameters (see quirks.zig)
         // gets the translated request without them from the start.
-        if (mode == .translate and app.quirks.rejectsSampling(app.io, up.name, t.model)) {
+        if (mode == .translate and app.quirks.rejectsSampling(app.io, &key_hash, up.name, t.model)) {
             if (try quirks.stripSampling(arena, out_body)) |stripped| out_body = stripped;
             mode.translate.sampling_stripped = true;
         }
-        if (mode == .translate and app.quirks.needsThoughtSignature(app.io, up.name, t.model)) {
+        if (mode == .translate and app.quirks.needsThoughtSignature(app.io, &key_hash, up.name, t.model)) {
             if (try quirks.addThoughtSignatures(arena, out_body)) |signed| out_body = signed;
             mode.translate.signatures_added = true;
         }
@@ -406,7 +528,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     // The model refused temperature/top_p/top_k, which a client
                     // of the other protocol could not have known. Remember it
                     // and send the same request once more without them.
-                    app.quirks.noteRejectsSampling(app.gpa, app.io, up.name, t.model);
+                    app.quirks.noteRejectsSampling(app.gpa, app.io, &key_hash, up.name, t.model);
                     mode.translate.sampling_stripped = true;
                     if (try quirks.stripSampling(arena, out_body)) |stripped| {
                         log.info("{s}/{s} rejects sampling parameters; retrying without them", .{ up.name, t.model });
@@ -419,7 +541,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     // The model wants a signature on earlier tool calls that the
                     // client's protocol cannot carry. Remember it and resend
                     // with the placeholder the provider documents for this.
-                    app.quirks.noteNeedsThoughtSignature(app.gpa, app.io, up.name, t.model);
+                    app.quirks.noteNeedsThoughtSignature(app.gpa, app.io, &key_hash, up.name, t.model);
                     mode.translate.signatures_added = true;
                     if (try quirks.addThoughtSignatures(arena, out_body)) |signed| {
                         log.info("{s}/{s} requires thought signatures on tool calls; retrying with placeholders", .{ up.name, t.model });
@@ -435,12 +557,18 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     // The client already has part of the response; all we can
                     // do is bill what was metered and drop the connection.
                     try attempts.append(arena, .{ .upstream = up.name, .outcome = "stream_aborted" });
-                    const used = usage.normalized(up.kind);
+                    // The provider's closing usage may never have arrived
+                    // (OpenAI sends it last). The provider still charges for
+                    // what it generated, so bill an estimate rather than
+                    // nothing; never less than what was metered.
+                    const estimated = !usage.final_seen;
+                    const used = if (estimated) usage.estimated(up.kind, body.len) else usage.normalized(up.kind);
                     acc.status = 499;
                     acc.upstream.set(up.name);
                     acc.attempts = tried;
+                    acc.estimated = estimated;
                     acc.input_tokens = used.input_tokens;
-                    acc.cached_input_tokens = used.cached_input_tokens + used.cache_write_input_tokens;
+                    acc.cached_input_tokens = used.cached_input_tokens +| used.cache_write_input_tokens;
                     acc.output_tokens = used.output_tokens;
                     if (ep.metered) report(app, arena, .{
                         .id = &req_id,
@@ -454,6 +582,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                         .cached_input_tokens = used.cached_input_tokens,
                         .cache_write_input_tokens = used.cache_write_input_tokens,
                         .output_tokens = used.output_tokens,
+                        .estimated = estimated,
                         .latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds(),
                         .attempts = attempts.items,
                     });
@@ -492,7 +621,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 acc.upstream.set(up.name);
                 acc.attempts = tried;
                 acc.input_tokens = used.input_tokens;
-                acc.cached_input_tokens = used.cached_input_tokens + used.cache_write_input_tokens;
+                acc.cached_input_tokens = used.cached_input_tokens +| used.cache_write_input_tokens;
                 acc.output_tokens = used.output_tokens;
                 try attempts.append(arena, .{ .upstream = up.name, .outcome = "ok" });
                 // A whole successful answer for a route that caches: keep it.
@@ -576,6 +705,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     if (last_retry_after) |v| try failed_headers.append(arena, .{ .name = "retry-after", .value = v });
     try request.respond(detail.written(), .{
         .status = if (rate_limited) .too_many_requests else .bad_gateway,
+        .keep_alive = reusable(request),
         .extra_headers = failed_headers.items,
     });
 }
@@ -660,6 +790,9 @@ const UsageReport = struct {
     output_tokens: u64,
     /// Answered from the gateway's response cache: counted, not billed.
     cached: bool = false,
+    /// The counts are an estimate: the response was cut off before the
+    /// provider's own figures arrived (see `Usage.estimated`).
+    estimated: bool = false,
     latency_ms: i64,
     attempts: []const Attempt,
     /// Unique per client request; the ledger dedups on it.
@@ -869,6 +1002,12 @@ fn forward(
     extras: *ForwardExtras,
 ) !ForwardResult {
     if (extras.capture) |c| c.reset();
+    // A fresh reader for this attempt's response.
+    usage.* = .{};
+    // While waiting for the upstream its own timeout applies, not the
+    // deadline on our answer; that comes back when this returns.
+    guard.disarm();
+    defer guard.arm(app.io, app.stream_idle_timeout_ms);
     const base = std.mem.trimEnd(u8, up.base_url, "/");
     const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, try config.upstreamPath(arena, up.v1_path, path) });
     const uri = try std.Uri.parse(url);
@@ -918,7 +1057,6 @@ fn forward(
     // the client stops reading, for the idle timeout, the watchdog cancels
     // this task and the read or write below fails.
     guard.arm(app.io, app.stream_idle_timeout_ms);
-    defer guard.disarm();
 
     const status = response.head.status;
     // Copy what we need from the head before the body reader invalidates it:
@@ -967,6 +1105,8 @@ fn forward(
             error.StreamTooLong => return error.UpstreamUnparseable,
             else => |e| return e,
         };
+        // Translation re-serialises this; refuse what the serialiser cannot take.
+        if (!guard_mod.jsonDepthOk(raw, guard_mod.max_upstream_json_depth)) return error.UpstreamUnparseable;
         if (@backingInt(status) == 400 and !x.sampling_stripped and quirks.mentionsSampling(raw)) return .drop_sampling;
         if (@backingInt(status) == 400 and !x.signatures_added and x.dir == .anthropic_to_openai and
             quirks.mentionsThoughtSignature(raw)) return .add_thought_signature;
@@ -984,7 +1124,7 @@ fn forward(
         }
         committed.* = true;
         out_headers.items[0].value = "application/json";
-        try request.respond(converted, .{ .status = status, .extra_headers = out_headers.items });
+        try request.respond(converted, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
         return .{ .done = status };
     }
 
@@ -1011,29 +1151,56 @@ fn forward(
     var usage_filter: usage_mod.UsageChunkFilter = .{};
     defer usage_filter.deinit(arena);
 
+    // Once the client has gone, the upstream is still read for a while: the
+    // usage that says what this cost usually arrives at the very end.
+    var client_gone = false;
+    var drained: usize = 0;
     while (true) {
         var vec = [_][]u8{&chunk};
         const n = upstream_body.readVec(&vec) catch |err| switch (err) {
             error.EndOfStream => break,
-            error.ReadFailed => return if (guard.timedOut()) error.StreamIdleTimeout else (response.bodyErr() orelse error.ReadFailed),
+            error.ReadFailed => {
+                if (client_gone) return error.ClientDisconnected;
+                return if (guard.timedOut()) error.StreamIdleTimeout else (response.bodyErr() orelse error.ReadFailed);
+            },
         };
         if (n == 0) continue;
         usage.feed(chunk[0..n]);
-        if (translator) |*tr| {
-            try tr.feed(chunk[0..n], &body_writer.writer);
-        } else if (mode == .hide_usage_chunk and is_sse) {
-            try usage_filter.feed(arena, chunk[0..n], &body_writer.writer);
-        } else {
-            if (capturing) |c| c.add(arena, chunk[0..n]);
-            try body_writer.writer.writeAll(chunk[0..n]);
+        if (client_gone) {
+            drained += n;
+            if (usage.final_seen or drained > max_abort_drain_bytes) return error.ClientDisconnected;
+            continue;
         }
-        // Flush per chunk so SSE tokens reach the client immediately: first
-        // our body buffer into the HTTP framing, then the framing to the socket
-        // (`BodyWriter.flush` alone only does the second half).
-        try body_writer.writer.flush();
-        try body_writer.flush();
+        const sent: anyerror!void = sent: {
+            if (translator) |*tr| {
+                tr.feed(chunk[0..n], &body_writer.writer) catch |e| break :sent e;
+            } else if (mode == .hide_usage_chunk and is_sse) {
+                usage_filter.feed(arena, chunk[0..n], &body_writer.writer) catch |e| break :sent e;
+            } else {
+                if (capturing) |c| c.add(arena, chunk[0..n]);
+                body_writer.writer.writeAll(chunk[0..n]) catch |e| break :sent e;
+            }
+            // Flush per chunk so SSE tokens reach the client immediately: first
+            // our body buffer into the HTTP framing, then the framing to the socket
+            // (`BodyWriter.flush` alone only does the second half).
+            body_writer.writer.flush() catch |e| break :sent e;
+            body_writer.flush() catch |e| break :sent e;
+        };
+        sent catch |err| {
+            // Nothing more can reach the client. If this task was cancelled
+            // (the client stopped reading until the idle timeout), or draining
+            // is off, or the figures are already in, stop here.
+            if (err == error.OutOfMemory) return err;
+            if (guard.timedOut()) return error.StreamIdleTimeout;
+            if (usage.final_seen or app.abort_drain_ms == 0) return error.ClientDisconnected;
+            client_gone = true;
+            // One allowance for the whole drain; it is not renewed per read.
+            guard.arm(app.io, app.abort_drain_ms);
+            continue;
+        };
         guard.arm(app.io, app.stream_idle_timeout_ms);
     }
+    if (client_gone) return error.ClientDisconnected;
     if (translator) |*tr| try tr.finish(&body_writer.writer);
     if (mode == .hide_usage_chunk and is_sse) try usage_filter.finish(&body_writer.writer);
     try body_writer.end();
@@ -1052,16 +1219,32 @@ fn forwardToControl(
     acc: *logging.Access,
     arena: std.mem.Allocator,
     request: *http.Server.Request,
+    guard: *watchdog.Conn,
     method: http.Method,
-    target: []const u8,
+    /// Canonical (see `guard.canonicalPath`) ...
+    path: []const u8,
+    /// ... and plain (see `guard.safeQuery`): both were checked by the caller.
+    query: []const u8,
     body: ?[]u8,
     hdrs: ClientHeaders,
     key_sha256: ?[]const u8,
 ) !void {
+    // The control plane's address comes from our own configuration; the
+    // client contributes a path and a query that were validated character by
+    // character, and they are set as components, never spliced into a string
+    // that is parsed again.
     const base = std.mem.trimEnd(u8, app.control_url, "/");
-    const url = try std.fmt.allocPrint(arena, "{s}/internal{s}", .{ base, target });
-    const uri = std.Uri.parse(url) catch
+    var uri = std.Uri.parse(base) catch
+        return respondError(acc, request, .service_unavailable, "control_plane_unavailable", "the control plane address is not a valid URL");
+    if (!guard_mod.canonicalPath(path) or !guard_mod.safeQuery(query))
         return respondError(acc, request, .bad_request, "invalid_request", "malformed request path");
+    const base_path = switch (uri.path) {
+        .raw => |p| p,
+        .percent_encoded => |p| p,
+    };
+    uri.path = .{ .percent_encoded = try std.fmt.allocPrint(arena, "{s}/internal{s}", .{ std.mem.trimEnd(u8, base_path, "/"), path }) };
+    uri.query = if (query.len > 0) .{ .percent_encoded = query } else null;
+    uri.fragment = null;
 
     var extra: std.ArrayList(http.Header) = .empty;
     try extra.append(arena, .{ .name = control.internal_header, .value = app.internal_token });
@@ -1088,10 +1271,17 @@ fn forwardToControl(
     };
     defer call.deinit();
 
+    // The control plane has its own timeout; our answer's deadline resumes after.
+    guard.disarm();
     var response = call.openWithTimeout(app.io, control_timeout_ms) catch |err| {
-        log.warn("control plane request {s} failed: {t}", .{ target, err });
+        guard.arm(app.io, app.stream_idle_timeout_ms);
+        // The path only: a signed URL's query is a credential.
+        log.warn("control plane request {s} failed: {t}", .{ path, err });
         return respondError(acc, request, .service_unavailable, "control_plane_unavailable", "media jobs need the control plane, which is not reachable");
     };
+    // A client that asks for a large file and then stops reading must not
+    // hold this connection for ever.
+    guard.arm(app.io, app.stream_idle_timeout_ms);
 
     const status = response.head.status;
     acc.status = @backingInt(status);
@@ -1126,6 +1316,7 @@ fn forwardToControl(
         try body_writer.writer.writeAll(chunk[0..n]);
         try body_writer.writer.flush();
         try body_writer.flush();
+        guard.arm(app.io, app.stream_idle_timeout_ms);
     }
     try body_writer.end();
 }
@@ -1150,6 +1341,7 @@ fn respondRateLimited(acc: *logging.Access, request: *http.Server.Request, retry
     }) catch {};
     try request.respond(w.buffered(), .{
         .status = .too_many_requests,
+        .keep_alive = reusable(request),
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
             .{ .name = "retry-after", .value = secs },
@@ -1172,6 +1364,7 @@ fn respondError(acc: *logging.Access, request: *http.Server.Request, status: htt
     errors.write(&w, protocolOf(acc), .{ .status = @backingInt(status), .reason = code, .message = message, .request_id = id }) catch {};
     try request.respond(w.buffered(), .{
         .status = status,
+        .keep_alive = reusable(request),
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
             .{ .name = "x-omnigate-request-id", .value = id },

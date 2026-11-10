@@ -175,6 +175,16 @@ pub fn keyFor(arena: std.mem.Allocator, route_model: []const u8, path: []const u
 
 /// JSON with object keys in byte order at every level and no whitespace.
 pub fn writeCanonical(arena: std.mem.Allocator, w: *Io.Writer, value: std.json.Value) !void {
+    return writeCanonicalAt(arena, w, value, 0);
+}
+
+/// Recursion bounded on its own account, whatever the caller checked: the
+/// request body was limited to `guard.max_client_json_depth` before it was
+/// parsed, and this refuses anything far beyond that instead of trusting it.
+const max_canonical_depth = 200;
+
+fn writeCanonicalAt(arena: std.mem.Allocator, w: *Io.Writer, value: std.json.Value, depth: usize) !void {
+    if (depth > max_canonical_depth) return error.JsonTooDeep;
     switch (value) {
         .object => |obj| {
             const keys = try arena.dupe([]const u8, obj.keys());
@@ -188,7 +198,7 @@ pub fn writeCanonical(arena: std.mem.Allocator, w: *Io.Writer, value: std.json.V
                 if (i > 0) try w.writeByte(',');
                 try std.json.Stringify.value(k, .{}, w);
                 try w.writeByte(':');
-                try writeCanonical(arena, w, obj.get(k).?);
+                try writeCanonicalAt(arena, w, obj.get(k) orelse .null, depth + 1);
             }
             try w.writeByte('}');
         },
@@ -196,7 +206,7 @@ pub fn writeCanonical(arena: std.mem.Allocator, w: *Io.Writer, value: std.json.V
             try w.writeByte('[');
             for (arr.items, 0..) |item, i| {
                 if (i > 0) try w.writeByte(',');
-                try writeCanonical(arena, w, item);
+                try writeCanonicalAt(arena, w, item, depth + 1);
             }
             try w.writeByte(']');
         },

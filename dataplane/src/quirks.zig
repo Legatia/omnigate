@@ -14,6 +14,12 @@
 //! Either way it is recorded here, so later requests skip the failed round
 //! trip.
 //!
+//! What is learned is learned PER GATEWAY KEY. The evidence is a provider's
+//! error text, and a client can make a provider echo text of its choosing
+//! ("temperature" in a tool name is enough), so a shared table would let one
+//! key switch sampling off for everyone using that model. Scoped to the key
+//! that provoked it, the worst a client can do is change its own requests.
+//!
 //! In memory only; relearned after a restart at the cost of one extra request
 //! per model.
 
@@ -24,10 +30,15 @@ pub const sampling_params = [_][]const u8{ "temperature", "top_p", "top_k" };
 
 pub const Quirks = struct {
     mutex: Io.Mutex = .init,
-    /// Keys are owned "<quirk>\n<upstream>\n<model>" strings.
+    /// Keys are owned "<quirk>\n<scope>\n<upstream>\n<model>" strings, where
+    /// the scope is the gateway key (its hash) the request came with.
     learned: std.StringHashMapUnmanaged(void) = .empty,
 
     const Quirk = enum { no_sampling, thought_signature };
+
+    /// Beyond this nothing more is remembered (each request then pays its
+    /// own retry); the table can never grow without bound.
+    pub const max_learned = 20_000;
 
     pub fn deinit(q: *Quirks, gpa: std.mem.Allocator) void {
         var it = q.learned.keyIterator();
@@ -35,35 +46,35 @@ pub const Quirks = struct {
         q.learned.deinit(gpa);
     }
 
-    pub fn rejectsSampling(q: *Quirks, io: Io, upstream: []const u8, model: []const u8) bool {
-        return q.has(io, .no_sampling, upstream, model);
+    pub fn rejectsSampling(q: *Quirks, io: Io, scope: []const u8, upstream: []const u8, model: []const u8) bool {
+        return q.has(io, .no_sampling, scope, upstream, model);
     }
 
-    pub fn noteRejectsSampling(q: *Quirks, gpa: std.mem.Allocator, io: Io, upstream: []const u8, model: []const u8) void {
-        q.note(gpa, io, .no_sampling, upstream, model);
+    pub fn noteRejectsSampling(q: *Quirks, gpa: std.mem.Allocator, io: Io, scope: []const u8, upstream: []const u8, model: []const u8) void {
+        q.note(gpa, io, .no_sampling, scope, upstream, model);
     }
 
-    pub fn needsThoughtSignature(q: *Quirks, io: Io, upstream: []const u8, model: []const u8) bool {
-        return q.has(io, .thought_signature, upstream, model);
+    pub fn needsThoughtSignature(q: *Quirks, io: Io, scope: []const u8, upstream: []const u8, model: []const u8) bool {
+        return q.has(io, .thought_signature, scope, upstream, model);
     }
 
-    pub fn noteNeedsThoughtSignature(q: *Quirks, gpa: std.mem.Allocator, io: Io, upstream: []const u8, model: []const u8) void {
-        q.note(gpa, io, .thought_signature, upstream, model);
+    pub fn noteNeedsThoughtSignature(q: *Quirks, gpa: std.mem.Allocator, io: Io, scope: []const u8, upstream: []const u8, model: []const u8) void {
+        q.note(gpa, io, .thought_signature, scope, upstream, model);
     }
 
-    fn has(q: *Quirks, io: Io, quirk: Quirk, upstream: []const u8, model: []const u8) bool {
-        var buf: [512]u8 = undefined;
-        const key = std.fmt.bufPrint(&buf, "{t}\n{s}\n{s}", .{ quirk, upstream, model }) catch return false;
+    fn has(q: *Quirks, io: Io, quirk: Quirk, scope: []const u8, upstream: []const u8, model: []const u8) bool {
+        var buf: [640]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{t}\n{s}\n{s}\n{s}", .{ quirk, scope, upstream, model }) catch return false;
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
         return q.learned.contains(key);
     }
 
-    fn note(q: *Quirks, gpa: std.mem.Allocator, io: Io, quirk: Quirk, upstream: []const u8, model: []const u8) void {
-        const key = std.fmt.allocPrint(gpa, "{t}\n{s}\n{s}", .{ quirk, upstream, model }) catch return;
+    fn note(q: *Quirks, gpa: std.mem.Allocator, io: Io, quirk: Quirk, scope: []const u8, upstream: []const u8, model: []const u8) void {
+        const key = std.fmt.allocPrint(gpa, "{t}\n{s}\n{s}\n{s}", .{ quirk, scope, upstream, model }) catch return;
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
-        if (q.learned.contains(key)) return gpa.free(key);
+        if (q.learned.contains(key) or q.learned.count() >= max_learned) return gpa.free(key);
         q.learned.put(gpa, key, {}) catch gpa.free(key);
     }
 };
@@ -169,16 +180,19 @@ test "remembers per upstream and model" {
     var q: Quirks = .{};
     defer q.deinit(gpa);
 
-    try std.testing.expect(!q.rejectsSampling(io, "anthropic", "claude-x"));
-    q.noteRejectsSampling(gpa, io, "anthropic", "claude-x");
-    q.noteRejectsSampling(gpa, io, "anthropic", "claude-x");
-    try std.testing.expect(q.rejectsSampling(io, "anthropic", "claude-x"));
-    try std.testing.expect(!q.rejectsSampling(io, "anthropic", "claude-y"));
-    try std.testing.expect(!q.rejectsSampling(io, "other", "claude-x"));
+    try std.testing.expect(!q.rejectsSampling(io, "key-a", "anthropic", "claude-x"));
+    q.noteRejectsSampling(gpa, io, "key-a", "anthropic", "claude-x");
+    q.noteRejectsSampling(gpa, io, "key-a", "anthropic", "claude-x");
+    try std.testing.expect(q.rejectsSampling(io, "key-a", "anthropic", "claude-x"));
+    try std.testing.expect(!q.rejectsSampling(io, "key-a", "anthropic", "claude-y"));
+    try std.testing.expect(!q.rejectsSampling(io, "key-a", "other", "claude-x"));
+    // What one gateway key provoked says nothing about another key's requests.
+    try std.testing.expect(!q.rejectsSampling(io, "key-b", "anthropic", "claude-x"));
 
     // Different quirks of the same model are independent.
-    try std.testing.expect(!q.needsThoughtSignature(io, "anthropic", "claude-x"));
-    q.noteNeedsThoughtSignature(gpa, io, "google", "gemini-x");
-    try std.testing.expect(q.needsThoughtSignature(io, "google", "gemini-x"));
-    try std.testing.expect(!q.rejectsSampling(io, "google", "gemini-x"));
+    try std.testing.expect(!q.needsThoughtSignature(io, "key-a", "anthropic", "claude-x"));
+    q.noteNeedsThoughtSignature(gpa, io, "key-a", "google", "gemini-x");
+    try std.testing.expect(q.needsThoughtSignature(io, "key-a", "google", "gemini-x"));
+    try std.testing.expect(!q.needsThoughtSignature(io, "key-b", "google", "gemini-x"));
+    try std.testing.expect(!q.rejectsSampling(io, "key-a", "google", "gemini-x"));
 }

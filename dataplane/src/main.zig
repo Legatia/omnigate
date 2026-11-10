@@ -27,6 +27,10 @@
 //!                            0 = no limit)
 //!   OMNIGATE_MAX_CONNECTIONS  client connections served at once; further ones
 //!                            get an immediate 503 (default 4096)
+//!   OMNIGATE_ABORT_DRAIN_MS  when a client leaves mid-stream, keep reading the
+//!                            upstream this long to learn the final usage
+//!                            before billing an estimate (default 5000; 0 =
+//!                            bill the estimate at once)
 //!   OMNIGATE_SHUTDOWN_GRACE_MS  on SIGINT/SIGTERM (Ctrl-C/Ctrl-Break on
 //!                            Windows): how long requests in flight may take
 //!                            to finish before the process exits (default 10000)
@@ -53,6 +57,30 @@ const reporter = @import("reporter.zig");
 const watchdog = @import("watchdog.zig");
 
 const log = std.log.scoped(.main);
+
+/// Exit status after a panic, so a supervisor can tell it from a clean stop
+/// (0) and from a startup error (1). 70 is sysexits' EX_SOFTWARE.
+pub const panic_exit_code = 70;
+
+/// Last line of defence. Input is validated so that it cannot reach a panic
+/// (see guard.zig), but a panic in any task ends the whole process, so if
+/// one ever happens it must at least be visible and restartable: one log
+/// line in the configured format, then exit with `panic_exit_code`. Nothing
+/// is flushed here on purpose: usage events are appended to the spool file as
+/// they are queued, so they are already with the operating system and are
+/// delivered after the restart. What a panic does lose is whatever had not
+/// become an event yet (requests still in flight) and the refusal counters
+/// since their last flush; with OMNIGATE_SPOOL=off, also the unsent queue.
+///
+/// Debug builds keep std's handler, whose stack trace is worth more there.
+pub const panic = std.debug.FullPanic(if (@import("builtin").mode == .debug) std.debug.defaultPanic else panicExit);
+
+fn panicExit(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    _ = first_trace_addr;
+    logging.panicLine(msg);
+    std.process.exit(panic_exit_code);
+}
 
 /// Every level is compiled in; `logging` filters at run time.
 pub const std_options: std.Options = .{
@@ -92,6 +120,7 @@ pub const App = struct {
     upstream_timeout_ms: u32,
     client_timeout_ms: u32,
     stream_idle_timeout_ms: u32,
+    abort_drain_ms: u32,
     max_connections: u32,
     config_cache_path: ?[]const u8,
     /// When this process started (Unix seconds); reported as the creation
@@ -210,6 +239,7 @@ pub fn main(init: std.process.Init) !void {
     const upstream_timeout_ms: u32 = if (env.get("OMNIGATE_UPSTREAM_TIMEOUT_MS")) |s| try std.fmt.parseInt(u32, s, 10) else 600_000;
     const client_timeout_ms = try envInt(env, u32, "OMNIGATE_CLIENT_TIMEOUT_MS", 30_000);
     const stream_idle_timeout_ms = try envInt(env, u32, "OMNIGATE_STREAM_IDLE_TIMEOUT_MS", 300_000);
+    const abort_drain_ms = try envInt(env, u32, "OMNIGATE_ABORT_DRAIN_MS", 5_000);
     const max_connections = try envInt(env, u32, "OMNIGATE_MAX_CONNECTIONS", 4096);
     const shutdown_grace_ms = try envInt(env, u32, "OMNIGATE_SHUTDOWN_GRACE_MS", 10_000);
     const cache_max_mb = try envInt(env, u32, "OMNIGATE_CACHE_MAX_MB", 64);
@@ -284,6 +314,7 @@ pub fn main(init: std.process.Init) !void {
         .upstream_timeout_ms = upstream_timeout_ms,
         .client_timeout_ms = client_timeout_ms,
         .stream_idle_timeout_ms = stream_idle_timeout_ms,
+        .abort_drain_ms = abort_drain_ms,
         .max_connections = max_connections,
         .config_cache_path = config_cache_path,
         .started_unix_s = @divTrunc(Io.Timestamp.now(io, .real).toMilliseconds(), 1000),
@@ -389,6 +420,7 @@ test {
     _ = cache;
     _ = counters;
     _ = @import("headers.zig");
+    _ = @import("guard.zig");
     _ = @import("errors.zig");
     _ = @import("models.zig");
     _ = quirks;

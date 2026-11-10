@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const http = std.http;
+const guard = @import("guard.zig");
 
 /// Passed when the name matches exactly (case-insensitive).
 const exact = [_][]const u8{
@@ -43,16 +44,23 @@ pub fn passes(name: []const u8) bool {
 /// copied into `arena` because the head is invalidated once the body is read.
 pub fn collect(arena: std.mem.Allocator, head_bytes: []const u8) ![]const http.Header {
     var out: std.ArrayList(http.Header) = .empty;
-    var it = http.HeaderIterator.init(head_bytes);
+    // Not `std.http.HeaderIterator`: it unwraps a null on a line without a
+    // colon, and this head comes from the network.
+    var it = guard.HeaderIterator.init(head_bytes);
     while (it.next()) |h| {
         if (out.items.len >= max_headers) break;
         if (!passes(h.name)) continue;
         if (h.value.len == 0 or h.value.len > max_value_len) continue;
-        // The parser splits on CRLF, but a bare CR or LF must never be relayed.
-        if (std.mem.findAny(u8, h.value, "\r\n") != null) continue;
+        // Nothing with a control byte in it (a bare CR or LF above all) is relayed.
+        if (hasControl(h.value) or hasControl(h.name)) continue;
         try out.append(arena, .{ .name = try arena.dupe(u8, h.name), .value = try arena.dupe(u8, h.value) });
     }
     return out.items;
+}
+
+fn hasControl(text: []const u8) bool {
+    for (text) |c| if (c < 0x20 or c == 0x7f) return true;
+    return false;
 }
 
 pub fn find(list: []const http.Header, name: []const u8) ?[]const u8 {
@@ -125,4 +133,21 @@ test "oversized values and a flood of headers are bounded" {
     const kept = try collect(arena, head.items);
     try testing.expectEqual(@as(usize, max_headers), kept.len);
     try testing.expectEqual(@as(?[]const u8, null), find(kept, "x-ratelimit-huge"));
+}
+
+test "a malformed upstream head is skipped over, not trusted" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A line without a colon, a truncated head, and control bytes in a value.
+    const got = try collect(arena, "HTTP/1.1 200 OK\r\nX\r\nretry-after: 7\r\nx-request-id: a\x01b\r\nx-ratelimit-reset: 1\rs\r\nrequest-id: ok");
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualStrings("7", find(got, "retry-after").?);
+    try testing.expectEqualStrings("ok", find(got, "request-id").?);
+    try testing.expect(find(got, "x-request-id") == null);
+
+    for ([_][]const u8{ "", "X", "HTTP/1.1 200 OK\r\nX\r\n", "\r\n\r\n", "HTTP/1.1 200 OK\r\n:\r\n: \r\n" }) |head| {
+        try testing.expectEqual(@as(usize, 0), (try collect(arena, head)).len);
+    }
 }

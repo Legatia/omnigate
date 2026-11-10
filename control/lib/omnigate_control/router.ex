@@ -8,6 +8,9 @@ defmodule OmnigateControl.Router do
       planes authenticate the gateway key and forward `/v1/jobs*` and
       `/v1/files*` here, naming the key in `x-omnigate-key-sha256`.
     * `GET  /admin/usage`     — per-key totals as JSON (admin token or session)
+    * `GET  /admin/overview`  — everything the dashboard shows, as JSON
+    * `GET/POST /admin/keys`, `PATCH/DELETE /admin/keys/:name`,
+      `POST /admin/keys/:name/rotate` — managed gateway keys, see `Keys`
     * `GET  /`                — dashboard (session; redirects to `/login`)
     * `GET/POST /login`, `POST /logout` — dashboard sessions, see `AdminAuth`
     * `GET  /metrics`         — Prometheus metrics (admin token or session)
@@ -19,12 +22,13 @@ defmodule OmnigateControl.Router do
   """
   use Plug.Router
 
-  alias OmnigateControl.{AdminAuth, ConfigStore, Jobs, Ledger, Metrics, Storage, UrlSigner}
+  alias OmnigateControl.{Admin, AdminAuth, ConfigStore, Dashboard, Jobs, Keys, Ledger, Metrics, Storage, UrlSigner}
 
   plug :match
   plug Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"]
   plug :internal_auth
   plug :admin_auth
+  plug :csrf
   plug :dispatch
 
   get "/healthz" do
@@ -80,7 +84,15 @@ defmodule OmnigateControl.Router do
           _ -> 20
         end
 
-      send_json(conn, 200, %{object: "list", data: key.key_sha256 |> Jobs.list(limit) |> Enum.map(&Jobs.view/1)})
+      # Jobs created before a key rotation are still this key's jobs.
+      jobs =
+        key
+        |> Keys.hashes()
+        |> Enum.flat_map(&Jobs.list(&1, limit))
+        |> Enum.sort_by(& &1["created_ms"], :desc)
+        |> Enum.take(limit)
+
+      send_json(conn, 200, %{object: "list", data: Enum.map(jobs, &Jobs.view/1)})
     else
       {:error, status, type, message} -> send_error(conn, status, type, message)
     end
@@ -88,7 +100,7 @@ defmodule OmnigateControl.Router do
 
   get "/internal/v1/jobs/:id" do
     with {:ok, key} <- gateway_key(conn),
-         %{} = job <- Jobs.get(key.key_sha256, id) do
+         %{} = job <- own_job(key, id) do
       send_json(conn, 200, Jobs.view(job))
     else
       {:error, status, type, message} -> send_error(conn, status, type, message)
@@ -98,7 +110,8 @@ defmodule OmnigateControl.Router do
 
   post "/internal/v1/jobs/:id/cancel" do
     with {:ok, key} <- gateway_key(conn),
-         %{} = job <- Jobs.cancel(key.key_sha256, id) do
+         %{"key_sha256" => owner} <- own_job(key, id),
+         %{} = job <- Jobs.cancel(owner, id) do
       send_json(conn, 200, Jobs.view(job))
     else
       {:error, status, type, message} -> send_error(conn, status, type, message)
@@ -122,11 +135,60 @@ defmodule OmnigateControl.Router do
   end
 
   get "/admin/usage" do
-    send_json(conn, 200, %{keys: key_rows()})
+    send_json(conn, 200, %{keys: Admin.keys()})
+  end
+
+  get "/admin/overview" do
+    send_json(conn, 200, Admin.overview())
+  end
+
+  # -- managed keys ------------------------------------------------------------
+
+  get "/admin/keys" do
+    send_json(conn, 200, %{keys: Admin.keys()})
+  end
+
+  post "/admin/keys" do
+    case Keys.create(json_object(conn)) do
+      # The only response that ever contains the key itself.
+      {:ok, key, raw} -> send_json(conn, 201, key |> Admin.key_view() |> Map.put(:key, raw))
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  patch "/admin/keys/:name" do
+    case Keys.update(name, json_object(conn)) do
+      {:ok, key} -> send_json(conn, 200, Admin.key_view(key))
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  post "/admin/keys/:name/rotate" do
+    case Keys.rotate(name) do
+      {:ok, key, raw} -> send_json(conn, 200, key |> Admin.key_view() |> Map.put(:key, raw))
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  delete "/admin/keys/:name" do
+    case Keys.delete(name) do
+      :ok -> send_json(conn, 200, %{deleted: name})
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
   end
 
   get "/" do
-    send_html(conn, 200, dashboard())
+    nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+
+    # A bearer-token request has no session to tie a CSRF token to; it does
+    # not need one either.
+    csrf =
+      case AdminAuth.session(conn) do
+        nil -> ""
+        session -> AdminAuth.csrf_token(session)
+      end
+
+    send_html(conn, 200, Dashboard.page(Admin.overview(), csrf, nonce), nonce)
   end
 
   get "/login" do
@@ -173,10 +235,12 @@ defmodule OmnigateControl.Router do
     config = ConfigStore.get()
 
     body = %{
+      # A disabled key is left out altogether, so data planes refuse it as
+      # an unknown key (401) rather than as one that is out of budget.
       keys:
-        Enum.map(config.keys, fn k ->
-          %{key_sha256: k.key_sha256, name: k.name, blocked: blocked?(k), rpm: k.rpm, models: k.models}
-        end),
+        for k <- config.keys, not Keys.disabled?(k) do
+          %{key_sha256: k.key_sha256, name: k.name, blocked: Keys.over_budget?(k), rpm: k.rpm, models: k.models}
+        end,
       upstreams: config.upstreams,
       routes:
         Enum.map(config.routes, fn r ->
@@ -192,16 +256,28 @@ defmodule OmnigateControl.Router do
   # The data plane authenticated the gateway key; it tells us which one.
   defp gateway_key(conn) do
     with [hash] <- get_req_header(conn, "x-omnigate-key-sha256"),
-         %{} = key <- Enum.find(ConfigStore.get().keys, &(&1.key_sha256 == hash)) do
+         %{} = key <- Keys.find_current(hash),
+         false <- Keys.disabled?(key) do
       {:ok, key}
     else
       _ -> {:error, 401, "invalid_api_key", "unknown gateway key"}
     end
   end
 
+  # A job belongs to a key under its current secret or one from before a rotation.
+  defp own_job(key, id), do: Enum.find_value(Keys.hashes(key), &Jobs.get(&1, id))
+
+  # A JSON object body, or an empty map for anything else (validated downstream).
+  defp json_object(conn) do
+    case conn.body_params do
+      %{} = params -> Map.delete(params, "_csrf")
+      _ -> %{}
+    end
+  end
+
   # The data plane also checks this, but its view lags by one poll interval.
   defp within_budget(key) do
-    if blocked?(key), do: {:error, 402, "budget_exceeded", "this key has exhausted its budget"}, else: :ok
+    if Keys.over_budget?(key), do: {:error, 402, "budget_exceeded", "this key has exhausted its budget"}, else: :ok
   end
 
   # A key may be limited to a list of models. The data plane applies the same
@@ -219,7 +295,13 @@ defmodule OmnigateControl.Router do
   defp file_access(conn, job_id, name) do
     case get_req_header(conn, "x-omnigate-key-sha256") do
       [hash] ->
-        if Jobs.get(hash, job_id), do: :ok, else: {:error, 404, "file_not_found", "no such file"}
+        owner = Keys.find_current(hash)
+
+        if owner && !Keys.disabled?(owner) && own_job(owner, job_id) do
+          :ok
+        else
+          {:error, 404, "file_not_found", "no such file"}
+        end
 
       _ ->
         case UrlSigner.verify(job_id, name, conn.query_params["exp"], conn.query_params["sig"]) do
@@ -260,19 +342,6 @@ defmodule OmnigateControl.Router do
     send_json(conn, status, %{error: %{type: type, message: message}})
   end
 
-  defp blocked?(%{budget_usd: nil}), do: false
-  defp blocked?(k), do: Ledger.spend(k.key_sha256) >= k.budget_usd
-
-  defp key_rows do
-    Enum.map(ConfigStore.get().keys, fn k ->
-      Map.merge(Ledger.totals(k.key_sha256), %{
-        name: k.name,
-        budget_usd: k.budget_usd,
-        blocked: blocked?(k)
-      })
-    end)
-  end
-
   defp internal_auth(%{path_info: ["internal" | _]} = conn, _opts) do
     expected = System.get_env("OMNIGATE_INTERNAL_TOKEN") || ""
 
@@ -309,6 +378,23 @@ defmodule OmnigateControl.Router do
 
   defp admin_auth(conn, _opts), do: conn
 
+  # Cross-site request forgery: a page on another site can make the browser
+  # send a request here with the session cookie attached. Anything that
+  # changes state must therefore prove it came from our own page.
+  defp csrf(%{method: method} = conn, _opts) when method in ["POST", "PUT", "PATCH", "DELETE"] do
+    protected = match?(["admin" | _], conn.path_info) or conn.path_info == ["logout"]
+
+    if not protected or AdminAuth.csrf_ok?(conn) do
+      conn
+    else
+      conn
+      |> send_json(403, %{error: %{type: "csrf_failed", message: "missing or wrong CSRF token; reload the dashboard and try again"}})
+      |> halt()
+    end
+  end
+
+  defp csrf(conn, _opts), do: conn
+
   defp redirect(conn, to) do
     conn |> put_resp_header("location", to) |> send_resp(302, "")
   end
@@ -320,13 +406,25 @@ defmodule OmnigateControl.Router do
       get_req_header(conn, "x-forwarded-proto") == ["https"]
   end
 
-  defp send_html(conn, status, html) do
+  # Nothing may load from anywhere else. With a nonce (the dashboard) only
+  # the page's own inline style and script run, and the script may talk to
+  # this origin; without one (the login page) there is no script at all.
+  defp send_html(conn, status, html, nonce \\ nil) do
+    policy =
+      if nonce do
+        "default-src 'none'; style-src 'nonce-#{nonce}'; script-src 'nonce-#{nonce}'; connect-src 'self'; img-src data:; " <>
+          "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+      else
+        "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+      end
+
     conn
     |> put_resp_content_type("text/html")
     |> put_resp_header("cache-control", "no-store")
     |> put_resp_header("x-frame-options", "DENY")
+    |> put_resp_header("x-content-type-options", "nosniff")
     |> put_resp_header("referrer-policy", "no-referrer")
-    |> put_resp_header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+    |> put_resp_header("content-security-policy", policy)
     |> send_resp(status, html)
   end
 
@@ -335,7 +433,7 @@ defmodule OmnigateControl.Router do
 
     """
     <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>omnigate · sign in</title>
+    <title>omnigate · sign in</title><link rel="icon" href="data:,">
     <style>body{font:14px system-ui;margin:0;min-height:100vh;display:grid;place-items:center;color:#222;background:#fafafa}
     form{background:#fff;border:1px solid #ddd;border-radius:8px;padding:24px;width:min(320px,calc(100vw - 32px));box-sizing:border-box}
     h1{font-size:18px;margin:0 0 16px}label{display:block;margin-bottom:6px}
@@ -355,55 +453,5 @@ defmodule OmnigateControl.Router do
     |> send_resp(status, JSON.encode!(body))
   end
 
-  defp dashboard do
-    rows =
-      Enum.map_join(key_rows(), "\n", fn r ->
-        budget = if r.budget_usd, do: :erlang.float_to_binary(r.budget_usd, decimals: 4), else: "∞"
-
-        "<tr><td>#{h(r.name)}</td><td>#{r.requests}</td><td>#{r.errors}</td><td>#{r.input_tokens}</td>" <>
-          "<td>#{r.output_tokens}</td><td>#{r.jobs}</td><td>$#{:erlang.float_to_binary(r.cost_usd, decimals: 6)}</td>" <>
-          "<td>$#{budget}</td><td>#{if r.blocked, do: "blocked", else: "active"}</td></tr>"
-      end)
-
-    events =
-      Ledger.recent()
-      |> Enum.reject(&(&1["kind"] == "media"))
-      |> Enum.map_join("\n", fn e ->
-        attempts = Enum.map_join(e["attempts"] || [], " → ", &"#{&1["upstream"]}:#{&1["outcome"]}")
-
-        "<tr><td>#{h(e["ts"])}</td><td>#{h(e["route_model"])}</td><td>#{h(e["upstream"] || "-")}</td>" <>
-          "<td>#{e["status"]}</td><td>#{e["input_tokens"]}/#{e["output_tokens"]}</td>" <>
-          "<td>#{e["latency_ms"]} ms</td><td>#{h(attempts)}</td></tr>"
-      end)
-
-    jobs =
-      Enum.map_join(Jobs.Store.recent(20), "\n", fn j ->
-        attempts = Enum.map_join(j["attempts"] || [], " → ", &"#{&1["upstream"]}:#{&1["outcome"]}")
-        webhook = if j["webhook"], do: "#{j["webhook"]["status"]} (#{j["webhook"]["attempts"]})", else: "-"
-
-        "<tr><td>#{h(j["created_at"])}</td><td>#{h(j["id"])}</td><td>#{h(j["model"])}</td><td>#{h(j["status"])}</td>" <>
-          "<td>#{h(j["upstream"] || "-")}</td><td>#{length(j["outputs"] || [])}</td>" <>
-          "<td>$#{:erlang.float_to_binary((j["cost_usd"] || 0) * 1.0, decimals: 6)}#{if j["cached"], do: " (cached)"}</td>" <>
-          "<td>#{h(webhook)}</td><td>#{h(attempts)}</td></tr>"
-      end)
-
-    """
-    <!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2">
-    <title>omnigate</title>
-    <style>body{font:14px system-ui;margin:24px;color:#222}table{border-collapse:collapse;margin-bottom:24px}
-    td,th{border:1px solid #ddd;padding:4px 8px;text-align:left}th{background:#f5f5f5}
-    .top{display:flex;justify-content:space-between;align-items:center}.top button{font:inherit;padding:4px 10px;cursor:pointer}</style></head>
-    <body><div class="top"><h1>omnigate control plane</h1>
-    <form method="post" action="/logout"><button type="submit">Sign out</button></form></div>
-    <h2>Keys</h2><table><tr><th>Key</th><th>Requests</th><th>Errors</th><th>In tok</th><th>Out tok</th>
-    <th>Jobs</th><th>Spend</th><th>Budget</th><th>State</th></tr>#{rows}</table>
-    <h2>Recent requests</h2><table><tr><th>Time</th><th>Model</th><th>Served by</th><th>Status</th>
-    <th>Tokens in/out</th><th>Latency</th><th>Attempts</th></tr>#{events}</table>
-    <h2>Recent media jobs</h2><table><tr><th>Created</th><th>Job</th><th>Model</th><th>Status</th><th>Served by</th>
-    <th>Outputs</th><th>Cost</th><th>Webhook</th><th>Attempts</th></tr>#{jobs}</table></body></html>
-    """
-  end
-
-  defp h(nil), do: ""
   defp h(s), do: s |> to_string() |> Plug.HTML.html_escape()
 end

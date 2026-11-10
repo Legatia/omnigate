@@ -10,6 +10,7 @@ defmodule OmnigateControl.Application do
 
     children = [
       {OmnigateControl.ConfigStore, path: config_path()},
+      {OmnigateControl.Keys, path: keys_path()},
       {OmnigateControl.Ledger, path: ledger_path()},
       {OmnigateControl.Jobs.Store, path: jobs_path()},
       {Task.Supervisor, name: OmnigateControl.Jobs.TaskSup},
@@ -32,6 +33,12 @@ defmodule OmnigateControl.Application do
     System.get_env("OMNIGATE_LEDGER") ||
       Application.get_env(:omnigate_control, :ledger_path) ||
       Path.expand("data/ledger.jsonl", File.cwd!())
+  end
+
+  defp keys_path do
+    System.get_env("OMNIGATE_KEYS") ||
+      Application.get_env(:omnigate_control, :keys_path) ||
+      Path.expand("data/keys.json", File.cwd!())
   end
 
   defp jobs_path do

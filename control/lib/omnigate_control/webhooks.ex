@@ -34,7 +34,8 @@ defmodule OmnigateControl.Webhooks do
   @doc "Signing secret for a gateway key: its own, else the global one, else nil."
   def secret_for(key_sha256) do
     config = ConfigStore.get()
-    key = Enum.find(config.keys, &(&1.key_sha256 == key_sha256))
+    # The key may have been rotated since the job was created.
+    key = OmnigateControl.Keys.find_owner(key_sha256)
     (key && key[:webhook_secret]) || config.media.webhooks.secret || System.get_env("OMNIGATE_WEBHOOK_SECRET")
   end
 
@@ -44,15 +45,63 @@ defmodule OmnigateControl.Webhooks do
   private or link-local addresses are refused.
   """
   def check_url(url) do
+    case target(url) do
+      {:ok, _address} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  The address a delivery to `url` must connect to: `{:ok, ip}`.
+
+  The host is resolved once, every address it resolves to is checked against
+  the private-address rules, and the caller then connects to the returned
+  address itself (`Http.request(..., connect_to: ip)`). Checking a name and
+  then letting the HTTP client resolve it again would let a hostile DNS
+  server answer "public" for the check and "internal" for the call.
+  """
+  def target(url) do
     uri = URI.parse(url)
 
     cond do
-      uri.scheme not in ["http", "https"] -> {:error, "webhook_url must be http or https"}
-      uri.host in [nil, ""] -> {:error, "webhook_url has no host"}
-      uri.userinfo != nil -> {:error, "webhook_url must not contain credentials"}
-      ConfigStore.get().media.webhooks.allow_private -> :ok
-      true -> public_host(uri.host)
+      uri.scheme not in ["http", "https"] ->
+        {:error, "webhook_url must be http or https"}
+
+      uri.host in [nil, ""] ->
+        {:error, "webhook_url has no host"}
+
+      uri.userinfo != nil ->
+        {:error, "webhook_url must not contain credentials"}
+
+      true ->
+        addresses = resolve(uri.host)
+
+        cond do
+          addresses == [] -> {:error, "webhook_url host does not resolve"}
+          ConfigStore.get().media.webhooks.allow_private -> {:ok, hd(addresses)}
+          Enum.any?(addresses, &private?/1) -> {:error, "webhook_url resolves to a private or loopback address"}
+          true -> {:ok, hd(addresses)}
+        end
     end
+  end
+
+  # IPv4 first. A literal address needs no lookup. Tests swap the resolver.
+  defp resolve(host) do
+    case :inet.parse_address(String.to_charlist(host)) do
+      {:ok, ip} ->
+        [ip]
+
+      {:error, _} ->
+        resolver = Application.get_env(:omnigate_control, :webhook_resolver, &system_resolve/1)
+        resolver.(host)
+    end
+  end
+
+  defp system_resolve(host) do
+    for family <- [:inet, :inet6],
+        {:ok, list} <- [:inet.getaddrs(String.to_charlist(host), family)],
+        addr <- list,
+        do: addr
   end
 
   # -- timers ----------------------------------------------------------------
@@ -128,7 +177,9 @@ defmodule OmnigateControl.Webhooks do
   end
 
   defp post(job, url, config) do
-    with :ok <- check_url(url),
+    # Resolved and checked again on every attempt; the address that passed
+    # the check is the one connected to.
+    with {:ok, address} <- target(url),
          secret when is_binary(secret) <- secret_for(job["key_sha256"]) do
       body =
         JSON.encode!(%{
@@ -147,8 +198,9 @@ defmodule OmnigateControl.Webhooks do
         {"user-agent", "omnigate-webhooks/0.1"}
       ]
 
-      # Redirects are not followed: a 3xx is a failed delivery.
-      case Http.request(:post, url, headers, body, timeout: config.timeout_ms) do
+      # Redirects are not followed: a 3xx is a failed delivery. (Following one
+      # would mean calling an address nobody checked.)
+      case Http.request(:post, url, headers, body, timeout: config.timeout_ms, connect_to: address) do
         {:ok, %{status: status}} -> {:ok, status}
         {:error, reason} -> {:error, reason |> inspect() |> String.slice(0, 200)}
       end
@@ -167,20 +219,6 @@ defmodule OmnigateControl.Webhooks do
   end
 
   defp signing_key(secret), do: secret
-
-  defp public_host(host) do
-    addrs =
-      for family <- [:inet, :inet6],
-          {:ok, list} <- [:inet.getaddrs(String.to_charlist(host), family)],
-          addr <- list,
-          do: addr
-
-    cond do
-      addrs == [] -> {:error, "webhook_url host does not resolve"}
-      Enum.any?(addrs, &private?/1) -> {:error, "webhook_url resolves to a private or loopback address"}
-      true -> :ok
-    end
-  end
 
   defp private?({a, b, _, _}) do
     a in [0, 10, 127] or (a == 172 and b in 16..31) or (a == 192 and b == 168) or (a == 169 and b == 254) or

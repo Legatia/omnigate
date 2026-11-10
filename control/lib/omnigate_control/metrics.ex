@@ -7,7 +7,7 @@ defmodule OmnigateControl.Metrics do
   to instrument and nothing extra to store. Per-key series are labelled with
   the key's configured name, never its hash.
   """
-  alias OmnigateControl.{ConfigStore, Ledger}
+  alias OmnigateControl.{ConfigStore, Keys, Ledger}
   alias OmnigateControl.Jobs.Store
 
   @job_statuses ~w(queued running succeeded failed canceled)
@@ -21,7 +21,8 @@ defmodule OmnigateControl.Metrics do
     jobs = Store.all()
     {uptime_ms, _} = :erlang.statistics(:wall_clock)
 
-    keys = Enum.map(config.keys, fn k -> {k, Ledger.totals(k.key_sha256)} end)
+    # Across rotations of a managed key, so its series never restart.
+    keys = Enum.map(config.keys, fn k -> {k, Keys.totals(k)} end)
     per_key = fn fun -> Enum.map(keys, fn {k, t} -> {[key: k.name], fun.(k, t)} end) end
 
     by_status = Enum.frequencies_by(jobs, & &1["status"])

@@ -50,10 +50,27 @@ defmodule OmnigateControl.Ledger do
 
   @doc "Counts for monitoring: events recorded since the log began, and dedup ids currently held."
   def stats do
-    %{
-      events: :ets.foldl(fn {_key, totals}, sum -> sum + totals.requests end, 0, @table),
-      dedup_ids: :ets.info(@seen, :size)
-    }
+    %{events: grand_totals().requests, dedup_ids: :ets.info(@seen, :size)}
+  end
+
+  @doc "Totals over every key."
+  def grand_totals do
+    :ets.foldl(
+      fn
+        {key, totals}, sum when is_binary(key) -> Map.merge(sum, totals, fn _field, a, b -> a + b end)
+        _day_row, sum -> sum
+      end,
+      empty_totals(),
+      @table
+    )
+  end
+
+  @doc "Totals over every key for one UTC day, given as `\"YYYY-MM-DD\"` (default: today)."
+  def day_totals(day \\ Date.utc_today() |> Date.to_iso8601()) do
+    case :ets.lookup(@table, {:day, day}) do
+      [{_, totals}] -> totals
+      [] -> empty_totals()
+    end
   end
 
   @doc "Totals for one key hash."
@@ -190,12 +207,25 @@ defmodule OmnigateControl.Ledger do
     # Kept with the time we recorded it, so old ids can be pruned.
     if id = event["id"], do: :ets.insert(@seen, {id, recorded_ms(event)})
 
-    key = event["key_sha256"]
-    t = totals(key)
+    add(event["key_sha256"], event)
+
+    # One extra row per UTC day (of the event's own time), for "today" figures.
+    case event["ts"] do
+      <<day::binary-size(10), _rest::binary>> -> add({:day, day}, event)
+      _ -> :ok
+    end
+  end
+
+  defp add(row, event) do
+    t =
+      case :ets.lookup(@table, row) do
+        [{_, totals}] -> totals
+        [] -> empty_totals()
+      end
 
     :ets.insert(
       @table,
-      {key,
+      {row,
        %{
          t
          | requests: t.requests + 1,

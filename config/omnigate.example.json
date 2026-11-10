@@ -5,11 +5,19 @@
       "key_sha256": "<sha256 hex of the gateway key you hand to the app>",
       "budget_usd": 25.0,
       "rpm": 600,
+      "disabled": false,
       "models": [
         "claude",
         "gpt",
         "gemini",
-        "image"
+        "image",
+        "video",
+        "image-sync",
+        "speech",
+        "gemini-image",
+        "gemini-speech",
+        "grok-video",
+        "gemini-video"
       ],
       "webhook_secret_env": "MY_APP_WEBHOOK_SECRET"
     }

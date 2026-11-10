@@ -4,7 +4,7 @@ defmodule OmnigateControl do
 
   Source of truth for gateway keys, budgets, routes and the usage ledger.
   Zig data-plane nodes pull `GET /internal/config` and push
-  `POST /internal/usage`; this node computes spend and flips keys to
+  `POST /internal/usage/batch`; this node computes spend and flips keys to
   `blocked` when they exceed their budget.
   """
 

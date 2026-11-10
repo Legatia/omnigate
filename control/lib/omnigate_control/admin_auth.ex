@@ -14,6 +14,12 @@ defmodule OmnigateControl.AdminAuth do
   Sessions are stateless: the cookie is `<expiry>.<nonce>.<mac>`, signed with
   a key derived from the admin token. Changing the token ends every session.
 
+  Requests that change something and are authenticated by the session cookie
+  must also carry a CSRF token (`x-csrf-token` header or `_csrf` form field).
+  The token is an HMAC of the session cookie, so it is per session and needs
+  no server-side state. Requests authenticated by the bearer token are exempt:
+  a browser never attaches that header on its own.
+
   Failed logins are counted per client address and refused for a while after
   too many, to slow down guessing. Behind a reverse proxy every client shares
   the proxy's address, so the limit then applies to all of them together.
@@ -93,7 +99,8 @@ defmodule OmnigateControl.AdminAuth do
     bearer?(conn) or session?(conn)
   end
 
-  defp bearer?(conn) do
+  @doc "True when the request carries the admin token as a bearer token."
+  def bearer?(conn) do
     case Plug.Conn.get_req_header(conn, "authorization") do
       ["Bearer " <> token] -> valid_token?(String.trim(token))
       ["bearer " <> token] -> valid_token?(String.trim(token))
@@ -101,9 +108,41 @@ defmodule OmnigateControl.AdminAuth do
     end
   end
 
-  defp session?(conn) do
+  defp session?(conn), do: session(conn) != nil
+
+  @doc "The request's session cookie value when it is a valid session, else nil."
+  def session(conn) do
     conn = Plug.Conn.fetch_cookies(conn)
-    valid_session?(conn.req_cookies[@cookie])
+    value = conn.req_cookies[@cookie]
+    if valid_session?(value), do: value
+  end
+
+  @doc "The CSRF token that goes with a session cookie value."
+  def csrf_token(session) when is_binary(session), do: mac("csrf." <> session)
+
+  @doc """
+  May this request change state? Yes with the bearer token; with a session
+  cookie only when the matching CSRF token came along, in the `x-csrf-token`
+  header or the `_csrf` body field.
+  """
+  def csrf_ok?(conn) do
+    cond do
+      bearer?(conn) ->
+        true
+
+      session = session(conn) ->
+        sent =
+          case Plug.Conn.get_req_header(conn, "x-csrf-token") do
+            [token] -> token
+            _ -> is_map(conn.body_params) && conn.body_params["_csrf"]
+          end
+
+        is_binary(sent) and Plug.Crypto.secure_compare(sent, csrf_token(session))
+
+      true ->
+        # Not authenticated at all: nothing to protect, and other plugs refuse it.
+        true
+    end
   end
 
   # -- failed-login throttle ---------------------------------------------------

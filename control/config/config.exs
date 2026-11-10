@@ -9,6 +9,7 @@ if config_env() == :test do
     port: 4999,
     ledger_path: Path.join(System.tmp_dir!(), "omnigate-test-ledger-#{stamp}.jsonl"),
     jobs_path: Path.join(System.tmp_dir!(), "omnigate-test-jobs-#{stamp}.jsonl"),
+    keys_path: Path.join(System.tmp_dir!(), "omnigate-test-keys-#{stamp}.json"),
     media_dir: Path.join(System.tmp_dir!(), "omnigate-test-media-#{stamp}"),
     signing_secret: "test-signing-secret",
     admin_token: "test-admin-token-0123456789"

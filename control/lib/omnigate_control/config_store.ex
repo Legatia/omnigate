@@ -13,8 +13,22 @@ defmodule OmnigateControl.ConfigStore do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @doc "The normalized config map."
-  def get, do: :persistent_term.get({__MODULE__, :config})
+  @doc """
+  The normalized config map. Its `keys` are the keys written in the config
+  file followed by the ones created through the admin API (`Keys`), so
+  everything downstream sees one list.
+  """
+  def get do
+    config = :persistent_term.get({__MODULE__, :config})
+    %{config | keys: only_file(config.keys) ++ OmnigateControl.Keys.managed()}
+  end
+
+  @doc "Only the keys written in the config file."
+  def file_keys, do: only_file(:persistent_term.get({__MODULE__, :config}).keys)
+
+  # A config that went through `get/0` and was put back (tests do this)
+  # carries managed keys; they must not be counted twice.
+  defp only_file(keys), do: Enum.reject(keys, &(Map.get(&1, :source) == :managed))
 
   @doc "When the config was last (re)loaded, and how many reloads succeeded since boot."
   def meta, do: :persistent_term.get({__MODULE__, :meta}, %{reloads: 0, loaded_at_ms: 0})
@@ -100,14 +114,19 @@ defmodule OmnigateControl.ConfigStore do
             rpm: to_int(k["rpm"], 0),
             # Route model names (text or media) this key may use; nil = all.
             models: models(k["models"]),
-            webhook_secret: secret(k, "webhook_secret")
+            webhook_secret: secret(k, "webhook_secret"),
+            # Switched off by the operator: refused everywhere, usage kept.
+            disabled: k["disabled"] == true,
+            source: :file,
+            created_at: nil,
+            old_hashes: []
           }
         end),
       upstreams:
         Enum.map(raw["upstreams"] || [], fn u ->
           %{
             name: Map.fetch!(u, "name"),
-            kind: Map.fetch!(u, "kind"),
+            kind: text_kind!(u),
             base_url: Map.fetch!(u, "base_url"),
             api_key_env: Map.fetch!(u, "api_key_env"),
             # Max wait for response headers; 0 = the data plane's default.
@@ -276,6 +295,20 @@ defmodule OmnigateControl.ConfigStore do
           Path.expand("data/media", File.cwd!()),
       url_ttl_s: to_int(s["url_ttl_s"], 3_600)
     }
+  end
+
+  # The data plane only speaks these two protocols and cannot parse a snapshot
+  # that names another, so a typo must fail here, where the old config is kept.
+  defp text_kind!(u) do
+    case Map.fetch!(u, "kind") do
+      kind when kind in ["openai", "anthropic"] ->
+        kind
+
+      other ->
+        raise ArgumentError,
+              "upstream #{inspect(u["name"])}: kind must be \"openai\" or \"anthropic\", got #{inspect(other)} " <>
+                "(media providers go under media.upstreams)"
+    end
   end
 
   # "outputs" and "/outputs/" both mean the key prefix "outputs/".

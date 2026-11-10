@@ -9,6 +9,10 @@ defmodule OmnigateControl.Jobs.Adapters.XaiVideo do
       `expired`; when done, `video.url` is the file
 
   Price it with `per_second_usd`, which multiplies by `input.duration`.
+
+  Checked against the real service with `grok-imagine-video-1.5-lite`
+  (November 2026): submit, poll to `done`, download. The `failed` and
+  `expired` states and image inputs have only met the mock.
   """
   @behaviour OmnigateControl.Jobs.Adapter
 

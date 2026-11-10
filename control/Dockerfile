@@ -41,6 +41,7 @@ ENV OMNIGATE_CONTROL_BIND=0.0.0.0 \
     OMNIGATE_CONFIG=/config/omnigate.json \
     OMNIGATE_LEDGER=/data/ledger.jsonl \
     OMNIGATE_JOBS=/data/jobs.jsonl \
+    OMNIGATE_KEYS=/data/keys.json \
     OMNIGATE_MEDIA_DIR=/data/media \
     RELEASE_DISTRIBUTION=none \
     LANG=C.UTF-8

@@ -13,11 +13,18 @@ defmodule OmnigateControl.Http do
 
   `body` is `nil`, a binary, or `{:file, path, size}` to stream a file from
   disk. Options: `:timeout` (ms, default 30 s), `:redirect` (default false),
-  `:content_type`.
+  `:content_type`, and `:connect_to`.
+
+  `connect_to: ip` (an `:inet` address tuple) opens the connection to that
+  address instead of resolving the URL's host again, while still sending the
+  host's name in `Host`, in TLS SNI, and checking the certificate against it.
+  Callers that validated an address use it so that the address they checked
+  is the one that gets called.
   """
   @spec request(atom(), String.t(), [{String.t(), String.t()}], term(), keyword()) ::
           {:ok, response()} | {:error, term()}
   def request(method, url, headers, body \\ nil, opts \\ []) do
+    {url, headers, opts} = pin(url, headers, opts)
     hdrs = to_httpc_headers(headers)
     url_c = String.to_charlist(url)
 
@@ -165,6 +172,30 @@ defmodule OmnigateControl.Http do
 
   defp content_type(opts), do: String.to_charlist(Keyword.get(opts, :content_type, "application/json"))
 
+  # Rewrites the URL to the pinned address and carries the real host name in
+  # the Host header and, via `:tls_name`, into the TLS options.
+  @doc false
+  def pin(url, headers, opts) do
+    case Keyword.get(opts, :connect_to) do
+      nil ->
+        {url, headers, opts}
+
+      ip ->
+        uri = URI.parse(url)
+        literal = ip |> :inet.ntoa() |> to_string()
+        literal = if tuple_size(ip) == 8, do: "[" <> literal <> "]", else: literal
+        default_port = if uri.scheme == "https", do: 443, else: 80
+        host_header = if uri.port in [nil, default_port], do: uri.host, else: "#{uri.host}:#{uri.port}"
+
+        pinned =
+          "#{uri.scheme}://#{literal}:#{uri.port || default_port}#{uri.path || "/"}" <>
+            if(uri.query, do: "?" <> uri.query, else: "")
+
+        headers = [{"host", host_header} | Enum.reject(headers, fn {k, _} -> String.downcase(k) == "host" end)]
+        {pinned, headers, Keyword.put(opts, :tls_name, uri.host)}
+    end
+  end
+
   defp http_opts(url, opts) do
     base = [
       timeout: Keyword.get(opts, :timeout, 30_000),
@@ -175,11 +206,18 @@ defmodule OmnigateControl.Http do
     if String.starts_with?(url, "https://") do
       base ++
         [
-          ssl: [
-            verify: :verify_peer,
-            cacerts: :public_key.cacerts_get(),
-            customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
-          ]
+          ssl:
+            [
+              verify: :verify_peer,
+              cacerts: :public_key.cacerts_get(),
+              customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
+            ] ++
+              case Keyword.get(opts, :tls_name) do
+                # Connecting to a pinned address: name the host for SNI and
+                # for the certificate check, since the URL no longer does.
+                nil -> []
+                name -> [server_name_indication: String.to_charlist(name)]
+              end
         ]
     else
       base

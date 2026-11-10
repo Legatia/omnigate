@@ -4,7 +4,7 @@ defmodule OmnigateControl.Retention do
   section. Everything is off unless configured, so an upgrade never deletes
   anything by itself.
 
-      "retention": { "jobs_days": 30, "ledger_ids_days": 7, "delete_bucket_objects": true }
+      "retention": { "jobs_days": 30, "ledger_ids_days": 14, "ledger_days": 90, "delete_bucket_objects": true }
 
     * `jobs_days`: finished jobs (succeeded, failed, canceled) that finished
       more than this many days ago are removed from the job store and from
@@ -27,7 +27,16 @@ defmodule OmnigateControl.Retention do
       would be counted twice, so keep this well above the longest outage a
       data plane might spool through.
 
-  A value of 0, or leaving a setting out, means "keep forever".
+    * `ledger_days`: sealed ledger segments (the files `ledger.NNNNNN.jsonl`
+      next to the active `ledger.jsonl`) older than this are deleted. Their
+      contribution to every total lives on in the ledger's snapshot, so
+      lifetime and current-period spend stay exact; what goes is the
+      per-request history in those files. A segment is deleted only once
+      two snapshot generations cover it, and the newest sealed segment is
+      always kept.
+
+  A value of 0, or leaving a setting out, means "keep forever" (except
+  `ledger_ids_days`, which defaults to 14 when left out).
 
   One sweep runs shortly after boot and then every hour.
   """

@@ -22,4 +22,7 @@ defmodule OmnigateControl do
 
   @doc "Lowercase hex SHA-256, matching the data plane's `sha256Hex`."
   def sha256_hex(data), do: :crypto.hash(:sha256, data) |> Base.encode16(case: :lower)
+
+  @doc "This application's version, from mix.exs (the one place it is written)."
+  def version, do: :omnigate_control |> Application.spec(:vsn) |> to_string()
 end

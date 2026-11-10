@@ -112,7 +112,7 @@ defmodule OmnigateControl.AdminKeysTest do
       # Delete.
       assert {200, %{"deleted" => ^name}, _} = admin(:delete, "/admin/keys/#{name}")
       assert snapshot_key(name) == nil
-      assert {404, %{"error" => %{"type" => "key_not_found"}}, _} = admin(:delete, "/admin/keys/#{name}")
+      assert {404, %{"error" => %{"code" => "key_not_found"}}, _} = admin(:delete, "/admin/keys/#{name}")
       # The ledger keeps what the key spent.
       assert Ledger.totals(hash).cost_usd == 0.75
     end
@@ -129,16 +129,16 @@ defmodule OmnigateControl.AdminKeysTest do
             {%{"name" => unique("k"), "models" => [1]}, "models"},
             {%{"name" => unique("k"), "disabled" => "yes"}, "disabled"}
           ] do
-        assert {400, %{"error" => %{"type" => "invalid_request", "message" => message}}, _} = admin(:post, "/admin/keys", body)
+        assert {400, %{"error" => %{"code" => "invalid_request", "message" => message}}, _} = admin(:post, "/admin/keys", body)
         assert message =~ hint
       end
 
       name = unique("dup")
       assert {201, _, _} = admin(:post, "/admin/keys", %{"name" => name})
-      assert {409, %{"error" => %{"type" => "key_exists"}}, _} = admin(:post, "/admin/keys", %{"name" => name})
+      assert {409, %{"error" => %{"code" => "key_exists"}}, _} = admin(:post, "/admin/keys", %{"name" => name})
 
       [file_key | _] = ConfigStore.file_keys()
-      assert {409, %{"error" => %{"type" => "key_exists"}}, _} = admin(:post, "/admin/keys", %{"name" => file_key.name})
+      assert {409, %{"error" => %{"code" => "key_exists"}}, _} = admin(:post, "/admin/keys", %{"name" => file_key.name})
       assert {400, _, _} = admin(:patch, "/admin/keys/#{name}", %{"rpm" => -3})
     end
 
@@ -150,7 +150,7 @@ defmodule OmnigateControl.AdminKeysTest do
             {:post, "/admin/keys/#{file_key.name}/rotate", nil},
             {:delete, "/admin/keys/#{file_key.name}", nil}
           ] do
-        assert {409, %{"error" => %{"type" => "read_only_key", "message" => message}}, _} = admin(method, path, body)
+        assert {409, %{"error" => %{"code" => "read_only_key", "message" => message}}, _} = admin(method, path, body)
         assert message =~ "config file"
       end
 
@@ -196,7 +196,7 @@ defmodule OmnigateControl.AdminKeysTest do
     test "a cookie-authenticated change needs the session's CSRF token", %{cookie: cookie, csrf: csrf} do
       name = unique("csrf")
 
-      assert {403, %{"error" => %{"type" => "csrf_failed"}}, _} = request(:post, "/admin/keys", %{"name" => name}, [cookie])
+      assert {403, %{"error" => %{"code" => "csrf_failed"}}, _} = request(:post, "/admin/keys", %{"name" => name}, [cookie])
       assert {403, _, _} = request(:post, "/admin/keys", %{"name" => name}, [cookie, {"x-csrf-token", "wrong"}])
       # A token from another session is no good either.
       other = AdminAuth.csrf_token(AdminAuth.issue_session())

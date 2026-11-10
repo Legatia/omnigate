@@ -8,17 +8,6 @@
 
 # Applications: the data plane.
 {$OMNIGATE_API_HOST:localhost} {
-	# Stored job outputs are bytes a provider produced. Whatever the gateway
-	# says about them, a browser must download them, not sniff a type and not
-	# run them as a page on this origin. (Defaults: they apply only where the
-	# gateway did not set the header itself.)
-	@files path /v1/files/*
-	header @files {
-		?Content-Disposition attachment
-		?X-Content-Type-Options nosniff
-		?Content-Security-Policy "sandbox; default-src 'none'"
-	}
-
 	reverse_proxy dataplane:8080 {
 		# Pass streamed tokens through as they arrive.
 		flush_interval -1

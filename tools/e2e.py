@@ -239,6 +239,8 @@ def text_config():
             {"name": "mock-slow", "kind": "openai", "base_url": "http://127.0.0.1:9004", "api_key_env": "MOCK_API_KEY", "timeout_ms": 500},
             # A provider whose OpenAI-compatible API is not under /v1 (Gemini's layout).
             {"name": "mock-compat", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY", "v1_path": "/v1beta/openai"},
+            # Nothing listens here: every call is refused at once.
+            {"name": "mock-dead", "kind": "openai", "base_url": "http://127.0.0.1:9", "api_key_env": "MOCK_API_KEY"},
         ],
         "routes": [
             {"model": "chat", "targets": [dict(upstream="mock-flaky", model="flaky-1", **price),
@@ -247,6 +249,9 @@ def text_config():
             {"model": "compat", "targets": [dict(upstream="mock-compat", model="ok-1", **price)]},
             {"model": "signed", "targets": [dict(upstream="mock-ok", model="sig-1", **price)]},
             {"model": "cached", "cache_ttl_s": 60, "targets": [dict(upstream="mock-ok", model="ok-1", **price)]},
+            # The first target answers 429 (with retry-after: 7), the second is down.
+            {"model": "limited-then-dead", "targets": [dict(upstream="mock-ok", model="rate-limited-1", **price),
+                                                       dict(upstream="mock-dead", model="x", **price)]},
             # The same mock under two upstream names, so the response header tells them apart.
             {"model": "spread", "strategy": "round_robin", "targets": [dict(upstream="mock-ok", model="ok-1", **price),
                                                                        dict(upstream="mock-compat", model="ok-1", **price)]},
@@ -264,6 +269,8 @@ class Stack:
         self.work = work
         self.media = media
         self.procs = {}
+        # Extra settings for the gateway, kept across its restarts.
+        self.gateway_env = {}
         self.config_path = os.path.join(work, "omnigate.e2e.json")
         with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -336,16 +343,18 @@ class Stack:
         if not wait_port(CONTROL_PORT, 240, proc):
             self.fail("control plane did not start", "control")
 
-    def start_gateway(self):
+    def start_gateway(self, extra_env=None):
         exe = os.path.join(ROOT, "dataplane", "zig-out", "bin", "omnigate-dp" + (".exe" if WINDOWS else ""))
         if not os.path.exists(exe):
             self.fail(f"{exe} not found; run `zig build` in dataplane/ first")
-        proc = self.start("gateway", [exe], cwd=self.work, env={
+        env = {
             "OMNIGATE_LISTEN": f"127.0.0.1:{GATEWAY_PORT}",
             "OMNIGATE_CONTROL_URL": CONTROL,
             "OMNIGATE_POLL_MS": "300",
             "OMNIGATE_FLUSH_MS": "200",
-        })
+        }
+        env.update(extra_env or self.gateway_env)
+        proc = self.start("gateway", [exe], cwd=self.work, env=env)
         if not wait_port(GATEWAY_PORT, 15, proc):
             self.fail("gateway did not start", "gateway")
 
@@ -524,6 +533,11 @@ def text_checks(stack):
     main_calls += 1
     check("an upstream whose API is not under /v1 is reached at its own path (v1_path)",
           status == 200 and headers.get("x-omnigate-upstream") == "mock-compat", (status, body))
+    status, headers, body = chat("limited-then-dead")
+    main_calls += 1
+    check("a provider's 429 reaches the client as 429 with its retry-after, even when a later target was simply down",
+          status == 429 and headers.get("retry-after") == "7" and body.get("error", {}).get("code") == "upstream_rate_limited"
+          and body["error"].get("type") == "rate_limit_error", (status, headers.get("retry-after"), body))
     t0 = time.time()
     status, headers, _ = chat("slow")
     main_calls += 1
@@ -646,10 +660,11 @@ def text_checks(stack):
     row = wait_until(lambda: main_row_with(main_calls), 10)
     check(f"ledger has exactly the {main_calls} metered calls of the main key", bool(row), usage_row("main"))
     row = row or usage_row("main")
-    # Every call but two used at least 11 input tokens: the one the provider
-    # refused with a 400 and the one served from the response cache have none.
+    # Every call but three used at least 11 input tokens: the one the provider
+    # refused with a 400, the one it rate-limited, and the one served from the
+    # response cache have none.
     check("tokens and cost are recorded",
-          row.get("input_tokens", 0) >= 11 * (main_calls - 2) and row.get("cost_usd", 0) > 0 and row.get("errors", 0) >= 1, row)
+          row.get("input_tokens", 0) >= 11 * (main_calls - 3) and row.get("cost_usd", 0) > 0 and row.get("errors", 0) >= 1, row)
 
     codes = [chat("direct", key=KEY_BUDGET)[0] for _ in range(4)]
     blocked = wait_until(lambda: chat("direct", key=KEY_BUDGET)[0] == 402, 10, 0.3)
@@ -822,9 +837,27 @@ def media_checks(stack):
     status, _, other = jcall("GET", f"{GATEWAY}/v1/jobs/{job_id}", key=KEY_OTHER)
     check("another key cannot see the job (404)", status == 404, (status, other))
 
+    # One error shape for the jobs API, whichever process refuses: the
+    # control plane (no such job, bad model) or the data plane (bad method).
+    shapes = []
+    for method, path, body_ in (("GET", "/v1/jobs/job_does_not_exist", None), ("POST", "/v1/jobs", {"model": "no-such-model", "input": {}}),
+                                ("DELETE", f"/v1/jobs/{job_id}", None)):
+        status, headers, err = jcall(method, GATEWAY + path, key=KEY_MAIN, body=body_)
+        e = err.get("error", {})
+        shapes.append((status, sorted(e), e.get("code"), e.get("type"), len(headers.get("x-request-id", "")) == 32))
+    check("job errors have one shape whichever plane refuses: message, type, param, code, and a request id header",
+          shapes == [(404, ["code", "message", "param", "type"], "job_not_found", "invalid_request_error", True),
+                     (404, ["code", "message", "param", "type"], "model_not_found", "invalid_request_error", True),
+                     (405, ["code", "message", "param", "type"], "method_not_allowed", "invalid_request_error", True)], shapes)
+    status, headers, _ = call("GET", plain, key=KEY_MAIN)
+    check("a stored file is served as a download the browser must not sniff or run",
+          status == 200 and headers.get("content-disposition", "").startswith("attachment")
+          and headers.get("x-content-type-options") == "nosniff" and "sandbox" in headers.get("content-security-policy", ""),
+          {k: headers.get(k) for k in ("content-disposition", "x-content-type-options", "content-security-policy")})
+
     status, _, refused = create_job({"model": "image", "input": {"prompt": "x"}}, key=KEY_LIMITED)
     check("a key limited to other models cannot create this job (403)",
-          status == 403 and refused.get("error", {}).get("type") == "model_not_allowed", (status, refused))
+          status == 403 and refused.get("error", {}).get("code") == "model_not_allowed", (status, refused))
 
     _, _, models = jcall("GET", GATEWAY + "/v1/models", key=KEY_MAIN)
     ids = {m["id"] for m in models.get("data", [])}
@@ -988,7 +1021,7 @@ def media_checks(stack):
 # --------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="omnigate end-to-end test against mock providers")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", choices=["text", "media"], help="run one half only")
     ap.add_argument("--keep", action="store_true", help="keep the temp dir (logs, ledger, outputs)")
     args = ap.parse_args()

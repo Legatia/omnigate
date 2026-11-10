@@ -429,7 +429,14 @@ defmodule OmnigateControl.Ledger do
   # A segment goes only when BOTH snapshot generations cover it: then either
   # one alone still reproduces the totals it contributed.
   def handle_call({:prune_segments, cutoff_ms}, _from, state) do
-    state = if state.since_snapshot > 0, do: take_snapshot(state), else: state
+    # Two generations must cover a segment, and after a restart only one is
+    # vouched for: the snapshot this process booted from. On a busy system
+    # the next snapshot comes by itself; on a quiet one nothing is recorded,
+    # no snapshot is written, and due segments would never go. So write one
+    # now. It is built from the state the validated snapshot produced, and
+    # the validated one becomes the spare: two generations, both good.
+    quiet_restart = is_integer(state.covered) and is_nil(state.covered_prev)
+    state = if state.since_snapshot > 0 or quiet_restart, do: take_snapshot(state), else: state
 
     deleted =
       case {state.covered, state.covered_prev} do

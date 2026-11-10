@@ -4,7 +4,7 @@
 //! use, and so on never reaches an upstream, so it never becomes a usage
 //! event and the ledger cannot see it. These counters make such requests
 //! visible: they are kept per (key name, reason), where the reason is the
-//! error `type` the client was given, and handed to the control plane every
+//! error `code` the client was given, and handed to the control plane every
 //! flush interval as
 //!
 //!     POST /internal/counters

@@ -31,7 +31,7 @@ fn call(app: *App, method: http.Method, path: []const u8, payload: ?[]const u8, 
         .headers = .{
             .content_type = if (payload != null) .{ .override = "application/json" } else .default,
             .accept_encoding = .{ .override = "identity" },
-            .user_agent = .{ .override = "omnigate/0.1" },
+            .user_agent = .{ .override = @import("main.zig").user_agent },
         },
         .extra_headers = &extra,
     });

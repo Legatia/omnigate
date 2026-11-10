@@ -327,9 +327,9 @@ test "one canonical spelling per path" {
     for ([_][]const u8{ "/", "/healthz", "/v1/jobs", "/v1/jobs/job_abc123/cancel", "/v1/files/job_1/out-0.png", "/v1/models/gpt-4.1_mini:free@x~1" }) |p|
         try testing.expect(canonicalPath(p));
     for ([_][]const u8{
-        "",               "v1/jobs",       "/v1/jobs/",     "//v1/jobs",        "/v1//jobs",
-        "/v1/./jobs",     "/v1/../jobs",   "/v1/jobs/..",   "/v1/jobs/.",       "/%76%31/jobs",
-        "/v1/jobs%2f",    "/v1\\jobs",     "/v1/jobs;a=b",  "/v1/jobs?x",       "/v1/jo bs",
+        "",            "v1/jobs",     "/v1/jobs/",    "//v1/jobs",  "/v1//jobs",
+        "/v1/./jobs",  "/v1/../jobs", "/v1/jobs/..",  "/v1/jobs/.", "/%76%31/jobs",
+        "/v1/jobs%2f", "/v1\\jobs",   "/v1/jobs;a=b", "/v1/jobs?x", "/v1/jo bs",
     }) |p| try testing.expect(!canonicalPath(p));
 }
 

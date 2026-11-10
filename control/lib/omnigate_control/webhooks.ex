@@ -160,7 +160,7 @@ defmodule OmnigateControl.Webhooks do
         {"webhook-id", msg_id},
         {"webhook-timestamp", Integer.to_string(timestamp)},
         {"webhook-signature", signature(secret, msg_id, timestamp, body)},
-        {"user-agent", "omnigate-webhooks/0.1"}
+        {"user-agent", "omnigate-webhooks/" <> OmnigateControl.version()}
       ]
 
       # Redirects are not followed: a 3xx is a failed delivery. (Following one

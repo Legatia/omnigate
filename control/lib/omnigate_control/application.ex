@@ -12,6 +12,8 @@ defmodule OmnigateControl.Application do
   @impl true
   def start(_type, _args) do
     with :ok <- check_internal_token(),
+         :ok <- OmnigateControl.Env.check_all(),
+         {:ok, _ip} <- bind_address(),
          {:ok, config} <- config_path(),
          :ok <- OmnigateControl.AdminAuth.setup() do
       start_children(config)
@@ -37,7 +39,7 @@ defmodule OmnigateControl.Application do
   defp start_children(config) do
     OmnigateControl.Rejections.setup()
     OmnigateControl.RateLimit.setup()
-    ip = bind_address()
+    {:ok, ip} = bind_address()
 
     children = [
       {OmnigateControl.ConfigStore, path: config},
@@ -110,17 +112,16 @@ defmodule OmnigateControl.Application do
           Logger.warning("control plane listening on #{text}: reachable from the network over plain HTTP; terminate TLS in front of it")
         end
 
-        ip
+        {:ok, ip}
 
       {:error, _} ->
-        raise ArgumentError, "OMNIGATE_CONTROL_BIND is not an IP address: #{inspect(text)}"
+        {:error, "OMNIGATE_CONTROL_BIND is not an IP address: #{inspect(text)}"}
     end
   end
 
+  # Validated by `Env.check_all/0` before anything starts.
   defp port do
-    case System.get_env("OMNIGATE_CONTROL_PORT") do
-      nil -> Application.get_env(:omnigate_control, :port, 4000)
-      v -> String.to_integer(v)
-    end
+    {:ok, port} = OmnigateControl.Env.integer("OMNIGATE_CONTROL_PORT", Application.get_env(:omnigate_control, :port, 4000), 1..65_535)
+    port
   end
 end

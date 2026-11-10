@@ -26,6 +26,7 @@ Run:  python tools/mock_upstream.py
 
 import base64
 import json
+import sys
 import os
 import struct
 import threading
@@ -370,6 +371,9 @@ def serve(port, handler):
 
 
 if __name__ == "__main__":
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        raise SystemExit(0)
     # MOCK_PORT_OFFSET shifts every port, so two copies can run side by side.
     offset = int(os.environ.get("MOCK_PORT_OFFSET", "0"))
     for port, handler in [(9001 + offset, Flaky), (9002 + offset, OpenAIOk), (9003 + offset, AnthropicOk), (9004 + offset, Slow), (9005 + offset, Stall)]:

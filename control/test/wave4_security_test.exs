@@ -228,7 +228,7 @@ defmodule OmnigateControl.Wave4SecurityTest do
         conn(:post, "/login", big) |> put_req_header("content-type", "application/x-www-form-urlencoded") |> put_req_header("content-length", "10009") |> call()
 
       assert conn.status == 413
-      assert %{"error" => %{"type" => "payload_too_large"}} = json(conn)
+      assert %{"error" => %{"code" => "payload_too_large"}} = json(conn)
 
       # A normal login form still goes through to the password check.
       ok =
@@ -252,7 +252,7 @@ defmodule OmnigateControl.Wave4SecurityTest do
 
       refused = post_job(key.key_sha256, body, "/internal/v1/jobs/")
       assert refused.status == 429
-      assert %{"error" => %{"type" => "rate_limit_exceeded"}} = json(refused)
+      assert %{"error" => %{"code" => "rate_limit_exceeded"}} = json(refused)
       assert [retry] = get_resp_header(refused, "retry-after")
       assert String.to_integer(retry) in 1..60
       assert post_job(key.key_sha256, body).status == 429
@@ -283,7 +283,7 @@ defmodule OmnigateControl.Wave4SecurityTest do
 
       third = post_job(key.key_sha256, body)
       assert third.status == 429
-      assert %{"error" => %{"type" => "too_many_open_jobs"}} = json(third)
+      assert %{"error" => %{"code" => "too_many_open_jobs"}} = json(third)
       assert get_resp_header(third, "retry-after") != []
       assert Provider.count(:submit) <= 2
 

@@ -11,7 +11,7 @@ const std = @import("std");
 const Io = std.Io;
 
 /// Messages above this level are dropped (`std.log.Level`: err < warn < info < debug).
-var max_level: std.atomic.Value(u8) = .init(@intFromEnum(std.log.Level.info));
+var max_level: std.atomic.Value(u8) = .init(@backingInt(std.log.Level.info));
 var json: bool = false;
 /// For timestamps; set once at startup, before any other task runs.
 var clock_io: ?Io = null;
@@ -20,7 +20,7 @@ pub const ConfigError = error{ InvalidLogLevel, InvalidLogFormat };
 
 pub fn configure(io: Io, level_text: ?[]const u8, format_text: ?[]const u8) ConfigError!void {
     clock_io = io;
-    if (level_text) |t| max_level.store(@intFromEnum(try parseLevel(t)), .release);
+    if (level_text) |t| max_level.store(@backingInt(try parseLevel(t)), .release);
     if (format_text) |t| {
         if (std.mem.eql(u8, t, "json")) {
             json = true;
@@ -40,7 +40,7 @@ pub fn parseLevel(text: []const u8) ConfigError!std.log.Level {
 }
 
 pub fn enabled(level: std.log.Level) bool {
-    return @intFromEnum(level) <= max_level.load(.acquire);
+    return @backingInt(level) <= max_level.load(.acquire);
 }
 
 /// Installed as `std_options.logFn`.

@@ -24,8 +24,10 @@ defmodule OmnigateControl.Audit do
 
   Never a key, a token, a password or a webhook secret.
 
-  The file only grows; rotate or archive it with your usual log tooling
-  (the control plane reopens nothing, so restart it after moving the file).
+  The file is rotated by size: at `OMNIGATE_AUDIT_MAX_MB` (default 50, 0 =
+  never) it becomes `audit.jsonl.1`, the previous `.1` becomes `.2`, and so
+  on up to `.3`; the oldest is dropped. It is opened afresh for every entry,
+  so it can also be moved or archived from outside without a restart.
   The newest entries are also kept in memory for `GET /admin/audit` and the
   dashboard.
   """
@@ -79,9 +81,12 @@ defmodule OmnigateControl.Audit do
         n
 
       _ ->
-        case Float.parse(System.get_env("OMNIGATE_AUDIT_MAX_MB") || "50") do
-          {mb, _} when mb >= 0 -> round(mb * 1_048_576)
-          _ -> 50 * 1_048_576
+        # Checked at startup (`OmnigateControl.Env.check_all/0`), so a bad
+        # value never gets this far; the fallback is for tests that start
+        # this process on its own.
+        case OmnigateControl.Env.number("OMNIGATE_AUDIT_MAX_MB", 50) do
+          {:ok, mb} -> round(mb * 1_048_576)
+          {:error, _} -> 50 * 1_048_576
         end
     end
   end

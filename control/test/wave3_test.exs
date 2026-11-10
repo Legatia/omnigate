@@ -25,7 +25,7 @@ defmodule OmnigateControl.Wave3Test do
         conn = conn(:post, path, ~s({"model": "x", )) |> as_json()
         conn = Enum.reduce(creds.(path), conn, fn {k, v}, c -> put_req_header(c, k, v) end) |> call()
         assert conn.status == 400, path
-        assert %{"error" => %{"type" => "invalid_json", "message" => message}} = json(conn)
+        assert %{"error" => %{"code" => "invalid_json", "message" => message}} = json(conn)
         assert is_binary(message)
         assert get_resp_header(conn, "content-type") |> hd() =~ "application/json"
       end
@@ -39,7 +39,7 @@ defmodule OmnigateControl.Wave3Test do
       # Without credentials the body is never parsed at all.
       anonymous = conn(:post, "/internal/usage/batch", big) |> as_json() |> call()
       assert anonymous.status == 401
-      assert %{"error" => %{"type" => "payload_too_large"}} = json(conn)
+      assert %{"error" => %{"code" => "payload_too_large"}} = json(conn)
     end
 
     test "an unexpected failure is a 500 that names a request id and nothing else" do
@@ -47,10 +47,12 @@ defmodule OmnigateControl.Wave3Test do
         capture_log(fn ->
           conn = conn(:get, "/__test/raise") |> call()
           assert conn.status == 500
-          assert %{"error" => %{"type" => "internal_error", "message" => message, "request_id" => id}} = json(conn)
+          assert %{"error" => %{"code" => "internal_error", "message" => message, "request_id" => id}} = json(conn)
           refute message =~ "secret detail"
           refute conn.resp_body =~ "secret detail"
-          assert id =~ ~r/^[0-9a-f]{16}$/
+          assert id =~ ~r/^[0-9a-f]{32}$/
+          # The same id is in the response header.
+          assert get_resp_header(conn, "x-request-id") == [id]
           send(self(), {:id, id})
         end)
 
@@ -63,11 +65,11 @@ defmodule OmnigateControl.Wave3Test do
     test "unknown paths and a missing internal token use the error object too" do
       conn = conn(:get, "/no/such/thing") |> call()
       assert conn.status == 404
-      assert %{"error" => %{"type" => "not_found"}} = json(conn)
+      assert %{"error" => %{"code" => "not_found"}} = json(conn)
 
       conn = conn(:get, "/internal/config") |> call()
       assert conn.status == 401
-      assert %{"error" => %{"type" => "unauthorized"}} = json(conn)
+      assert %{"error" => %{"code" => "unauthorized"}} = json(conn)
     end
   end
 

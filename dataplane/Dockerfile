@@ -33,7 +33,7 @@ COPY src ./src
 
 # Unit tests run as part of the image build, then a static (musl) release build.
 RUN /opt/zig/zig build test --summary all \
- && /opt/zig/zig build -Doptimize=ReleaseSafe -Dtarget="$(uname -m)-linux-musl" --prefix /out
+ && /opt/zig/zig build -Doptimize=ReleaseSafe -Dstrip=true -Dtarget="$(uname -m)-linux-musl" --prefix /out
 
 # The spool and config cache live in /data; make it writable by the runtime user.
 RUN mkdir /data && chown 10001:10001 /data

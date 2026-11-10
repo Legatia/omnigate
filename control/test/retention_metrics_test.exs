@@ -127,7 +127,7 @@ defmodule OmnigateControl.RetentionMetricsTest do
     before = length(Store.all())
     conn = post.("limited", "no-such-media-model")
     assert conn.status == 403
-    assert %{"error" => %{"type" => "model_not_allowed", "message" => message}} = JSON.decode!(conn.resp_body)
+    assert %{"error" => %{"code" => "model_not_allowed", "message" => message}} = JSON.decode!(conn.resp_body)
     assert message =~ "no-such-media-model"
     assert length(Store.all()) == before
 

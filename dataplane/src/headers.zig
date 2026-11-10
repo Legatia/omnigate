@@ -40,17 +40,67 @@ pub fn passes(name: []const u8) bool {
     return false;
 }
 
+/// From the control plane (job and file responses) these reach the client:
+/// how a stored file must be treated by a browser, where it lives when it is
+/// in a bucket (`location` on a 302), and when to retry. The request ids are
+/// not in the list: the gateway sets its own, which the control plane echoes.
+const control_exact = [_][]const u8{
+    "content-disposition",
+    "x-content-type-options",
+    "content-security-policy",
+    "cache-control",
+    "retry-after",
+    "location",
+};
+
+/// A presigned bucket URL in `location` is long.
+pub const max_control_value_len = 4096;
+
+pub fn passesFromControl(name: []const u8) bool {
+    for (control_exact) |e| if (std.ascii.eqlIgnoreCase(name, e)) return true;
+    return false;
+}
+
 /// The headers of `head_bytes` (a raw response head) that may be relayed,
 /// copied into `arena` because the head is invalidated once the body is read.
 pub fn collect(arena: std.mem.Allocator, head_bytes: []const u8) ![]const http.Header {
+    return collectWith(arena, head_bytes, passes, max_value_len);
+}
+
+/// The same for a response head from the control plane.
+pub fn collectFromControl(arena: std.mem.Allocator, head_bytes: []const u8) ![]const http.Header {
+    return collectWith(arena, head_bytes, passesFromControl, max_control_value_len);
+}
+
+/// The ids to put in `x-request-id` and `request-id`. A provider's own id is
+/// preferred (a support ticket can quote it); when it sent only one of the
+/// two headers that id goes in both, so the two never disagree; without
+/// either, both carry the gateway's id.
+pub fn requestIds(relayed: []const http.Header, own: []const u8) struct { x_request_id: []const u8, request_id: []const u8 } {
+    const x = find(relayed, "x-request-id");
+    const r = find(relayed, "request-id");
+    return .{ .x_request_id = x orelse r orelse own, .request_id = r orelse x orelse own };
+}
+
+/// Of two `retry-after` values, the one that waits longer. Values that are
+/// not a plain number of seconds (an HTTP date) lose to ones that are.
+pub fn longerRetryAfter(a: ?[]const u8, b: ?[]const u8) ?[]const u8 {
+    const av = a orelse return b;
+    const bv = b orelse return a;
+    const an = std.fmt.parseInt(u64, std.mem.trim(u8, av, " "), 10) catch return bv;
+    const bn = std.fmt.parseInt(u64, std.mem.trim(u8, bv, " "), 10) catch return av;
+    return if (bn > an) bv else av;
+}
+
+fn collectWith(arena: std.mem.Allocator, head_bytes: []const u8, comptime pass: fn ([]const u8) bool, comptime max_len: usize) ![]const http.Header {
     var out: std.ArrayList(http.Header) = .empty;
     // Not `std.http.HeaderIterator`: it unwraps a null on a line without a
     // colon, and this head comes from the network.
     var it = guard.HeaderIterator.init(head_bytes);
     while (it.next()) |h| {
         if (out.items.len >= max_headers) break;
-        if (!passes(h.name)) continue;
-        if (h.value.len == 0 or h.value.len > max_value_len) continue;
+        if (!pass(h.name)) continue;
+        if (h.value.len == 0 or h.value.len > max_len) continue;
         // Nothing with a control byte in it (a bare CR or LF above all) is relayed.
         if (hasControl(h.value) or hasControl(h.name)) continue;
         try out.append(arena, .{ .name = try arena.dupe(u8, h.name), .value = try arena.dupe(u8, h.value) });
@@ -150,4 +200,65 @@ test "a malformed upstream head is skipped over, not trusted" {
     for ([_][]const u8{ "", "X", "HTTP/1.1 200 OK\r\nX\r\n", "\r\n\r\n", "HTTP/1.1 200 OK\r\n:\r\n: \r\n" }) |head| {
         try testing.expectEqual(@as(usize, 0), (try collect(arena, head)).len);
     }
+}
+
+test "control-plane headers: file handling, redirects and retry hints pass; nothing else" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const filler: [900]u8 = @splat('a');
+    const long_url = try std.fmt.allocPrint(arena, "https://bucket.example/{s}?X-Amz-Signature=abc", .{&filler});
+    const head = try std.fmt.allocPrint(arena, "HTTP/1.1 302 Found\r\n" ++
+        "content-type: application/json\r\n" ++
+        "Location: {s}\r\n" ++
+        "Content-Disposition: attachment; filename=\"out-0.png\"\r\n" ++
+        "x-content-type-options: nosniff\r\n" ++
+        "content-security-policy: sandbox; default-src 'none'\r\n" ++
+        "cache-control: private, max-age=0\r\n" ++
+        "retry-after: 10\r\n" ++
+        "set-cookie: omnigate_session=secret\r\n" ++
+        "x-request-id: from-the-control-plane\r\n" ++
+        "server: Bandit\r\n" ++
+        "content-length: 0\r\n\r\n", .{long_url});
+    const kept = try collectFromControl(arena, head);
+    try testing.expectEqual(@as(usize, 6), kept.len);
+    try testing.expectEqualStrings(long_url, find(kept, "location").?);
+    try testing.expectEqualStrings("nosniff", find(kept, "X-Content-Type-Options").?);
+    try testing.expect(find(kept, "set-cookie") == null);
+    try testing.expect(find(kept, "x-request-id") == null);
+    try testing.expect(find(kept, "server") == null);
+    // The provider allowlist is a different list.
+    try testing.expect(!passes("location") and !passes("content-disposition"));
+    try testing.expect(!passesFromControl("x-ratelimit-remaining-requests"));
+}
+
+test "request ids: the provider's, one for both when it sent only one, else ours" {
+    const both = [_]http.Header{ .{ .name = "x-request-id", .value = "x1" }, .{ .name = "Request-Id", .value = "r1" } };
+    const only_x = [_]http.Header{.{ .name = "X-Request-Id", .value = "x1" }};
+    const only_r = [_]http.Header{.{ .name = "request-id", .value = "r1" }};
+
+    var ids = requestIds(&both, "own");
+    try testing.expectEqualStrings("x1", ids.x_request_id);
+    try testing.expectEqualStrings("r1", ids.request_id);
+    ids = requestIds(&only_x, "own");
+    try testing.expectEqualStrings("x1", ids.x_request_id);
+    try testing.expectEqualStrings("x1", ids.request_id);
+    ids = requestIds(&only_r, "own");
+    try testing.expectEqualStrings("r1", ids.x_request_id);
+    try testing.expectEqualStrings("r1", ids.request_id);
+    ids = requestIds(&.{}, "own");
+    try testing.expectEqualStrings("own", ids.x_request_id);
+    try testing.expectEqualStrings("own", ids.request_id);
+}
+
+test "the longer of two retry-after values" {
+    try testing.expectEqualStrings("30", longerRetryAfter("7", "30").?);
+    try testing.expectEqualStrings("30", longerRetryAfter("30", "7").?);
+    try testing.expectEqualStrings("7", longerRetryAfter(null, "7").?);
+    try testing.expectEqualStrings("7", longerRetryAfter("7", null).?);
+    try testing.expect(longerRetryAfter(null, null) == null);
+    // A date cannot be compared; the number wins either way round.
+    try testing.expectEqualStrings("5", longerRetryAfter("Wed, 21 Oct 2026 07:28:00 GMT", "5").?);
+    try testing.expectEqualStrings("5", longerRetryAfter("5", "Wed, 21 Oct 2026 07:28:00 GMT").?);
 }

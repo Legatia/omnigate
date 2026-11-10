@@ -1,6 +1,14 @@
 """Hostile-input test for the gateway: malformed, ambiguous and oversized requests.
 
+    python tools/malformed_test.py                 # starts its own stack (mocks, control plane, gateway)
+    python tools/malformed_test.py --thorough      # the same with many more generated cases
     python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key --model demo-direct
+
+Without --gateway it needs only a built data plane (`zig build` in
+dataplane/) and `mix`: it starts the mock providers, the control plane and
+the gateway through the end-to-end harness (tools/e2e.py), on that harness's
+ports and with state in a temp dir, and stops them at the end. With --gateway
+it tests an instance you started yourself.
 
 Sends, over raw sockets, every request from the security review that used to
 crash the data plane or slip past a check, a few hundred generated variations
@@ -13,23 +21,29 @@ under test; where a case has one right answer (400, 411, ...) that is checked
 too. Exit code 0 only if the gateway survived everything and every expected
 status matched.
 
-Optional, with a stand-in control plane that lists the usage events it got
-(--events-url): checks that a client which reads the start of a stream and
-hangs up is still billed.
+It also checks that a client which reads the start of a stream and hangs up
+is still billed: always when it started the stack itself (it then reads the
+ledger through the control plane's admin API), and against your own instance
+when --events-url names a URL that lists the usage events received.
 
 Standard library only. Point it at a test instance, never at production.
 """
 
 import argparse
 import json
+import os
 import random
+import shutil
 import socket
 import sys
+import tempfile
 import time
 import urllib.request
 
 results = []
 ARGS = None
+# Set when this script started the stack itself: how to read the ledger.
+OVERVIEW = None
 
 
 def host_port():
@@ -312,8 +326,45 @@ def generated(rng, count):
 
 
 def events():
+    """Recent usage events as dicts with id, input_tokens, output_tokens, estimated."""
+    if OVERVIEW:
+        url, token = OVERVIEW
+        req = urllib.request.Request(url, headers={"authorization": "Bearer " + token})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.load(r).get("requests", [])
     with urllib.request.urlopen(ARGS.events_url, timeout=5) as r:
         return json.load(r)
+
+
+def start_own_stack():
+    """Mocks, control plane and gateway through the end-to-end harness. Returns the stack to stop."""
+    global OVERVIEW
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import e2e
+
+    config = e2e.text_config()
+    price = {"price_in_per_mtok": 100.0, "price_out_per_mtok": 300.0}
+    # The mock on :9005 starts a stream and then either goes on for ever
+    # without reporting usage (model names starting with "drip") or goes silent.
+    config["upstreams"].append({"name": "mock-stall", "kind": "openai", "base_url": "http://127.0.0.1:9005", "api_key_env": "MOCK_API_KEY"})
+    config["routes"].append({"model": "drip", "targets": [dict(upstream="mock-stall", model="drip-1", **price)]})
+    config["routes"].append({"model": "stall", "targets": [dict(upstream="mock-stall", model="stall-1", **price)]})
+
+    work = tempfile.mkdtemp(prefix="omnigate-malformed-")
+    stack = e2e.Stack(work, config, False)
+    # Short enough that the two "estimated" cases finish within the default wait.
+    stack.gateway_env = {"OMNIGATE_STREAM_IDLE_TIMEOUT_MS": "4000", "OMNIGATE_ABORT_DRAIN_MS": "1500"}
+    stack.start_mocks()
+    stack.start_control()
+    stack.start_gateway()
+    if not e2e.wait_until(lambda: e2e.call("GET", e2e.GATEWAY + "/v1/models", key=e2e.KEY_MAIN)[0] == 200, 15):
+        stack.fail("gateway never received its config from the control plane", "gateway")
+
+    ARGS.gateway = f"127.0.0.1:{e2e.GATEWAY_PORT}"
+    ARGS.key, ARGS.model, ARGS.rpm_key = e2e.KEY_MAIN, "direct", e2e.KEY_RPM
+    ARGS.drip_model, ARGS.stall_model = "drip", "stall"
+    OVERVIEW = (e2e.CONTROL + "/admin/overview", e2e.ADMIN_TOKEN)
+    return stack, work
 
 
 def billing_on_disconnect():
@@ -372,13 +423,14 @@ def billing_on_disconnect():
 
 def main():
     global ARGS
-    ap = argparse.ArgumentParser(description="Hostile-input test for the omnigate data plane.")
-    ap.add_argument("--gateway", default="127.0.0.1:8080", help="host:port of the data plane")
-    ap.add_argument("--key", required=True, help="a valid gateway key")
-    ap.add_argument("--model", required=True, help="a text route that key may use")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--gateway", help="host:port of a data plane you started; without it the script starts its own stack")
+    ap.add_argument("--key", help="a valid gateway key (with --gateway)")
+    ap.add_argument("--model", help="a text route that key may use (with --gateway)")
     ap.add_argument("--rpm-key", help="a rate-limited key, to check the trailing-slash bypass")
     ap.add_argument("--seed", type=int, default=20261110)
-    ap.add_argument("--count", type=int, default=400, help="generated cases")
+    ap.add_argument("--count", type=int, default=None, help="generated cases (default 250, or 1500 with --thorough)")
+    ap.add_argument("--thorough", action="store_true", help="many more generated cases; takes several minutes")
     ap.add_argument("--events-url", help="URL listing the usage events a stand-in control plane received")
     ap.add_argument("--drip-model", help="a route whose upstream streams on and on without ever reporting usage "
                                          "(the gateway reads on for OMNIGATE_ABORT_DRAIN_MS, then estimates)")
@@ -387,7 +439,33 @@ def main():
     ap.add_argument("--drain-wait", type=float, default=15, help="seconds to wait for the estimated event")
     ap.add_argument("--verbose", action="store_true")
     ARGS = ap.parse_args()
+    if ARGS.count is None:
+        ARGS.count = 1500 if ARGS.thorough else 250
 
+    stack = work = None
+    if ARGS.gateway is None:
+        stack, work = start_own_stack()
+    elif not (ARGS.key and ARGS.model):
+        ap.error("--gateway needs --key and --model")
+    try:
+        good = run()
+    finally:
+        if stack:
+            stack.stop_all()
+            if good_enough_to_clean(stack):
+                shutil.rmtree(work, ignore_errors=True)
+    sys.exit(0 if good else 1)
+
+
+def good_enough_to_clean(stack):
+    """Keep the logs when something failed, so the gateway's last words can be read."""
+    failed = [name for name, ok in results if not ok]
+    if failed:
+        print(f"logs kept in {stack.work}")
+    return not failed
+
+
+def run():
     if not alive():
         raise SystemExit(f"nothing answers /healthz at {ARGS.gateway}")
     raw, _ = exchange(post("/v1/chat/completions", chat_body()), read_timeout=5, keep_reading=8)
@@ -399,7 +477,7 @@ def main():
     smuggling()
     paths()
     generated(random.Random(ARGS.seed), ARGS.count)
-    if ARGS.events_url:
+    if ARGS.events_url or OVERVIEW:
         billing_on_disconnect()
 
     raw, _ = exchange(post("/v1/chat/completions", chat_body()), read_timeout=5, keep_reading=8)
@@ -408,7 +486,7 @@ def main():
     print(f"\n  {'PASS' if ok else 'FAIL'}  after all of that, a normal request still works", flush=True)
     good = summary()
     print(f"({time.time() - started:.0f}s)")
-    sys.exit(0 if good else 1)
+    return good
 
 
 if __name__ == "__main__":

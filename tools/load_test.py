@@ -488,7 +488,7 @@ def pct(values, p):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Load and soak test for the omnigate data plane.")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gateway", default="http://127.0.0.1:8080")
     ap.add_argument("--key", default="og-unlimited-key")
     ap.add_argument("--limited-key", default=None, help="a key with a requests-per-minute limit")

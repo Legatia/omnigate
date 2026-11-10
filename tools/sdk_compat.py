@@ -780,7 +780,7 @@ def fidelity_cases(openai, anthropic):
 # --------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="omnigate through the official OpenAI and Anthropic Python SDKs")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--keep", action="store_true", help="keep the temp dir (logs, ledger)")
     args = ap.parse_args()
     openai, anthropic = load_sdks()

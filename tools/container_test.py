@@ -391,10 +391,12 @@ def checks():
     s, h, data = req("GET", API_HOST, url.split(f":{PORT}", 1)[-1] if url else "/none")
     check("signed URL downloads the re-hosted file over TLS",
           s == 200 and hashlib.sha256(data).hexdigest() == out.get("sha256"), (s, len(data)))
+    # The file name shows the header comes from the gateway itself (it relays
+    # what the control plane set), not from a default added by the proxy.
     check("the stored file is served as a download in a sandbox, never as a page on this origin",
-          "attachment" in h.get("content-disposition", "") and h.get("x-content-type-options") == "nosniff"
+          h.get("content-disposition", "").startswith("attachment; filename=") and h.get("x-content-type-options") == "nosniff"
           and "sandbox" in h.get("content-security-policy", ""), h)
-    hook =wait_until(lambda: (lambda w: w if w.get("status") == "delivered" else None)(
+    hook = wait_until(lambda: (lambda w: w if w.get("status") == "delivered" else None)(
         jreq("GET", API_HOST, f"/v1/jobs/{jid}", key=KEY)[2].get("webhook", {})), 20) or {}
     check("webhook is retried and delivered", hook.get("status") == "delivered" and hook.get("attempts") == 2, hook)
 
@@ -526,7 +528,7 @@ def hardening():
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--compose", action="store_true", help="start the stack with compose.yaml (needs the Compose plugin)")

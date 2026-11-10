@@ -10,7 +10,7 @@ defmodule OmnigateControl.Rejections do
       {"counters": [{"key": "my-app", "reason": "rate_limit_exceeded", "count": 12}, ...]}
 
   `key` is the gateway key's name, or `"-"` when the request had no usable
-  key. `reason` is the `error.type` the client was given.
+  key. `reason` is the `error.code` the client was given.
 
   Counts live in memory only and restart from zero with the control plane,
   like any Prometheus counter. The number of distinct (key, reason) pairs is

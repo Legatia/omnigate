@@ -69,7 +69,7 @@ def run(name, url, headers, body, total, concurrency):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gateway", default="http://127.0.0.1:8080")
     ap.add_argument("--upstream", default="http://127.0.0.1:9002")
     ap.add_argument("--key", default="og-unlimited-key")

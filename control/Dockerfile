@@ -48,7 +48,12 @@ ENV OMNIGATE_CONTROL_BIND=0.0.0.0 \
     LANG=C.UTF-8
 EXPOSE 4000
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+# The port opens only after the ledger has been read. That is under a second
+# from a snapshot, but a first start on a large ledger written by an older
+# version replays all of it (about 11 s per million events measured), so the
+# start period is generous: failures inside it do not count against the
+# container, and a healthy answer ends it early.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
   CMD wget -q -O /dev/null http://127.0.0.1:4000/readyz || exit 1
 
 CMD ["/app/bin/omnigate_control", "start"]

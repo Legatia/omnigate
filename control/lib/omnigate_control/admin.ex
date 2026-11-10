@@ -71,7 +71,9 @@ defmodule OmnigateControl.Admin do
       generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
       totals: Ledger.grand_totals(),
       today: Ledger.day_totals(),
-      keys: Enum.map(config.keys, &key_view/1),
+      # Including managed keys shadowed by a file key of the same name: an
+      # operator must be able to see why such a key stopped working.
+      keys: keys(),
       requests: Ledger.recent() |> Enum.reject(&(&1["kind"] == "media")) |> Enum.take(25) |> Enum.map(&request_view(&1, names)),
       jobs: Enum.map(Jobs.Store.recent(25), &job_view(&1, names)),
       rejected: Enum.take(Rejections.all(), 50),
@@ -85,6 +87,8 @@ defmodule OmnigateControl.Admin do
 
   defp request_view(e, names) do
     %{
+      # The request id the client was given (`x-omnigate-request-id`).
+      id: e["id"],
       ts: e["ts"],
       key: Map.get(names, e["key_sha256"]),
       model: e["route_model"],
@@ -98,6 +102,9 @@ defmodule OmnigateControl.Admin do
       output_tokens: e["output_tokens"] || 0,
       # Answered from the data plane's response cache, at no cost.
       cached: e["cached"] == true,
+      # The client left mid-stream and the provider's final usage never
+      # came: the token counts are the data plane's estimate.
+      estimated: e["estimated"] == true,
       latency_ms: e["latency_ms"],
       cost_usd: e["cost_usd"] || 0.0,
       attempts: attempts(e["attempts"])

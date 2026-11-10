@@ -363,6 +363,33 @@ defmodule OmnigateControl.LedgerSnapshotTest do
     stop(pid)
   end
 
+  test "a restart on a quiet system can still delete due segments", %{dir: dir, path: path} do
+    future = System.os_time(:millisecond) + 86_400_000
+    pid = boot(path)
+    record(pid, 1..4)
+    {:ok, 2} = Ledger.rotate(pid)
+    record(pid, 5..8)
+    {:ok, 3} = Ledger.rotate(pid)
+    assert [{1, _}, {2, _}] = Files.sealed(path)
+    stop(pid)
+
+    # Nothing is recorded after this boot: no event, so no snapshot by itself.
+    pid = boot(path)
+    assert Ledger.prune_segments(future, pid) == 1
+    assert [{2, _}] = Files.sealed(path)
+    expected = reference(dir, [{1..4, "k1"}, {5..8, "k1"}])
+    assert_same(pid, expected)
+    stop(pid)
+
+    # And the totals survive another restart, and a crash right after it.
+    pid = boot(path)
+    assert_same(pid, expected)
+    kill(pid)
+    pid = boot(path)
+    assert_same(pid, expected)
+    stop(pid)
+  end
+
   test "a crash part-way through deleting segments changes nothing", %{dir: dir, path: path} do
     expected = reference(dir, [{1..6, "k1"}, {7..12, "k1"}, {13..18, "k1"}, {19..24, "k1"}])
 

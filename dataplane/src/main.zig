@@ -58,6 +58,11 @@ const watchdog = @import("watchdog.zig");
 
 const log = std.log.scoped(.main);
 
+/// From `build.zig.zon`, by way of `build.zig`.
+pub const version = @import("build_options").version;
+/// What the gateway calls itself to upstreams and to the control plane.
+pub const user_agent = "omnigate/" ++ version;
+
 /// Exit status after a panic, so a supervisor can tell it from a clean stop
 /// (0) and from a startup error (1). 70 is sysexits' EX_SOFTWARE.
 pub const panic_exit_code = 70;
@@ -202,12 +207,35 @@ fn refuse(io: Io, stream: Io.net.Stream) void {
     stream.shutdown(io, .send) catch {};
 }
 
+/// A numeric setting, read strictly: unset or empty means `default`; anything
+/// that is not a whole number of type `T` (trailing junk, a sign that does
+/// not fit, out of range) stops the gateway at startup with a message that
+/// names the variable. A typo must not quietly become a default.
 fn envInt(env: *const std.process.Environ.Map, comptime T: type, name: []const u8, default: T) !T {
-    const text = env.get(name) orelse return default;
-    return std.fmt.parseInt(T, text, 10) catch {
-        log.err("{s} is not a valid number: {s}", .{ name, text });
+    const raw = env.get(name) orelse return default;
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    if (text.len == 0) return default;
+    return parseSetting(T, text) orelse {
+        log.err("{s} is not a valid number: \"{s}\" (expected a whole number from {d} to {d})", .{ name, raw, std.math.minInt(T), std.math.maxInt(T) });
         return error.InvalidEnvironment;
     };
+}
+
+/// Digits only: `std.fmt.parseInt` would also take `1_000` and `+5`.
+fn parseSetting(comptime T: type, text: []const u8) ?T {
+    if (text.len == 0) return null;
+    for (text) |c| if (c < '0' or c > '9') return null;
+    return std.fmt.parseInt(T, text, 10) catch null;
+}
+
+test "numeric settings are parsed strictly" {
+    try std.testing.expectEqual(@as(?u32, 2000), parseSetting(u32, "2000"));
+    try std.testing.expectEqual(@as(?u32, 0), parseSetting(u32, "0"));
+    try std.testing.expectEqual(@as(?u16, 65535), parseSetting(u16, "65535"));
+    for ([_][]const u8{ "", "5x", "x5", "-1", "+5", "1_000", "1.5", " 5", "5 ", "0x10", "99999999999" }) |bad| {
+        try std.testing.expectEqual(@as(?u32, null), parseSetting(u32, bad));
+    }
+    try std.testing.expectEqual(@as(?u16, null), parseSetting(u16, "65536"));
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -234,9 +262,9 @@ pub fn main(init: std.process.Init) !void {
         log.err("OMNIGATE_INTERNAL_TOKEN is not set", .{});
         return error.MissingInternalToken;
     }
-    const poll_ms: i64 = if (env.get("OMNIGATE_POLL_MS")) |s| try std.fmt.parseInt(i64, s, 10) else 2000;
-    const flush_ms: i64 = if (env.get("OMNIGATE_FLUSH_MS")) |s| try std.fmt.parseInt(i64, s, 10) else 500;
-    const upstream_timeout_ms: u32 = if (env.get("OMNIGATE_UPSTREAM_TIMEOUT_MS")) |s| try std.fmt.parseInt(u32, s, 10) else 600_000;
+    const poll_ms: i64 = try envInt(env, u31, "OMNIGATE_POLL_MS", 2000);
+    const flush_ms: i64 = try envInt(env, u31, "OMNIGATE_FLUSH_MS", 500);
+    const upstream_timeout_ms = try envInt(env, u32, "OMNIGATE_UPSTREAM_TIMEOUT_MS", 600_000);
     const client_timeout_ms = try envInt(env, u32, "OMNIGATE_CLIENT_TIMEOUT_MS", 30_000);
     const stream_idle_timeout_ms = try envInt(env, u32, "OMNIGATE_STREAM_IDLE_TIMEOUT_MS", 300_000);
     const abort_drain_ms = try envInt(env, u32, "OMNIGATE_ABORT_DRAIN_MS", 5_000);
@@ -249,8 +277,14 @@ pub fn main(init: std.process.Init) !void {
     const cache_env = env.get("OMNIGATE_CONFIG_CACHE") orelse "omnigate-config.cache.json";
     const config_cache_path: ?[]const u8 = if (std.mem.eql(u8, cache_env, "off")) null else cache_env;
 
-    const colon = std.mem.findScalarLast(u8, listen, ':') orelse return error.InvalidListenAddress;
-    const port = try std.fmt.parseInt(u16, listen[colon + 1 ..], 10);
+    const colon = std.mem.findScalarLast(u8, listen, ':') orelse {
+        log.err("OMNIGATE_LISTEN must be host:port, got \"{s}\"", .{listen});
+        return error.InvalidListenAddress;
+    };
+    const port = parseSetting(u16, listen[colon + 1 ..]) orelse {
+        log.err("OMNIGATE_LISTEN has no valid port: \"{s}\"", .{listen});
+        return error.InvalidListenAddress;
+    };
     const host = listen[0..colon];
     const address = try Io.net.IpAddress.parse(host, port);
     // Where to connect to reach our own listener (see `stopWatcher`).
@@ -273,8 +307,8 @@ pub fn main(init: std.process.Init) !void {
     defer limiter.deinit(gpa);
 
     var upstream_health: health.Health = .{
-        .threshold = if (env.get("OMNIGATE_COOLDOWN_FAILURES")) |s| try std.fmt.parseInt(u32, s, 10) else 5,
-        .cooldown_ms = if (env.get("OMNIGATE_COOLDOWN_MS")) |s| try std.fmt.parseInt(i64, s, 10) else 30_000,
+        .threshold = try envInt(env, u32, "OMNIGATE_COOLDOWN_FAILURES", 5),
+        .cooldown_ms = try envInt(env, u31, "OMNIGATE_COOLDOWN_MS", 30_000),
     };
     defer upstream_health.deinit(gpa);
 

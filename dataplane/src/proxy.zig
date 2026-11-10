@@ -28,9 +28,14 @@ const watchdog = @import("watchdog.zig");
 const Usage = usage_mod.Usage;
 const App = @import("main.zig").App;
 
+const main = @import("main.zig");
 const log = std.log.scoped(.proxy);
 
 const max_request_body = 8 * 1024 * 1024;
+/// Job requests are parsed by the control plane, whose limit is this (see
+/// `@max_body_bytes` in its router): a body it would refuse is refused here,
+/// with the same answer, instead of being sent across first.
+const max_job_body = 8_000_000;
 const default_anthropic_version = "2023-06-01";
 /// How long the control plane gets to answer a jobs/files request.
 const control_timeout_ms = 30_000;
@@ -314,8 +319,8 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(acc, request, secs);
         }
         const job_body: ?[]u8 = if (method == .POST)
-            (try readBody(arena, request, guard)) orelse
-                return respondError(acc, request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB")
+            (try readBody(arena, request, guard, max_job_body)) orelse
+                return respondError(acc, request, .payload_too_large, "payload_too_large", "the request body is larger than the jobs API accepts (8,000,000 bytes)")
         else
             null;
         guard.arm(app.io, app.stream_idle_timeout_ms);
@@ -329,7 +334,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     const kind = ep.kind;
 
     // --- body -------------------------------------------------------------
-    const body = (try readBody(arena, request, guard)) orelse
+    const body = (try readBody(arena, request, guard, max_request_body)) orelse
         return respondError(acc, request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB");
     guard.arm(app.io, app.stream_idle_timeout_ms);
 
@@ -439,6 +444,9 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     var last_retry_after: ?[]const u8 = null;
     // Status of the last attempt, when it got an HTTP answer at all.
     var last_status: ?u16 = null;
+    // Did any target answer 429, and the longest wait any of them asked for.
+    var any_rate_limited = false;
+    var longest_retry_after: ?[]const u8 = null;
 
     // The order to try the targets in: the route's strategy picks who goes
     // first (see balance.zig); upstreams that are cooling down after repeated
@@ -611,6 +619,10 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 noteFailure(app, up.name);
                 last_retry_after = extras.retry_after;
                 last_status = @backingInt(status);
+                if (last_status.? == 429) {
+                    any_rate_limited = true;
+                    longest_retry_after = headers_mod.longerRetryAfter(longest_retry_after, extras.retry_after);
+                }
             },
             // Handled inside the loop above; they never escape it.
             .drop_sampling, .add_thought_signature => unreachable,
@@ -666,10 +678,12 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         if (all_unservable) return respondError(acc, request, .bad_request, "untranslatable_request", "this request uses a feature that cannot be translated for this model's provider");
     }
 
-    // The last target tried decides the answer: if it said 429, so do we (with
-    // its `retry-after`), so that SDKs back off as they would at the provider.
-    // Anything else is a 502.
-    const rate_limited = last_status != null and last_status.? == 429;
+    // Nothing succeeded. If any target said 429, so do we, with the longest
+    // `retry-after` any of them gave, so that SDKs back off as they would at
+    // the provider: a later target that was merely down does not make the
+    // rate limit go away. Anything else is a 502.
+    const rate_limited = any_rate_limited;
+    if (rate_limited) last_retry_after = longest_retry_after;
     const final_status: u16 = if (rate_limited) 429 else 502;
     if (ep.metered) report(app, arena, .{
         .id = &req_id,
@@ -729,11 +743,11 @@ fn noteFailure(app: *App, upstream: []const u8) void {
 
 /// Read the whole request body; null when it exceeds `max_request_body`.
 /// The client timeout armed on `guard` covers the read and ends with it.
-fn readBody(arena: std.mem.Allocator, request: *http.Server.Request, guard: *watchdog.Conn) !?[]u8 {
+fn readBody(arena: std.mem.Allocator, request: *http.Server.Request, guard: *watchdog.Conn, limit: usize) !?[]u8 {
     defer guard.disarm();
     var body_buf: [8 * 1024]u8 = undefined;
     const body_reader = try request.readerExpectContinue(&body_buf);
-    return body_reader.allocRemaining(arena, .limited(max_request_body)) catch |err| switch (err) {
+    return body_reader.allocRemaining(arena, .limited(limit)) catch |err| switch (err) {
         error.StreamTooLong => return null,
         else => return if (guard.timedOut()) error.ClientTimeout else err,
     };
@@ -1018,7 +1032,7 @@ fn forward(
         .content_type = .{ .override = "application/json" },
         // Keep bodies uncompressed so they can be streamed and metered as-is.
         .accept_encoding = .{ .override = "identity" },
-        .user_agent = .{ .override = "omnigate/0.1" },
+        .user_agent = .{ .override = main.user_agent },
     };
     switch (up.kind) {
         .openai => {
@@ -1078,6 +1092,7 @@ fn forward(
     // Response headers: ours, then the provider's that passed the allowlist.
     // Slot 0 is the content type, which depends on the branch taken below.
     var attempt_buf: [12]u8 = undefined;
+    const ids = headers_mod.requestIds(relayed, req_id);
     var out_headers: std.ArrayList(http.Header) = .empty;
     try out_headers.appendSlice(arena, &.{
         .{ .name = "content-type", .value = content_type },
@@ -1085,10 +1100,9 @@ fn forward(
         .{ .name = "x-omnigate-upstream", .value = up.name },
         .{ .name = "x-omnigate-attempts", .value = std.fmt.bufPrint(&attempt_buf, "{d}", .{attempt_no}) catch unreachable },
         .{ .name = "x-omnigate-request-id", .value = req_id },
-        // The ids the OpenAI and the Anthropic SDK read: the provider's own
-        // when it sent one (so a support ticket can quote it), otherwise ours.
-        .{ .name = "x-request-id", .value = headers_mod.find(relayed, "x-request-id") orelse req_id },
-        .{ .name = "request-id", .value = headers_mod.find(relayed, "request-id") orelse req_id },
+        // The ids the OpenAI and the Anthropic SDK read (see `requestIds`).
+        .{ .name = "x-request-id", .value = ids.x_request_id },
+        .{ .name = "request-id", .value = ids.request_id },
     });
     if (extras.cache_note) |note| try out_headers.append(arena, .{ .name = "x-omnigate-cache", .value = note });
     for (relayed) |h| {
@@ -1250,6 +1264,9 @@ fn forwardToControl(
     try extra.append(arena, .{ .name = control.internal_header, .value = app.internal_token });
     if (key_sha256) |k| try extra.append(arena, .{ .name = "x-omnigate-key-sha256", .value = k });
     if (hdrs.idempotency_key) |k| try extra.append(arena, .{ .name = "idempotency-key", .value = k });
+    // Our id for this request, so that the control plane's log lines (and
+    // the `request_id` in a 500 from it) match what the client was given.
+    try extra.append(arena, .{ .name = "x-omnigate-request-id", .value = acc.request_id.get() });
 
     var call: UpstreamCall = .{
         .client = app.client,
@@ -1263,7 +1280,7 @@ fn forwardToControl(
                 // The jobs API is JSON-only, whatever the client labelled it.
                 .content_type = if (body != null) .{ .override = "application/json" } else .default,
                 .accept_encoding = .{ .override = "identity" },
-                .user_agent = .{ .override = "omnigate/0.1" },
+                .user_agent = .{ .override = main.user_agent },
             },
             .extra_headers = extra.items,
         },
@@ -1288,18 +1305,26 @@ fn forwardToControl(
     const content_type = try arena.dupe(u8, response.head.content_type orelse "application/json");
     const content_length = response.head.content_length;
 
+    // What the control plane says about the answer that the client needs:
+    // how a stored file is to be handled, where a bucket-stored one is, when
+    // to retry (headers.zig has the list).
+    const relayed = try headers_mod.collectFromControl(arena, response.head.bytes);
+
     const request_id = acc.request_id.get();
+    var out_headers: std.ArrayList(http.Header) = .empty;
+    try out_headers.appendSlice(arena, &.{
+        .{ .name = "content-type", .value = content_type },
+        .{ .name = "x-omnigate-request-id", .value = request_id },
+        .{ .name = "x-request-id", .value = request_id },
+        .{ .name = "request-id", .value = request_id },
+    });
+    try out_headers.appendSlice(arena, relayed);
     var resp_buf: [8 * 1024]u8 = undefined;
     var body_writer = try request.respondStreaming(&resp_buf, .{
         .content_length = content_length,
         .respond_options = .{
             .status = status,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = content_type },
-                .{ .name = "x-omnigate-request-id", .value = request_id },
-                .{ .name = "x-request-id", .value = request_id },
-                .{ .name = "request-id", .value = request_id },
-            },
+            .extra_headers = out_headers.items,
         },
     });
 

@@ -349,7 +349,7 @@ def convert(doc):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Convert a LiteLLM config.yaml to an omnigate config.")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("litellm_config")
     ap.add_argument("-o", "--output", help="write the omnigate JSON here (default: stdout)")
     ap.add_argument("--generate-key", metavar="NAME",

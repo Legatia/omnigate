@@ -472,10 +472,10 @@ defmodule OmnigateControl.JobsTest do
     test "create, read, list, cancel and download through the router" do
       assert {401, _} = call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{}}) |> json()
 
-      assert {401, %{"error" => %{"type" => "invalid_api_key"}}} =
+      assert {401, %{"error" => %{"code" => "invalid_api_key"}}} =
                call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{}}, internal("deadbeef")) |> json()
 
-      assert {404, %{"error" => %{"type" => "model_not_found"}}} = call(:post, "/internal/v1/jobs", %{"model" => "nope", "input" => %{}}, internal()) |> json()
+      assert {404, %{"error" => %{"code" => "model_not_found"}}} = call(:post, "/internal/v1/jobs", %{"model" => "nope", "input" => %{}}, internal()) |> json()
 
       idem = [{"idempotency-key", "http-#{System.unique_integer([:positive])}"}]
       assert {202, created} = call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{"prompt" => "via http"}}, internal() ++ idem) |> json()
@@ -528,7 +528,7 @@ defmodule OmnigateControl.JobsTest do
       dev = OmnigateControl.sha256_hex("og-dev-key")
       {:ok, _} = Ledger.record_media(%{"id" => "job_budget#{System.unique_integer([:positive])}", "key_sha256" => dev, "status" => 200, "cost_usd" => 5.0})
 
-      assert {402, %{"error" => %{"type" => "budget_exceeded"}}} =
+      assert {402, %{"error" => %{"code" => "budget_exceeded"}}} =
                call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{}}, internal(dev)) |> json()
     end
   end

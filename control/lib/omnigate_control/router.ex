@@ -29,6 +29,15 @@ defmodule OmnigateControl.Router do
 
   require Logger
 
+  # First path segments that are reachable without the admin token: the
+  # internal API (which has its own token), probes and the login form. The
+  # test route exists, and is listed, only in a build that compiles it in.
+  @public_segments ["internal", "healthz", "readyz", "login", "logout"] ++
+                     if(Application.compile_env(:omnigate_control, :test_routes, false), do: ["__test"], else: [])
+
+  # Largest request body the parser reads; anything bigger is a 413.
+  @max_body_bytes 8_000_000
+
   # Order matters. The guards below decide by `conn.path_info`, which is the
   # path exactly as sent, while the router matches on the percent-DECODED
   # path: `/%61dmin/keys` used to slip past every guard and still reach the
@@ -36,12 +45,16 @@ defmodule OmnigateControl.Router do
   # anything else runs, and the guards refuse whatever they do not recognise.
   # Authentication also comes before body parsing, so an anonymous caller
   # cannot make this process parse megabytes of JSON.
+  plug(:request_id)
   plug(:plain_path)
   plug(:match)
   plug(:internal_auth)
   plug(:admin_auth)
   plug(:small_public_body)
-  plug(Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"])
+  # The limit is spelled out because the data plane enforces the same number
+  # for job requests (`max_job_body` in proxy.zig): a body one process
+  # accepts must not be refused by the other.
+  plug(Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"], length: @max_body_bytes)
   plug(:csrf)
   plug(:dispatch)
 
@@ -74,10 +87,12 @@ defmodule OmnigateControl.Router do
   defp failure(conn, error, stack) do
     # The id ties the client's error to this log line; nothing else about the
     # failure leaves the process.
-    id = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+    id = conn.assigns[:request_id] || new_request_id()
     Logger.error("request #{id} #{conn.method} #{conn.request_path} failed: " <> Exception.format(:error, error, stack))
 
-    send_json(conn, 500, %{error: %{type: "internal_error", message: "the control plane failed to handle this request", request_id: id}})
+    conn
+    |> put_resp_header("x-request-id", id)
+    |> send_error(500, "internal_error", "the control plane failed to handle this request", %{request_id: id})
   end
 
   get "/healthz" do
@@ -117,7 +132,7 @@ defmodule OmnigateControl.Router do
         send_json(conn, 200, counts)
 
       _ ->
-        send_json(conn, 400, %{error: "expected {\"events\": [...]}"})
+        send_error(conn, 400, "invalid_request", "expected {\"events\": [...]}")
     end
   end
 
@@ -129,7 +144,7 @@ defmodule OmnigateControl.Router do
         send_json(conn, 200, %{accepted: Rejections.record(counters)})
 
       _ ->
-        send_json(conn, 400, %{error: "expected {\"counters\": [...]}"})
+        send_error(conn, 400, "invalid_request", "expected {\"counters\": [...]}")
     end
   end
 
@@ -527,9 +542,28 @@ defmodule OmnigateControl.Router do
 
   defp safe_filename(_), do: "output.bin"
 
-  defp send_error(conn, status, type, message) do
-    send_json(conn, status, %{error: %{type: type, message: message}})
+  # Every error leaves in one shape (see `OmnigateControl.Errors`): the
+  # reason in `error.code`, an OpenAI-style category in `error.type`. It is
+  # the shape the data plane uses for its own refusals, so a client of
+  # `/v1/jobs` sees the same thing whichever process said no.
+  defp send_error(conn, status, reason, message, extra \\ %{}) do
+    send_json(conn, status, OmnigateControl.Errors.body(status, reason, message, extra))
   end
+
+  # Each request gets an id, returned as `x-request-id` and written with any
+  # failure in the log. A data plane relaying a client's request sends its
+  # own id along, so one id follows the request through both processes.
+  defp request_id(conn, _opts) do
+    id =
+      case get_req_header(conn, "x-omnigate-request-id") do
+        [given] when byte_size(given) in 8..64 -> if given =~ ~r/\A[A-Za-z0-9_-]+\z/, do: given, else: new_request_id()
+        _ -> new_request_id()
+      end
+
+    conn |> assign(:request_id, id) |> put_resp_header("x-request-id", id)
+  end
+
+  defp new_request_id, do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
 
   defp internal_auth(%{path_info: ["internal" | _]} = conn, _opts) do
     expected = OmnigateControl.internal_token() || ""
@@ -563,7 +597,7 @@ defmodule OmnigateControl.Router do
       AdminAuth.bearer_throttled?(address) ->
         conn
         |> put_resp_header("retry-after", "60")
-        |> send_json(429, %{error: %{type: "too_many_attempts", message: "too many wrong admin tokens from this address; wait a minute"}})
+        |> send_error(429, "too_many_attempts", "too many wrong admin tokens from this address; wait a minute")
         |> halt()
 
       AdminAuth.bearer?(conn) ->
@@ -575,7 +609,7 @@ defmodule OmnigateControl.Router do
 
         conn
         |> put_resp_header("www-authenticate", "Bearer")
-        |> send_json(401, %{error: %{type: "unauthorized", message: "send Authorization: Bearer <admin token>"}})
+        |> send_error(401, "unauthorized", "send Authorization: Bearer <admin token>")
         |> halt()
     end
   end
@@ -587,10 +621,10 @@ defmodule OmnigateControl.Router do
   # Everything else must be one of the few paths that are public on purpose.
   # An unknown first segment is refused here rather than left to the router,
   # so a route added later is closed until someone decides who may call it.
-  defp admin_auth(%{path_info: [first | _]} = conn, _opts) when first in ["internal", "healthz", "readyz", "login", "logout", "__test"], do: conn
+  defp admin_auth(%{path_info: [first | _]} = conn, _opts) when first in @public_segments, do: conn
 
   defp admin_auth(conn, _opts) do
-    conn |> send_json(404, %{error: %{type: "not_found", message: "no such endpoint"}}) |> halt()
+    conn |> send_error(404, "not_found", "no such endpoint") |> halt()
   end
 
   # The only body an anonymous caller may send is the login form, which is a
@@ -634,7 +668,7 @@ defmodule OmnigateControl.Router do
     if is_binary(conn.request_path) and Enum.all?(conn.path_info, plain) and not String.contains?(conn.request_path, "%") do
       conn
     else
-      conn |> send_json(400, %{error: %{type: "invalid_request", message: "the request path must not contain encoded characters"}}) |> halt()
+      conn |> send_error(400, "invalid_request", "the request path must not contain encoded characters") |> halt()
     end
   end
 
@@ -648,7 +682,7 @@ defmodule OmnigateControl.Router do
       conn
     else
       conn
-      |> send_json(403, %{error: %{type: "csrf_failed", message: "missing or wrong CSRF token; reload the dashboard and try again"}})
+      |> send_error(403, "csrf_failed", "missing or wrong CSRF token; reload the dashboard and try again")
       |> halt()
     end
   end

@@ -1,0 +1,26 @@
+{
+  "keys": [
+    { "name": "dev", "key": "og-dev-key", "budget_usd": 0.01 },
+    { "name": "unlimited", "key": "og-unlimited-key" }
+  ],
+  "upstreams": [
+    { "name": "mock-flaky", "kind": "openai", "base_url": "http://127.0.0.1:9001", "api_key_env": "MOCK_API_KEY" },
+    { "name": "mock-ok", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY" },
+    { "name": "mock-anthropic", "kind": "anthropic", "base_url": "http://127.0.0.1:9003", "api_key_env": "MOCK_API_KEY" }
+  ],
+  "routes": [
+    {
+      "model": "demo-chat",
+      "targets": [
+        { "upstream": "mock-flaky", "model": "flaky-1", "price_in_per_mtok": 100.0, "price_out_per_mtok": 300.0 },
+        { "upstream": "mock-ok", "model": "ok-1", "price_in_per_mtok": 100.0, "price_out_per_mtok": 300.0 }
+      ]
+    },
+    {
+      "model": "demo-claude",
+      "targets": [
+        { "upstream": "mock-anthropic", "model": "mock-claude", "price_in_per_mtok": 100.0, "price_out_per_mtok": 300.0 }
+      ]
+    }
+  ]
+}

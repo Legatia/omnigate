@@ -1,0 +1,12 @@
+# Zig
+dataplane/.zig-cache/
+dataplane/zig-out/
+
+# Elixir
+control/_build/
+control/deps/
+control/data/
+erl_crash.dump
+
+# Local secrets
+.env

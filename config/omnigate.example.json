@@ -1,0 +1,23 @@
+{
+  "keys": [
+    { "name": "my-app", "key_sha256": "<sha256 hex of the gateway key you hand to the app>", "budget_usd": 25.0 }
+  ],
+  "upstreams": [
+    { "name": "anthropic", "kind": "anthropic", "base_url": "https://api.anthropic.com", "api_key_env": "ANTHROPIC_API_KEY" },
+    { "name": "openai", "kind": "openai", "base_url": "https://api.openai.com", "api_key_env": "OPENAI_API_KEY" }
+  ],
+  "routes": [
+    {
+      "model": "claude",
+      "targets": [
+        { "upstream": "anthropic", "model": "claude-sonnet-5-5", "price_in_per_mtok": 0.0, "price_out_per_mtok": 0.0 }
+      ]
+    },
+    {
+      "model": "gpt",
+      "targets": [
+        { "upstream": "openai", "model": "<openai model id>", "price_in_per_mtok": 0.0, "price_out_per_mtok": 0.0 }
+      ]
+    }
+  ]
+}

@@ -25,9 +25,74 @@ defmodule OmnigateControl.Jobs.Adapter do
 
   @callback cancel(upstream(), target_model :: String.t(), provider_id :: String.t(), state :: map(), ctx()) :: :ok
 
+  @typedoc "What a job is billed for: characters of text and seconds of media the adapter asks the provider for."
+  @type billable :: %{chars: non_neg_integer(), seconds: number()}
+
+  @doc """
+  The billable quantities in the request this adapter sends for `input`.
+
+  Pricing must follow what goes to the provider, not what the client labelled:
+  each adapter counts the text it actually forwards and the duration it
+  actually requests. It is a pure function of `input` (built from the same
+  code as the request), so it gives the same answer when a job is resumed
+  after a restart.
+  """
+  @callback billable(input :: map()) :: billable()
+
   @optional_callbacks poll: 5, cancel: 5
 
   alias OmnigateControl.Jobs.Adapters
+
+  @doc """
+  Characters in the string values of `fields` in `input`, added up. Adapters
+  that forward the whole input cannot know which of several text fields the
+  provider will read, so every one that is sent is counted.
+  """
+  def chars(input, fields) when is_map(input) do
+    Enum.reduce(fields, 0, fn field, sum ->
+      case input[field] do
+        text when is_binary(text) -> sum + String.length(text)
+        _ -> sum
+      end
+    end)
+  end
+
+  @doc "Characters of every string found under a `\"text\"` key anywhere inside `term`, plus `term` itself when it is a string."
+  def text_chars(text) when is_binary(text), do: String.length(text)
+  def text_chars(list) when is_list(list), do: list |> Enum.map(&text_chars_in/1) |> Enum.sum()
+  def text_chars(map) when is_map(map), do: text_chars_in(map)
+  def text_chars(_), do: 0
+
+  defp text_chars_in(map) when is_map(map) do
+    Enum.reduce(map, 0, fn
+      {"text", text}, sum when is_binary(text) -> sum + String.length(text)
+      {_key, value}, sum when is_map(value) or is_list(value) -> sum + text_chars_in(value)
+      _, sum -> sum
+    end)
+  end
+
+  defp text_chars_in(list) when is_list(list), do: list |> Enum.map(&text_chars_in/1) |> Enum.sum()
+  defp text_chars_in(_), do: 0
+
+  @doc """
+  Seconds requested by `input`: the largest of the given fields, never below
+  zero. Values are numbers or numeric strings (some providers take `"5"`).
+  """
+  def seconds(input, fields) when is_map(input) do
+    fields |> Enum.map(&quantity(input[&1])) |> Enum.max(fn -> 0 end) |> max(0)
+  end
+
+  @doc "A number or a fully numeric string as a number; anything else is 0."
+  def quantity(n) when is_number(n), do: n
+
+  def quantity(s) when is_binary(s) do
+    case Float.parse(String.trim(s)) do
+      {f, ""} -> f
+      _ -> 0
+    end
+  end
+
+  def quantity(_), do: 0
 
   @doc "Adapter module for an upstream `kind`, or nil."
   def for_kind("replicate"), do: Adapters.Replicate

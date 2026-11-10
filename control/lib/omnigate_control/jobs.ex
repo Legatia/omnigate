@@ -22,12 +22,15 @@ defmodule OmnigateControl.Jobs do
   Create a job for gateway key `key_sha256` from request `params`.
 
   Returns `{:ok, job}` (new), `{:existing, job}` (idempotent replay) or
-  `{:error, http_status, type, message}`.
+  `{:error, http_status, type, message}`. With `open_cap: {limit, hashes}`
+  the job is refused (429) when the key already has `limit` unfinished jobs.
   """
-  def create(key_sha256, params, idempotency_key \\ nil) do
+  def create(key_sha256, params, idempotency_key \\ nil, opts \\ []) do
     with {:ok, route} <- route(params["model"]),
          {:ok, input} <- object(params["input"], "input", true),
          {:ok, metadata} <- object(params["metadata"], "metadata", false),
+         :ok <- small_enough(input, metadata),
+         :ok <- quantities_ok(input),
          {:ok, webhook_url} <- webhook_url(params["webhook_url"], key_sha256),
          :ok <- idempotency_key_ok(idempotency_key) do
       now = DateTime.utc_now()
@@ -61,7 +64,17 @@ defmodule OmnigateControl.Jobs do
         "run" => nil
       }
 
-      case Store.create(job) do
+      created =
+        case Keyword.get(opts, :open_cap) do
+          {limit, hashes} -> Store.create(job, {limit, hashes})
+          nil -> Store.create(job)
+        end
+
+      case created do
+        {:error, :too_many_open} ->
+          {limit, _} = Keyword.fetch!(opts, :open_cap)
+          {:error, 429, "too_many_open_jobs", "this key already has #{limit} unfinished jobs; wait for some to finish"}
+
         {:ok, job} ->
           if cache? and serve_from_cache(job, route) do
             {:ok, Store.get(job["id"])}
@@ -194,18 +207,18 @@ defmodule OmnigateControl.Jobs do
     })
   end
 
-  @doc "Cost in USD of a finished job under a target's price."
-  def cost(price, input, output_count) do
-    chars =
-      case Enum.find_value(~w(text prompt input), &(is_binary(input[&1]) && input[&1])) do
-        nil -> 0
-        text -> String.length(text)
-      end
+  @doc """
+  Cost in USD of a finished job under a target's price.
 
-    seconds = number(input["duration"] || input["seconds"])
+  `billable` is what the adapter reported it sent (`Adapter.billable/1`), not
+  what the client's input says. Every component is at least zero on its own,
+  so no field can lower the price of another.
+  """
+  def cost(price, billable, output_count) do
+    part = fn rate, quantity -> if is_number(rate) and is_number(quantity) and rate > 0 and quantity > 0, do: rate * quantity, else: 0.0 end
 
-    price.per_job_usd + price.per_output_usd * output_count + price.per_input_char_usd * chars +
-      price.per_second_usd * seconds
+    part.(price.per_job_usd, 1) + part.(price.per_output_usd, output_count) +
+      part.(price.per_input_char_usd, Map.get(billable, :chars, 0)) + part.(price.per_second_usd, Map.get(billable, :seconds, 0))
   end
 
   @doc "Stable hash of a route model and input, ignoring key order."
@@ -319,6 +332,54 @@ defmodule OmnigateControl.Jobs do
   defp object(map, _name, _required) when is_map(map), do: {:ok, map}
   defp object(_, name, _), do: {:error, 400, "invalid_request", "\"#{name}\" must be an object"}
 
+  # A job's input is kept in memory and on disk for as long as the job is.
+  defp small_enough(input, metadata) do
+    max = ConfigStore.get().media |> Map.get(:max_input_bytes, 1_048_576)
+
+    if byte_size(JSON.encode!(input)) + byte_size(JSON.encode!(metadata)) > max do
+      {:error, 413, "payload_too_large", "\"input\" and \"metadata\" together must not exceed #{max} bytes"}
+    else
+      :ok
+    end
+  end
+
+  @durations ~w(duration seconds)
+  @counts ~w(n num_outputs num_images)
+
+  # These fields feed the price. A negative or non-numeric value is refused
+  # here rather than left for a provider to ignore.
+  defp quantities_ok(input) do
+    Enum.find_value(@durations ++ @counts, :ok, fn field ->
+      case Map.fetch(input, field) do
+        :error ->
+          nil
+
+        {:ok, value} ->
+          cond do
+            field in @durations and not seconds?(value) ->
+              {:error, 400, "invalid_request", "\"input.#{field}\" must be a number of seconds, 0 or more"}
+
+            field in @counts and not (is_integer(value) and value >= 0) ->
+              {:error, 400, "invalid_request", "\"input.#{field}\" must be a whole number, 0 or more"}
+
+            true ->
+              nil
+          end
+      end
+    end)
+  end
+
+  defp seconds?(n) when is_number(n), do: n >= 0
+
+  defp seconds?(s) when is_binary(s) do
+    case Float.parse(String.trim(s)) do
+      {f, ""} -> f >= 0
+      _ -> false
+    end
+  end
+
+  defp seconds?(_), do: false
+
   defp webhook_url(nil, _key), do: {:ok, nil}
 
   defp webhook_url(url, key_sha256) when is_binary(url) do
@@ -339,17 +400,6 @@ defmodule OmnigateControl.Jobs do
   defp idempotency_key_ok(nil), do: :ok
   defp idempotency_key_ok(k) when byte_size(k) in 1..255, do: :ok
   defp idempotency_key_ok(_), do: {:error, 400, "invalid_request", "Idempotency-Key must be 1 to 255 bytes"}
-
-  defp number(n) when is_number(n), do: n
-
-  defp number(s) when is_binary(s) do
-    case Float.parse(s) do
-      {f, _} -> f
-      :error -> 0
-    end
-  end
-
-  defp number(_), do: 0
 
   defp hash(data), do: :crypto.hash(:sha256, data) |> Base.encode16(case: :lower)
   defp random_id, do: :crypto.strong_rand_bytes(12) |> Base.encode16(case: :lower)

@@ -23,3 +23,7 @@ config/omnigate.json
 
 # Python
 __pycache__/
+
+# Compose secret files (copy from the .example files)
+.env.control
+.env.dataplane

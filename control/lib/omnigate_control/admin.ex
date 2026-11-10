@@ -22,6 +22,7 @@ defmodule OmnigateControl.Admin do
       period_resets_at: Keys.period_resets_at(key),
       rpm: Map.get(key, :rpm, 0),
       models: Map.get(key, :models),
+      max_open_jobs: Keys.max_open_jobs(key),
       disabled: Keys.disabled?(key),
       blocked: Keys.over_budget?(key),
       state: Keys.state(key),

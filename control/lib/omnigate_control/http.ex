@@ -63,25 +63,69 @@ defmodule OmnigateControl.Http do
     e -> {:error, Exception.message(e)}
   end
 
+  @max_redirects 5
+
   @doc """
   Stream a GET response body to `dest`, hashing as it goes.
 
   Aborts once more than `max_bytes` have arrived. Returns
   `{:ok, %{bytes, sha256, content_type}}`.
+
+  Redirects are followed here, one hop at a time and at most
+  `:max_redirects` (default #{@max_redirects}) of them, never by the HTTP
+  client. With `guard: fun`, every URL about to be fetched, the first one and
+  each redirect target, is passed to `fun` first: `{:ok, ip}` means "fetch it,
+  connecting to exactly this address", `{:error, reason}` stops the download.
+  That is how a URL that came out of a provider's answer is kept away from
+  internal addresses (see `OmnigateControl.NetGuard`).
   """
   def download(url, dest, max_bytes, opts \\ []) do
+    File.mkdir_p!(Path.dirname(dest))
+    follow(url, dest, max_bytes, opts, Keyword.get(opts, :max_redirects, @max_redirects))
+  rescue
+    e -> {:error, Exception.message(e)}
+  end
+
+  defp follow(url, dest, max_bytes, opts, hops_left) do
+    with {:ok, hop_opts} <- guard(url, opts) do
+      case fetch_once(url, dest, max_bytes, hop_opts) do
+        {:redirect, _location} when hops_left <= 0 ->
+          {:error, "too many redirects"}
+
+        {:redirect, location} ->
+          # Relative targets are resolved against the URL that sent them.
+          follow(url |> URI.merge(location) |> URI.to_string(), dest, max_bytes, opts, hops_left - 1)
+
+        result ->
+          result
+      end
+    end
+  end
+
+  defp guard(url, opts) do
+    case Keyword.get(opts, :guard) do
+      nil ->
+        {:ok, opts}
+
+      fun ->
+        case fun.(url) do
+          {:ok, ip} -> {:ok, Keyword.put(opts, :connect_to, ip)}
+          {:error, reason} -> {:error, "blocked: #{reason}"}
+        end
+    end
+  end
+
+  defp fetch_once(url, dest, max_bytes, opts) do
     idle = Keyword.get(opts, :idle_timeout, 60_000)
-    headers = to_httpc_headers(Keyword.get(opts, :headers, []))
+    {url, headers, opts} = pin(url, Keyword.get(opts, :headers, []), opts)
+    http_opts = http_opts(url, Keyword.put(opts, :redirect, false))
 
-    http_opts = http_opts(url, Keyword.put(opts, :redirect, true))
-
-    case :httpc.request(:get, {String.to_charlist(url), headers}, http_opts,
+    case :httpc.request(:get, {String.to_charlist(url), to_httpc_headers(headers)}, http_opts,
            sync: false,
            stream: {:self, :once},
            body_format: :binary
          ) do
       {:ok, ref} ->
-        File.mkdir_p!(Path.dirname(dest))
         file = File.open!(dest, [:write, :binary, :raw])
 
         result =
@@ -91,14 +135,12 @@ defmodule OmnigateControl.Http do
             File.close(file)
           end
 
-        if match?({:error, _}, result), do: File.rm(dest)
+        if not match?({:ok, _}, result), do: File.rm(dest)
         result
 
       {:error, reason} ->
         {:error, reason}
     end
-  rescue
-    e -> {:error, Exception.message(e)}
   end
 
   defp receive_stream(ref, file, st, max, idle) do
@@ -130,7 +172,14 @@ defmodule OmnigateControl.Http do
            content_type: st.ctype
          }}
 
-      # Non-2xx responses are not streamed; they arrive whole.
+      # Non-2xx responses are not streamed; they arrive whole. A redirect is
+      # handed back to the caller, which decides whether to follow it.
+      {:http, {^ref, {{_, status, _}, headers, _body}}} when status in [301, 302, 303, 307, 308] ->
+        case header_map(headers)["location"] do
+          location when is_binary(location) and location != "" -> {:redirect, location}
+          _ -> {:error, {:http_status, status}}
+        end
+
       {:http, {^ref, {{_, status, _}, _headers, _body}}} ->
         {:error, {:http_status, status}}
 

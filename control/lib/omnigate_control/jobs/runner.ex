@@ -14,7 +14,7 @@ defmodule OmnigateControl.Jobs.Runner do
   """
   require Logger
 
-  alias OmnigateControl.{ConfigStore, Http, Jobs, Storage}
+  alias OmnigateControl.{ConfigStore, Http, Jobs, NetGuard, Storage}
   alias OmnigateControl.Jobs.{Adapter, Store}
 
   @max_transient_poll_errors 5
@@ -211,7 +211,7 @@ defmodule OmnigateControl.Jobs.Runner do
           "outputs" => records,
           "upstream" => t.upstream.name,
           "target_model" => t.target.model,
-          "cost_usd" => Jobs.cost(t.target.price, job["input"], length(records)),
+          "cost_usd" => Jobs.cost(t.target.price, t.adapter.billable(job["input"]), length(records)),
           "attempts" => (Store.get(job["id"])["attempts"] || []) ++ [%{"upstream" => t.upstream.name, "outcome" => "ok"}]
         })
 
@@ -231,7 +231,9 @@ defmodule OmnigateControl.Jobs.Runner do
   defp fetch({:url, url}, tmp, max), do: fetch({:url, url, nil}, tmp, max)
 
   defp fetch({:url, url, hint}, tmp, max) do
-    with {:ok, meta} <- Http.download(url, tmp, max) do
+    # The URL came out of a provider's answer: never fetch it, or anything
+    # it redirects to, from an address we would not call for a webhook.
+    with {:ok, meta} <- Http.download(url, tmp, max, guard: &NetGuard.target(&1, "output url")) do
       {:ok, %{"bytes" => meta.bytes, "sha256" => meta.sha256, "content_type" => content_type(hint, meta.content_type, url)}}
     end
   end

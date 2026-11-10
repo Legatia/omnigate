@@ -8,6 +8,17 @@
 
 # Applications: the data plane.
 {$OMNIGATE_API_HOST:localhost} {
+	# Stored job outputs are bytes a provider produced. Whatever the gateway
+	# says about them, a browser must download them, not sniff a type and not
+	# run them as a page on this origin. (Defaults: they apply only where the
+	# gateway did not set the header itself.)
+	@files path /v1/files/*
+	header @files {
+		?Content-Disposition attachment
+		?X-Content-Type-Options nosniff
+		?Content-Security-Policy "sandbox; default-src 'none'"
+	}
+
 	reverse_proxy dataplane:8080 {
 		# Pass streamed tokens through as they arrive.
 		flush_interval -1
@@ -16,9 +27,21 @@
 
 # Operators: the control plane's dashboard and admin API.
 {$OMNIGATE_ADMIN_HOST:admin.localhost} {
-	# The internal API is for data planes on the private network only.
+	# The internal API is for data planes on the private network only. (The
+	# control plane also refuses any percent-encoded spelling of a path, so
+	# /%69nternal/... does not get through either.)
 	@internal path /internal /internal/*
 	respond @internal 404
+
+	# Optional allow-list: only these source ranges may reach the dashboard
+	# and the admin API at all; everyone else gets 403 before the control
+	# plane sees the request. OMNIGATE_ADMIN_ALLOW is a space-separated list
+	# of CIDR ranges, e.g. "203.0.113.0/24 2001:db8::/32". The default lets
+	# everyone through (the admin token is then the only gate). This is the
+	# address Caddy sees: behind another proxy or Docker Desktop's network
+	# that is the proxy's or the Docker gateway's address, not the client's.
+	@outside not remote_ip {$OMNIGATE_ADMIN_ALLOW:0.0.0.0/0 ::/0}
+	respond @outside 403
 
 	reverse_proxy control:4000
 }

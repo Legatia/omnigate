@@ -25,6 +25,7 @@ defmodule OmnigateControl.Jobs.Adapters.Gemini do
 
   import OmnigateControl.Jobs.Adapter, only: [decode: 1, describe: 1]
   alias OmnigateControl.Http
+  alias OmnigateControl.Jobs.Adapter
 
   @impl true
   def submit(up, model, input, ctx) do
@@ -63,6 +64,17 @@ defmodule OmnigateControl.Jobs.Adapters.Gemini do
 
       _ ->
         {:error, "invalid_input: prompt (or text, or contents) is required"}
+    end
+  end
+
+  # Counted from the request body itself, so the short form (`prompt`, else
+  # `text`) and the native form (`contents`) are both billed for the text
+  # that is really sent.
+  @impl true
+  def billable(input) do
+    case request_body(input) do
+      {:ok, body} -> %{chars: Adapter.text_chars(body["contents"]) + Adapter.text_chars(body["systemInstruction"]), seconds: 0}
+      _ -> %{chars: 0, seconds: 0}
     end
   end
 

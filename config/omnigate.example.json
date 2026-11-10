@@ -6,6 +6,7 @@
       "budget_usd": 25.0,
       "budget_period": "monthly",
       "rpm": 600,
+      "max_open_jobs": 20,
       "disabled": false,
       "models": [
         "claude",
@@ -84,6 +85,8 @@
     "public_base_url": "https://gateway.example.com",
     "poll_interval_ms": 2000,
     "max_output_bytes": 536870912,
+    "max_input_bytes": 1048576,
+    "max_open_jobs": 100,
     "upstreams": [
       {
         "name": "replicate",
@@ -266,7 +269,7 @@
   },
   "retention": {
     "jobs_days": 30,
-    "ledger_ids_days": 7,
+    "ledger_ids_days": 14,
     "delete_bucket_objects": true,
     "ledger_days": 90
   }

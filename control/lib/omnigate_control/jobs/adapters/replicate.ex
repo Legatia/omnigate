@@ -17,6 +17,7 @@ defmodule OmnigateControl.Jobs.Adapters.Replicate do
 
   import OmnigateControl.Jobs.Adapter, only: [decode: 1, describe: 1, transient?: 1]
   alias OmnigateControl.Http
+  alias OmnigateControl.Jobs.Adapter
 
   @impl true
   def submit(up, model, input, ctx) do
@@ -76,6 +77,11 @@ defmodule OmnigateControl.Jobs.Adapters.Replicate do
   defp error_text(nil), do: "no detail"
   defp error_text(e) when is_binary(e), do: String.slice(e, 0, 300)
   defp error_text(e), do: e |> inspect() |> String.slice(0, 300)
+
+  # The whole input goes to the provider, so every text field in it counts,
+  # and so does whichever of the duration fields asks for more.
+  @impl true
+  def billable(input), do: %{chars: Adapter.chars(input, ~w(prompt text input)), seconds: Adapter.seconds(input, ~w(duration seconds))}
 
   defp headers(ctx), do: [{"authorization", "Bearer #{ctx.api_key}"}]
 end

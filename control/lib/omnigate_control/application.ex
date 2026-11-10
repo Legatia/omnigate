@@ -3,29 +3,44 @@ defmodule OmnigateControl.Application do
   use Application
   require Logger
 
+  # The development config ships in the repository: its gateway keys and
+  # webhook secret are public, and it allows calls to private addresses. It
+  # may stand in for a missing OMNIGATE_CONFIG only in a development or test
+  # build, never in a release.
+  @dev_build Mix.env() in [:dev, :test]
+
   @impl true
   def start(_type, _args) do
-    # Without it every data-plane call would be refused: better not to start
-    # than to look healthy and serve nothing.
-    if is_nil(OmnigateControl.internal_token()) do
-      message =
-        "OMNIGATE_INTERNAL_TOKEN is not set (or is empty). It is the shared secret between the data plane and " <>
-          "the control plane; set it to the same long random value for both, then start again."
-
-      Logger.error(message)
-      {:error, message}
+    with :ok <- check_internal_token(),
+         {:ok, config} <- config_path(),
+         :ok <- OmnigateControl.AdminAuth.setup() do
+      start_children(config)
     else
-      start_children()
+      {:error, message} ->
+        Logger.error(message)
+        {:error, message}
     end
   end
 
-  defp start_children do
-    OmnigateControl.AdminAuth.setup()
+  # Without it every data-plane call would be refused: better not to start
+  # than to look healthy and serve nothing.
+  defp check_internal_token do
+    if is_nil(OmnigateControl.internal_token()) do
+      {:error,
+       "OMNIGATE_INTERNAL_TOKEN is not set (or is empty). It is the shared secret between the data plane and " <>
+         "the control plane; set it to the same long random value for both, then start again."}
+    else
+      :ok
+    end
+  end
+
+  defp start_children(config) do
     OmnigateControl.Rejections.setup()
+    OmnigateControl.RateLimit.setup()
     ip = bind_address()
 
     children = [
-      {OmnigateControl.ConfigStore, path: config_path()},
+      {OmnigateControl.ConfigStore, path: config},
       {OmnigateControl.Audit, path: audit_path()},
       {OmnigateControl.Keys, path: keys_path()},
       {OmnigateControl.Ledger, path: ledger_path()},
@@ -35,15 +50,28 @@ defmodule OmnigateControl.Application do
       # One-shot: continue jobs and webhooks left unfinished by the last run.
       Supervisor.child_spec({Task, &OmnigateControl.Jobs.resume_all/0}, id: :jobs_resume, restart: :temporary),
       OmnigateControl.Retention,
-      {Bandit, plug: OmnigateControl.Router, ip: ip, port: port()}
+      # HTTP/1.1 only: nothing here needs HTTP/2 or WebSockets, and every
+      # protocol left on is one more parser in front of the authentication.
+      {Bandit, plug: OmnigateControl.Router, ip: ip, port: port(), http_2_options: [enabled: false], websocket_options: [enabled: false]}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: OmnigateControl.Supervisor)
   end
 
-  defp config_path do
-    System.get_env("OMNIGATE_CONFIG") ||
-      Path.expand("../config/omnigate.dev.json", File.cwd!())
+  @doc false
+  def config_path(env \\ System.get_env("OMNIGATE_CONFIG"), dev_build \\ @dev_build) do
+    cond do
+      is_binary(env) and env != "" ->
+        {:ok, env}
+
+      dev_build ->
+        {:ok, Path.expand("../config/omnigate.dev.json", File.cwd!())}
+
+      true ->
+        {:error,
+         "OMNIGATE_CONFIG is not set. Point it at your config file (see config/omnigate.example.json). " <>
+           "The development config, with its published keys, is only used automatically in development builds."}
+    end
   end
 
   defp ledger_path do

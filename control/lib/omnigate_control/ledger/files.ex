@@ -318,16 +318,25 @@ defmodule OmnigateControl.Ledger.Files do
       {:ok, <<@magic, sum::binary-size(32), payload::binary>>} ->
         if :crypto.hash(:sha256, payload) == sum do
           try do
+            # `:safe` refuses anything that would create atoms or functions.
+            # The checksum only catches accidents (it is not a signature), so
+            # the decoded term is also checked row by row before any of it is
+            # put into the tables: a file that does not look exactly like a
+            # snapshot is ignored and the ledger is replayed instead.
             case :erlang.binary_to_term(payload, [:safe]) do
               %{version: 1, covered: {seq, offset}, totals: t, seen: s} = snapshot
-              when is_integer(seq) and is_integer(offset) and is_list(t) and is_list(s) ->
-                {:ok, snapshot}
+              when is_integer(seq) and seq >= 0 and is_integer(offset) and offset >= 0 and is_list(t) and is_list(s) ->
+                if Enum.all?(t, &totals_row?/1) and Enum.all?(s, &seen_row?/1) and recent?(Map.get(snapshot, :recent, [])) do
+                  {:ok, snapshot}
+                else
+                  {:error, "unexpected contents"}
+                end
 
               _ ->
                 {:error, "unexpected contents"}
             end
           rescue
-            ArgumentError -> {:error, "undecodable contents"}
+            _ -> {:error, "undecodable contents"}
           end
         else
           {:error, "checksum mismatch"}
@@ -343,6 +352,11 @@ defmodule OmnigateControl.Ledger.Files do
         {:error, "unreadable: #{inspect(reason)}"}
     end
   end
+
+  defp totals_row?(row), do: is_tuple(row) and tuple_size(row) >= 2
+  defp seen_row?({id, at}), do: is_binary(id) and is_integer(at)
+  defp seen_row?(_), do: false
+  defp recent?(list), do: is_list(list) and Enum.all?(list, &is_map/1)
 
   # The bytes the snapshot covers must still exist and be the same bytes.
   defp check_covers(path, %{covered: {seq, offset}} = snapshot) do

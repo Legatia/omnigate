@@ -16,6 +16,8 @@ Either way it starts, on a private Docker network:
     control    the control-plane image
     dataplane  the data-plane image
     proxy      Caddy with deploy/Caddyfile, published on 127.0.0.1:18443
+    proxy-locked  the same, with OMNIGATE_ADMIN_ALLOW set to a range nobody
+               is in, published on 127.0.0.1:18444 (tests the allow-list)
 
 and talks to them only through the proxy, over TLS, verifying certificates
 against the proxy's own CA. Everything it creates is named omnigate-test-*
@@ -38,6 +40,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 P = "omnigate-test"                      # prefix of everything we create
 NET = P
 PORT = 18443
+LOCKED_PORT = 18444                      # the proxy whose admin allow-list excludes us
+SERVICES = ("mocks", "control", "dataplane", "proxy", "proxy-locked")
 API_HOST, ADMIN_HOST = "localhost", "admin.localhost"
 INTERNAL, ADMIN = "container-internal-token-0123456789", "container-admin-token-0123456789"
 KEY, OTHER = "og-container-main", "og-container-other"
@@ -153,6 +157,50 @@ def stream(path, body):
     return r.status, "".join(text), (last - first) if first else 0.0
 
 
+def raw(host, payload, port=None, verify=True, timeout=8):
+    """Send bytes exactly as given over TLS (nothing normalises them) and
+    return (status, response bytes). Status 0: the peer closed or stayed
+    silent without answering."""
+    ctx = CTX
+    if not verify:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    data = b""
+    try:
+        sock = socket.create_connection(("127.0.0.1", port or PORT), timeout)
+    except OSError:
+        return 0, b""
+    try:
+        tls = ctx.wrap_socket(sock, server_hostname=host)
+        tls.sendall(payload)
+        # The head is all we need; do not wait for a body or for the close.
+        while b"\r\n\r\n" not in data:
+            chunk = tls.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (OSError, ssl.SSLError):
+        pass
+    finally:
+        sock.close()
+    parts = data.split(b" ", 2)
+    status = int(parts[1]) if data.startswith(b"HTTP/") and len(parts) > 1 and parts[1].isdigit() else 0
+    return status, data
+
+
+def get_raw(host, path, headers=(), **kw):
+    """A GET whose path reaches the proxy byte for byte."""
+    head = [f"GET {path} HTTP/1.1", f"Host: {host}:{kw.get('port') or PORT}", "Connection: close", *headers]
+    return raw(host, ("\r\n".join(head) + "\r\n\r\n").encode("latin-1"), **kw)
+
+
+def alive(service):
+    """Is the container running, and has it never been restarted or killed?"""
+    state = docker("inspect", cname(service), "--format", "{{.State.Running}} {{.RestartCount}} {{.State.OOMKilled}}", check_rc=False)
+    return state == "true 0 false", state
+
+
 def usage(name):
     _, _, body = jreq("GET", ADMIN_HOST, "/admin/usage", key=ADMIN)
     return next((r for r in body.get("keys", []) if r.get("name") == name), {})
@@ -187,14 +235,14 @@ def config():
 
 
 def names():
-    return [cname(n) for n in ("mocks", "control", "dataplane", "proxy")]
+    return [cname(n) for n in SERVICES]
 
 
 def cleanup():
     if COMPOSE and COMPOSE_FILES:
         compose("down", "-v", "--remove-orphans", check_rc=False)
     # Leftovers of either mode, e.g. from an interrupted earlier run.
-    services = ("mocks", "control", "dataplane", "proxy")
+    services = SERVICES
     docker("rm", "-f", *[f"{P}-{n}" for n in services], *[f"{P}-{n}-1" for n in services], check_rc=False)
     docker("volume", "rm", "-f", *[f"{P}{sep}{v}" for sep in ("-", "_") for v in ("control-data", "dataplane-data", "caddy-data", "caddy-config")], check_rc=False)
     docker("network", "rm", NET, f"{P}_default", check_rc=False)
@@ -218,35 +266,51 @@ def start(work):
         "-e", "MOCK_BIND=0.0.0.0", "-e", "MOCK_PUBLIC_HOST=mocks", "-e", f"MOCK_WEBHOOK_SECRET={HOOK_SECRET}", "-e", "PYTHONUNBUFFERED=1",
         cmd=("sh", "-c", "python /tools/mock_upstream.py & exec python /tools/mock_media.py"))
     run("control", IMAGES["control"], "-v", f"{cfg_path}:/config/omnigate.json:ro", "-v", f"{P}-control-data:/data",
-        "-e", f"OMNIGATE_INTERNAL_TOKEN={INTERNAL}", "-e", f"OMNIGATE_ADMIN_TOKEN={ADMIN}", "-e", "MOCK_API_KEY=mock-secret")
+        "-e", f"OMNIGATE_INTERNAL_TOKEN={INTERNAL}", "-e", f"OMNIGATE_ADMIN_TOKEN={ADMIN}", "-e", "MOCK_API_KEY=mock-secret",
+        "-e", "OMNIGATE_TRUST_FORWARDED=1")
     run("dataplane", IMAGES["dataplane"], "-v", f"{P}-dataplane-data:/data",
         "-e", f"OMNIGATE_INTERNAL_TOKEN={INTERNAL}", "-e", "MOCK_API_KEY=mock-secret",
         "-e", "OMNIGATE_POLL_MS=300", "-e", "OMNIGATE_FLUSH_MS=200")
     run("proxy", "caddy:2.11-alpine", "-p", f"127.0.0.1:{PORT}:443",
         "-v", f"{ROOT}/deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "-v", f"{P}-caddy-data:/data")
+    run("proxy-locked", "caddy:2.11-alpine", "-p", f"127.0.0.1:{LOCKED_PORT}:443", "-e", f"OMNIGATE_ADMIN_ALLOW={LOCKED_ALLOW}",
+        "-v", f"{ROOT}/deploy/Caddyfile:/etc/caddy/Caddyfile:ro")
+
+
+# Documentation ranges (RFC 5737, RFC 3849): no client is ever in them.
+LOCKED_ALLOW = "192.0.2.0/24 2001:db8::/32"
 
 
 def start_compose(work, cfg_path):
     """Bring up the repository's compose.yaml, changed only where a test must differ."""
-    env_path = os.path.join(work, "test.env")
-    with open(env_path, "w", encoding="utf-8") as f:
+    # Two files, as in a real deployment: what one container gets, the other does not.
+    control_env, dataplane_env = os.path.join(work, "control.env"), os.path.join(work, "dataplane.env")
+    with open(control_env, "w", encoding="utf-8") as f:
         f.write(f"OMNIGATE_INTERNAL_TOKEN={INTERNAL}\nOMNIGATE_ADMIN_TOKEN={ADMIN}\nMOCK_API_KEY=mock-secret\n")
+    with open(dataplane_env, "w", encoding="utf-8") as f:
+        f.write(f"OMNIGATE_INTERNAL_TOKEN={INTERNAL}\nMOCK_API_KEY=mock-secret\n")
     override = os.path.join(work, "compose.test.yaml")
     with open(override, "w", encoding="utf-8") as f:
         f.write(f"""\
 services:
   control:
-    env_file: !override ["{env_path}"]
+    env_file: !override ["{control_env}"]
     volumes: !override
       - "{cfg_path}:/config/omnigate.json:ro"
       - control-data:/data
   dataplane:
-    env_file: !override ["{env_path}"]
+    env_file: !override ["{dataplane_env}"]
     environment:
       OMNIGATE_POLL_MS: "300"
       OMNIGATE_FLUSH_MS: "200"
   proxy:
     ports: !override ["127.0.0.1:{PORT}:443"]
+  proxy-locked:
+    image: caddy:2.11-alpine
+    ports: ["127.0.0.1:{LOCKED_PORT}:443"]
+    environment:
+      OMNIGATE_ADMIN_ALLOW: "{LOCKED_ALLOW}"
+    volumes: ["{ROOT}/deploy/Caddyfile:/etc/caddy/Caddyfile:ro"]
   mocks:
     image: python:3.12-alpine
     volumes: ["{ROOT}/tools:/tools:ro"]
@@ -327,7 +391,10 @@ def checks():
     s, h, data = req("GET", API_HOST, url.split(f":{PORT}", 1)[-1] if url else "/none")
     check("signed URL downloads the re-hosted file over TLS",
           s == 200 and hashlib.sha256(data).hexdigest() == out.get("sha256"), (s, len(data)))
-    hook = wait_until(lambda: (lambda w: w if w.get("status") == "delivered" else None)(
+    check("the stored file is served as a download in a sandbox, never as a page on this origin",
+          "attachment" in h.get("content-disposition", "") and h.get("x-content-type-options") == "nosniff"
+          and "sandbox" in h.get("content-security-policy", ""), h)
+    hook =wait_until(lambda: (lambda w: w if w.get("status") == "delivered" else None)(
         jreq("GET", API_HOST, f"/v1/jobs/{jid}", key=KEY)[2].get("webhook", {})), 20) or {}
     check("webhook is retried and delivered", hook.get("status") == "delivered" and hook.get("attempts") == 2, hook)
 
@@ -363,12 +430,99 @@ def checks():
     health = wait_until(lambda: docker("inspect", cname("control"), "--format", "{{.State.Health.Status}}") == "healthy", 40, 1.0)
     check("the control-plane container reports healthy", bool(health), docker("inspect", cname("control"), "--format", "{{.State.Health.Status}}"))
 
+    hardening()
+
     # `docker stop` sends SIGTERM to PID 1: the gateway must drain and exit by itself.
     t0 = time.time()
     docker("stop", "-t", "25", cname("dataplane"))
     took = time.time() - t0
     code = docker("inspect", cname("dataplane"), "--format", "{{.State.ExitCode}}")
     check("the gateway container shuts down cleanly on SIGTERM (exit 0, no kill)", code == "0" and took < 20, (code, f"{took:.1f}s"))
+
+
+def hardening():
+    """What the security review asked to see hold in a real deployment: the
+    requests go through the real proxy, byte for byte as written here."""
+    section("guarded paths, spelled oddly")
+    token = [f"Authorization: Bearer {ADMIN}"]
+    s, _ = get_raw(ADMIN_HOST, "/admin/keys", token)
+    check("the plain admin path works with the admin token (the control for the checks below)", s == 200, s)
+    odd = ["/%61dmin/keys", "/admin%2Fkeys", "/admin/%6beys", "/%2e/admin/keys", "/admin/./keys", "//admin/keys", "/admin//keys",
+           "/x/../admin/keys", "/admin;x/keys", "/admin/keys%00", "/%6detrics", "//metrics"]
+    got = {p: get_raw(ADMIN_HOST, p)[0] for p in odd}
+    check("no spelling of an admin path answers without credentials", all(400 <= s < 500 for s in got.values()), got)
+    s, data = get_raw(ADMIN_HOST, "/%61dmin/keys", token)
+    check("a percent-encoded admin path is refused outright, even with the admin token", s == 400 and b"og-container" not in data, s)
+
+    internal = [f"x-omnigate-internal: {INTERNAL}"]
+    odd = ["/internal/config", "/internal", "/%69nternal/config", "/internal%2Fconfig", "/%2finternal/config", "//internal/config",
+           "/./internal/config", "/internal/./config", "/x/../internal/config", "/INTERNAL/config", "/internal;/config", "/internal/config/"]
+    got = {p: get_raw(ADMIN_HOST, p, internal) for p in odd}
+    leaks = {p: s for p, (s, data) in got.items() if not 400 <= s < 500 or b'"upstreams"' in data}
+    check("no spelling of /internal/config gets through the proxy, even with the internal token", not leaks, leaks)
+    s, _, _ = req("POST", API_HOST, "/v1/jobs/", key=OTHER, body={"model": "image", "input": {"prompt": "x"}})
+    check("a job path with a trailing slash does not create a job", 400 <= s < 500, s)
+
+    section("admin allow-list")
+    up = wait_until(lambda: get_raw(API_HOST, "/healthz", port=LOCKED_PORT, verify=False)[0] == 200, 40, 0.5)
+    check("a proxy with an allow-list still serves the gateway to everyone", bool(up), logs("proxy-locked", 8))
+    got = {p: get_raw(ADMIN_HOST, p, token, port=LOCKED_PORT, verify=False)[0] for p in ("/", "/login", "/admin/keys", "/healthz")}
+    check("outside the allow-list the admin host answers 403 to everything, token or not", set(got.values()) == {403}, got)
+
+    section("secrets and shutdown, per container")
+    env = json.loads(docker("inspect", cname("dataplane"), "--format", "{{json .Config.Env}}"))
+    held = {e.split("=", 1)[0] for e in env}
+    check("the gateway container holds the internal token and no admin token",
+          "OMNIGATE_INTERNAL_TOKEN" in held and "OMNIGATE_ADMIN_TOKEN" not in held and ADMIN not in " ".join(env), sorted(held))
+    if COMPOSE:
+        grace = {s: docker("inspect", cname(s), "--format", "{{.Config.StopTimeout}}") for s in ("control", "dataplane")}
+        check("compose.yaml gives both services time to stop cleanly", grace == {"control": "30", "dataplane": "20"}, grace)
+
+    section("malformed requests over raw TLS")
+    host, auth = f"Host: {API_HOST}:{PORT}", f"Authorization: Bearer {OTHER}"
+    post = f"POST /v1/chat/completions HTTP/1.1\r\n{host}\r\n{auth}\r\nContent-Type: application/json\r\n"
+    cases = {
+        "bodiless POST": post + "Connection: close\r\n\r\n",
+        "bodiless POST to /v1/jobs": post.replace("/v1/chat/completions", "/v1/jobs") + "Connection: close\r\n\r\n",
+        "header line without a colon": f"GET /healthz HTTP/1.1\r\n{host}\r\nthis line has no colon\r\n\r\n",
+        "no request line": "\r\n\r\nGARBAGE\r\n\r\n",
+        "unknown method and version": f"FROB /healthz HTTP/9.9\r\n{host}\r\n\r\n",
+        "two content lengths": post + "Content-Length: 2\r\nContent-Length: 7\r\n\r\n{}",
+        "length and chunked together": post + "Content-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "broken chunk size": post + "Transfer-Encoding: chunked\r\n\r\nZZZ\r\n{}\r\n",
+        "body shorter than declared": post + 'Content-Length: 5000\r\n\r\n{"model":',
+        "64 kB header": f"GET /healthz HTTP/1.1\r\n{host}\r\nX-Pad: {'a' * 65536}\r\nConnection: close\r\n\r\n",
+        "600 headers": f"GET /healthz HTTP/1.1\r\n{host}\r\n" + "".join(f"X-N-{i}: v\r\n" for i in range(600)) + "Connection: close\r\n\r\n",
+        "bare line feeds": f"GET /healthz HTTP/1.1\n{host}\n\n",
+    }
+    got = {name: raw(API_HOST, payload.encode("latin-1"), timeout=3)[0] for name, payload in cases.items()}
+    print("      answers: " + ", ".join(f"{name} -> {s or 'closed'}" for name, s in got.items()), flush=True)
+    check("a bodiless POST gets a client-error answer, not a crash or a hang", 400 <= got["bodiless POST"] < 500, got["bodiless POST"])
+    # 502 (a body the proxy could not read) and 505 are the proxy's own answers.
+    # Bare line feeds are tolerated by the proxy, which forwards a clean request.
+    served = {n: s for n, s in got.items() if n != "bare line feeds" and (200 <= s < 400 or s in (500, 503, 504))}
+    check("malformed requests are refused or dropped, never served and never an internal error", not served, got)
+    s, _, _ = req("GET", API_HOST, "/healthz")
+    ok, state = alive("dataplane")
+    check("the gateway is still up after all of it (same process, never restarted)", s == 200 and ok and chat(key=OTHER)[0] == 200, (s, state))
+
+    host = f"Host: {ADMIN_HOST}:{PORT}"
+    login = f"POST /login HTTP/1.1\r\n{host}\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+    cases = {
+        "bodiless login": login + "Connection: close\r\n\r\n",
+        # Sent in full: the proxy cannot relay an answer while it waits for a
+        # body the client declared and never sends.
+        "8 kB login body": login + "Content-Length: 8192\r\nConnection: close\r\n\r\n" + "password=" + "a" * 8183,
+        "login with a broken chunk": login + "Transfer-Encoding: chunked\r\n\r\nZZZ\r\nx\r\n",
+        "bodiless admin POST": f"POST /admin/keys HTTP/1.1\r\n{host}\r\nAuthorization: Bearer {ADMIN}\r\nConnection: close\r\n\r\n",
+        "64 kB header": f"GET /healthz HTTP/1.1\r\n{host}\r\nX-Pad: {'a' * 65536}\r\nConnection: close\r\n\r\n",
+    }
+    got = {name: raw(ADMIN_HOST, payload.encode("latin-1"), timeout=3)[0] for name, payload in cases.items()}
+    print("      answers: " + ", ".join(f"{name} -> {s or 'closed'}" for name, s in got.items()), flush=True)
+    check("an oversized login body is refused, not parsed", got["8 kB login body"] == 413, got)
+    s, _, _ = req("GET", ADMIN_HOST, "/healthz")
+    ok, state = alive("control")
+    check("the control plane is still up after malformed requests", s == 200 and ok, (s, state, got))
 
 
 def main():

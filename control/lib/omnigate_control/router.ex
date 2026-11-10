@@ -25,7 +25,7 @@ defmodule OmnigateControl.Router do
   """
   use Plug.Router
 
-  alias OmnigateControl.{Admin, AdminAuth, Audit, ConfigStore, Dashboard, Jobs, Keys, Ledger, Metrics, Rejections, Storage, UrlSigner}
+  alias OmnigateControl.{Admin, AdminAuth, Audit, ConfigStore, Dashboard, Jobs, Keys, Ledger, Metrics, RateLimit, Rejections, Storage, UrlSigner}
 
   require Logger
 
@@ -40,6 +40,7 @@ defmodule OmnigateControl.Router do
   plug(:match)
   plug(:internal_auth)
   plug(:admin_auth)
+  plug(:small_public_body)
   plug(Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"])
   plug(:csrf)
   plug(:dispatch)
@@ -137,15 +138,20 @@ defmodule OmnigateControl.Router do
   post "/internal/v1/jobs" do
     with {:ok, key} <- gateway_key(conn),
          :ok <- within_budget(key),
-         :ok <- model_allowed(key, conn.body_params["model"]) do
+         :ok <- model_allowed(key, conn.body_params["model"]),
+         :ok <- within_rate(key) do
       idempotency_key = conn |> get_req_header("idempotency-key") |> List.first()
 
-      case Jobs.create(key.key_sha256, conn.body_params, idempotency_key) do
+      # Unfinished jobs are counted across the key's rotations.
+      case Jobs.create(key.key_sha256, conn.body_params, idempotency_key, open_cap: {Keys.max_open_jobs(key), Keys.hashes(key)}) do
         {:ok, job} -> send_json(conn, 202, Jobs.view(job))
         {:existing, job} -> send_json(conn, 200, Jobs.view(job))
+        # Too many unfinished jobs: worth trying again once some have finished.
+        {:error, 429, type, message} -> conn |> put_resp_header("retry-after", "10") |> send_error(429, type, message)
         {:error, status, type, message} -> send_error(conn, status, type, message)
       end
     else
+      {:error, 429, type, message, retry_after_s} -> conn |> put_resp_header("retry-after", Integer.to_string(retry_after_s)) |> send_error(429, type, message)
       {:error, status, type, message} -> send_error(conn, status, type, message)
     end
   end
@@ -299,7 +305,7 @@ defmodule OmnigateControl.Router do
   end
 
   post "/login" do
-    address = conn.remote_ip
+    address = AdminAuth.client_address(conn)
 
     cond do
       AdminAuth.throttled?(address) ->
@@ -430,6 +436,16 @@ defmodule OmnigateControl.Router do
     if Keys.over_budget?(key), do: {:error, 402, "budget_exceeded", "this key has exhausted its budget"}, else: :ok
   end
 
+  # The key's requests-per-minute limit, counted here for job creation. The
+  # data plane counts too, but only for the exact paths it recognises, and a
+  # limit that guards paid work must not depend on that.
+  defp within_rate(key) do
+    case RateLimit.check(key.name, Map.get(key, :rpm, 0)) do
+      :ok -> :ok
+      {:error, retry_after_s} -> {:error, 429, "rate_limit_exceeded", "this key is over its requests-per-minute limit", retry_after_s}
+    end
+  end
+
   # A key may be limited to a list of models. The data plane applies the same
   # list to text routes; media jobs are checked here.
   defp model_allowed(%{models: nil}, _model), do: :ok
@@ -478,15 +494,38 @@ defmodule OmnigateControl.Router do
       end
 
     if path && File.regular?(path) do
+      # The bytes and their declared type came from a provider. They are sent
+      # as a download from a sandboxed, script-less context, and never as a
+      # type a browser would render as a page on this origin.
       conn
-      |> put_resp_header("content-type", output["content_type"] || "application/octet-stream")
+      |> put_resp_header("content-type", safe_type(output["content_type"]))
+      |> put_resp_header("content-disposition", "attachment; filename=\"#{safe_filename(output["name"])}\"")
       |> put_resp_header("x-content-type-options", "nosniff")
+      |> put_resp_header("content-security-policy", "sandbox; default-src 'none'")
       |> put_resp_header("cache-control", "private, max-age=3600")
       |> send_file(200, path)
     else
       send_error(conn, 404, "file_not_found", "no such file")
     end
   end
+
+  @inline_safe ~w(image/png image/jpeg image/webp image/gif video/mp4 video/webm video/quicktime
+                  audio/mpeg audio/wav audio/x-wav audio/ogg audio/flac audio/pcm application/json)
+
+  # Media types that cannot carry script keep their type; anything else
+  # (text/html, image/svg+xml, XML, unknown) is served as opaque bytes.
+  defp safe_type(type) when is_binary(type) do
+    base = type |> String.split(";") |> hd() |> String.trim() |> String.downcase()
+    if base in @inline_safe, do: base, else: "application/octet-stream"
+  end
+
+  defp safe_type(_), do: "application/octet-stream"
+
+  defp safe_filename(name) when is_binary(name) do
+    if name =~ ~r/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/, do: name, else: "output.bin"
+  end
+
+  defp safe_filename(_), do: "output.bin"
 
   defp send_error(conn, status, type, message) do
     send_json(conn, status, %{error: %{type: type, message: message}})
@@ -512,13 +551,32 @@ defmodule OmnigateControl.Router do
   # browser to the login form. Everything else here is either public
   # (`/healthz`, `/login`) or guarded by `internal_auth` above.
   defp admin_auth(%{path_info: [first | _]} = conn, _opts) when first in ["admin", "metrics"] do
-    if AdminAuth.authorized?(conn) do
-      conn
-    else
-      conn
-      |> put_resp_header("www-authenticate", "Bearer")
-      |> send_json(401, %{error: %{type: "unauthorized", message: "send Authorization: Bearer <admin token>"}})
-      |> halt()
+    address = AdminAuth.client_address(conn)
+
+    cond do
+      AdminAuth.session(conn) != nil ->
+        conn
+
+      # Token guessing is slowed the same way password guessing is: after too
+      # many wrong tokens from one address, every token from it is refused
+      # for a while, the right one included.
+      AdminAuth.bearer_throttled?(address) ->
+        conn
+        |> put_resp_header("retry-after", "60")
+        |> send_json(429, %{error: %{type: "too_many_attempts", message: "too many wrong admin tokens from this address; wait a minute"}})
+        |> halt()
+
+      AdminAuth.bearer?(conn) ->
+        conn
+
+      true ->
+        # Only a wrong token counts; a request with no token at all is not a guess.
+        if get_req_header(conn, "authorization") != [], do: AdminAuth.note_bearer_failure(address)
+
+        conn
+        |> put_resp_header("www-authenticate", "Bearer")
+        |> send_json(401, %{error: %{type: "unauthorized", message: "send Authorization: Bearer <admin token>"}})
+        |> halt()
     end
   end
 
@@ -535,13 +593,45 @@ defmodule OmnigateControl.Router do
     conn |> send_json(404, %{error: %{type: "not_found", message: "no such endpoint"}}) |> halt()
   end
 
+  # The only body an anonymous caller may send is the login form, which is a
+  # few dozen bytes. Refusing anything larger by its declared length (and
+  # anything that does not declare one) keeps the parser away from megabytes
+  # sent by someone who has not authenticated.
+  @public_body_limit 4096
+  defp small_public_body(%{method: method, path_info: [first]} = conn, _opts) when first in ["login", "logout"] and method in ["POST", "PUT", "PATCH"] do
+    declared =
+      case get_req_header(conn, "content-length") do
+        [n] ->
+          case Integer.parse(n) do
+            {bytes, ""} -> bytes
+            _ -> :invalid
+          end
+
+        [] ->
+          if get_req_header(conn, "transfer-encoding") == [], do: 0, else: :invalid
+
+        _ ->
+          :invalid
+      end
+
+    if is_integer(declared) and declared <= @public_body_limit do
+      conn
+    else
+      conn |> send_error(413, "payload_too_large", "the request body is larger than this endpoint accepts") |> halt()
+    end
+  end
+
+  defp small_public_body(conn, _opts), do: conn
+
   # No route here needs a percent-encoded character (ids, names and file
   # names are all plain), so any `%` in the path is refused outright, as is
   # anything that would decode differently from how it was sent.
   defp plain_path(conn, _opts) do
     plain = fn segment -> not String.contains?(segment, ["%", "\\", <<0>>]) and segment not in [".", ".."] end
 
-    if Enum.all?(conn.path_info, plain) and not String.contains?(conn.request_path, "%") do
+    # A request line without a usable path (some servers hand over nil for
+    # odd targets such as "//host") is refused like any other odd spelling.
+    if is_binary(conn.request_path) and Enum.all?(conn.path_info, plain) and not String.contains?(conn.request_path, "%") do
       conn
     else
       conn |> send_json(400, %{error: %{type: "invalid_request", message: "the request path must not contain encoded characters"}}) |> halt()

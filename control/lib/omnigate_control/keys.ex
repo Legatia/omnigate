@@ -24,7 +24,7 @@ defmodule OmnigateControl.Keys do
   alias OmnigateControl.{ConfigStore, Ledger}
 
   @name_format ~r/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
-  @fields [:budget_usd, :budget_period, :rpm, :models, :webhook_secret, :disabled]
+  @fields [:budget_usd, :budget_period, :rpm, :models, :max_open_jobs, :webhook_secret, :disabled]
   @max_old_hashes 50
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -93,6 +93,14 @@ defmodule OmnigateControl.Keys do
 
   def disabled?(key), do: Map.get(key, :disabled, false) == true
 
+  @doc "How many unfinished jobs the key may have at once: its own setting, else the media default. 0 = no limit."
+  def max_open_jobs(key) do
+    case Map.get(key, :max_open_jobs) do
+      nil -> ConfigStore.get().media |> Map.get(:max_open_jobs, 100)
+      n -> n
+    end
+  end
+
   @doc "`active`, `blocked` (budget spent) or `disabled` (switched off by an operator)."
   def state(key) do
     cond do
@@ -129,6 +137,7 @@ defmodule OmnigateControl.Keys do
             budget_period: "total",
             rpm: 0,
             models: nil,
+            max_open_jobs: nil,
             webhook_secret: nil,
             disabled: false,
             source: :managed,
@@ -266,6 +275,10 @@ defmodule OmnigateControl.Keys do
 
   defp validate(:models, _), do: invalid("models must be a list of model names, or null for all models")
 
+  defp validate(:max_open_jobs, nil), do: {:ok, nil}
+  defp validate(:max_open_jobs, n) when is_integer(n) and n >= 0, do: {:ok, n}
+  defp validate(:max_open_jobs, _), do: invalid("max_open_jobs must be a whole number (0 for no limit), or null for the default")
+
   defp validate(:disabled, b) when is_boolean(b), do: {:ok, b}
   defp validate(:disabled, _), do: invalid("disabled must be true or false")
 
@@ -293,6 +306,7 @@ defmodule OmnigateControl.Keys do
           budget_period: if(k["budget_period"] in ConfigStore.budget_periods(), do: k["budget_period"], else: "total"),
           rpm: if(is_integer(k["rpm"]), do: k["rpm"], else: 0),
           models: if(is_list(k["models"]), do: k["models"]),
+          max_open_jobs: if(is_integer(k["max_open_jobs"]) and k["max_open_jobs"] >= 0, do: k["max_open_jobs"]),
           webhook_secret: k["webhook_secret"],
           disabled: k["disabled"] == true,
           source: :managed,

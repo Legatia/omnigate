@@ -13,6 +13,7 @@ defmodule OmnigateControl.Jobs.Adapters.OpenAIImages do
 
   import OmnigateControl.Jobs.Adapter, only: [decode: 1, describe: 1]
   alias OmnigateControl.Http
+  alias OmnigateControl.Jobs.Adapter
 
   @impl true
   def submit(up, model, input, ctx) do
@@ -31,6 +32,10 @@ defmodule OmnigateControl.Jobs.Adapters.OpenAIImages do
         {:error, describe(other)}
     end
   end
+
+  # The whole input is forwarded; the prompt is what is billed per character.
+  @impl true
+  def billable(input), do: %{chars: Adapter.chars(input, ~w(prompt)), seconds: 0}
 
   defp output(%{"b64_json" => b64}, content_type) when is_binary(b64) do
     case Base.decode64(b64, ignore: :whitespace) do

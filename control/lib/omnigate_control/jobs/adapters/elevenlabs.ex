@@ -14,6 +14,7 @@ defmodule OmnigateControl.Jobs.Adapters.ElevenLabs do
 
   import OmnigateControl.Jobs.Adapter, only: [describe: 1]
   alias OmnigateControl.Http
+  alias OmnigateControl.Jobs.Adapter
 
   @impl true
   def submit(up, model, input, ctx) do
@@ -38,6 +39,10 @@ defmodule OmnigateControl.Jobs.Adapters.ElevenLabs do
       _ -> {:error, "invalid_input: text and voice_id are required"}
     end
   end
+
+  # `text` is what is spoken; nothing else in the input is billed per character.
+  @impl true
+  def billable(input), do: %{chars: Adapter.chars(input, ~w(text)), seconds: 0}
 
   defp content_type("mp3" <> _), do: "audio/mpeg"
   defp content_type("pcm" <> _), do: "audio/pcm"

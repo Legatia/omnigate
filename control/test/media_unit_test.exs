@@ -101,13 +101,14 @@ defmodule OmnigateControl.MediaUnitTest do
     @price %{per_job_usd: 0.01, per_output_usd: 0.002, per_input_char_usd: 0.0001, per_second_usd: 0.1}
 
     test "adds per-job, per-output, per-character and per-second prices" do
-      assert_in_delta Jobs.cost(@price, %{"text" => "hello", "duration" => 5}, 2),
+      assert_in_delta Jobs.cost(@price, %{chars: 5, seconds: 5}, 2),
                       0.01 + 2 * 0.002 + 5 * 0.0001 + 5 * 0.1,
                       1.0e-12
     end
 
-    test "tolerates missing or textual durations" do
-      assert_in_delta Jobs.cost(@price, %{"prompt" => "ab", "duration" => "8"}, 1), 0.01 + 0.002 + 0.0002 + 0.8, 1.0e-12
+    test "takes its quantities from the adapter, including textual durations" do
+      billable = OmnigateControl.Jobs.Adapters.Replicate.billable(%{"prompt" => "ab", "duration" => "8"})
+      assert_in_delta Jobs.cost(@price, billable, 1), 0.01 + 0.002 + 0.0002 + 0.8, 1.0e-12
       assert_in_delta Jobs.cost(@price, %{}, 0), 0.01, 1.0e-12
     end
   end

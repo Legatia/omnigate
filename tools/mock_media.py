@@ -24,6 +24,8 @@ Knobs carried in a job's `input` (provider mocks):
     mock_delay_s   seconds until the job completes (default 1.0)
     num_outputs    number of output files (Replicate mock)
     mock_fail      make the fal mock complete with an error result
+    mock_output_url   Replicate mock: report this URL as the output (a hostile provider)
+    mock_redirect_to  Replicate mock: report an output URL that redirects to this one
 
 Webhook receiver paths:
     POST /hook            always 200
@@ -161,7 +163,7 @@ class Base(BaseHTTPRequestHandler):
 
 def replicate_handler(always_fail: bool):
     class Replicate(Base):
-        stats = {"submits": 0, "polls": 0, "cancels": 0, "downloads": 0}
+        stats = {"submits": 0, "polls": 0, "cancels": 0, "downloads": 0, "redirects": 0, "internal_hits": 0}
         predictions: dict = {}
 
         def view(self, p: dict) -> dict:
@@ -177,6 +179,12 @@ def replicate_handler(always_fail: bool):
                 else:
                     status = "succeeded"
                     urls = ["%s/files/%s-%d.png" % (self.base_url(), p["id"], i) for i in range(p["n"])]
+                    # A hostile (or compromised) provider: its "output" points
+                    # wherever the test says, directly or through a redirect.
+                    if isinstance(p["input"].get("mock_output_url"), str):
+                        urls = [p["input"]["mock_output_url"]]
+                    elif isinstance(p["input"].get("mock_redirect_to"), str):
+                        urls = ["%s/redirect?to=%s" % (self.base_url(), urllib.parse.quote(p["input"]["mock_redirect_to"], safe=""))]
                     output = urls if p["as_list"] else urls[0]
             return {
                 "id": p["id"],
@@ -238,6 +246,20 @@ def replicate_handler(always_fail: bool):
             if self.maybe_stats():
                 return
             path = self.path.split("?")[0]
+            if path == "/redirect":
+                # Sends the downloader somewhere else; counted so a test can
+                # tell whether the first hop was fetched at all.
+                self.bump("redirects")
+                to = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("to", [""])[0]
+                self.send_response(302)
+                self.send_header("location", to)
+                self.send_header("content-length", "0")
+                self.end_headers()
+                return
+            if path == "/internal-only":
+                # Stands for something that only exists on the private network.
+                self.bump("internal_hits")
+                return self.send(200, b"secret", "text/plain")
             if path.startswith("/files/"):
                 # Output files are public, like the real delivery URLs.
                 self.bump("downloads")

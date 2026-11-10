@@ -2,10 +2,12 @@ defmodule OmnigateControl.Jobs.Store do
   @moduledoc """
   Durable job state.
 
-  Every change to a job appends its full snapshot to a JSONL log and syncs it
-  to disk before the change is visible, then updates an ETS table that reads
-  go to directly. On boot the log is replayed (last snapshot per job wins)
-  and rewritten compacted, so it does not grow across restarts. While
+  A new job appends its full snapshot to a JSONL log; every later change
+  appends only the fields that changed (a patch line), so a job's input is
+  written once, not on every state change. Each line is synced to disk before
+  the change is visible, then an ETS table that reads go to directly is
+  updated. On boot the log is replayed (snapshots, then patches applied in
+  order) and rewritten compacted, so it does not grow across restarts. While
   running, the log is compacted again whenever it holds well over twice as
   many lines as there are jobs, so a process that never restarts does not
   leave a long history for the next boot either. Boot therefore reads a file
@@ -29,7 +31,25 @@ defmodule OmnigateControl.Jobs.Store do
   Insert a new job. With an idempotency key that was already used by the same
   gateway key, returns `{:existing, job}` and inserts nothing.
   """
-  def create(job), do: GenServer.call(__MODULE__, {:create, job})
+  def create(job), do: GenServer.call(__MODULE__, {:create, job, nil})
+
+  @doc """
+  Like `create/1`, but refuses with `{:error, :too_many_open}` when the
+  gateway key already has `limit` unfinished jobs. `hashes` are the key's
+  current and earlier secrets' hashes, so a rotation does not reset the count.
+  Checked inside the store, so two requests cannot both take the last slot.
+  """
+  def create(job, {limit, hashes}) when is_integer(limit) and is_list(hashes), do: GenServer.call(__MODULE__, {:create, job, {limit, hashes}})
+
+  @doc "Unfinished jobs created under any of `hashes`."
+  def open_count(hashes) when is_list(hashes) do
+    Enum.reduce(hashes, 0, fn hash, sum ->
+      case :ets.lookup(@index, {:open, hash}) do
+        [{_, n}] -> sum + n
+        [] -> sum
+      end
+    end)
+  end
 
   @doc """
   Apply `fun` to the current job. `fun` returns the new job, or `:noop` to
@@ -128,7 +148,7 @@ defmodule OmnigateControl.Jobs.Store do
   defp compact_check_ms, do: Application.get_env(:omnigate_control, :jobs_compact_check_ms, 60_000)
 
   @impl true
-  def handle_call({:create, job}, _from, state) do
+  def handle_call({:create, job, cap}, _from, state) do
     idem = idem_key(job)
 
     case idem && :ets.lookup(@index, idem) do
@@ -136,8 +156,19 @@ defmodule OmnigateControl.Jobs.Store do
         {:reply, {:existing, get(id)}, state}
 
       _ ->
-        persist(state, job)
-        {:reply, {:ok, job}, state}
+        case cap do
+          {limit, hashes} when limit > 0 ->
+            if open_count(hashes) >= limit do
+              {:reply, {:error, :too_many_open}, state}
+            else
+              persist(state, job)
+              {:reply, {:ok, job}, state}
+            end
+
+          _ ->
+            persist(state, job)
+            {:reply, {:ok, job}, state}
+        end
     end
   end
 
@@ -153,7 +184,7 @@ defmodule OmnigateControl.Jobs.Store do
 
           %{} = new ->
             new = Map.put(new, "updated_at", now_iso())
-            persist(state, new)
+            persist_change(state, job, new)
             {:reply, {:ok, new}, state}
         end
     end
@@ -183,6 +214,7 @@ defmodule OmnigateControl.Jobs.Store do
 
   defp unindex(job) do
     id = job["id"]
+    if open?(job), do: count_open(job["key_sha256"], -1)
     :ets.delete(@table, id)
 
     idem = idem_key(job)
@@ -198,13 +230,42 @@ defmodule OmnigateControl.Jobs.Store do
 
   defp persist(state, job) do
     # Write-ahead: on disk before anyone can observe the change.
-    :ok = IO.binwrite(state.file, [JSON.encode!(job), ?\n])
-    :ok = :file.datasync(state.file)
-    Process.put(:appended, Process.get(:appended, 0) + 1)
+    append(state, job)
     index(job)
   end
 
+  # Only what changed goes to disk: a patch line naming the job, the fields
+  # with new values and the fields that went away. A job's input (up to a
+  # megabyte) is therefore written once, when the job is created.
+  defp persist_change(state, old, new) do
+    changed = for {field, value} <- new, Map.get(old, field, :__absent__) != value, into: %{}, do: {field, value}
+    dropped = Map.keys(old) -- Map.keys(new)
+    append(state, %{"id" => new["id"], "_patch" => changed, "_drop" => dropped})
+    index(new)
+  end
+
+  defp append(state, line) do
+    :ok = IO.binwrite(state.file, [JSON.encode!(line), ?\n])
+    :ok = :file.datasync(state.file)
+    Process.put(:appended, Process.get(:appended, 0) + 1)
+  end
+
+  @terminal ~w(succeeded failed canceled)
+  defp open?(nil), do: false
+  defp open?(job), do: job["status"] not in @terminal
+
+  defp count_open(key, delta) when is_binary(key) and delta != 0 do
+    :ets.update_counter(@index, {:open, key}, delta, {{:open, key}, 0})
+  end
+
+  defp count_open(_key, _delta), do: :ok
+
   defp index(job) do
+    # Keep the per-key count of unfinished jobs in step with every change.
+    was_open = open?(get(job["id"]))
+    is_open = open?(job)
+    if is_open != was_open, do: count_open(job["key_sha256"], if(is_open, do: 1, else: -1))
+
     :ets.insert(@table, {job["id"], job})
     if idem = idem_key(job), do: :ets.insert(@index, {idem, job["id"]})
 
@@ -226,8 +287,17 @@ defmodule OmnigateControl.Jobs.Store do
         # A torn final line (crash mid-write) is skipped, not fatal. It still
         # counts as a line, so the file is rewritten without it.
         case JSON.decode(line) do
-          {:ok, %{"id" => _} = job} -> index(job)
-          _ -> Logger.warning("job store: skipping unreadable line during replay")
+          {:ok, %{"id" => id, "_patch" => %{} = changed} = patch} ->
+            case get(id) do
+              nil -> Logger.warning("job store: skipping a change to unknown job #{inspect(id)} during replay")
+              job -> job |> Map.merge(changed) |> Map.drop(List.wrap(patch["_drop"])) |> index()
+            end
+
+          {:ok, %{"id" => _} = job} ->
+            index(job)
+
+          _ ->
+            Logger.warning("job store: skipping unreadable line during replay")
         end
 
         lines + 1

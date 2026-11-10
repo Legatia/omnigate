@@ -17,6 +17,10 @@ if config_env() == :test do
     media_dir: Path.join(System.tmp_dir!(), "omnigate-test-media-#{stamp}"),
     signing_secret: "test-signing-secret",
     admin_token: "test-admin-token-0123456789",
+    # The suite sends wrong admin tokens on purpose, all from 127.0.0.1; the
+    # lockout that follows would turn unrelated tests into 429s. The lockout
+    # itself is tested with its own address and its own limit.
+    bearer_max_failures: 1_000_000,
     # Compiles a route that raises, for the error-shape test.
     test_routes: true
 end

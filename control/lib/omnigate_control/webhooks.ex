@@ -60,49 +60,7 @@ defmodule OmnigateControl.Webhooks do
   then letting the HTTP client resolve it again would let a hostile DNS
   server answer "public" for the check and "internal" for the call.
   """
-  def target(url) do
-    uri = URI.parse(url)
-
-    cond do
-      uri.scheme not in ["http", "https"] ->
-        {:error, "webhook_url must be http or https"}
-
-      uri.host in [nil, ""] ->
-        {:error, "webhook_url has no host"}
-
-      uri.userinfo != nil ->
-        {:error, "webhook_url must not contain credentials"}
-
-      true ->
-        addresses = resolve(uri.host)
-
-        cond do
-          addresses == [] -> {:error, "webhook_url host does not resolve"}
-          ConfigStore.get().media.webhooks.allow_private -> {:ok, hd(addresses)}
-          Enum.any?(addresses, &private?/1) -> {:error, "webhook_url resolves to a private or loopback address"}
-          true -> {:ok, hd(addresses)}
-        end
-    end
-  end
-
-  # IPv4 first. A literal address needs no lookup. Tests swap the resolver.
-  defp resolve(host) do
-    case :inet.parse_address(String.to_charlist(host)) do
-      {:ok, ip} ->
-        [ip]
-
-      {:error, _} ->
-        resolver = Application.get_env(:omnigate_control, :webhook_resolver, &system_resolve/1)
-        resolver.(host)
-    end
-  end
-
-  defp system_resolve(host) do
-    for family <- [:inet, :inet6],
-        {:ok, list} <- [:inet.getaddrs(String.to_charlist(host), family)],
-        addr <- list,
-        do: addr
-  end
+  def target(url), do: OmnigateControl.NetGuard.target(url, "webhook_url")
 
   # -- timers ----------------------------------------------------------------
 
@@ -226,14 +184,4 @@ defmodule OmnigateControl.Webhooks do
   end
 
   defp signing_key(secret), do: secret
-
-  defp private?({a, b, _, _}) do
-    a in [0, 10, 127] or (a == 172 and b in 16..31) or (a == 192 and b == 168) or (a == 169 and b == 254) or
-      (a == 100 and b in 64..127) or a >= 224
-  end
-
-  # IPv4-mapped (::ffff:a.b.c.d)
-  defp private?({0, 0, 0, 0, 0, 0xFFFF, hi, lo}), do: private?({div(hi, 256), rem(hi, 256), div(lo, 256), rem(lo, 256)})
-  defp private?({0, 0, 0, 0, 0, 0, 0, n}) when n in [0, 1], do: true
-  defp private?({a, _, _, _, _, _, _, _}), do: Bitwise.band(a, 0xFE00) == 0xFC00 or Bitwise.band(a, 0xFFC0) == 0xFE80
 end

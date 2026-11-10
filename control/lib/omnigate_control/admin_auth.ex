@@ -20,9 +20,15 @@ defmodule OmnigateControl.AdminAuth do
   no server-side state. Requests authenticated by the bearer token are exempt:
   a browser never attaches that header on its own.
 
-  Failed logins are counted per client address and refused for a while after
-  too many, to slow down guessing. Behind a reverse proxy every client shares
-  the proxy's address, so the limit then applies to all of them together.
+  Failed logins and wrong bearer tokens are counted per client address and
+  refused for a while after too many, to slow down guessing. Behind a reverse
+  proxy every client shares the proxy's address, so the limit then applies to
+  all of them together, and anyone can lock everyone out by guessing. Set
+  `OMNIGATE_TRUST_FORWARDED=1` when the only way in is a proxy that writes
+  `X-Forwarded-For` itself (compose.yaml does): the address the proxy reports
+  is then used instead. Do not set it when clients can reach the control
+  plane directly, because they could then pick the address they are counted
+  under.
   """
   require Logger
 
@@ -31,39 +37,57 @@ defmodule OmnigateControl.AdminAuth do
   @failures :omnigate_login_failures
   @max_failures 5
   @window_s 60
+  # Wrong bearer tokens on /admin and /metrics. Higher than the login limit:
+  # scripts share an address more often than people do, and a lockout here
+  # also stops the operator's own automation for a minute.
+  @max_bearer_failures 20
+  @min_token_bytes 16
+  @max_tracked 10_000
 
   def cookie_name, do: @cookie
   def session_ttl_s, do: @session_ttl_s
 
-  @doc "Resolve the admin token and create the failed-login table. Call once at boot."
+  @doc """
+  Resolve the admin token and create the failed-login table. Call once at
+  boot. `{:error, message}` when a token was set but is too short to be safe:
+  the control plane then refuses to start rather than run with it.
+  """
   def setup do
     if :ets.whereis(@failures) == :undefined do
       :ets.new(@failures, [:named_table, :public, :set])
     end
 
-    token =
-      case System.get_env("OMNIGATE_ADMIN_TOKEN") || Application.get_env(:omnigate_control, :admin_token) do
-        token when is_binary(token) and token != "" ->
-          if byte_size(token) < 16 do
-            Logger.warning("OMNIGATE_ADMIN_TOKEN is shorter than 16 characters; use a long random value")
-          end
+    case resolve_token(System.get_env("OMNIGATE_ADMIN_TOKEN") || Application.get_env(:omnigate_control, :admin_token)) do
+      {:ok, token} ->
+        :persistent_term.put({__MODULE__, :token}, token)
+        :persistent_term.put({__MODULE__, :session_key}, :crypto.mac(:hmac, :sha256, token, "omnigate-session-v1"))
+        :ok
 
-          token
+      {:error, _message} = error ->
+        error
+    end
+  end
 
-        _ ->
-          generated = Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
+  @doc false
+  def resolve_token(token) when is_binary(token) and token != "" do
+    if byte_size(token) < @min_token_bytes do
+      {:error,
+       "OMNIGATE_ADMIN_TOKEN is shorter than #{@min_token_bytes} characters. It is the dashboard password and the admin API token; " <>
+         "set a long random value (or leave it unset to have one generated for this run)."}
+    else
+      {:ok, token}
+    end
+  end
 
-          Logger.warning(
-            "OMNIGATE_ADMIN_TOKEN is not set. Generated one for this run (dashboard password and /admin API token): " <>
-              generated
-          )
+  def resolve_token(_unset) do
+    generated = Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
 
-          generated
-      end
+    Logger.warning(
+      "OMNIGATE_ADMIN_TOKEN is not set. Generated one for this run (dashboard password and /admin API token): " <>
+        generated
+    )
 
-    :persistent_term.put({__MODULE__, :token}, token)
-    :persistent_term.put({__MODULE__, :session_key}, :crypto.mac(:hmac, :sha256, token, "omnigate-session-v1"))
-    :ok
+    {:ok, generated}
   end
 
   @doc "Is this the admin token? Constant-time."
@@ -147,6 +171,26 @@ defmodule OmnigateControl.AdminAuth do
 
   # -- failed-login throttle ---------------------------------------------------
 
+  @doc """
+  The address failed attempts are counted against: the peer, or, when
+  `OMNIGATE_TRUST_FORWARDED` is on, the last hop of `X-Forwarded-For` (the
+  one the nearest proxy wrote). IPv6 addresses are cut to their /64, since a
+  single host usually owns all of it.
+  """
+  def client_address(conn, trust_forwarded \\ System.get_env("OMNIGATE_TRUST_FORWARDED") in ["1", "true"]) do
+    with true <- trust_forwarded,
+         [_ | _] = values <- Plug.Conn.get_req_header(conn, "x-forwarded-for"),
+         hop = values |> List.last() |> String.split(",") |> List.last() |> String.trim(),
+         {:ok, ip} <- :inet.parse_address(String.to_charlist(hop)) do
+      network(ip)
+    else
+      _ -> network(conn.remote_ip)
+    end
+  end
+
+  defp network({a, b, c, d, _, _, _, _}), do: {a, b, c, d, 0, 0, 0, 0}
+  defp network(ip), do: ip
+
   @doc "Has this address used up its failed attempts for the current window?"
   def throttled?(address, now \\ System.os_time(:second)) do
     case :ets.lookup(@failures, address) do
@@ -161,16 +205,38 @@ defmodule OmnigateControl.AdminAuth do
         :ets.insert(@failures, {address, count + 1, window_start})
 
       _ ->
+        forget_expired(now)
         :ets.insert(@failures, {address, 1, now})
     end
 
     :ok
   end
 
+  # Entries are only useful for one window. Sweep the finished ones once the
+  # table has grown, so guesses from many addresses cannot fill memory.
+  defp forget_expired(now) do
+    if :ets.info(@failures, :size) > @max_tracked do
+      :ets.select_delete(@failures, [{{:_, :_, :"$1"}, [{:"=<", :"$1", now - @window_s}], [true]}])
+    end
+  end
+
   def clear_failures(address) do
     :ets.delete(@failures, address)
     :ok
   end
+
+  @doc "Has this address sent too many wrong bearer tokens in the current window?"
+  def bearer_throttled?(address, now \\ System.os_time(:second)) do
+    case :ets.lookup(@failures, {:bearer, address}) do
+      [{_, count, window_start}] -> now - window_start < @window_s and count >= max_bearer_failures()
+      [] -> false
+    end
+  end
+
+  def note_bearer_failure(address, now \\ System.os_time(:second)), do: note_failure({:bearer, address}, now)
+  def clear_bearer_failures(address), do: clear_failures({:bearer, address})
+
+  defp max_bearer_failures, do: Application.get_env(:omnigate_control, :bearer_max_failures, @max_bearer_failures)
 
   defp mac(payload) do
     key = :persistent_term.get({__MODULE__, :session_key})

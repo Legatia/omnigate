@@ -22,6 +22,7 @@ defmodule OmnigateControl.Jobs.Adapters.GeminiInteractions do
 
   import OmnigateControl.Jobs.Adapter, only: [decode: 1, describe: 1, transient?: 1]
   alias OmnigateControl.Http
+  alias OmnigateControl.Jobs.Adapter
   alias OmnigateControl.Jobs.Adapters.Gemini
 
   @impl true
@@ -91,6 +92,15 @@ defmodule OmnigateControl.Jobs.Adapters.GeminiInteractions do
 
   # in_progress and anything else that is not final.
   def interpret(_), do: :pending
+
+  # Counted from the request body: the text of `input`, whichever form it took.
+  @impl true
+  def billable(input) do
+    case request_body(input, "") do
+      {:ok, body} -> %{chars: Adapter.text_chars(body["input"]) + Adapter.text_chars(body["system_instruction"]), seconds: 0}
+      _ -> %{chars: 0, seconds: 0}
+    end
+  end
 
   defp headers(ctx), do: [{"x-goog-api-key", ctx.api_key}]
 end

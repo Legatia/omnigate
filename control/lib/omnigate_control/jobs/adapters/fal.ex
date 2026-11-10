@@ -17,6 +17,7 @@ defmodule OmnigateControl.Jobs.Adapters.Fal do
 
   import OmnigateControl.Jobs.Adapter, only: [decode: 1, describe: 1, transient?: 1]
   alias OmnigateControl.Http
+  alias OmnigateControl.Jobs.Adapter
 
   @impl true
   def submit(up, model, input, ctx) do
@@ -83,6 +84,11 @@ defmodule OmnigateControl.Jobs.Adapters.Fal do
 
   defp trusted(up, url) when is_binary(url), do: if(String.starts_with?(url, up.base_url <> "/"), do: url)
   defp trusted(_up, _), do: nil
+
+  # The whole input goes to the provider, so every text field in it counts,
+  # and so does whichever of the duration fields asks for more.
+  @impl true
+  def billable(input), do: %{chars: Adapter.chars(input, ~w(prompt text input)), seconds: Adapter.seconds(input, ~w(duration seconds))}
 
   defp headers(ctx), do: [{"authorization", "Key #{ctx.api_key}"}]
 end

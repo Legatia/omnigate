@@ -1,19 +1,34 @@
 # omnigate with TLS in front.
 #
-#   cp .env.example .env        # then edit it
+#   cp .env.control.example .env.control       # then edit it
+#   cp .env.dataplane.example .env.dataplane   # then edit it
 #   cp config/omnigate.example.json config/omnigate.json   # then edit it
 #   docker compose up -d --build
 #
 # Only the proxy publishes ports. The gateway is at https://$OMNIGATE_API_HOST,
-# the dashboard at https://$OMNIGATE_ADMIN_HOST.
+# the dashboard at https://$OMNIGATE_ADMIN_HOST (set both, and optionally
+# OMNIGATE_ADMIN_ALLOW, in .env; see .env.example).
+#
+# Secrets are split by who needs them. The data plane faces the internet, so
+# it gets the internal token and the text providers' keys and nothing else:
+# no admin token, no media provider keys, no webhook secrets, no bucket
+# credentials. Keep it that way when you add variables.
 
 services:
   control:
     build: ./control
     restart: unless-stopped
-    # .env carries the two omnigate tokens plus the keys of media providers
-    # and buckets named in the config.
-    env_file: .env
+    # The admin token, the internal token, media provider keys, webhook
+    # secrets and bucket credentials.
+    env_file: .env.control
+    environment:
+      # The proxy is the only way in and writes X-Forwarded-For itself, so
+      # failed logins and wrong tokens are counted per real client address
+      # instead of all against the proxy. Remove this if you publish the
+      # control plane's port directly.
+      OMNIGATE_TRUST_FORWARDED: "1"
+    # A clean stop writes a ledger snapshot; give it time.
+    stop_grace_period: 30s
     volumes:
       - ./config/omnigate.json:/config/omnigate.json:ro
       - control-data:/data
@@ -21,9 +36,12 @@ services:
   dataplane:
     build: ./dataplane
     restart: unless-stopped
-    # .env carries the internal token plus the keys of the text providers
-    # named in the config (api_key_env).
-    env_file: .env
+    # The internal token and the keys of the text providers named in the
+    # config (api_key_env). Nothing else belongs here.
+    env_file: .env.dataplane
+    # Longer than OMNIGATE_SHUTDOWN_GRACE_MS (10 s by default), so in-flight
+    # requests finish and queued usage is delivered before Docker kills it.
+    stop_grace_period: 20s
     volumes:
       - dataplane-data:/data
     depends_on:
@@ -38,6 +56,9 @@ services:
     environment:
       OMNIGATE_API_HOST: ${OMNIGATE_API_HOST:-localhost}
       OMNIGATE_ADMIN_HOST: ${OMNIGATE_ADMIN_HOST:-admin.localhost}
+      # Who may reach the dashboard and admin API at all (CIDR ranges,
+      # space-separated). Open by default; narrow it to your office or VPN.
+      OMNIGATE_ADMIN_ALLOW: ${OMNIGATE_ADMIN_ALLOW:-0.0.0.0/0 ::/0}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

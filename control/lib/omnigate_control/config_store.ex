@@ -172,6 +172,8 @@ defmodule OmnigateControl.ConfigStore do
             rpm: to_int(k["rpm"], 0),
             # Route model names (text or media) this key may use; nil = all.
             models: models(k["models"]),
+            # Jobs this key may have unfinished at once; nil = the media default.
+            max_open_jobs: open_jobs!(k["max_open_jobs"], "key #{inspect(k["name"])}"),
             webhook_secret: secret(k, "webhook_secret"),
             # Switched off by the operator: refused everywhere, usage kept.
             disabled: k["disabled"] == true,
@@ -227,6 +229,13 @@ defmodule OmnigateControl.ConfigStore do
       media: normalize_media(raw["media"] || %{}),
       retention: normalize_retention(raw["retention"] || %{})
     }
+  end
+
+  defp open_jobs!(nil, _where), do: nil
+  defp open_jobs!(n, _where) when is_integer(n) and n >= 0, do: n
+
+  defp open_jobs!(other, where) do
+    raise ArgumentError, "#{where}: \"max_open_jobs\" must be a whole number, 0 (no limit) or more, got #{inspect(other)}"
   end
 
   defp models(nil), do: nil
@@ -296,11 +305,17 @@ defmodule OmnigateControl.ConfigStore do
     raise ArgumentError, "route #{inspect(model)}: a target's \"weight\" must be a non-negative integer, got #{inspect(other)}"
   end
 
-  # How long finished things are kept, in days. 0 (the default) keeps them forever.
+  # How long finished things are kept, in days. 0 keeps them forever, and is
+  # the default for everything except the ledger's duplicate-detection ids.
+  @default_ledger_ids_days 14
+
   defp normalize_retention(r) do
     %{
       jobs_days: days(r["jobs_days"], "jobs_days"),
-      ledger_ids_days: days(r["ledger_ids_days"], "ledger_ids_days"),
+      # Event ids are only needed while a data plane might still resend an
+      # event, and the set otherwise grows with every request ever served. So
+      # this one has a finite default; an explicit 0 still keeps them forever.
+      ledger_ids_days: if(is_nil(r["ledger_ids_days"]), do: @default_ledger_ids_days, else: days(r["ledger_ids_days"], "ledger_ids_days")),
       # Ledger segments (the event history) older than this are deleted;
       # totals are kept in the ledger's snapshots.
       ledger_days: days(r["ledger_days"], "ledger_days"),
@@ -330,6 +345,10 @@ defmodule OmnigateControl.ConfigStore do
       public_base_url: String.trim_trailing(m["public_base_url"] || "http://127.0.0.1:8080", "/"),
       poll_interval_ms: to_int(m["poll_interval_ms"], 2_000),
       max_output_bytes: to_int(m["max_output_bytes"], 512 * 1024 * 1024),
+      # A job's input and metadata are kept in memory and on disk while the job exists.
+      max_input_bytes: to_int(m["max_input_bytes"], 1_048_576),
+      # Unfinished jobs one key may have at a time (a key can set its own); 0 = no limit.
+      max_open_jobs: open_jobs!(m["max_open_jobs"], "media") || 100,
       upstreams:
         Enum.map(m["upstreams"] || [], fn u ->
           %{
@@ -353,10 +372,10 @@ defmodule OmnigateControl.ConfigStore do
                   upstream: Map.fetch!(t, "upstream"),
                   model: Map.fetch!(t, "model"),
                   price: %{
-                    per_job_usd: to_float(price["per_job_usd"] || 0),
-                    per_output_usd: to_float(price["per_output_usd"] || 0),
-                    per_input_char_usd: to_float(price["per_input_char_usd"] || 0),
-                    per_second_usd: to_float(price["per_second_usd"] || 0)
+                    per_job_usd: media_price!(price["per_job_usd"], r["model"]),
+                    per_output_usd: media_price!(price["per_output_usd"], r["model"]),
+                    per_input_char_usd: media_price!(price["per_input_char_usd"], r["model"]),
+                    per_second_usd: media_price!(price["per_second_usd"], r["model"])
                   }
                 }
               end)
@@ -373,6 +392,13 @@ defmodule OmnigateControl.ConfigStore do
         secret: secret(webhooks, "secret")
       }
     }
+  end
+
+  defp media_price!(nil, _model), do: 0.0
+  defp media_price!(n, _model) when is_number(n) and n >= 0, do: n * 1.0
+
+  defp media_price!(other, model) do
+    raise ArgumentError, "media route #{inspect(model)}: a price must be a number of dollars, 0 or more, got #{inspect(other)}"
   end
 
   defp normalize_storage(%{"kind" => "s3"} = s) do

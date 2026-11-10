@@ -1,10 +1,11 @@
-# CI for omnigate. Five jobs, all on Linux:
+# CI for omnigate. Six jobs, all on Linux:
 #
 #   dataplane   Zig unit tests and a build of the data plane. Zig is installed
 #               the way dataplane/Dockerfile installs it: downloaded from
 #               ziglang.org and checked against the SHA-256 that file pins
 #               (see .github/actions/setup-zig).
-#   control     Elixir unit tests of the control plane (`mix test`).
+#   control     Formatting check (`mix format --check-formatted`) and Elixir
+#               unit tests of the control plane (`mix test`).
 #   tools       Unit tests of the LiteLLM importer (Python, stdlib only).
 #   e2e         tools/e2e.py: mock providers, the control plane and the data
 #               plane as local processes, checked end to end. Runs only if the
@@ -12,6 +13,12 @@
 #               job rather than passed along as an artifact: a default
 #               `zig build` targets the CPU of the machine it runs on, and two
 #               jobs are not guaranteed to get the same CPU model.
+#   sdk         tools/sdk_compat.py: the same local stack as the text half of
+#               e2e, driven through the official OpenAI and Anthropic Python
+#               SDKs. The two SDKs are installed from PyPI at their latest
+#               versions (the job log prints which); they are the only
+#               third-party Python packages any job installs. Runs only if
+#               the two unit-test jobs pass.
 #   containers  tools/container_test.py --compose: builds both images, starts
 #               compose.yaml (plus mock providers) and checks it through the
 #               TLS proxy.
@@ -83,6 +90,11 @@ jobs:
         working-directory: control
         run: mix deps.get
 
+      # control/.formatter.exs sets the line length the code is written to.
+      - name: Formatting
+        working-directory: control
+        run: mix format --check-formatted
+
       - name: Unit tests
         working-directory: control
         run: mix test
@@ -142,7 +154,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Listens on 127.0.0.1 only: 9001-9004 and 9101-9109 (mocks), 14000
+      # Listens on 127.0.0.1 only: 9001-9005 and 9101-9109 (mocks), 14000
       # (control plane), 18080 (gateway). State and logs go to a directory
       # named omnigate-e2e-* under TMPDIR.
       - name: End-to-end test
@@ -156,6 +168,73 @@ jobs:
         with:
           name: e2e-logs
           path: ${{ runner.temp }}/omnigate-e2e-*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  sdk:
+    name: Official SDKs (mock providers)
+    needs: [dataplane, control]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-zig
+
+      # tools/sdk_compat.py uses the harness in tools/e2e.py, which runs
+      # dataplane/zig-out/bin/omnigate-dp.
+      - name: Build the data plane
+        working-directory: dataplane
+        run: zig build
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      # Same key as the e2e job: both compile the control plane in the dev
+      # environment, so either job's cache serves the other.
+      - name: Cache dependencies and their build
+        uses: actions/cache@v6
+        with:
+          path: |
+            control/deps
+            control/_build
+          key: mix-dev-${{ runner.os }}-otp-${{ steps.beam.outputs.otp-version }}-elixir-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('control/mix.lock') }}
+
+      # The harness starts the control plane with `mix run --no-halt` and
+      # waits for its port; compiling first keeps that wait short.
+      - name: Fetch and compile the control plane
+        working-directory: control
+        run: |
+          mix deps.get
+          mix compile
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Not pinned: the point of this job is to notice when a new SDK release
+      # stops working against the gateway. The test prints the versions it ran.
+      - name: Install the OpenAI and Anthropic SDKs
+        run: python -m pip install openai anthropic
+
+      # Listens on 127.0.0.1 only: 9001-9005 (text mocks), 14000 (control
+      # plane), 18080 (gateway). State and logs go to a directory named
+      # omnigate-sdk-* under TMPDIR. Known gaps are reported as GAP and do not
+      # fail the job (that would need --strict).
+      - name: SDK compatibility test
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python tools/sdk_compat.py
+
+      - name: Upload logs and state
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdk-logs
+          path: ${{ runner.temp }}/omnigate-sdk-*
           if-no-files-found: ignore
           retention-days: 7
 

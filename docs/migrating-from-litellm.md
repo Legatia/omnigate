@@ -88,15 +88,23 @@ the provider has been tested through omnigate: see
 - **An `api_base` that comes from an environment variable**
   (`os.environ/...`). The entry is skipped; write the URL in the config.
 - **Virtual keys, teams and budgets.** They live in LiteLLM's database, not
-  in the YAML. Create gateway keys in the omnigate config, with
-  `budget_usd` and `rpm` as needed.
-- **`general_settings.master_key`.** Not imported; the tool says so.
+  in the YAML. Create gateway keys in omnigate instead: in the config file,
+  or at run time from the dashboard or the admin API
+  ([Admin](admin.md)), with `budget_usd`, `budget_period` and `rpm` as
+  needed. omnigate has keys but no teams or users.
+- **`general_settings.master_key`.** Not imported; the tool says so. The
+  nearest thing in omnigate is the admin token (`OMNIGATE_ADMIN_TOKEN`),
+  which is set in the control plane's environment.
 - **Per-deployment `rpm` / `tpm`, caching, guardrails and callbacks.**
+  omnigate's own exact-match response cache is turned on per route with
+  `cache_ttl_s` ([Configuration](configuration.md#response-cache)); the
+  importer never sets it.
 
 ## After the import
 
 1. **Keys.** If you did not use `--generate-key`, add at least one entry to
-   `keys` ([Configuration](configuration.md#gateway-keys)).
+   `keys` ([Configuration](configuration.md#gateway-keys)), or create a key
+   from the dashboard once the gateway is running.
 2. **Environment.** Set every variable the tool listed in the data plane's
    environment.
 3. **Prices.** Routes without prices in the YAML are imported with zero
@@ -105,6 +113,8 @@ the provider has been tested through omnigate: see
    trigger.
 4. **Clients.** Point applications at the gateway with one of the new
    gateway keys. The model names they send stay the same (`model_name`).
+   For the official SDKs that means changing `base_url` and the API key;
+   see [Using the official SDKs](api.md#using-the-official-sdks).
 5. **Media.** Add a `media` section by hand if you need image, video or
    speech jobs ([Providers](providers.md#media-providers)).
 

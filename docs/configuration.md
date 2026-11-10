@@ -5,7 +5,11 @@ Two things configure omnigate:
 - **One JSON file**, read by the control plane. It holds gateway keys,
   upstreams, routes, the media section and retention.
 - **Environment variables** for each process: addresses, tokens, file paths,
-  and every provider secret.
+  timeouts, and every provider secret.
+
+Gateway keys can also be created at run time through the admin API or the
+dashboard. Those live in a separate keys file, not in the config file; see
+[Admin](admin.md#gateway-keys-two-sources).
 
 Provider secrets are never in the JSON file. Each upstream names an
 environment variable (`api_key_env`) and the process that calls that provider
@@ -18,6 +22,7 @@ Contents:
   - [Gateway keys](#gateway-keys)
   - [Text upstreams](#text-upstreams)
   - [Text routes](#text-routes)
+  - [Response cache](#response-cache)
   - [Retention](#retention)
   - [Media](#media)
 - [Environment variables](#environment-variables)
@@ -60,16 +65,21 @@ Every top-level section is optional and defaults to empty.
 
 ### Gateway keys
 
-`keys[]` are the credentials applications present to the data plane.
+`keys[]` are the credentials applications present to the data plane. Keys
+written here are "file keys": they are read-only for the admin API, and are
+listed before the managed keys created through it
+([Admin](admin.md#gateway-keys-two-sources)).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | required | Label shown in the dashboard, `/admin/usage` and metrics. |
+| `name` | string | required | Label shown in the dashboard, the admin API, the access log and metrics. Give every key its own name; the admin API refuses a managed key whose name a file key already has. |
 | `key` | string | one of `key` / `key_sha256` is required | The key in clear text. Hashed on load. Meant for local development. |
 | `key_sha256` | string | | Lowercase hex SHA-256 of the key. If both fields are present, this one is used. |
-| `budget_usd` | number | none (no budget) | The key is blocked once its recorded spend reaches this amount. See [Operations](operations.md#budgets). |
+| `budget_usd` | number | none (no budget) | The key is blocked once its recorded spend in the current budget period reaches this amount. See [Operations](operations.md#budgets). |
+| `budget_period` | string | `total` | What the budget covers: `total` (everything, never resets), `monthly` (the current UTC calendar month) or `daily` (the current UTC day). Any other value is rejected when the file is loaded. |
 | `rpm` | integer | `0` (unlimited) | Requests per minute, enforced by each data-plane process. |
 | `models` | list of strings | absent (all models) | Route names, text or media, the key may use. An empty list allows none. Anything other than a list of strings is rejected when the file is loaded. |
+| `disabled` | boolean | `false` | `true` switches the key off without removing it: the gateway answers it with 401, and its usage stays in the ledger. |
 | `webhook_secret` | string | none | Signing secret for this key's job webhooks. |
 | `webhook_secret_env` | string | none | Name of an environment variable (read by the control plane) holding that secret. Used when `webhook_secret` is absent. |
 
@@ -96,6 +106,7 @@ Example:
   "name": "my-app",
   "key_sha256": "<sha256 hex of the gateway key you hand to the app>",
   "budget_usd": 25.0,
+  "budget_period": "monthly",
   "rpm": 600,
   "models": ["claude", "gpt", "gemini", "image"],
   "webhook_secret_env": "MY_APP_WEBHOOK_SECRET"
@@ -121,10 +132,10 @@ header (the client's, or `2023-06-01` if the client sent none). If the named
 variable is not set in the data plane's environment, an empty key is sent and
 the provider will refuse the request.
 
-The control plane does not check `kind`. A value other than `openai` or
-`anthropic` is passed on, and the data plane then cannot parse the config
-snapshot: it logs `config sync failed` and keeps serving its last good
-config until the file is fixed.
+`kind` is checked when the file is loaded: a value other than `openai` or
+`anthropic` is refused with a message naming the upstream (at startup the
+control plane does not start; on a reload the previous config stays in
+force). Media providers do not go here; they go under `media.upstreams`.
 
 ### Text routes
 
@@ -134,6 +145,7 @@ config until the file is fixed.
 |---|---|---|---|
 | `model` | string | required | The name clients put in `"model"`. |
 | `strategy` | string | `failover` | `failover`, `round_robin` or `weighted`. Any other value is rejected when the file is loaded. |
+| `cache_ttl_s` | non-negative integer | `0` (off) | Seconds the data plane may answer an identical request from its own memory instead of calling a provider. See [Response cache](#response-cache). |
 | `targets` | list | required | Tried in the order the strategy gives; see below. |
 
 Each target:
@@ -143,8 +155,14 @@ Each target:
 | `upstream` | string | required | Name of an entry in `upstreams[]`. |
 | `model` | string | required | The provider's model id. Replaces `"model"` in the forwarded request. |
 | `weight` | non-negative integer | `1` | Used by `weighted` only. `0` means never first, but still a fallback. |
-| `price_in_per_mtok` | number | `0` | US dollars per million input tokens. |
+| `price_in_per_mtok` | number | `0` | US dollars per million input tokens that were not served from the provider's prompt cache. |
+| `price_cached_in_per_mtok` | number, 0 or more | the value of `price_in_per_mtok` | US dollars per million input tokens read from the provider's prompt cache. |
+| `price_cache_write_per_mtok` | number, 0 or more | the value of `price_in_per_mtok` | US dollars per million input tokens written to the provider's prompt cache (Anthropic-style upstreams report these). |
 | `price_out_per_mtok` | number | `0` | US dollars per million output tokens. |
+
+A config that sets only the input and output prices bills every input token
+at the input price, cached or not. How the four token counts are told apart
+is in [Operations](operations.md#budgets).
 
 Strategies:
 
@@ -172,7 +190,7 @@ Example with two providers behind one name:
   "model": "claude",
   "strategy": "weighted",
   "targets": [
-    { "upstream": "anthropic", "model": "claude-sonnet-5-5", "weight": 3, "price_in_per_mtok": 2.0, "price_out_per_mtok": 10.0 },
+    { "upstream": "anthropic", "model": "claude-sonnet-5-5", "weight": 3, "price_in_per_mtok": 2.0, "price_cached_in_per_mtok": 0.1, "price_out_per_mtok": 10.0 },
     { "upstream": "openai", "model": "<openai model id>", "weight": 1, "price_in_per_mtok": 0.0, "price_out_per_mtok": 0.0 }
   ]
 }
@@ -181,16 +199,55 @@ Example with two providers behind one name:
 The prices above are the ones in `config/omnigate.example.json`; check them
 against your provider's price list before relying on the spend figures.
 
+### Response cache
+
+A text route with `cache_ttl_s` above 0 lets each data plane remember
+successful answers and reuse them:
+
+```json
+{ "model": "faq", "cache_ttl_s": 600, "targets": [ { "upstream": "openai", "model": "<openai model id>" } ] }
+```
+
+- **What is cached.** Non-streaming answers with a 2xx status on the metered
+  endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/completions`,
+  `/v1/embeddings`, `/v1/responses`). Requests with `"stream": true` are
+  never looked up or stored.
+- **What counts as the same request.** The same gateway key, the same route
+  name, the same endpoint path and the same JSON body. Key order inside
+  objects and whitespace do not matter; array order and every value do. The
+  match is exact: there is no semantic matching.
+- **Never across keys.** The gateway key is part of the identity, so one key
+  is never served an answer another key paid for.
+- **Checks still apply.** A hit is looked up after authentication, the
+  budget, the model list and the rate limit, and counts against the rate
+  limit like any request.
+- **Billing.** A hit is recorded in the ledger as a request with no tokens
+  and no cost, marked as served from cache.
+- **Bounds.** The cache lives in the memory of each data-plane process:
+  `OMNIGATE_CACHE_MAX_MB` (64 by default; `0` turns caching off whatever the
+  routes say). The least recently used answers are evicted first, an answer
+  larger than a quarter of that budget is not kept, and a restart starts
+  empty. Several data planes each have their own cache.
+- There is no per-request switch; a client cannot opt out or force a
+  refresh. Removing `cache_ttl_s` from the route stops lookups as soon as
+  the data planes have polled the new config.
+
+Responses carry `x-omnigate-cache: hit` or `miss`; see
+[API](api.md#response-cache). This is separate from the media job cache
+(`media.routes[].cache_ttl_s`, below), which stores output files in the
+control plane and is shared across keys.
+
 ### Retention
 
 ```json
-"retention": { "jobs_days": 30, "ledger_ids_days": 7 }
+"retention": { "jobs_days": 30, "ledger_ids_days": 7, "delete_bucket_objects": true }
 ```
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `jobs_days` | number, fractions allowed | `0` (keep forever) | Finished jobs older than this are removed, with their files on local disk. |
+| `jobs_days` | number, fractions allowed | `0` (keep forever) | Finished jobs older than this are removed, with their output files: on local disk, and in the bucket unless `delete_bucket_objects` is `false`. |
 | `ledger_ids_days` | number, fractions allowed | `0` (keep forever) | The ledger forgets duplicate-detection ids recorded longer ago than this. |
+| `delete_bucket_objects` | boolean | `true` | Whether a removed job's objects are also deleted from an S3-compatible bucket. Only has an effect when `jobs_days` is set. Anything but `true` or `false` is rejected when the file is loaded. |
 
 Nothing is deleted unless you set these. Details and caveats are in
 [Operations](operations.md#retention).
@@ -296,7 +353,7 @@ that asks for a webhook when none of these is set is refused
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OMNIGATE_INTERNAL_TOKEN` | none | Shared secret for `/internal/*`, sent by the data plane in the `x-omnigate-internal` header. Must be the same on both sides. The data plane exits at startup without it. The control plane starts without it but then refuses every internal request, so nothing works. |
+| `OMNIGATE_INTERNAL_TOKEN` | none | Shared secret for `/internal/*`, sent by the data plane in the `x-omnigate-internal` header. Must be the same on both sides. Required by both: without it (or with an empty value, which counts as not set) the data plane exits at startup and the control plane refuses to start, each with a log line that names the variable. |
 
 ### Data plane
 
@@ -305,8 +362,15 @@ that asks for a webhook when none of these is set is refused
 | `OMNIGATE_LISTEN` | `127.0.0.1:8080` | IP address and port to listen on. |
 | `OMNIGATE_CONTROL_URL` | `http://127.0.0.1:4000` | Base URL of the control plane. |
 | `OMNIGATE_POLL_MS` | `2000` | How often the config is fetched. |
-| `OMNIGATE_FLUSH_MS` | `500` | How often queued usage is sent. |
+| `OMNIGATE_FLUSH_MS` | `500` | How often queued usage, and the counts of refused requests, are sent. |
 | `OMNIGATE_UPSTREAM_TIMEOUT_MS` | `600000` | Maximum wait for upstream response headers. `0` means no limit. An upstream's `timeout_ms` overrides it. |
+| `OMNIGATE_CLIENT_TIMEOUT_MS` | `30000` | How long a client may take to send a request (head and body), and how long an idle keep-alive connection is kept open. `0` means no limit. |
+| `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` | `300000` | A response in progress is cut off when the upstream sends nothing, or the client reads nothing, for this long. What was metered up to then is still billed. `0` means no limit. |
+| `OMNIGATE_MAX_CONNECTIONS` | `4096` | Client connections served at once. Further connections get an immediate `503` (`overloaded`) and are closed. |
+| `OMNIGATE_SHUTDOWN_GRACE_MS` | `10000` | After SIGINT or SIGTERM (Ctrl-C or Ctrl-Break on Windows): how long requests in flight may take to finish before they are cut off and the process exits. |
+| `OMNIGATE_CACHE_MAX_MB` | `64` | Memory for the [response cache](#response-cache) of routes that set `cache_ttl_s`. `0` turns it off. |
+| `OMNIGATE_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (`warning` and `err` are accepted too; case does not matter). |
+| `OMNIGATE_LOG_FORMAT` | `text` | `text`, or `json` for one JSON object per line. See [Operations](operations.md#logs). |
 | `OMNIGATE_COOLDOWN_FAILURES` | `5` | Consecutive failures before an upstream is tried last. `0` turns cooldowns off. |
 | `OMNIGATE_COOLDOWN_MS` | `30000` | How long an upstream stays in that state. |
 | `OMNIGATE_SPOOL` | `omnigate-usage.spool` | File for undelivered usage events. `off` keeps them in memory only. |
@@ -315,7 +379,8 @@ that asks for a webhook when none of these is set is refused
 
 The spool and the config cache are relative to the data plane's working
 directory unless given as absolute paths. A numeric variable that does not
-parse stops the data plane at startup.
+parse, or a log level or format that is not one of the values above, stops
+the data plane at startup.
 
 ### Control plane
 
@@ -328,6 +393,8 @@ parse stops the data plane at startup.
 | `OMNIGATE_CONFIG` | `../config/omnigate.dev.json` | Path of the config file. |
 | `OMNIGATE_LEDGER` | `data/ledger.jsonl` | The usage ledger. |
 | `OMNIGATE_JOBS` | `data/jobs.jsonl` | Job state. |
+| `OMNIGATE_KEYS` | `data/keys.json` | Gateway keys created through the admin API or the dashboard: hashes, limits, and a key's webhook secret if it has one. See [Admin](admin.md#gateway-keys-two-sources). |
+| `OMNIGATE_AUDIT_LOG` | `data/audit.jsonl` | The admin audit log. See [Admin](admin.md#the-audit-log). |
 | `OMNIGATE_MEDIA_DIR` | `data/media` | Where local output storage keeps files, unless the config names a `dir`. |
 | `OMNIGATE_SIGNING_SECRET` | derived from `OMNIGATE_INTERNAL_TOKEN` | Signs the download URLs of locally stored files. |
 | `OMNIGATE_WEBHOOK_SECRET` | none | Last-resort webhook signing secret. |
@@ -355,11 +422,15 @@ The container images set some of these differently; see
 The data plane never reads the config file. It fetches a snapshot from the
 control plane (`GET /internal/config`) that contains:
 
-- for each key: its SHA-256, name, `rpm`, `models`, and whether it is
-  currently blocked by its budget;
+- for each key that is not disabled, from the config file or created
+  through the admin API: its SHA-256, name, `rpm`, `models`, and whether it
+  is currently blocked by its budget (a disabled key is left out, so the
+  data plane treats it as unknown);
 - the text upstreams as configured (the `api_key_env` name, never a secret);
-- for each text route: `model`, `strategy`, and each target's `upstream`,
-  `model` and `weight`.
+- for each text route: `model`, `strategy`, `cache_ttl_s`, and each target's
+  `upstream`, `model` and `weight`;
+- the names of the media routes, which the data plane only uses to list
+  them in `GET /v1/models`.
 
-Budgets, prices, raw keys, webhook secrets and the whole `media` section
-stay in the control plane.
+Budgets, budget periods, prices, raw keys, webhook secrets and the rest of
+the `media` section stay in the control plane.

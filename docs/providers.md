@@ -13,8 +13,11 @@ under sustained or concurrent load against real providers.
 - [Not reachable](#not-reachable)
 
 Model ids in the examples marked `<...>` are placeholders: use an id your
-account has. All prices in the examples are `0.0`; fill in your provider's
-prices to get spend figures and budgets.
+account has. Unless an example says otherwise its prices are `0.0`; fill in
+your provider's prices to get spend figures and budgets. Text targets take
+four prices: input, output, and optionally prompt-cache reads and writes
+(`price_cached_in_per_mtok`, `price_cache_write_per_mtok`), which default to
+the input price; see [Configuration](configuration.md#text-routes).
 
 ## Text providers
 
@@ -26,6 +29,14 @@ in `api_key_env`. Field reference:
 The gateway speaks two protocols, `openai` and `anthropic`. A client can use
 either protocol with any upstream on `/v1/chat/completions` and
 `/v1/messages`; see [Translation](api.md#translation).
+
+For every text provider, the gateway passes the provider's rate-limit,
+retry-after and request-id response headers on to the client
+([API](api.md#response)), and tells prompt-cache reads and writes apart
+from ordinary input when it meters a call
+([Operations](operations.md#budgets)). Both are covered by unit tests on
+OpenAI- and Anthropic-format responses; the "Status" lines below predate
+them and do not include them.
 
 ### OpenAI
 

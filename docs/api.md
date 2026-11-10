@@ -12,6 +12,7 @@ Contents:
 - [Authentication](#authentication)
 - [Errors](#errors)
 - [Text endpoints](#text-endpoints)
+- [Using the official SDKs](#using-the-official-sdks)
 - [Jobs API](#jobs-api)
 - [File URLs](#file-urls)
 - [Webhooks](#webhooks)
@@ -35,6 +36,9 @@ x-api-key: og-unlimited-key
 Every gateway endpoint needs a key except `GET /healthz` and a file URL that
 carries a valid signature.
 
+A key that has been disabled, deleted or rotated away is answered like a
+key that never existed: `401 invalid_api_key`.
+
 ## Errors
 
 Errors produced by the gateway itself have one shape, whichever protocol the
@@ -49,19 +53,24 @@ client speaks:
 | 400 | `invalid_json` | The body is not a JSON object. |
 | 400 | `missing_model` | No `"model"` string in the body. |
 | 401 | `missing_api_key` | No key was sent. |
-| 401 | `invalid_api_key` | The key is not in the config. |
-| 402 | `budget_exceeded` | The key has spent its budget. |
+| 401 | `invalid_api_key` | The key is not known: never configured, deleted, disabled, or replaced by a rotation. |
+| 402 | `budget_exceeded` | The key has spent its budget for the current period and the request would start new work (a text request, or `POST /v1/jobs`). Reading is still allowed; see [below](#what-an-over-budget-key-can-still-do). |
 | 403 | `model_not_allowed` | The key's `models` list does not include this model. |
 | 404 | `not_found` | The path is not an endpoint the gateway serves. |
 | 404 | `model_not_found` | No route has this name. |
 | 405 | `method_not_allowed` | A method other than GET or POST on `/v1/jobs*` or `/v1/files/*`. |
 | 413 | `payload_too_large` | The request body exceeds 8 MiB. |
 | 429 | `rate_limit_exceeded` | The key is over its `rpm`. The response has a `Retry-After` header in seconds. |
-| 502 | `all_upstreams_failed` | Every target of the route failed. The error also has `attempts`. |
+| 502 | `all_upstreams_failed` | Every target of the route failed. The error also has `attempts`. If the last upstream that answered sent a `retry-after` header, the 502 carries it. |
 | 503 | `gateway_not_ready` | The data plane has no config yet (the control plane has never answered and there is no cached config). |
 | 503 | `control_plane_unavailable` | A jobs or files request could not reach the control plane. |
+| 503 | `overloaded` | The data plane is already serving `OMNIGATE_MAX_CONNECTIONS` connections. Sent at once, without reading the request, with `retry-after: 1` and `connection: close`. |
 
 The jobs API adds a few of its own; they are listed [below](#job-errors).
+
+There is no 408. A client that takes longer than
+`OMNIGATE_CLIENT_TIMEOUT_MS` to send its request, or leaves a keep-alive
+connection idle that long, has its connection closed without a response.
 
 A 502 looks like this:
 
@@ -89,9 +98,23 @@ was translated, the error body is converted to the client's protocol. A 429
 or 5xx from a provider triggers failover instead; the client only sees it as
 part of a 502 when every target fails.
 
-The gateway checks a request in this order: config present, key present and
-known, budget, endpoint, body size, JSON, `model`, model limits, rate limit,
-route.
+The gateway checks a text request in this order: config present, key
+present and known, budget, endpoint, body size, JSON, `model`, model limits,
+rate limit, route, and then the response cache if the route has one.
+
+### What an over-budget key can still do
+
+A key that has spent its budget may not start anything new, but keeps
+access to what it already has:
+
+| Request | Over budget |
+|---|---|
+| Text endpoints (`POST /v1/chat/completions` and the others) | `402 budget_exceeded` |
+| `POST /v1/jobs` | `402 budget_exceeded` |
+| `GET /v1/models` | allowed |
+| `GET /v1/jobs`, `GET /v1/jobs/{id}` | allowed |
+| `POST /v1/jobs/{id}/cancel` | allowed (cancelling only saves money) |
+| `GET /v1/files/...` | allowed |
 
 ## Text endpoints
 
@@ -143,14 +166,41 @@ The provider's response, streamed as it arrives, with these headers added:
 |---|---|
 | `x-omnigate-upstream` | Name of the upstream that answered. |
 | `x-omnigate-attempts` | How many upstreams the request was sent to, this one included. |
-| `x-omnigate-request-id` | Id of this request; also the id of its usage event in the ledger. |
+| `x-omnigate-request-id` | Id of this request (32 hex characters); also the id of its usage event in the ledger. |
+| `x-omnigate-cache` | Only on routes with `cache_ttl_s`, for non-streaming requests: `hit` or `miss`. See [Response cache](#response-cache). |
 
-A 502 `all_upstreams_failed` carries only `x-omnigate-request-id`.
+A 502 `all_upstreams_failed` carries `x-omnigate-request-id`, and
+`retry-after` when the last upstream that answered sent one.
 
-Of the provider's own response headers only `content-type` is kept (and
-`content-length`, when the body is passed through untouched). Provider
-headers such as rate-limit counters or request ids do not reach the client.
-The gateway also sets `cache-control: no-cache`.
+**Provider headers.** The provider's `content-type` is kept (and
+`content-length`, when the body is passed through untouched), and the
+gateway sets `cache-control: no-cache`. Beyond that, a fixed allowlist of
+provider response headers is passed to the client under their original
+names:
+
+| Passed on | Examples |
+|---|---|
+| `retry-after`, `retry-after-ms`, `x-should-retry` | How long to wait before retrying. |
+| `x-request-id`, `request-id` | The provider's request id, for support tickets. |
+| `openai-processing-ms`, `openai-version` | |
+| every header starting with `x-ratelimit-` | `x-ratelimit-remaining-requests`, `x-ratelimit-reset-tokens` |
+| every header starting with `anthropic-ratelimit-` | `anthropic-ratelimit-tokens-remaining` |
+
+- Names are matched without regard to case. Everything else is dropped:
+  connection and framing headers, cookies, the provider's organization and
+  project headers, CDN headers.
+- A translated response keeps the upstream's names: a client that asked in
+  the OpenAI format and was served by an Anthropic upstream gets
+  `anthropic-ratelimit-*` headers, not `x-ratelimit-*`.
+- At most 32 headers are passed per response, and a header with an empty
+  value or a value longer than 512 bytes is dropped.
+- These headers describe the provider's limits for **your provider key**,
+  shared by every gateway key that uses the upstream. They are not the
+  gateway key's own `rpm` limit.
+
+The allowlist is covered by unit tests; the mock providers do not send
+these headers, so the end-to-end test does not exercise it, and the README
+does not record a check against a real provider.
 
 ### Streaming
 
@@ -165,6 +215,37 @@ removes the extra usage chunk from what the client receives.
 Failover happens only before the first byte of a response reaches the
 client. If a stream breaks after that, the connection is closed and what was
 metered so far is recorded (with status 499 in the ledger).
+
+A stream that goes silent is cut off the same way: when the upstream sends
+nothing, or the client reads nothing, for `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`
+(five minutes by default), the gateway closes the connection and records
+what was metered so far, also with status 499.
+
+### Response cache
+
+A route with `cache_ttl_s` answers repeated identical requests from the data
+plane's memory; see [Configuration](configuration.md#response-cache) for
+what "identical" means and what bounds the cache. From the client's side:
+
+- Only non-streaming requests take part. The first one is forwarded and
+  comes back with `x-omnigate-cache: miss` next to the usual headers.
+- A repeat within the TTL, from the same gateway key, comes back with the
+  stored status, `content-type` and body, and these headers only:
+  `x-omnigate-cache: hit` and a new `x-omnigate-request-id`. There is no
+  `x-omnigate-upstream` or `x-omnigate-attempts`, because no upstream was
+  called, and no provider headers.
+- A hit is byte for byte the stored answer, including the provider's
+  response id and token usage figures from the original call. The gateway
+  bills it as zero tokens and zero cost.
+- Only complete 2xx answers are stored. Errors are never cached.
+- Translated answers are cached too, in the client's protocol.
+
+```bash
+curl -i http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer <gateway key>" -d '{"model":"<a route with cache_ttl_s>","messages":[{"role":"user","content":"hi"}]}'
+```
+
+(The dev config has no cached text route; add `"cache_ttl_s": 60` to one of
+its routes to try this.)
 
 ### Translation
 
@@ -182,28 +263,120 @@ the route name in `model`, in the client's protocol.
   thought signature on earlier tool calls (Gemini 3 and later). Requests in
   the provider's own protocol are not touched and get the provider's error.
 
-The README lists what has not been verified here: images in translated
-requests, long conversations, large payloads, and the official OpenAI and
-Anthropic SDKs as clients (the checks used plain HTTP).
+The README lists what has not been verified against real providers here:
+images in translated requests, long conversations, large payloads, and the
+official OpenAI and Anthropic SDKs as clients (those checks used plain
+HTTP). Since then `tools/sdk_compat.py` drives both SDKs through the
+gateway against the mock providers, in both translation directions; see
+[Using the official SDKs](#using-the-official-sdks).
 
 ### `GET /v1/models`
 
-Lists the text routes the key may use. Media routes are not in this list.
+Lists the routes the key may use: the text routes first, then the media
+routes (the models of the [jobs API](#jobs-api)). A key with a `models`
+list sees only the names on it. The list does not say which kind a model
+is; a media model is used with `POST /v1/jobs`, not with the text endpoints.
+A key over its budget can still call this.
 
 ```json
 {
   "object": "list",
   "data": [
     {"id": "demo-chat", "object": "model", "owned_by": "omnigate"},
-    {"id": "demo-claude", "object": "model", "owned_by": "omnigate"}
+    {"id": "demo-claude", "object": "model", "owned_by": "omnigate"},
+    {"id": "demo-image", "object": "model", "owned_by": "omnigate"}
   ]
 }
 ```
+
+(Shortened: the dev config has more routes.) Each entry has exactly these
+three fields. There is no `GET /v1/models/{id}`.
 
 ### `GET /healthz`
 
 Answers `200` with the body `ok` and needs no key. It says the process is
 up; it does not say that a config has been loaded.
+
+## Using the official SDKs
+
+The OpenAI and Anthropic SDKs work against the gateway by changing two
+things: the base URL and the API key (a **gateway key**, not a provider
+key). `"model"` is a route name from your config.
+
+`tools/sdk_compat.py` runs the official Python SDKs through the gateway
+against the mock providers: both SDKs against both kinds of upstream, sync
+and async, streaming and not, tools, embeddings, the Responses API, and the
+exception classes each SDK raises. It is the basis for this section. It has
+not been run against real providers, and only the Python SDKs are covered.
+
+The snippets below use the quickstart's key and routes. Install the SDKs
+yourself (`pip install openai anthropic`); the repository does not depend
+on them.
+
+**OpenAI SDK.** The base URL ends in `/v1`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="og-unlimited-key")
+
+reply = client.chat.completions.create(
+    model="demo-chat",
+    messages=[{"role": "user", "content": "hi"}],
+)
+print(reply.choices[0].message.content)
+```
+
+**Anthropic SDK.** The base URL is the gateway's address without `/v1`
+(the SDK adds `/v1/messages` itself):
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:8080", api_key="og-unlimited-key")
+
+message = client.messages.create(
+    model="demo-claude",
+    max_tokens=64,
+    messages=[{"role": "user", "content": "hi"}],
+)
+print(message.content[0].text)
+```
+
+Either SDK can use either kind of route: `model="demo-claude"` with the
+OpenAI SDK, or `model="demo-direct"` with the Anthropic SDK, goes through
+[translation](#translation).
+
+Things to know:
+
+- **Environment variables.** Both SDKs read `OPENAI_*` / `ANTHROPIC_*`
+  variables (API key, base URL) when an argument is not given. Pass
+  `base_url` and `api_key` explicitly, or make sure your shell does not hold
+  a provider key that would be sent to the gateway instead.
+- **Either header works.** The Anthropic SDK sends the key as `x-api-key`;
+  built with `auth_token=` instead of `api_key=` it sends
+  `Authorization: Bearer`, which the gateway accepts as well.
+- **Retries.** The SDKs retry 429 and 5xx answers by themselves. The
+  gateway's own `429 rate_limit_exceeded` carries `Retry-After`; set
+  `max_retries=0` on the client if you want to see such answers instead of
+  waiting through them.
+- **Errors.** Gateway errors arrive as the SDK's usual classes by status:
+  401 `AuthenticationError`, 403 `PermissionDeniedError`, 404
+  `NotFoundError`, 429 `RateLimitError`.
+- **Gateway headers.** `with_raw_response` exposes `x-omnigate-request-id`,
+  `x-omnigate-upstream` and `x-omnigate-attempts`.
+
+Known differences an SDK user can see. The test reports these as `GAP`
+rather than failures (`--strict` turns them into failures):
+
+| SDK call | What happens |
+|---|---|
+| OpenAI `models.retrieve(id)` | Not served: there is no `GET /v1/models/{id}`. |
+| OpenAI `models.list()` | Items have no `created` field. |
+| Anthropic `models.list()` | Items are OpenAI-shaped (`id`, `object`, `owned_by`), not Anthropic's (`type`, `display_name`). |
+| OpenAI `exc.code` on a gateway error | Not set: the gateway's error object has `type` and `message` only. |
+| Anthropic error type on a gateway error from `/v1/messages` | The gateway's own error object is used, not Anthropic's `{"type": "error", ...}` envelope. |
+| `_request_id` on a response | Empty against the mocks, which send no request-id header. The gateway does pass a provider's `x-request-id` / `request-id` on ([Response](#response)), but that has not been checked with an SDK against a real provider. |
 
 ## Jobs API
 
@@ -219,7 +392,11 @@ POST /v1/jobs/{id}/cancel     cancel a job
 ```
 
 Only `POST /v1/jobs` counts against the key's rate limit. A key sees only its
-own jobs; another key's job id answers 404.
+own jobs; another key's job id answers 404. A managed key keeps its jobs
+when its secret is rotated ([Admin](admin.md#rotate)).
+
+A key over its budget cannot create a job (`402 budget_exceeded`) but can
+still fetch, list and cancel its jobs and download their files.
 
 ### Create a job
 
@@ -396,6 +573,7 @@ In addition to the [general errors](#errors):
 | 400 | `invalid_request` | `input` is missing or not an object; `metadata` is not an object; the `Idempotency-Key` is empty or longer than 255 bytes. |
 | 400 | `webhook_not_configured` | `webhook_url` was given but no signing secret is configured for this key. |
 | 400 | `invalid_webhook_url` | The URL is not http(s), has no host, contains credentials, does not resolve, or resolves to a private or loopback address. |
+| 402 | `budget_exceeded` | Create only: the key has spent its budget for the current period. The control plane checks this itself, without waiting for the data plane's next config poll. |
 | 403 | `model_not_allowed` | The key's `models` list does not include this model. |
 | 404 | `model_not_found` | No media route has this name. |
 | 404 | `job_not_found` | No such job for this key. |
@@ -471,6 +649,11 @@ webhook-signature: v1,<base64 HMAC-SHA256>
 
 - Any 2xx answer counts as delivered. Anything else, a redirect included, is
   a failed attempt.
+- The host name is resolved once per attempt. Every address it resolves to
+  is checked against the private-address rule, and the connection is then
+  made to the address that was checked (with the host name still used for
+  the `Host` header and the TLS certificate), so a DNS answer that changes
+  between the check and the call cannot redirect a delivery inwards.
 - Failed attempts are retried after the delays in
   `media.webhooks.retry_schedule_ms`, up to `max_attempts` deliveries in
   total. After that the webhook's `status` is `failed`.
@@ -537,12 +720,24 @@ Everything in this section is on the control plane's port and uses the
 
 `200` with the body `ok`. No authentication.
 
-### `GET /admin/usage`
+### Admin API
 
-Per-key totals from the ledger.
+| Method and path | Purpose |
+|---|---|
+| `GET /admin/keys` | Every gateway key, from the config file and managed, with its usage. |
+| `POST /admin/keys` | Create a managed key. The answer is the only one that contains the key itself. |
+| `PATCH /admin/keys/{name}` | Change a managed key's budget, period, rate limit, models, webhook secret or disabled flag. |
+| `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. |
+| `DELETE /admin/keys/{name}` | Delete a managed key. |
+| `GET /admin/usage` | The same document as `GET /admin/keys`. |
+| `GET /admin/overview` | Everything the dashboard shows, as JSON. |
+| `GET /admin/audit?limit=N` | The newest entries of the admin audit log. |
+
+Request bodies, answers, error types and `curl` examples for all of these
+are in [Admin](admin.md). In short:
 
 ```bash
-curl http://127.0.0.1:4000/admin/usage -H "Authorization: Bearer dev-admin-token-change-me"
+curl http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-change-me"
 ```
 
 ```json
@@ -550,12 +745,25 @@ curl http://127.0.0.1:4000/admin/usage -H "Authorization: Bearer dev-admin-token
   "keys": [
     {
       "name": "dev",
+      "source": "file",
+      "created_at": null,
       "budget_usd": 0.01,
+      "budget_period": "total",
+      "period_spend_usd": 0.0108,
+      "period_resets_at": null,
+      "rpm": 0,
+      "models": null,
+      "disabled": false,
       "blocked": true,
+      "state": "blocked",
+      "has_webhook_secret": false,
       "requests": 4,
       "errors": 0,
       "input_tokens": 36,
+      "cached_input_tokens": 0,
+      "cache_write_input_tokens": 0,
       "output_tokens": 24,
+      "cached_responses": 0,
       "jobs": 0,
       "cost_usd": 0.0108
     }
@@ -563,15 +771,34 @@ curl http://127.0.0.1:4000/admin/usage -H "Authorization: Bearer dev-admin-token
 }
 ```
 
-(Numbers are illustrative.) `requests` counts text calls and media jobs;
-`jobs` counts the media jobs among them; `errors` counts ledger events with a
-status of 400 or above, which includes failed and canceled jobs.
+(Numbers are illustrative.)
 
-Without a valid token or session the answer is `401`:
+| Field | Meaning |
+|---|---|
+| `source` | `file` (written in the config file, read-only here) or `managed` (created through this API). |
+| `state` | `active`, `blocked` (budget spent for the current period) or `disabled`. `blocked` and `disabled` are also given as booleans. |
+| `budget_period`, `period_spend_usd`, `period_resets_at` | What the budget covers, the spend that counts against it, and when that starts over (`null` for a total budget). |
+| `requests` | Text calls and media jobs recorded in the ledger. `jobs` counts the media jobs among them. |
+| `errors` | Ledger events with a status of 400 or above, which includes failed and canceled jobs. |
+| `input_tokens` | Input tokens that were not served from a provider's prompt cache. |
+| `cached_input_tokens`, `cache_write_input_tokens` | Input tokens read from, and written to, a provider's prompt cache. |
+| `cached_responses` | Requests answered from the gateway's own [response cache](#response-cache). |
+| `cost_usd` | Total spend. |
+
+A key that was rotated keeps one row: usage recorded under its earlier
+secrets is included.
+
+Without a valid token or session the answer is `401`, with a
+`WWW-Authenticate: Bearer` header:
 
 ```json
 {"error": {"type": "unauthorized", "message": "send Authorization: Bearer <admin token>"}}
 ```
+
+A change (`POST`, `PATCH`, `DELETE`) authenticated by a session cookie
+instead of the bearer token must also carry the session's CSRF token, or
+the answer is `403 csrf_failed`. Requests with the bearer token need
+nothing extra. See [Admin](admin.md#csrf-scripts-and-browsers).
 
 ### `GET /metrics`
 
@@ -583,42 +810,54 @@ curl http://127.0.0.1:4000/metrics -H "Authorization: Bearer dev-admin-token-cha
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `omnigate_build_info` | gauge | `version` | Always 1. |
+| `omnigate_build_info` | gauge | `version` | Always 1. The version is the control plane's (`control/mix.exs`). |
 | `omnigate_uptime_seconds` | gauge | | Seconds since the control plane started. |
 | `omnigate_config_reloads_total` | counter | | Config file reloads applied since start. |
 | `omnigate_config_last_reload_timestamp_seconds` | gauge | | Unix time the config was last loaded. |
 | `omnigate_key_requests_total` | counter | `key` | Requests and media jobs recorded in the ledger. |
 | `omnigate_key_errors_total` | counter | `key` | Recorded requests that ended with status 400 or above. |
-| `omnigate_key_input_tokens_total` | counter | `key` | Input tokens billed. |
-| `omnigate_key_output_tokens_total` | counter | `key` | Output tokens billed. |
+| `omnigate_key_input_tokens_total` | counter | `key` | Input tokens that were not served from a provider's prompt cache. |
+| `omnigate_key_cached_input_tokens_total` | counter | `key` | Input tokens read from a provider's prompt cache. |
+| `omnigate_key_cache_write_input_tokens_total` | counter | `key` | Input tokens written to a provider's prompt cache. |
+| `omnigate_key_output_tokens_total` | counter | `key` | Output tokens. |
+| `omnigate_key_cached_responses_total` | counter | `key` | Requests answered from the data plane's response cache. |
 | `omnigate_key_jobs_total` | counter | `key` | Media jobs recorded in the ledger. |
-| `omnigate_key_cost_usd_total` | counter | `key` | Spend in US dollars. |
+| `omnigate_key_cost_usd_total` | counter | `key` | Spend in US dollars, over the whole ledger. |
 | `omnigate_key_budget_usd` | gauge | `key` | Budget, for keys that have one. |
-| `omnigate_key_blocked` | gauge | `key` | 1 when the key has spent its budget and is refused, else 0. |
+| `omnigate_key_period_cost_usd` | gauge | `key` | Spend in the key's current budget period: this month, this day, or everything for a total budget. |
+| `omnigate_key_blocked` | gauge | `key` | 1 when the key has spent its budget for the current period and is refused, else 0. |
+| `omnigate_rejected_requests_total` | counter | `key`, `reason` | Requests data planes refused before routing, since this control plane started. `reason` is the `error.type` the client got; `key` is the key's name, or `-` when the request had no usable key. |
 | `omnigate_jobs` | gauge | `status` | Media jobs currently in the job store, by status. |
 | `omnigate_webhooks` | gauge | `state` | Webhook deliveries of the jobs currently in the job store, by state. |
 | `omnigate_ledger_events_total` | counter | | Usage events in the ledger. |
 | `omnigate_ledger_dedup_ids` | gauge | | Event ids held in memory to reject resent events. |
 
-The `key` label is the key's configured `name`, never its hash. See
-[Operations](operations.md#metrics) for a scrape config and caveats.
+The `key` label is the key's `name`, never its hash, and covers both file
+and managed keys. See [Operations](operations.md#metrics) for a scrape
+config and caveats.
 
 ### Dashboard and sessions
 
 | Method and path | Purpose |
 |---|---|
-| `GET /` | The dashboard (read-only): keys, recent requests, recent media jobs. Redirects to `/login` without a session. |
+| `GET /` | The dashboard: totals, keys (with create, disable, rotate and delete for managed keys), recent requests and media jobs, refused requests, admin activity, and a read-only view of the configuration. Redirects to `/login` without a session. See [Admin](admin.md#the-dashboard). |
 | `GET /login` | The sign-in form. |
 | `POST /login` | Form field `password` = the admin token. Sets the `omnigate_session` cookie (12 hours, `HttpOnly`, `SameSite=Strict`) and redirects to `/`. A wrong token answers 401; after five failures from one address, 429 for a minute. |
-| `POST /logout` | Clears the cookie. |
+| `POST /logout` | Clears the cookie. From a session it needs the CSRF token, which the dashboard's sign-out button sends. |
 
 A valid session cookie is accepted wherever the admin token is, so
-`/admin/usage` and `/metrics` also work in a signed-in browser.
+`/admin/*` and `/metrics` also work in a signed-in browser (reads without
+anything extra, changes with the CSRF token).
+
+The dashboard and login pages are sent with a `Content-Security-Policy`
+that allows nothing from other origins, `X-Frame-Options: DENY`,
+`Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
 
 ### `/internal/*`
 
 Used by data planes only, with the internal token in the
 `x-omnigate-internal` header: `GET /internal/config`,
-`POST /internal/usage/batch`, and the jobs and files API under
-`/internal/v1/`. It is not a public interface. The Compose proxy answers 404
-for these paths from outside.
+`POST /internal/usage/batch`, `POST /internal/counters` (counts of refused
+requests), and the jobs and files API under `/internal/v1/`. It is not a
+public interface. The Compose proxy answers 404 for these paths from
+outside.

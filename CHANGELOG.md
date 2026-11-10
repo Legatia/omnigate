@@ -4,9 +4,15 @@ All notable changes to omnigate are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). There are no
 tagged releases yet; everything so far is under "Unreleased".
 
+When a release is cut, the "Unreleased" section is renamed to
+`## [<version>] - <date>` and a new, empty "Unreleased" section is started
+above it. The release workflow publishes the section whose heading starts
+with `## [<version>]` as the release notes, so keep that heading format;
+see [docs/releasing.md](docs/releasing.md).
+
 Which features have been checked against real providers, and which have
 only met a mock, is tracked in the README's
-[Known gaps](README.md#known-gaps) section rather than here.
+[Known gaps](README.md#known-gaps) section and in `docs/`, rather than here.
 
 ## [Unreleased]
 
@@ -44,6 +50,35 @@ only met a mock, is tracked in the README's
   upstreams still go last.
 - Per-key model limits (`models`): anything else is a 403
   `model_not_allowed`.
+- Client timeout (`OMNIGATE_CLIENT_TIMEOUT_MS`, 30 s): a client that does
+  not finish sending its request, or leaves a keep-alive connection idle,
+  is disconnected.
+- Stream idle timeout (`OMNIGATE_STREAM_IDLE_TIMEOUT_MS`, 5 min): a response
+  that stops moving is cut off, and what was metered up to then is billed.
+- Connection cap (`OMNIGATE_MAX_CONNECTIONS`, 4096): further connections get
+  an immediate 503 `overloaded` with `retry-after`.
+- Graceful shutdown on SIGINT and SIGTERM (Ctrl-C and Ctrl-Break on
+  Windows): requests in flight get `OMNIGATE_SHUTDOWN_GRACE_MS` (10 s) to
+  finish, and queued usage is delivered before exit.
+- Access log: one line per request with key name, route, upstream,
+  attempts, tokens, latency and request id. `OMNIGATE_LOG_LEVEL` sets the
+  level, and `OMNIGATE_LOG_FORMAT=json` writes every log line as one JSON
+  object.
+- Response cache, opt-in per route with `cache_ttl_s`: an identical
+  non-streaming request from the same gateway key is answered from memory.
+  Bounded by `OMNIGATE_CACHE_MAX_MB` (64); responses carry
+  `x-omnigate-cache: hit` or `miss`; hits are counted but not billed.
+- Provider response headers for the caller are passed on by allowlist:
+  `retry-after`, `x-ratelimit-*`, `anthropic-ratelimit-*`, the provider's
+  request id and a few more. A final 502 carries the last upstream's
+  `retry-after`.
+- Prompt-cache accounting: usage events separate uncached input, cache
+  reads and cache writes, normalised by the upstream's protocol (OpenAI
+  counts cached tokens inside its input figure, Anthropic beside it).
+- Requests refused before routing (bad key, rate limit, disallowed model,
+  timeouts, the connection cap and so on) are counted per key name and
+  reason and reported to the control plane.
+- `GET /v1/models` also lists the media job models the key may use.
 
 **Control plane**
 
@@ -74,6 +109,33 @@ only met a mock, is tracked in the README's
   `jobs_days`, ledger duplicate-detection ids after `ledger_ids_days`. Off
   by default.
 - `GET /metrics` in Prometheus text format, behind the admin token.
+- Managed gateway keys: create, change, disable, rotate and delete keys
+  through `/admin/keys` or the dashboard, without editing the config. A new
+  key is shown once and stored only as a hash, in `OMNIGATE_KEYS`
+  (`data/keys.json`). Keys in the config file keep working and are
+  read-only for the API. A rotated key keeps its spend, budget and jobs.
+- New dashboard: totals for today and overall, spend against budget per
+  key, key management, recent requests and media jobs, refused requests,
+  admin activity and a read-only configuration view. It updates live from
+  `GET /admin/overview` and loads no external assets.
+- CSRF protection for changes made with a dashboard session; requests with
+  the bearer token are exempt.
+- Budget periods: `budget_period` on a key is `total` (default), `monthly`
+  or `daily` (UTC). A monthly or daily key unblocks by itself when the
+  period turns.
+- Prices for prompt-cache tokens per text target:
+  `price_cached_in_per_mtok` and `price_cache_write_per_mtok`, both
+  defaulting to the input price.
+- Admin audit log (`OMNIGATE_AUDIT_LOG`, `data/audit.jsonl`): key changes,
+  sign-ins and sign-outs, shown in the dashboard and at `GET /admin/audit`.
+- `disabled` on a key in the config file.
+- Metrics: `omnigate_key_cached_input_tokens_total`,
+  `omnigate_key_cache_write_input_tokens_total`,
+  `omnigate_key_cached_responses_total`, `omnigate_key_period_cost_usd` and
+  `omnigate_rejected_requests_total{key, reason}`.
+- Retention also deletes a removed job's objects from an S3-compatible
+  bucket (`retention.delete_bucket_objects`, on by default; only acts when
+  `jobs_days` is set).
 
 **Packaging and tools**
 
@@ -93,6 +155,21 @@ only met a mock, is tracked in the README's
   Fireworks, xAI and Perplexity entries.
 - Documentation under `docs/`, `CONTRIBUTING.md`, `SECURITY.md`, this
   changelog, and a CI workflow (`.github/workflows/ci.yml`).
+- `tools/load_test.py`: a load and soak test with well-behaved and hostile
+  clients (stalled, silent, disconnecting, oversized, malformed).
+- `tools/sdk_compat.py`: runs the official OpenAI and Anthropic Python SDKs
+  through the gateway against the mock providers (sync, async, streaming,
+  errors, both translation directions). Needs `pip install openai anthropic`.
+- `tools/mock_upstream.py`: a fifth mock on port 9005 that stalls
+  mid-stream, and `MOCK_PORT_OFFSET` to run a second copy on other ports.
+- CI: an `sdk` job that runs `tools/sdk_compat.py`, and a formatting check
+  (`mix format --check-formatted`) in the control-plane job.
+- Release workflow (`.github/workflows/release.yml`): pushing a tag `v*`
+  builds data-plane binaries for five targets, pushes multi-architecture
+  images of both planes to GHCR and creates a GitHub release with this
+  changelog's section as notes. Described in `docs/releasing.md`.
+- `docs/admin.md` (dashboard, key lifecycle, budgets, audit log, CSRF) and
+  a section on using the official SDKs in `docs/api.md`.
 
 ### Changed
 
@@ -106,6 +183,31 @@ only met a mock, is tracked in the README's
   `whsec_` prefix (same key bytes), and test placeholders are assembled at
   compile time, so secret scanners no longer flag them.
 - `config/omnigate.json`, the operator's own config, is ignored by git.
+- A key over its budget is refused only where it would start new work (text
+  requests and `POST /v1/jobs`). It keeps access to its model list, its
+  jobs and files, and can cancel a job. Previously it got 402 everywhere.
+- Both processes refuse to start without `OMNIGATE_INTERNAL_TOKEN`, and an
+  empty value counts as not set. The control plane used to start without it
+  and then refuse every data-plane request.
+- A text upstream whose `kind` is not `openai` or `anthropic` is refused
+  when the config is loaded. It used to be passed on to data planes, which
+  could not parse the snapshot.
+- In usage events, the ledger and metrics, `input_tokens` now means input
+  that was **not** served from the provider's prompt cache. For
+  OpenAI-style upstreams, which count cached tokens inside their input
+  figure, cached tokens moved to `cached_input_tokens`. Cost is unchanged
+  unless a cache price is configured.
+- `GET /admin/usage` returns more fields per key (source, state, budget
+  period, cache token counts) and includes managed keys.
+- Webhook delivery resolves the target host once per attempt, checks the
+  addresses and connects to the checked address. This closes DNS rebinding
+  between the check and the call.
+- Optimized data-plane builds use the multi-threaded allocator instead of
+  the standard library's checking allocator, which cut memory for 100,000
+  queued usage events from 427 MiB to 77 MiB.
+- The control plane's code is formatted with `mix format` at a line length
+  of 160, and CI enforces it.
+- The retention log line also reports the bucket objects removed.
 
 ### Fixed
 
@@ -119,3 +221,10 @@ only met a mock, is tracked in the README's
 - Translated requests that Gemini 3 and later refuse for lacking a "thought
   signature" on earlier tool calls are retried with the placeholder Google
   documents, and the model is remembered. Found against the real Gemini API.
+- A client that connected and sent nothing, or stopped half-way through a
+  request, held a thread for ever. Found with the load test.
+- Data-plane memory crept upwards under load, because usage events were
+  allocated on request threads and freed on the flush thread. The queue is
+  now one reused buffer. Found with the load test.
+- As PID 1 in a container the data plane ignored SIGTERM, so `docker stop`
+  waited for its kill timeout. It now drains and exits with status 0.

@@ -1,0 +1,484 @@
+# Release workflow for omnigate.
+#
+# Pushing a tag `v<version>` (for example v0.2.0, or v0.2.0-rc.1 for a
+# pre-release) publishes that version:
+#
+#   prepare    Checks the tag against the versions written in the source,
+#              takes the release notes from CHANGELOG.md, and checks that the
+#              release Dockerfile still matches dataplane/Dockerfile. Nothing
+#              is built or published if any of this fails.
+#   binaries   Runs the Zig unit tests, then cross-compiles the data plane for
+#              five targets and packs each one with a SHA-256 file.
+#   images     Builds multi-architecture (amd64, arm64) container images of
+#              both planes and pushes them to GHCR, tagged with the version
+#              and, unless it is a pre-release, `latest`.
+#   release    Creates the GitHub release with the archives, the checksums
+#              and the notes. Runs last, so a release never appears before
+#              its images exist.
+#
+# Starting the workflow by hand (workflow_dispatch) is a dry run: prepare,
+# binaries and images run in full, but no image is pushed and no release is
+# created.
+#
+# No job needs a secret beyond the token GitHub gives every run. The process
+# for a maintainer is in docs/releasing.md.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to name the dry-run archives with (nothing is published)"
+        required: false
+        default: "0.0.0-dryrun"
+        type: string
+
+# Nothing by default; each job below asks for what it needs.
+permissions: {}
+
+# One run per tag (or per branch for dry runs), never cancelled half way.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Version and release notes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # A pushed tag v1.2.3 is version 1.2.3 and is published. Anything else
+      # (a manual run) is a dry run named after the `version` input.
+      - name: Work out the version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+            version="${REF_NAME#v}"
+            publish=true
+          else
+            tag=""
+            version="${INPUT_VERSION:-0.0.0-dryrun}"
+            version="${version#v}"
+            publish=false
+          fi
+          # Also what a container image tag may contain.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'; then
+            echo "::error::'$version' is not a version like 1.2.3 or 1.2.3-rc.1 (tags must look like v1.2.3)"
+            exit 1
+          fi
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "version $version, publish=$publish, prerelease=$prerelease"
+
+      # control/mix.exs is where the control plane's version comes from (it is
+      # what the omnigate_build_info metric reports); dataplane/build.zig.zon
+      # carries the same number for the data plane.
+      - name: The tag matches the versions in the source
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PUBLISH: ${{ steps.version.outputs.publish }}
+        run: |
+          set -euo pipefail
+          mix_version="$(sed -n 's/^ *version: "\(.*\)",$/\1/p' control/mix.exs | head -n 1)"
+          zon_version="$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' dataplane/build.zig.zon | head -n 1)"
+          echo "control/mix.exs: '$mix_version', dataplane/build.zig.zon: '$zon_version', releasing: '$VERSION'"
+          if [ "$mix_version" = "$VERSION" ] && [ "$zon_version" = "$VERSION" ]; then
+            exit 0
+          fi
+          message="version $VERSION does not match control/mix.exs ($mix_version) and dataplane/build.zig.zon ($zon_version); change both files, commit, and tag that commit"
+          if [ "$PUBLISH" = "true" ]; then
+            echo "::error::$message"
+            exit 1
+          fi
+          echo "::warning::dry run: $message"
+
+      # The notes are the section of CHANGELOG.md headed "## [<version>]".
+      # A dry run falls back to the "Unreleased" section.
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PUBLISH: ${{ steps.version.outputs.publish }}
+        run: |
+          set -euo pipefail
+          section() {
+            awk -v want="## [$1]" '
+              /^## \[/ { if (found) exit; if (index($0, want) == 1) { found = 1; next } }
+              found { print }
+            ' CHANGELOG.md
+          }
+          section "$VERSION" > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            if [ "$PUBLISH" = "true" ]; then
+              echo "::error::CHANGELOG.md has no section '## [$VERSION]' (or it is empty); add it before tagging"
+              exit 1
+            fi
+            echo "::warning::dry run: CHANGELOG.md has no section '## [$VERSION]'; showing 'Unreleased' instead"
+            section "Unreleased" > release-notes.md
+          fi
+          {
+            echo "### Release notes for $VERSION"
+            echo
+            cat release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # .github/release/dataplane.Dockerfile repeats the final stage of
+      # dataplane/Dockerfile (user, volume, environment, entry point). If one
+      # was changed without the other, the published image would differ from
+      # the one the container test checks.
+      - name: The release Dockerfile matches dataplane/Dockerfile
+        run: |
+          set -euo pipefail
+          final_stage() { sed -n '/^FROM scratch/,$p' "$1" | sed 's/--from=[a-z]*/--from=STAGE/'; }
+          if ! diff <(final_stage dataplane/Dockerfile) <(final_stage .github/release/dataplane.Dockerfile); then
+            echo "::error::the final stage of .github/release/dataplane.Dockerfile differs from dataplane/Dockerfile; bring them back in line"
+            exit 1
+          fi
+
+      - name: Keep the release notes for the release job
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  binaries:
+    name: Data plane binaries
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      # Zig target triples. The Linux ones are static (musl) binaries, the
+      # same as the container image uses.
+      TARGETS: x86_64-linux-musl aarch64-linux-musl x86_64-windows aarch64-macos x86_64-macos
+    steps:
+      - uses: actions/checkout@v7
+
+      # The Zig version pinned in dataplane/Dockerfile, checksum verified.
+      - uses: ./.github/actions/setup-zig
+
+      - name: Unit tests
+        working-directory: dataplane
+        run: zig build test --summary all
+
+      # One optimized build per target, all from this x86-64 Linux runner.
+      - name: Cross-compile
+        working-directory: dataplane
+        run: |
+          set -euo pipefail
+          for target in $TARGETS; do
+            echo "::group::$target"
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/out/$target"
+            ls -l "$RUNNER_TEMP/out/$target/bin"
+            echo "::endgroup::"
+          done
+
+      # The only binary this runner can execute. Without the internal token
+      # the data plane refuses to start: it must exit by itself with an
+      # ordinary error status, not hang and not crash.
+      - name: Smoke test the x86-64 Linux binary
+        run: |
+          set -uo pipefail
+          bin="$RUNNER_TEMP/out/x86_64-linux-musl/bin/omnigate-dp"
+          file "$bin" || true
+          cd "$RUNNER_TEMP"
+          # The step's shell stops at the first failing command; this one is
+          # meant to fail, so read its status instead.
+          set +e
+          timeout 30 env -u OMNIGATE_INTERNAL_TOKEN "$bin" > smoke.log 2>&1
+          code=$?
+          set -e
+          cat smoke.log
+          if [ "$code" -le 0 ] || [ "$code" -ge 124 ]; then
+            echo "::error::expected the data plane to refuse to start without OMNIGATE_INTERNAL_TOKEN (exit status 1); got status $code"
+            exit 1
+          fi
+          echo "refused to start without the internal token (status $code), as it should"
+
+      # omnigate-dp-<version>-<target>.tar.gz (.zip for Windows), each holding
+      # one directory of the same name with the binary in it, and next to each
+      # archive a .sha256 file in `sha256sum -c` format.
+      - name: Package
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          stage="$RUNNER_TEMP/stage"
+          dist="$RUNNER_TEMP/dist"
+          mkdir -p "$stage" "$dist"
+          for target in $TARGETS; do
+            name="omnigate-dp-${VERSION}-${target}"
+            mkdir "$stage/$name"
+            case "$target" in
+              *-windows*)
+                cp "$out/$target/bin/omnigate-dp.exe" "$stage/$name/"
+                archive="$name.zip"
+                (cd "$stage" && python3 -m zipfile -c "$dist/$archive" "$name")
+                ;;
+              *)
+                cp "$out/$target/bin/omnigate-dp" "$stage/$name/"
+                chmod 0755 "$stage/$name/omnigate-dp"
+                archive="$name.tar.gz"
+                tar -C "$stage" --owner=0 --group=0 --numeric-owner -czf "$dist/$archive" "$name"
+                ;;
+            esac
+            (cd "$dist" && sha256sum "$archive" > "$archive.sha256")
+          done
+          (cd "$dist" && sha256sum -c ./*.sha256)
+          ls -l "$dist"
+          {
+            echo "### Archives for $VERSION"
+            echo
+            echo '```'
+            cat "$dist"/*.sha256
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # What the image build needs: the two Linux binaries, laid out as
+      # .github/release/dataplane.Dockerfile expects them.
+      - name: Lay out the Linux binaries for the image build
+        run: |
+          set -euo pipefail
+          context="$RUNNER_TEMP/image-context"
+          mkdir -p "$context/bin/amd64" "$context/bin/arm64"
+          cp "$RUNNER_TEMP/out/x86_64-linux-musl/bin/omnigate-dp" "$context/bin/amd64/omnigate-dp"
+          cp "$RUNNER_TEMP/out/aarch64-linux-musl/bin/omnigate-dp" "$context/bin/arm64/omnigate-dp"
+
+      - name: Upload the archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload the Linux binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-context
+          path: ${{ runner.temp }}/image-context
+          if-no-files-found: error
+          retention-days: 7
+
+  images:
+    name: Container images
+    needs: [prepare, binaries]
+    runs-on: ubuntu-24.04
+    # The control plane's arm64 image is compiled under emulation, which is slow.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PUBLISH: ${{ needs.prepare.outputs.publish }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      PLATFORMS: linux/amd64,linux/arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the Linux binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: image-context
+          path: ${{ runner.temp }}/image-context
+
+      # Emulation is needed to build the control plane's arm64 image (its
+      # build stage compiles Elixir and assembles an Erlang runtime for the
+      # target architecture), and to start the arm64 data plane image once
+      # below. Building the data plane image needs none: it copies binaries
+      # that were cross-compiled in the binaries job.
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v4
+
+      # GHCR names must be lower case; the repository owner's name may not be.
+      - name: Image names
+        id: names
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "dataplane=ghcr.io/$owner/omnigate-dataplane"
+            echo "control=ghcr.io/$owner/omnigate-control"
+          } >> "$GITHUB_OUTPUT"
+
+      # The release Dockerfile is used nowhere else, so run what it produces
+      # once before publishing it: the container must start the binary as the
+      # runtime user and exit with the data plane's own "no internal token"
+      # error, not with a Docker error (status 125 and above).
+      - name: Smoke test the data plane image (amd64)
+        run: |
+          set -uo pipefail
+          docker buildx build --platform linux/amd64 --load --tag omnigate-dataplane:smoke \
+            --file .github/release/dataplane.Dockerfile "$RUNNER_TEMP/image-context" || exit 1
+          set +e
+          timeout 120 docker run --rm omnigate-dataplane:smoke > smoke.log 2>&1
+          code=$?
+          set -e
+          cat smoke.log
+          if [ "$code" -le 0 ] || [ "$code" -ge 124 ]; then
+            echo "::error::expected the container to exit with the data plane's own error status (1); got $code"
+            exit 1
+          fi
+
+      # The same for arm64, under emulation. A failure here may be the
+      # emulator's rather than the binary's, so it warns instead of failing.
+      - name: Smoke test the data plane image (arm64, emulated, advisory)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          docker buildx build --platform linux/arm64 --load --tag omnigate-dataplane:smoke-arm64 \
+            --file .github/release/dataplane.Dockerfile "$RUNNER_TEMP/image-context" || exit 1
+          set +e
+          timeout 120 docker run --rm --platform linux/arm64 omnigate-dataplane:smoke-arm64 > smoke-arm64.log 2>&1
+          code=$?
+          set -e
+          cat smoke-arm64.log
+          if [ "$code" -le 0 ] || [ "$code" -ge 124 ]; then
+            echo "::warning::the arm64 data plane image did not exit the way the amd64 one does under emulation (status $code); try it on real arm64 hardware"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # In a dry run the images are built for both platforms and left in the
+      # build cache: nothing is pushed.
+      - name: Build the data plane image
+        env:
+          IMAGE: ${{ steps.names.outputs.dataplane }}
+        run: |
+          set -euo pipefail
+          args=(--platform "$PLATFORMS" --tag "$IMAGE:$VERSION")
+          if [ "$PRERELEASE" != "true" ]; then args+=(--tag "$IMAGE:latest"); fi
+          if [ "$PUBLISH" = "true" ]; then args+=(--push); fi
+          docker buildx build "${args[@]}" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --file .github/release/dataplane.Dockerfile "$RUNNER_TEMP/image-context"
+
+      - name: Build the control plane image
+        env:
+          IMAGE: ${{ steps.names.outputs.control }}
+        run: |
+          set -euo pipefail
+          args=(--platform "$PLATFORMS" --tag "$IMAGE:$VERSION")
+          if [ "$PRERELEASE" != "true" ]; then args+=(--tag "$IMAGE:latest"); fi
+          if [ "$PUBLISH" = "true" ]; then args+=(--push); fi
+          docker buildx build "${args[@]}" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            control
+
+      - name: What was pushed
+        if: env.PUBLISH == 'true'
+        env:
+          DATAPLANE: ${{ steps.names.outputs.dataplane }}
+          CONTROL: ${{ steps.names.outputs.control }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$DATAPLANE:$VERSION"
+          docker buildx imagetools inspect "$CONTROL:$VERSION"
+
+  release:
+    name: GitHub release
+    needs: [prepare, binaries, images]
+    # Not in a dry run: this is the only job that may write to the repository.
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+    steps:
+      - name: Download the archives
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Download the release notes
+        uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: notes
+
+      # The CHANGELOG section, followed by where the images are and what was
+      # and was not executed while building this release.
+      - name: Finish the release notes
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          {
+            cat notes/release-notes.md
+            echo
+            echo "## Getting this release"
+            echo
+            echo "Container images (linux/amd64 and linux/arm64):"
+            echo
+            echo '```'
+            echo "docker pull ghcr.io/$owner/omnigate-dataplane:$VERSION"
+            echo "docker pull ghcr.io/$owner/omnigate-control:$VERSION"
+            echo '```'
+            echo
+            echo "Data plane binaries are attached below, each with a \`.sha256\` file"
+            echo "(\`sha256sum -c <archive>.sha256\`). The control plane is published as a container image only."
+            echo
+            echo "Of these, the release build executes only the x86-64 Linux binary and image."
+            echo "The arm64 Linux, Windows and macOS binaries are cross-compiled and were not run."
+          } > notes.md
+          cat notes.md
+
+      # Fails if a release for this tag already exists; delete that release
+      # (not the tag) before running the job again.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          args=(--title "omnigate $VERSION" --notes-file notes.md --verify-tag)
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+          gh release create "$TAG" "${args[@]}" dist/*

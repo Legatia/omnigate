@@ -1,0 +1,398 @@
+# Admin: dashboard, keys, budgets and the audit log
+
+Everything on this page happens on the **control plane's** port (4000 by
+default) and uses the **admin token** (`OMNIGATE_ADMIN_TOKEN`), never a
+gateway key. Keep that port private; see
+[Deployment](deployment.md#what-to-keep-private).
+
+- [Two ways in](#two-ways-in)
+- [The dashboard](#the-dashboard)
+- [Gateway keys: two sources](#gateway-keys-two-sources)
+- [Key lifecycle with curl](#key-lifecycle-with-curl)
+- [Budgets and periods](#budgets-and-periods)
+- [The audit log](#the-audit-log)
+- [CSRF: scripts and browsers](#csrf-scripts-and-browsers)
+- [Admin API reference](#admin-api-reference)
+
+The examples use the quickstart's addresses and admin token
+(`http://127.0.0.1:4000`, `dev-admin-token-change-me`). Key management has
+been exercised by the unit tests and the end-to-end test against mock
+providers; nothing here has run under production load.
+
+## Two ways in
+
+| | How | Used by |
+|---|---|---|
+| Bearer token | `Authorization: Bearer <admin token>` on every request | Scripts, `curl`, Prometheus |
+| Session | `POST /login` with the token as the form field `password`; the answer sets the `omnigate_session` cookie (12 hours, `HttpOnly`, `SameSite=Strict`, `Secure` behind TLS) | The dashboard in a browser |
+
+Both open the same things: the dashboard page, `/admin/*` and `/metrics`.
+Five failed logins from one address lock that address out for a minute.
+There is one admin token and no user accounts; changing the token ends
+every session.
+
+## The dashboard
+
+Open the control plane's address in a browser (`http://127.0.0.1:4000/` in
+the quickstart, `https://$OMNIGATE_ADMIN_HOST` behind the Compose proxy) and
+sign in with the admin token.
+
+The page is one HTML document with its styles and script inline; it loads
+nothing from other hosts. It is rendered on the server, so it shows current
+data with JavaScript off. With JavaScript on it refreshes itself every four
+seconds from `GET /admin/overview` (the top bar shows the time of the last
+update, in UTC), and the buttons that change keys work.
+
+From top to bottom:
+
+**Overview.** Six figures: requests, errors, tokens in, tokens out, spend
+and media jobs. Each shows the total over the whole ledger and, beneath it,
+the figure for today (the current UTC day).
+
+**Keys.** One row per gateway key, keys from the config file first.
+
+| Column | Shows |
+|---|---|
+| Key | The name, tagged `file` or `managed` (see [below](#gateway-keys-two-sources)). |
+| State | `active`, `blocked` (budget spent for the current period) or `disabled` (switched off by an operator). |
+| Spend | Without a budget: total spend. With one: spend against the budget with a progress bar; for a monthly or daily budget that is this period's spend, with the all-time total beneath. |
+| Requests, Errors, Tokens in / out, Jobs | Totals from the ledger. Prompt-cache reads and writes are noted next to the tokens when there are any. |
+| Per min | The key's `rpm`, or a dash for no limit. |
+| Models | The key's model list, or `all`. |
+| Actions | For managed keys: **Disable** / **Enable**, **Rotate**, **Delete**. For file keys: `in config file`. |
+
+Disable, Rotate and Delete ask for a second click: the button turns into
+`Confirm ...?` for six seconds, with a Cancel button next to it. Enable acts
+at once.
+
+Below the table is the **Create a key** form: name, optional budget in US
+dollars, what the budget covers (everything, each calendar month, each day),
+optional requests per minute, and an optional comma-separated model list.
+After creating or rotating a key the page shows the key itself in a panel
+with a Copy button. **That is the only time the key is shown**; only its
+SHA-256 is stored.
+
+**Recent requests.** Up to 25 of the newest text requests: time, key,
+model, the upstream and model that served it, status, tokens, latency, cost,
+and each failover attempt with its outcome. The list is kept in memory, so
+it starts empty when the control plane restarts (the totals do not: they are
+rebuilt from the ledger file).
+
+**Recent media jobs.** The 25 newest jobs: created, id, key, model, status,
+upstream, cost, links to the outputs, and the webhook's delivery state.
+
+**Refused requests.** Requests the gateway turned away before routing them
+(bad key, rate limit, disallowed model and so on), as counts per key and
+reason. These counts are kept in memory and start from zero whenever the
+control plane restarts; see [Operations](operations.md#refused-requests).
+
+**Admin activity.** The ten newest entries of the [audit log](#the-audit-log).
+
+**Configuration.** A read-only view of what the config file says: text
+upstreams (name, protocol, host), text routes (strategy, cache time,
+targets), media upstreams and routes, output storage, and retention.
+Upstreams are shown by host only; keys, hashes and secrets never appear.
+Routes, upstreams and everything under `media` are still changed by editing
+the config file.
+
+## Gateway keys: two sources
+
+| | File keys | Managed keys |
+|---|---|---|
+| Defined in | `keys[]` in the config file | The keys file, `OMNIGATE_KEYS` (default `data/keys.json`) |
+| Created by | Editing the file | `POST /admin/keys` or the dashboard |
+| Changed through the admin API | No: `409 read_only_key` | Yes |
+| The key itself | Chosen by you; the file holds it or its SHA-256 | Generated (`og-` followed by 43 random characters), returned once, never stored |
+| Shown in listings as | `"source": "file"` | `"source": "managed"` |
+
+The two lists are merged, file keys first, and everything else in the
+gateway treats them alike: the same snapshot goes to data planes, the same
+budgets, rate limits and model lists apply.
+
+Names are how keys are told apart in listings, metrics and the admin API's
+paths. The API refuses to create a managed key under a name that is
+already in use, by a managed key or a file key (`409 key_exists`). The
+config file is not checked the other way round: nothing in the code stops
+you from adding a file key with the name of an existing managed key, or two
+file keys with one name, so do not.
+
+Things to know about the keys file:
+
+- It is rewritten atomically (temporary file, sync, rename) on every change.
+  A change that cannot be saved is not applied (`500 storage_error`).
+- It holds key **hashes**, never keys. It does hold a key's
+  `webhook_secret` in clear text if you set one, because signing needs the
+  secret itself. Protect the data directory.
+- If the file exists but cannot be read or parsed, the control plane refuses
+  to start rather than start with no managed keys.
+- Back it up with the ledger; see [Deployment](deployment.md#backups).
+
+A change reaches the data planes with their next config poll
+(`OMNIGATE_POLL_MS`, two seconds by default). Because the data plane keeps
+serving its last config when the control plane is down, a key that was
+deleted or disabled during an outage of the *connection* between the two
+keeps working on that data plane until it can poll again.
+
+## Key lifecycle with curl
+
+Each command below sends the admin token as a bearer token, so none needs a
+CSRF token. The JSON answers are shown formatted; the ids, times and
+numbers are made up, the shape is what the code returns.
+
+### Create
+
+```bash
+curl -X POST http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-change-me" -H "Content-Type: application/json" -d '{"name":"my-app","budget_usd":25,"budget_period":"monthly","rpm":600,"models":["demo-chat","demo-claude"]}'
+```
+
+`201 Created`:
+
+```json
+{
+  "name": "my-app",
+  "key": "og-<43 characters, shown only in this answer>",
+  "source": "managed",
+  "created_at": "2026-11-10T12:00:00Z",
+  "budget_usd": 25.0,
+  "budget_period": "monthly",
+  "period_spend_usd": 0.0,
+  "period_resets_at": "2026-12-01T00:00:00Z",
+  "rpm": 600,
+  "models": ["demo-chat", "demo-claude"],
+  "disabled": false,
+  "blocked": false,
+  "state": "active",
+  "has_webhook_secret": false,
+  "requests": 0,
+  "errors": 0,
+  "input_tokens": 0,
+  "cached_input_tokens": 0,
+  "cache_write_input_tokens": 0,
+  "output_tokens": 0,
+  "cached_responses": 0,
+  "jobs": 0,
+  "cost_usd": 0.0
+}
+```
+
+Save `key` now: no later call returns it. Only `name` is required.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | required | 1 to 64 characters: letters, digits, `.`, `_`, `-`, starting with a letter or digit. Cannot be changed later. |
+| `budget_usd` | number, 0 or more, or `null` | `null` (no budget) | See [Budgets and periods](#budgets-and-periods). |
+| `budget_period` | `"total"`, `"monthly"` or `"daily"` | `"total"` | What the budget covers. |
+| `rpm` | whole number, 0 or more | `0` (no limit) | Requests per minute, per data-plane process. |
+| `models` | list of route names, or `null` | `null` (all) | Text and media routes the key may use. |
+| `webhook_secret` | string up to 256 characters, or `null` | `null` | Signing secret for this key's job webhooks. `""` also clears it. Never returned; listings show `has_webhook_secret`. |
+| `disabled` | boolean | `false` | A disabled key is refused. |
+
+Unknown fields are ignored. A bad value answers `400 invalid_request` with a
+message naming the field.
+
+### List
+
+```bash
+curl http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-change-me"
+```
+
+`{"keys": [...]}`: every key from both sources in the shape above, without
+`key`. `GET /admin/usage` returns the same document.
+
+### Change
+
+`PATCH` with only the fields to change; the others keep their values.
+
+```bash
+curl -X PATCH http://127.0.0.1:4000/admin/keys/my-app -H "Authorization: Bearer dev-admin-token-change-me" -H "Content-Type: application/json" -d '{"budget_usd":50,"rpm":1200}'
+```
+
+Remove a budget, or lift the model limit, with `null`:
+
+```bash
+curl -X PATCH http://127.0.0.1:4000/admin/keys/my-app -H "Authorization: Bearer dev-admin-token-change-me" -H "Content-Type: application/json" -d '{"budget_usd":null,"models":null}'
+```
+
+Disable a key without deleting it, and enable it again with `false`:
+
+```bash
+curl -X PATCH http://127.0.0.1:4000/admin/keys/my-app -H "Authorization: Bearer dev-admin-token-change-me" -H "Content-Type: application/json" -d '{"disabled":true}'
+```
+
+The answer is `200` with the key as in a listing. A disabled key is left
+out of the snapshot sent to data planes, so the gateway answers it with
+`401 invalid_api_key`, the same as a key that does not exist (a key over
+its budget gets `402 budget_exceeded` instead). Its usage stays in the
+ledger and it keeps its name.
+
+### Rotate
+
+```bash
+curl -X POST http://127.0.0.1:4000/admin/keys/my-app/rotate -H "Authorization: Bearer dev-admin-token-change-me"
+```
+
+`200` with the key record and a new `key`, again shown only once. The old
+secret stops working as soon as the data planes have polled; there is no
+overlap period in which both work. The record is kept: spend, budget and
+media jobs made under earlier secrets still belong to the key, so a job
+created before the rotation can be fetched with the new secret. The hashes
+of the 50 most recent earlier secrets are remembered for this (and are
+never accepted again).
+
+### Delete
+
+```bash
+curl -X DELETE http://127.0.0.1:4000/admin/keys/my-app -H "Authorization: Bearer dev-admin-token-change-me"
+```
+
+`200` with `{"deleted": "my-app"}`. The gateway then answers the key with
+`401`. Its usage events stay in the ledger file, but they no longer appear
+under a name in listings and metrics, and its media jobs can no longer be
+fetched through the gateway. Creating a new key with the same name later
+does not bring them back: the new key has a new secret and a new hash.
+
+### Errors
+
+Admin API errors have the gateway's usual shape,
+`{"error": {"type": "...", "message": "..."}}`.
+
+| Status | `error.type` | When |
+|---|---|---|
+| 400 | `invalid_request` | A missing or malformed `name`, or a field with a bad value. |
+| 401 | `unauthorized` | No valid admin token or session. |
+| 403 | `csrf_failed` | A session-authenticated change without the CSRF token; see [below](#csrf-scripts-and-browsers). |
+| 404 | `key_not_found` | No key has this name. |
+| 409 | `key_exists` | Create: the name is taken, by a managed or a file key. |
+| 409 | `read_only_key` | Change, rotate or delete of a key that is defined in the config file. |
+| 500 | `storage_error` | The keys file could not be written; nothing was changed. |
+
+## Budgets and periods
+
+A key with `budget_usd` is blocked once its recorded spend **in the current
+budget period** reaches the budget.
+
+| `budget_period` | Spend that counts | Unblocks |
+|---|---|---|
+| `total` (default) | Everything the key ever spent | Only when you raise or remove the budget |
+| `monthly` | The current calendar month, UTC | By itself at 00:00 UTC on the first of the next month |
+| `daily` | The current day, UTC | By itself at 00:00 UTC |
+
+- Both key sources take both fields: `budget_usd` and `budget_period` in a
+  `keys[]` entry of the config file, or in a create or `PATCH` call for a
+  managed key.
+- An event counts in the period of its own time (when the request finished
+  on the data plane, in UTC), not of the moment it reached the ledger.
+- Listings show `period_spend_usd` and `period_resets_at` (`null` for a
+  total budget); `/metrics` has `omnigate_key_period_cost_usd`.
+- A blocked key may not start anything new: text requests and
+  `POST /v1/jobs` answer `402 budget_exceeded`. It keeps read access to what
+  it already has: `GET /v1/models`, fetching and listing its jobs,
+  downloading its files, and cancelling a job.
+- Enforcement is after the fact, as before: the call that crosses the
+  budget completes, and the data plane learns of the block with its next
+  config poll. The same lag applies to unblocking when a period turns.
+
+What spend is made of, including prompt-cache token prices, is in
+[Operations](operations.md#budgets).
+
+## The audit log
+
+Every state-changing admin action appends one JSON line to
+`OMNIGATE_AUDIT_LOG` (default `data/audit.jsonl`; `/data/audit.jsonl` in the
+container image) and is synced to disk before the action's response is
+sent.
+
+```json
+{"ts": "2026-11-10T18:02:11Z", "action": "key.update", "target": "my-app", "auth": "token", "address": "203.0.113.7", "outcome": "ok", "fields": ["budget_usd", "rpm"]}
+```
+
+| Field | Meaning |
+|---|---|
+| `ts` | UTC time, to the second. |
+| `action` | `key.create`, `key.update`, `key.rotate`, `key.delete`, `login`, `logout`. |
+| `target` | The key name, or `null`. |
+| `auth` | How the caller was authenticated: `token` (bearer), `session` (dashboard), `password` (a login attempt) or `none`. |
+| `address` | The peer address of the connection. Behind a reverse proxy that is the proxy. |
+| `forwarded_for` | Present when the request had an `X-Forwarded-For` header: its value, cut to 200 characters. A direct caller can fake it, so it is recorded, not trusted. |
+| `outcome` | `ok`, or the error type (`invalid_request`, `key_exists`, `read_only_key`, `key_not_found`, ...). For logins: `ok`, `denied` or `throttled`. |
+| `fields` | For `key.update`: the names of the fields that were sent, never their values. |
+
+What is and is not recorded:
+
+- Failed attempts are recorded too (a refused create, a wrong password).
+  Requests refused before they reach a handler are not: a change without a
+  valid admin token (`401`) or without the CSRF token (`403`) leaves no
+  line.
+- A logout is recorded only when it ends a session.
+- Reads (`GET`) are not recorded.
+- Never a key, a token, a password or a webhook secret.
+- If the line cannot be written (a full disk, say), the action is still
+  carried out and the control plane logs an error.
+
+Read the newest entries, newest first:
+
+```bash
+curl "http://127.0.0.1:4000/admin/audit?limit=20" -H "Authorization: Bearer dev-admin-token-change-me"
+```
+
+`{"entries": [...]}`. `limit` is between 1 and 500 and defaults to 50. The
+control plane keeps the newest 500 entries in memory for this (reloaded
+from the file at start); older ones are only in the file.
+
+The file only grows. Rotate or archive it with your own log tooling, and
+restart the control plane after moving it: the file is opened once, at
+start.
+
+## CSRF: scripts and browsers
+
+Requests that change something (`POST`, `PATCH`, `DELETE` on `/admin/*`, and
+`POST /logout`) are protected against cross-site request forgery. Which
+rule applies depends on how the request is authenticated:
+
+- **Bearer token: nothing extra to send.** A browser never attaches an
+  `Authorization` header on its own, so a request that carries the admin
+  token cannot have been forged by another site. Every `curl` example on
+  this page works as written.
+- **Session cookie: a CSRF token is required.** The dashboard page carries
+  the token for its session in `<meta name="csrf" content="...">` and sends
+  it back in the `x-csrf-token` header (its sign-out form sends it as the
+  form field `_csrf`). Without it the answer is `403 csrf_failed`. The token
+  is derived from the session cookie, so it is different for every session
+  and nothing is stored on the server.
+
+If you script against the admin API, use the bearer token. Driving it with
+a session cookie works only if the script also reads the token out of the
+dashboard page, which is not a stable interface. `GET` requests need no
+CSRF token either way.
+
+## Admin API reference
+
+All on the control plane's port, all behind the admin token or a session.
+
+| Method and path | Purpose |
+|---|---|
+| `GET /admin/keys` | Every key with its usage. |
+| `POST /admin/keys` | Create a managed key. `201`, with the key itself. |
+| `PATCH /admin/keys/{name}` | Change a managed key. |
+| `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. `200`, with the new key. |
+| `DELETE /admin/keys/{name}` | Delete a managed key. |
+| `GET /admin/usage` | The same document as `GET /admin/keys`. |
+| `GET /admin/overview` | Everything the dashboard shows, as one JSON document. |
+| `GET /admin/audit?limit=N` | The newest audit entries. |
+| `GET /metrics` | Prometheus metrics; see [API](api.md#get-metrics). |
+
+`GET /admin/overview` is the feed the dashboard polls. Its top-level fields:
+
+| Field | Content |
+|---|---|
+| `generated_at` | UTC time the document was built. |
+| `totals`, `today` | `requests`, `errors`, `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `cached_responses`, `jobs`, `cost_usd`; over the whole ledger, and for the current UTC day. |
+| `keys` | As `GET /admin/keys`. |
+| `requests` | Up to 25 of the newest text requests recorded since the control plane started. |
+| `jobs` | The 25 newest media jobs, with output URLs and webhook state. |
+| `rejected` | Up to 50 `{key, reason, count}` series of refused requests, largest first. |
+| `audit` | The 10 newest audit entries. |
+| `config` | The read-only configuration view: upstreams by host, routes, media, storage, retention. |
+
+It is the dashboard's own feed rather than a versioned interface: expect its
+shape to follow the dashboard.

@@ -24,9 +24,9 @@ omnigate is two processes with a narrow interface between them.
 | | Data plane (`dataplane/`, Zig 0.17) | Control plane (`control/`, Elixir 1.20 / OTP 29) |
 |---|---|---|
 | Audience | Applications. The public port. | Operators and data planes. A private port. |
-| Owns | Authenticating gateway keys, rate limits, routing, load balancing, failover, cooldowns, protocol translation, streaming, counting tokens | The config file, prices, the usage ledger, budgets, media jobs, output storage, webhooks, dashboard, metrics, retention |
+| Owns | Authenticating gateway keys, rate limits, routing, load balancing, failover, cooldowns, protocol translation, streaming, counting tokens, the response cache, client and stream timeouts, the connection cap, the access log | The config file, managed keys, prices, the usage ledger, budgets and their periods, media jobs, output storage, webhooks, dashboard, admin API, audit log, metrics, retention |
 | Credentials it holds | Text provider keys (from its environment) | Media provider keys, bucket credentials, webhook secrets, the admin token |
-| State | In memory, plus two files: the usage spool and a cache of the last config | Files: the ledger, the job log, stored outputs |
+| State | In memory, plus two files: the usage spool and a cache of the last config | Files: the ledger, the job log, the keys file, the audit log, stored outputs |
 | Dependencies | The Zig standard library | Two direct Hex packages (Bandit, Plug); outbound HTTP uses OTP's `httpc` |
 | If it stops | Applications get no answers | Text traffic continues; jobs answer 503; usage waits in the spool |
 
@@ -42,57 +42,92 @@ All of it is HTTP from the data plane to the control plane, under
 | Call | Direction | Purpose |
 |---|---|---|
 | `GET /internal/config` | pull, every `OMNIGATE_POLL_MS` | The config snapshot. |
-| `POST /internal/usage/batch` | push, every `OMNIGATE_FLUSH_MS` when there is something to send | Usage events. |
+| `POST /internal/usage/batch` | push, every `OMNIGATE_FLUSH_MS` when there is something to send | Usage events. At-least-once, spooled to disk. |
+| `POST /internal/counters` | push, every `OMNIGATE_FLUSH_MS` when there is something to send | Counts of requests the data plane refused before routing, by key name and reason. Best effort, memory only. |
 | `/internal/v1/jobs*`, `/internal/v1/files/*` | per client request | The jobs API, forwarded. The data plane names the authenticated key in `x-omnigate-key-sha256`. |
 
 **The snapshot** is the data plane's whole view of the configuration:
 
-- keys as SHA-256 hashes with `name`, `rpm`, `models` and a `blocked` flag;
+- keys as SHA-256 hashes with `name`, `rpm`, `models` and a `blocked` flag.
+  File keys and managed keys are merged into one list before this point, so
+  the data plane cannot tell them apart; a disabled key is left out;
 - text upstreams, with the *name* of the environment variable holding each
   provider key;
-- text routes with `strategy` and each target's `upstream`, `model`,
-  `weight`;
+- text routes with `strategy`, `cache_ttl_s` and each target's `upstream`,
+  `model`, `weight`;
+- `media_models`, the names of the media routes, used only to list them in
+  `GET /v1/models`;
 - a `version`, a hash of all of the above. It changes whenever anything the
   data plane sees changes, including a key flipping to blocked.
 
-There are no budgets, prices or secrets in it, and nothing about media. The
-data plane installs a snapshot only when its version differs from the one in
-force, and writes it to the config cache file so that it can start from it
-when the control plane is down.
+There are no budgets, prices or secrets in it, and nothing about media
+beyond those names. The data plane installs a snapshot only when its
+version differs from the one in force, and writes it to the config cache
+file so that it can start from it when the control plane is down.
 
 Budgets reach the data plane only as the `blocked` flag: the control plane
-compares each key's recorded spend with its budget when it builds the
-snapshot.
+compares each key's recorded spend in its current budget period with its
+budget every time it builds the snapshot, which is on every poll. That is
+also how a monthly or daily key unblocks: the first snapshot built after
+the period turns no longer has the flag. Creating, changing, rotating or
+deleting a managed key travels the same way, as a changed key list in the
+next snapshot.
 
 ## A text request
 
-1. **Authenticate.** The key from `Authorization: Bearer` or `x-api-key` is
-   hashed and looked up in the snapshot. Unknown: 401. Blocked: 402.
-2. **Parse.** The body (at most 8 MiB) must be a JSON object with a `model`
+1. **Accept.** A connection beyond `OMNIGATE_MAX_CONNECTIONS` is answered
+   503 at once. Otherwise the connection gets a task and a deadline: a
+   watchdog task cancels it if the client does not deliver a request within
+   `OMNIGATE_CLIENT_TIMEOUT_MS`.
+2. **Authenticate.** The key from `Authorization: Bearer` or `x-api-key` is
+   hashed and looked up in the snapshot. Unknown: 401. Blocked: 402 for
+   anything that starts new work (reading the model list, jobs and files
+   stays allowed).
+3. **Parse.** The body (at most 8 MiB) must be a JSON object with a `model`
    string, which names a route.
-3. **Model limits, then rate limit.** A key restricted to a list of models
+4. **Model limits, then rate limit.** A key restricted to a list of models
    gets 403 for anything else. Then the per-key token bucket is charged.
-4. **Order the targets.** The route's strategy picks who goes first
+5. **Response cache.** If the route has `cache_ttl_s` and the request is
+   not a stream, the request is hashed together with the route name, the
+   path and the key's hash, and looked up in an in-memory cache. A hit is
+   answered from memory and reported as a usage event with no tokens,
+   marked `cached`; nothing below happens.
+6. **Order the targets.** The route's strategy picks who goes first
    (`failover`: config order; `round_robin`: rotating; `weighted`: random by
    weight). Targets whose upstream is cooling down go last.
-5. **Forward.** For each target in order: rewrite `model` to the target's
+7. **Forward.** For each target in order: rewrite `model` to the target's
    model id; if the upstream speaks the other protocol, translate the
    request; send it with the provider key from the environment; wait for the
    response headers up to the timeout.
    - Connection error: one retry on a fresh connection, then next target.
    - Timeout, 429 or 5xx: next target, and a failure is noted for cooldowns.
    - Anything else: this is the answer.
-6. **Stream.** The response body is copied to the client chunk by chunk and
+8. **Stream.** The response body is copied to the client chunk by chunk and
    flushed each time. On the way through, a scanner picks the token counts
    out of the bytes without buffering the body. If the upstream speaks the
    other protocol the stream is translated event by event. From the first
-   byte on there is no more failover.
-7. **Report.** One usage event is queued. The request does not wait for it
-   to be delivered.
+   byte on there is no more failover. The response head carries the
+   gateway's own headers and the provider headers on a fixed allowlist
+   (retry hints, rate-limit counters, request ids). Each chunk pushes the
+   connection's deadline forward; if nothing moves for
+   `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` the watchdog cancels the task, and what
+   was metered is reported with status 499.
+9. **Report.** One usage event is queued. The request does not wait for it
+   to be delivered. A complete, successful, non-streaming answer on a route
+   with `cache_ttl_s` is also put in the response cache.
+10. **Log.** One access-log line is written for the request.
 
 If every target fails, the client gets 502 `all_upstreams_failed` with the
 list of attempts, and a usage event with status 502 and no tokens is
 recorded.
+
+A request that is refused in steps 1 to 4 (and a route that does not exist)
+produces no usage event. It is counted per key name and reason instead, and
+the counts are sent to the control plane on the same interval as usage.
+
+**Stopping.** On SIGTERM or SIGINT the accept loop ends, idle connections
+are cancelled, requests in flight get `OMNIGATE_SHUTDOWN_GRACE_MS` to
+finish, and queued usage is delivered once more before the process exits.
 
 Two provider quirks are handled for translated requests only, because a
 client speaking the other protocol cannot know them: models that reject
@@ -126,18 +161,39 @@ A text usage event as the data plane sends it:
 | `upstream`, `target_model` | Which target answered; null when all failed. |
 | `status` | HTTP status sent to the client; 499 for a stream that broke mid-way; 502 when all targets failed. |
 | `stream` | Whether the request was streamed. |
-| `input_tokens`, `output_tokens` | As read from the provider's response. |
+| `input_tokens` | Input tokens that were not served from the provider's prompt cache. |
+| `cached_input_tokens` | Input tokens read from the provider's prompt cache. |
+| `cache_write_input_tokens` | Input tokens written to the provider's prompt cache. |
+| `output_tokens` | Output tokens. |
+| `cached` | `true` when the answer came from the gateway's own response cache; such an event has no upstream and no tokens. |
 | `latency_ms` | From the start of the failover loop to the end of the response. |
 | `attempts` | Each upstream tried and its outcome. |
 | `ts_ms` | When the request finished on the data plane. |
 
-The control plane adds `cost_usd` (from the target's prices at the time of
-recording), `ts` and `received_at`. Media jobs are written to the same
-ledger by the control plane itself, with `"kind": "media"`, the job id as
-`id`, and the job's own `cost_usd`.
+The token counts are read from the response in the provider's own terms and
+then normalised by the protocol of the upstream that answered: an
+OpenAI-style input count includes cached tokens, so they are subtracted; an
+Anthropic-style one does not, so its cache reads and writes are taken as
+reported. Whatever the provider, `input_tokens` in the ledger means
+"uncached input".
 
-At startup the ledger file is replayed to rebuild the totals and the set of
-seen ids. The file is never rewritten; `retention.ledger_ids_days` only
+The control plane adds `cost_usd` (the four counts times the target's four
+prices at the time of recording; zero for a `cached` event), `ts` (from
+`ts_ms`) and `received_at`. Media jobs are written to the same ledger by
+the control plane itself, with `"kind": "media"`, the job id as `id`, and
+the job's own `cost_usd`.
+
+Besides the per-key totals, the ledger keeps each key's spend per UTC month
+and per UTC day, keyed by the event's own time. That is what a monthly or
+daily budget is compared with. Rows of periods long past are dropped from
+memory (the file keeps the events), and totals for the current UTC day feed
+the dashboard's "today" figures.
+
+Totals are kept per key **hash**. A managed key that has been rotated has
+several hashes; the control plane adds them up wherever it shows a key.
+
+At startup the ledger file is replayed to rebuild all of this and the set
+of seen ids. The file is never rewritten; `retention.ledger_ids_days` only
 trims the in-memory id set.
 
 Known limits, from the README: spool appends are not fsynced, so a power
@@ -152,9 +208,10 @@ queued ──▶ running ──▶ succeeded
               └──────▶ canceled
 ```
 
-1. **Create.** The control plane checks the key's budget and model list,
-   finds the media route, validates `input`, `metadata`, the webhook URL and
-   the idempotency key, and writes the job to the job log. With an
+1. **Create.** The control plane checks the key's budget (for its current
+   period) and model list, finds the media route, validates `input`,
+   `metadata`, the webhook URL and the idempotency key, and writes the job
+   to the job log. With an
    idempotency key already used by this gateway key, the existing job is
    returned instead.
 2. **Cache.** If caching applies and an identical job succeeded earlier
@@ -178,7 +235,9 @@ queued ──▶ running ──▶ succeeded
    crash is harmless), and its webhook, if any, is armed.
 7. **Webhook.** Delivery attempts are scheduled by a small timer process;
    the state of each delivery is stored in the job, so retries continue
-   after a restart.
+   after a restart. For each attempt the target host is resolved once, the
+   addresses are checked against the private-address rule, and the
+   connection goes to the address that was checked.
 
 **Restart safety.** At startup the control plane replays the job log and
 resumes every unfinished job. A job with a recorded provider id goes
@@ -197,16 +256,30 @@ and `cancel`. There are seven: `replicate`, `fal`, `openai_images`,
 
 | File | Process | Written | Purpose |
 |---|---|---|---|
-| The config file | control (read only) | by you | Keys, upstreams, routes, media, retention. |
-| `ledger.jsonl` | control | Appended and synced per batch. Never rewritten. | Usage events; source of all spend totals. |
+| The config file | control (read only) | by you | File keys, upstreams, routes, media, retention. |
+| `ledger.jsonl` | control | Appended and synced per batch. Never rewritten. | Usage events; source of all spend totals, period spend included. |
 | `jobs.jsonl` | control | Each change appends the job's full snapshot, synced before the change is visible. Rewritten compacted (one line per job) at start and after a retention sweep. | Job state. |
+| `keys.json` | control | Replaced whole on every key change (temp file, sync, rename). | Managed keys: name, SHA-256 of the current secret and of earlier ones, budget and period, rate limit, models, disabled flag, and the webhook secret (in clear text) if set. Never a key itself. |
+| `audit.jsonl` | control | One line appended and synced per admin action. Never rewritten. | Who changed which key, and sign-ins. |
 | The media directory | control | One directory per job. | Locally stored outputs. |
 | `omnigate-usage.spool` | data | Appended per request (not synced); truncated when drained. | Undelivered usage events. |
 | `omnigate-config.cache.json` | data | Rewritten (temp file, then rename) when a new snapshot is installed. | Start without the control plane. Holds key hashes and routes, never secrets. |
 
-There is no database and no message broker. Rate-limit buckets, cooldowns,
-round-robin counters and learned model quirks are in the data plane's memory
-only and start fresh after a restart.
+File names are the defaults; each has an environment variable
+([Configuration](configuration.md#environment-variables)).
+
+There is no database and no message broker. In memory only, and starting
+fresh after a restart:
+
+- data plane: rate-limit buckets, cooldowns, round-robin counters, learned
+  model quirks, the response cache, and refusal counts not yet reported;
+- control plane: the refusal counts it has received, the failed-login
+  counters, and the short lists of recent requests and audit entries the
+  dashboard shows (the audit list is reloaded from its file; the request
+  list is not).
+
+Dashboard sessions are not state at all: the cookie is signed with a key
+derived from the admin token and carries its own expiry.
 
 ## Why it is built this way
 
@@ -225,11 +298,27 @@ The reasons below are the ones stated in the code and the README.
 - **Three audiences, three credentials.** Applications use gateway keys,
   data planes use the internal token, operators use the admin token, and
   none works in another's place.
+- **Keys are stored as hashes.** A managed key is generated by the control
+  plane, shown once and kept only as its SHA-256, like a file key written
+  with `key_sha256`. A lost key is replaced by rotation, not recovered.
+- **A cache must not leak across tenants.** The response cache makes the
+  gateway key part of the identity of a request, and sits behind
+  authentication, the budget, model limits and the rate limit.
+- **Refusals are worth seeing but not worth a disk write.** Requests the
+  gateway turns away are counted in memory and reported best effort, while
+  anything that costs money goes through the spool and the ledger.
+- **A slow or silent peer must not hold a thread for ever.** The data plane
+  uses one thread per connection, so every wait on a client or an upstream
+  has a deadline, enforced by one watchdog task that cancels the
+  connection's task (which also works on Windows, where shutting a socket
+  down from another thread does not wake a blocked read).
 - **No extra services to run.** State is files on disk, replayed at start.
   The README's comparison table lists this as a deliberate difference.
 - **Small dependency surface.** The data plane uses only the Zig standard
   library, the control plane has two direct Hex packages, the tools use only
-  the Python standard library.
+  the Python standard library. The one exception is deliberate and
+  optional: `tools/sdk_compat.py` needs the official OpenAI and Anthropic
+  SDKs, because testing them is its purpose.
 - **Provider output URLs expire.** So outputs are copied into storage the
   operator controls and jobs hand out the operator's URLs.
 - **Paying a provider twice is worse than a slow restart.** So the provider
@@ -238,4 +327,5 @@ The reasons below are the ones stated in the code and the README.
 
 What this design does not give you yet, also from the README: cluster-wide
 budgets and rate limits (both are per process or per node), latency- or
-cost-aware routing, text response caching, and ledger rotation.
+cost-aware routing, and ledger rotation. The response cache and the refusal
+counts are likewise per data-plane process, not shared.

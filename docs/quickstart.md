@@ -7,12 +7,13 @@ Two parts: run everything locally against the mock providers that ship in
 
 - Zig 0.17
 - Erlang/OTP 29 with Elixir 1.20
-- Python 3.9 or newer (the tools use the standard library only)
+- Python 3.9 or newer. The tools use the standard library only, except the
+  optional SDK test, which needs `pip install openai anthropic`.
 
-The README records what has been tried: Windows 11, and x86-64 Linux
-containers. Running the two processes directly on Linux or macOS is not
-listed as verified there. The commands below are given for PowerShell (as in
-the README) and for a POSIX shell.
+The README records what has been tried: Windows 11 and x86-64 Linux, where
+CI builds and runs both processes on Ubuntu 24.04 for every push. macOS and
+ARM are untried. The commands below are given for PowerShell (as in the
+README) and for a POSIX shell.
 
 On Windows, Erlang and Elixir are installed but not on `PATH`. In PowerShell,
 once per session:
@@ -39,16 +40,20 @@ python tools/e2e.py
 ```
 
 It starts the mock providers, the control plane and the gateway on their own
-ports (control plane 14000, gateway 18080, mocks 9001-9004 and 9101-9109),
+ports (control plane 14000, gateway 18080, mocks 9001-9005 and 9101-9109),
 keeps its state in a temporary directory, and exits non-zero if any check
 fails. It needs those ports to be free, so run it before you start the pieces
 by hand, not at the same time.
+
+If you have the official OpenAI and Anthropic Python SDKs installed,
+`python tools/sdk_compat.py` runs the same local stack through them; see
+[Using the official SDKs](api.md#using-the-official-sdks).
 
 ## 3. Run the pieces by hand
 
 Four terminals, all starting in the repository root.
 
-Terminal 1, mock text providers (ports 9001-9004):
+Terminal 1, mock text providers (ports 9001-9005):
 
 ```bash
 python tools/mock_upstream.py
@@ -89,8 +94,14 @@ cd dataplane && OMNIGATE_INTERNAL_TOKEN=dev-internal-token MOCK_API_KEY=mock-sec
 
 With no `OMNIGATE_CONFIG` set, the control plane loads
 `config/omnigate.dev.json`. Both processes must be given the same
-`OMNIGATE_INTERNAL_TOKEN`. `MOCK_API_KEY` is the variable the dev config's
-upstreams name in `api_key_env`; the mocks only insist that it is not empty.
+`OMNIGATE_INTERNAL_TOKEN`; neither starts without it. `MOCK_API_KEY` is the
+variable the dev config's upstreams name in `api_key_env`; the mocks only
+insist that it is not empty.
+
+The data plane prints one access-log line per request, with the key's name,
+the route, the upstream that answered, tokens and latency. Stop it with
+Ctrl-C: it finishes requests in flight and delivers queued usage before it
+exits.
 
 ## 4. Try it
 
@@ -137,7 +148,43 @@ curl http://127.0.0.1:8080/v1/jobs/JOB_ID -H "Authorization: Bearer og-unlimited
 ```
 
 Dashboard: <http://127.0.0.1:4000/>. Sign in with the admin token set above
-(`dev-admin-token-change-me`).
+(`dev-admin-token-change-me`). The calls you just made are under "Recent
+requests" and "Recent media jobs".
+
+### Create a key without editing the config
+
+In the dashboard, fill in "Create a key" under Keys; the new key is shown
+once. Or from a shell, with the admin token:
+
+```bash
+curl -X POST http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-change-me" -H "Content-Type: application/json" -d '{"name":"my-app","budget_usd":5,"budget_period":"monthly"}'
+```
+
+The answer contains `"key": "og-..."`. Within a couple of seconds the
+gateway accepts it:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer <the key from the answer>" -d '{"model":"demo-direct","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Keys made this way are stored (as hashes) in `control/data/keys.json`, not
+in the config file. Changing, rotating and deleting them is in
+[Admin](admin.md).
+
+### With an SDK
+
+The official OpenAI and Anthropic SDKs work by pointing `base_url` at the
+gateway and using a gateway key as the API key:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="og-unlimited-key")
+print(client.chat.completions.create(model="demo-chat", messages=[{"role": "user", "content": "hi"}]).choices[0].message.content)
+```
+
+The Anthropic snippet, and what differs from the real APIs, is in
+[Using the official SDKs](api.md#using-the-official-sdks).
 
 ### Demo routes and keys
 
@@ -252,5 +299,6 @@ restart is needed.
 ## Next
 
 - [Configuration](configuration.md) for every field and variable.
+- [Admin](admin.md) for the dashboard, managed keys, budgets and the audit log.
 - [Providers](providers.md) to add Anthropic, Gemini, xAI and media providers.
 - [Deployment](deployment.md) before exposing it to anything but localhost.

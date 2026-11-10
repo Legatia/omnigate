@@ -88,6 +88,9 @@ pub const Access = struct {
     /// The error `type` the gateway answered with when it refused the request
     /// itself. Not printed here (the status says it); proxy.zig counts these.
     rejected: ?[]const u8 = null,
+    /// The client speaks the Anthropic protocol (decides the shape of errors
+    /// and of the model list). Not printed.
+    anthropic: bool = false,
 };
 
 /// A short string copied into the struct, so it outlives the request arena.

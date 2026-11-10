@@ -7,6 +7,20 @@
   :9005  OpenAI-shaped, starts a stream, sends one chunk, then goes silent
          (forces the gateway's stream idle timeout)
 
+Special model names, on the working mocks (9002 and 9003):
+
+  rate-limited-1   always 429 with `retry-after: 7`
+  rid-1            answers carry the provider's own request id header
+                   (`x-request-id` on 9002, `request-id` on 9003)
+  sig-1            (9002) earlier tool calls must carry a thought signature
+
+A request that offers tools and whose last user message contains the words
+"use the tool" is answered with a call to the first tool (JSON or stream);
+once the conversation ends with the tool's result, the answer is text again.
+A non-streaming request that asks for structured output with a JSON schema
+(`response_format` on 9002, `output_config.format` on 9003) is answered with a
+JSON object that fits the schema instead of the usual sentence.
+
 Run:  python tools/mock_upstream.py
 """
 
@@ -31,18 +45,22 @@ class Base(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", 0))
         return json.loads(self.rfile.read(length) or b"{}")
 
-    def send_json(self, status, body):
+    def send_json(self, status, body, headers=None):
         data = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
-    def start_sse(self):
+    def start_sse(self, headers=None):
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("transfer-encoding", "chunked")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
 
     def sse(self, text):
@@ -54,6 +72,35 @@ class Base(BaseHTTPRequestHandler):
     def end_sse(self):
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
+
+
+TOOL_TRIGGER = "use the tool"
+
+
+def last_user_text(messages):
+    """Text of the final message if it is a plain user turn, else "" (e.g. after a tool result)."""
+    if not messages or messages[-1].get("role") != "user":
+        return ""
+    content = messages[-1].get("content")
+    if isinstance(content, str):
+        return content
+    parts = content if isinstance(content, list) else []
+    if any(isinstance(part, dict) and part.get("type") == "tool_result" for part in parts):
+        return ""
+    return " ".join(part.get("text", "") for part in parts if isinstance(part, dict) and part.get("type") == "text")
+
+
+def example_arguments(schema):
+    """Arguments that satisfy a tool's JSON schema: one made-up value per required property."""
+    schema = schema if isinstance(schema, dict) else {}
+    properties = schema.get("properties") or {}
+    names = schema.get("required") or list(properties)
+    samples = {"string": "Paris", "integer": 1, "number": 1.5, "boolean": True, "array": [], "object": {}}
+    return {name: samples.get((properties.get(name) or {}).get("type"), "Paris") for name in names}
+
+
+def pieces(text, size=7):
+    return [text[i:i + size] for i in range(0, len(text), size)] or [""]
 
 
 class Flaky(Base):
@@ -84,24 +131,55 @@ class OpenAIOk(Base):
                     if not tool_call.get("extra_content", {}).get("google", {}).get("thought_signature"):
                         return self.send_json(400, {"error": {"message": "Function call is missing a thought_signature in functionCall parts.",
                                                               "type": "invalid_request_error"}})
+        if req.get("model") == "rate-limited-1":
+            return self.send_json(429, {"error": {"message": "Rate limit reached for mock requests.", "type": "requests",
+                                                  "param": None, "code": "rate_limit_exceeded"}}, {"retry-after": "7"})
+        extra = {"x-request-id": "req_mock_openai_1"} if req.get("model") == "rid-1" else None
         if path.endswith("/embeddings"):
             return self.embeddings_api(req)
         if path.endswith("/responses"):
             return self.responses_api(req)
         usage = {"prompt_tokens": 11, "completion_tokens": len(WORDS), "total_tokens": 11 + len(WORDS)}
         created = int(time.time())
+        head = {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": created, "model": req.get("model")}
+        tools = [t.get("function") or {} for t in req.get("tools") or [] if isinstance(t, dict)]
+        if tools and TOOL_TRIGGER in last_user_text(req.get("messages")):
+            name, arguments = tools[0].get("name"), json.dumps(example_arguments(tools[0].get("parameters")))
+            if not req.get("stream"):
+                return self.send_json(200, {
+                    "id": "chatcmpl-mock", "object": "chat.completion", "created": created, "model": req.get("model"),
+                    "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                        "role": "assistant", "content": None,
+                        "tool_calls": [{"id": "call_mock_1", "type": "function", "function": {"name": name, "arguments": arguments}}]}}],
+                    "usage": usage,
+                }, extra)
+            # As at the provider: the call's id and name first, then its arguments in fragments.
+            deltas = [({"role": "assistant", "content": None, "tool_calls": [
+                {"index": 0, "id": "call_mock_1", "type": "function", "function": {"name": name, "arguments": ""}}]}, None)]
+            deltas += [({"tool_calls": [{"index": 0, "function": {"arguments": piece}}]}, None) for piece in pieces(arguments)]
+            deltas += [({}, "tool_calls")]
+            self.start_sse(extra)
+            for delta, finish in deltas:
+                self.sse(f"data: {json.dumps(dict(head, choices=[{'index': 0, 'delta': delta, 'finish_reason': finish}]))}\n\n")
+            if (req.get("stream_options") or {}).get("include_usage"):
+                self.sse(f"data: {json.dumps(dict(head, choices=[], usage=usage))}\n\n")
+            self.sse("data: [DONE]\n\n")
+            return self.end_sse()
         if not req.get("stream"):
+            text = "".join(WORDS)
+            response_format = req.get("response_format") or {}
+            if response_format.get("type") == "json_schema":
+                text = json.dumps(example_arguments((response_format.get("json_schema") or {}).get("schema")))
             return self.send_json(200, {
                 "id": "chatcmpl-mock", "object": "chat.completion", "created": created, "model": req.get("model"),
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(WORDS)},
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
                              "finish_reason": "stop"}],
                 "usage": usage,
-            })
+            }, extra)
         # As at the provider: the role first, one chunk per token, then a chunk
         # that carries only the finish_reason, then (if asked for) usage alone.
-        head = {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": created, "model": req.get("model")}
         deltas = [({"role": "assistant", "content": ""}, None)] + [({"content": w}, None) for w in WORDS] + [({}, "stop")]
-        self.start_sse()
+        self.start_sse(extra)
         for delta, finish in deltas:
             chunk = dict(head, choices=[{"index": 0, "delta": delta, "finish_reason": finish}])
             self.sse(f"data: {json.dumps(chunk)}\n\n")
@@ -174,12 +252,24 @@ class AnthropicOk(Base):
                                                                   "message": "`temperature` is deprecated for this model."}})
         if self.path.split("?")[0].endswith("/messages/count_tokens"):
             return self.send_json(200, {"input_tokens": 13})
+        if req.get("model") == "rate-limited-1":
+            return self.send_json(429, {"type": "error", "error": {"type": "rate_limit_error",
+                                                                  "message": "This request would exceed the mock rate limit."}},
+                                  {"retry-after": "7"})
+        extra = {"request-id": "req_mock_anthropic_1"} if req.get("model") == "rid-1" else None
+        tools = [t for t in req.get("tools") or [] if isinstance(t, dict)]
+        if tools and TOOL_TRIGGER in last_user_text(req.get("messages")):
+            return self.tool_use(req, tools[0], extra)
         if not req.get("stream"):
+            text = "".join(WORDS)
+            output_format = (req.get("output_config") or {}).get("format") or {}
+            if output_format.get("type") == "json_schema":
+                text = json.dumps(example_arguments(output_format.get("schema")))
             return self.send_json(200, {
                 "id": "msg_mock", "type": "message", "role": "assistant", "model": req.get("model"),
-                "content": [{"type": "text", "text": "".join(WORDS)}], "stop_reason": "end_turn", "stop_sequence": None,
+                "content": [{"type": "text", "text": text}], "stop_reason": "end_turn", "stop_sequence": None,
                 "usage": {"input_tokens": 13, "output_tokens": len(WORDS)},
-            })
+            }, extra)
         # The documented event flow: the empty message, the content block
         # opened, a ping, its text deltas, the block closed, then the stop
         # reason with the final output count.
@@ -197,7 +287,37 @@ class AnthropicOk(Base):
              "usage": {"output_tokens": len(WORDS)}},
             {"type": "message_stop"},
         ]
-        self.start_sse()
+        self.start_sse(extra)
+        for event in events:
+            self.sse(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n")
+        self.end_sse()
+
+    def tool_use(self, req, tool, extra):
+        """Answer with one tool_use block for `tool`, as JSON or as the documented event flow."""
+        name, arguments = tool.get("name"), example_arguments(tool.get("input_schema"))
+        usage = {"input_tokens": 13, "output_tokens": len(WORDS)}
+        if not req.get("stream"):
+            return self.send_json(200, {
+                "id": "msg_mock", "type": "message", "role": "assistant", "model": req.get("model"),
+                "content": [{"type": "tool_use", "id": "toolu_mock_1", "name": name, "input": arguments}],
+                "stop_reason": "tool_use", "stop_sequence": None, "usage": usage,
+            }, extra)
+        events = [
+            {"type": "message_start", "message": {
+                "id": "msg_mock", "type": "message", "role": "assistant", "model": req.get("model"), "content": [],
+                "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 13, "output_tokens": 1}}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "tool_use", "id": "toolu_mock_1", "name": name, "input": {}}},
+        ] + [
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": piece}}
+            for piece in pieces(json.dumps(arguments))
+        ] + [
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+             "usage": {"output_tokens": len(WORDS)}},
+            {"type": "message_stop"},
+        ]
+        self.start_sse(extra)
         for event in events:
             self.sse(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n")
         self.end_sse()

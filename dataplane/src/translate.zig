@@ -22,6 +22,9 @@ const Array = json.Array;
 
 /// Anthropic requires `max_tokens`; used when an OpenAI client omits it.
 const default_max_tokens = 4096;
+/// Stands in for OpenAI's `response_format: {"type":"json_object"}`, which
+/// Anthropic has no parameter for.
+const json_object_instruction = "Respond with a single valid JSON object and nothing else: no prose, no code fences.";
 /// Upper bound on one buffered SSE line / event.
 const max_event_bytes = 4 * 1024 * 1024;
 
@@ -233,6 +236,26 @@ fn requestOpenAiToAnthropic(a: Allocator, req: ObjectMap, target_model: []const 
         }
     }
 
+    // Structured output. A JSON schema maps onto Anthropic's structured
+    // outputs; plain "JSON mode" has no equivalent there, so it becomes an
+    // instruction.
+    if (getObj(req, "response_format")) |rf| {
+        const kind = getStr(rf, "type") orelse "";
+        if (eql(kind, "json_schema")) {
+            if (getObj(rf, "json_schema")) |js| if (js.get("schema")) |schema| if (schema == .object) {
+                var format: ObjectMap = .empty;
+                try format.put(a, "type", S("json_schema"));
+                try format.put(a, "schema", schema);
+                var output_config: ObjectMap = .empty;
+                try output_config.put(a, "format", .{ .object = format });
+                try out.put(a, "output_config", .{ .object = output_config });
+            };
+        } else if (eql(kind, "json_object")) {
+            if (system.items.len > 0) try system.appendSlice(a, "\n\n");
+            try system.appendSlice(a, json_object_instruction);
+        }
+    }
+
     if (system.items.len > 0) try out.put(a, "system", S(system.items));
     try out.put(a, "messages", try turns.toValue());
 
@@ -428,6 +451,21 @@ fn requestAnthropicToOpenAi(a: Allocator, req: ObjectMap, target_model: []const 
         }
     }
     if (getObj(req, "metadata")) |meta| if (getStr(meta, "user_id")) |u| try out.put(a, "user", S(u));
+
+    // Structured output: Anthropic's `output_config.format` is OpenAI's
+    // `response_format` with a JSON schema (which OpenAI wants named).
+    if (getObj(req, "output_config")) |oc| if (getObj(oc, "format")) |format| {
+        if (eql(getStr(format, "type") orelse "", "json_schema")) if (format.get("schema")) |schema| if (schema == .object) {
+            var js: ObjectMap = .empty;
+            try js.put(a, "name", S("response"));
+            try js.put(a, "schema", schema);
+            try js.put(a, "strict", .{ .bool = true });
+            var rf: ObjectMap = .empty;
+            try rf.put(a, "type", S("json_schema"));
+            try rf.put(a, "json_schema", .{ .object = js });
+            try out.put(a, "response_format", .{ .object = rf });
+        };
+    };
 
     // --- tools ---
     var tools = Array.init(a);
@@ -1340,6 +1378,60 @@ fn parseTest(a: Allocator, body: []const u8) !Value {
 
 fn requestTest(a: Allocator, dir: Direction, body: []const u8) !Value {
     return parseTest(a, try translateRequest(a, dir, body, "target-model"));
+}
+
+test "request: structured output maps both ways" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // OpenAI json_schema -> Anthropic output_config.format (name and strict are OpenAI-only).
+    const to_anthropic = try requestTest(a, .openai_to_anthropic,
+        \\{"model":"m","messages":[{"role":"user","content":"x"}],
+        \\ "response_format":{"type":"json_schema","json_schema":{"name":"person","strict":true,
+        \\   "schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}}}
+    );
+    try expectStrAt(to_anthropic, .{ "output_config", "format", "type" }, "json_schema");
+    try expectStrAt(to_anthropic, .{ "output_config", "format", "schema", "type" }, "object");
+    try expectStrAt(to_anthropic, .{ "output_config", "format", "schema", "required", 0 }, "name");
+    try testing.expect(at(to_anthropic, .{ "output_config", "format", "name" }) == null);
+    try testing.expect(at(to_anthropic, .{"response_format"}) == null);
+    try testing.expect(at(to_anthropic, .{"system"}) == null);
+
+    // JSON mode has no Anthropic parameter: it becomes an instruction, after any system prompt.
+    const json_mode = try requestTest(a, .openai_to_anthropic,
+        \\{"model":"m","messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"x"}],
+        \\ "response_format":{"type":"json_object"}}
+    );
+    try expectStrAt(json_mode, .{"system"}, "Be brief.\n\n" ++ json_object_instruction);
+    try testing.expect(at(json_mode, .{"output_config"}) == null);
+    const json_mode_alone = try requestTest(a, .openai_to_anthropic,
+        \\{"model":"m","messages":[{"role":"user","content":"x"}],"response_format":{"type":"json_object"}}
+    );
+    try expectStrAt(json_mode_alone, .{"system"}, json_object_instruction);
+
+    // Plain text, or a schema that is not an object, changes nothing.
+    const text_mode = try requestTest(a, .openai_to_anthropic,
+        \\{"model":"m","messages":[{"role":"user","content":"x"}],"response_format":{"type":"text"}}
+    );
+    try testing.expect(at(text_mode, .{"output_config"}) == null);
+    try testing.expect(at(text_mode, .{"system"}) == null);
+
+    // Anthropic output_config.format -> OpenAI response_format, which needs a name.
+    const to_openai = try requestTest(a, .anthropic_to_openai,
+        \\{"model":"m","max_tokens":5,"messages":[{"role":"user","content":"x"}],
+        \\ "output_config":{"effort":"low","format":{"type":"json_schema","schema":{"type":"object","properties":{}}}}}
+    );
+    try expectStrAt(to_openai, .{ "response_format", "type" }, "json_schema");
+    try expectStrAt(to_openai, .{ "response_format", "json_schema", "name" }, "response");
+    try expectStrAt(to_openai, .{ "response_format", "json_schema", "schema", "type" }, "object");
+    try testing.expect(at(to_openai, .{ "response_format", "json_schema", "strict" }).?.bool);
+    try testing.expect(at(to_openai, .{"output_config"}) == null);
+
+    const no_format = try requestTest(a, .anthropic_to_openai,
+        \\{"model":"m","max_tokens":5,"messages":[{"role":"user","content":"x"}],"output_config":{"effort":"low"}}
+    );
+    try testing.expect(at(no_format, .{"response_format"}) == null);
 }
 
 test "request openai->anthropic: system, turns and params" {

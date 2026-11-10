@@ -536,7 +536,7 @@ def text_checks(stack):
     check("a weighted route never starts with a weight-0 target", served == ["mock-compat"] * 4, served)
     status, _, body = chat("chat", key=KEY_LIMITED)
     check("a key limited to one model is refused another (403)",
-          status == 403 and body.get("error", {}).get("type") == "model_not_allowed", (status, body))
+          status == 403 and body.get("error", {}).get("code") == "model_not_allowed", (status, body))
     status, _, _ = chat("direct", key=KEY_LIMITED)
     check("... and can use the model it is allowed", status == 200, status)
     status, _, body = jcall("GET", GATEWAY + "/v1/models", key=KEY_LIMITED)

@@ -16,7 +16,9 @@ const balance = @import("balance.zig");
 const cache = @import("cache.zig");
 const config = @import("config.zig");
 const control = @import("control.zig");
+const errors = @import("errors.zig");
 const headers_mod = @import("headers.zig");
+const models = @import("models.zig");
 const logging = @import("logging.zig");
 const quirks = @import("quirks.zig");
 const translate = @import("translate.zig");
@@ -110,6 +112,15 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     const query = if (path.len < target.len) target[path.len + 1 ..] else "";
     acc.method = @tagName(method);
     acc.path.set(path);
+
+    // One id per client request. It is on every response as
+    // `x-omnigate-request-id`, and as `x-request-id` / `request-id` (what the
+    // OpenAI and Anthropic SDKs read) unless the provider supplied its own;
+    // it is also the usage event id the ledger dedups on.
+    var raw_id: [16]u8 = undefined;
+    app.io.random(&raw_id);
+    const req_id = std.fmt.bytesToHex(raw_id, .lower);
+    acc.request_id.set(&req_id);
     // Nothing more to wait for from a request without a body.
     if (!method.requestHasBody()) guard.disarm();
 
@@ -133,6 +144,12 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             hdrs.idempotency_key = try arena.dupe(u8, h.value);
         }
     }
+
+    // Which protocol this client speaks, for the shape of errors and of the
+    // model list: Anthropic's on its own endpoints, and on the shared
+    // `/v1/models` when the request carries Anthropic's version header.
+    acc.anthropic = std.mem.startsWith(u8, path, "/v1/messages") or
+        (hdrs.anthropic_version != null and std.mem.startsWith(u8, path, "/v1/models"));
 
     if (method == .GET and std.mem.eql(u8, path, "/healthz")) {
         acc.status = 200;
@@ -168,7 +185,10 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         return respondError(acc, request, .payment_required, "budget_exceeded", "this key has exhausted its budget");
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/models")) {
-        return respondModels(acc, arena, request, snapshot, key);
+        return respondModels(app, acc, arena, request, snapshot, key, null);
+    }
+    if (method == .GET and std.mem.startsWith(u8, path, "/v1/models/")) {
+        return respondModels(app, acc, arena, request, snapshot, key, path["/v1/models/".len..]);
     }
 
     // --- async media jobs: owned by the control plane ---------------------
@@ -228,13 +248,6 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
 
     const started = Io.Timestamp.now(app.io, .awake);
 
-    // One id per client request: returned in `x-omnigate-request-id` and used
-    // as the usage event id the ledger dedups on.
-    var raw_id: [16]u8 = undefined;
-    app.io.random(&raw_id);
-    const req_id = std.fmt.bytesToHex(raw_id, .lower);
-    acc.request_id.set(&req_id);
-
     // --- response cache -----------------------------------------------------
     // Only for routes that ask for it, and never for streams. The lookup comes
     // after authentication, model limits, the budget and the rate limit, so a
@@ -270,6 +283,8 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     .{ .name = "content-type", .value = hit.content_type },
                     .{ .name = "x-omnigate-cache", .value = "hit" },
                     .{ .name = "x-omnigate-request-id", .value = &req_id },
+                    .{ .name = "x-request-id", .value = &req_id },
+                    .{ .name = "request-id", .value = &req_id },
                 },
             });
         }
@@ -300,6 +315,8 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     // `retry-after` of the most recent upstream answer that made us fail
     // over, to pass on if that turns out to have been the last attempt.
     var last_retry_after: ?[]const u8 = null;
+    // Status of the last attempt, when it got an HTTP answer at all.
+    var last_status: ?u16 = null;
 
     // The order to try the targets in: the route's strategy picks who goes
     // first (see balance.zig); upstreams that are cooling down after repeated
@@ -452,6 +469,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 log.warn("upstream {s} failed: {t}", .{ up.name, err });
                 noteFailure(app, up.name);
                 last_retry_after = null;
+                last_status = null;
                 break;
             }
         }
@@ -463,6 +481,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 log.warn("upstream {s} returned {d}, failing over", .{ up.name, @backingInt(status) });
                 noteFailure(app, up.name);
                 last_retry_after = extras.retry_after;
+                last_status = @backingInt(status);
             },
             // Handled inside the loop above; they never escape it.
             .drop_sampling, .add_thought_signature => unreachable,
@@ -504,34 +523,61 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         }
     }
 
+    // Nothing was sent upstream because no target can serve this request at
+    // all. That is a fault of the request, not an outage: say so with a 400.
+    if (tried == 0 and attempts.items.len > 0) {
+        var all_mismatch = true;
+        var all_unservable = true;
+        for (attempts.items) |a| {
+            const mismatch = std.mem.eql(u8, a.outcome, "protocol_mismatch");
+            if (!mismatch) all_mismatch = false;
+            if (!mismatch and !std.mem.eql(u8, a.outcome, "untranslatable_request")) all_unservable = false;
+        }
+        if (all_mismatch) return respondError(acc, request, .bad_request, "endpoint_not_supported", "this endpoint is not available for this model: its providers speak the other protocol, and only chat completions and messages are translated");
+        if (all_unservable) return respondError(acc, request, .bad_request, "untranslatable_request", "this request uses a feature that cannot be translated for this model's provider");
+    }
+
+    // The last target tried decides the answer: if it said 429, so do we (with
+    // its `retry-after`), so that SDKs back off as they would at the provider.
+    // Anything else is a 502.
+    const rate_limited = last_status != null and last_status.? == 429;
+    const final_status: u16 = if (rate_limited) 429 else 502;
     if (ep.metered) report(app, arena, .{
         .id = &req_id,
         .key_sha256 = &key_hash,
         .route_model = route_model,
         .upstream = null,
         .target_model = null,
-        .status = 502,
+        .status = final_status,
         .stream = is_stream,
         .input_tokens = 0,
         .output_tokens = 0,
         .latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds(),
         .attempts = attempts.items,
     });
-    acc.status = 502;
+    acc.status = final_status;
     acc.attempts = tried;
-    const detail = try std.json.Stringify.valueAlloc(arena, .{
-        .@"error" = .{
-            .type = "all_upstreams_failed",
-            .message = "every target for this model failed",
-            .attempts = attempts.items,
-        },
-    }, .{});
-    // If the last upstream that answered said when to come back, say so too.
+    var detail: Io.Writer.Allocating = .init(arena);
+    try errors.write(&detail.writer, protocolOf(acc), .{
+        .status = final_status,
+        .reason = if (rate_limited) "upstream_rate_limited" else "all_upstreams_failed",
+        .message = if (rate_limited) "the provider is rate limiting this model; retry shortly" else "every target for this model failed",
+        .request_id = &req_id,
+        .attempts = attempts.items,
+    });
     var failed_headers: std.ArrayList(http.Header) = .empty;
-    try failed_headers.append(arena, .{ .name = "content-type", .value = "application/json" });
-    try failed_headers.append(arena, .{ .name = "x-omnigate-request-id", .value = &req_id });
+    try failed_headers.appendSlice(arena, &.{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "x-omnigate-request-id", .value = &req_id },
+        .{ .name = "x-request-id", .value = &req_id },
+        .{ .name = "request-id", .value = &req_id },
+    });
+    // If the last upstream that answered said when to come back, say so too.
     if (last_retry_after) |v| try failed_headers.append(arena, .{ .name = "retry-after", .value = v });
-    try request.respond(detail, .{ .status = .bad_gateway, .extra_headers = failed_headers.items });
+    try request.respond(detail.written(), .{
+        .status = if (rate_limited) .too_many_requests else .bad_gateway,
+        .extra_headers = failed_headers.items,
+    });
 }
 
 /// Seconds to wait if this key is over its requests-per-minute limit, else
@@ -596,10 +642,7 @@ const Endpoint = struct {
     }
 };
 
-const Attempt = struct {
-    upstream: []const u8,
-    outcome: []const u8,
-};
+const Attempt = errors.Attempt;
 
 const UsageReport = struct {
     key_sha256: []const u8,
@@ -904,9 +947,17 @@ fn forward(
         .{ .name = "x-omnigate-upstream", .value = up.name },
         .{ .name = "x-omnigate-attempts", .value = std.fmt.bufPrint(&attempt_buf, "{d}", .{attempt_no}) catch unreachable },
         .{ .name = "x-omnigate-request-id", .value = req_id },
+        // The ids the OpenAI and the Anthropic SDK read: the provider's own
+        // when it sent one (so a support ticket can quote it), otherwise ours.
+        .{ .name = "x-request-id", .value = headers_mod.find(relayed, "x-request-id") orelse req_id },
+        .{ .name = "request-id", .value = headers_mod.find(relayed, "request-id") orelse req_id },
     });
     if (extras.cache_note) |note| try out_headers.append(arena, .{ .name = "x-omnigate-cache", .value = note });
-    try out_headers.appendSlice(arena, relayed);
+    for (relayed) |h| {
+        // Already set above.
+        if (std.ascii.eqlIgnoreCase(h.name, "x-request-id") or std.ascii.eqlIgnoreCase(h.name, "request-id")) continue;
+        try out_headers.append(arena, h);
+    }
 
     // --- translated, not a stream: buffer, convert, answer in one piece -----
     if (mode == .translate and !is_sse) {
@@ -1047,12 +1098,18 @@ fn forwardToControl(
     const content_type = try arena.dupe(u8, response.head.content_type orelse "application/json");
     const content_length = response.head.content_length;
 
+    const request_id = acc.request_id.get();
     var resp_buf: [8 * 1024]u8 = undefined;
     var body_writer = try request.respondStreaming(&resp_buf, .{
         .content_length = content_length,
         .respond_options = .{
             .status = status,
-            .extra_headers = &.{.{ .name = "content-type", .value = content_type }},
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = content_type },
+                .{ .name = "x-omnigate-request-id", .value = request_id },
+                .{ .name = "x-request-id", .value = request_id },
+                .{ .name = "request-id", .value = request_id },
+            },
         },
     });
 
@@ -1073,50 +1130,101 @@ fn forwardToControl(
     try body_writer.end();
 }
 
+fn protocolOf(acc: *const logging.Access) errors.Protocol {
+    return if (acc.anthropic) .anthropic else .openai;
+}
+
 fn respondRateLimited(acc: *logging.Access, request: *http.Server.Request, retry_after_s: u32) !void {
     acc.status = 429;
     acc.rejected = "rate_limit_exceeded";
     var num: [16]u8 = undefined;
     const secs = std.fmt.bufPrint(&num, "{d}", .{retry_after_s}) catch unreachable;
-    try request.respond(
-        \\{"error":{"type":"rate_limit_exceeded","message":"this key is over its requests-per-minute limit"}}
-    , .{
+    const id = acc.request_id.get();
+    var buf: [768]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    errors.write(&w, protocolOf(acc), .{
+        .status = 429,
+        .reason = "rate_limit_exceeded",
+        .message = "this key is over its requests-per-minute limit",
+        .request_id = id,
+    }) catch {};
+    try request.respond(w.buffered(), .{
         .status = .too_many_requests,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
             .{ .name = "retry-after", .value = secs },
+            .{ .name = "x-omnigate-request-id", .value = id },
+            .{ .name = "x-request-id", .value = id },
+            .{ .name = "request-id", .value = id },
         },
     });
 }
 
-/// Answer with the gateway's own error object. `code` must be a string
-/// literal: it is kept as the reason this request is counted under.
+/// Answer with the gateway's own error, in the client's protocol (see
+/// errors.zig). `code` must be a string literal: it is the reason this
+/// request is counted under, and it is what the client sees as `code`.
 fn respondError(acc: *logging.Access, request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) !void {
     acc.status = @backingInt(status);
     acc.rejected = code;
-    var buf: [512]u8 = undefined;
+    const id = acc.request_id.get();
+    var buf: [768]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    std.json.Stringify.value(.{ .@"error" = .{ .type = code, .message = message } }, .{}, &w) catch {};
+    errors.write(&w, protocolOf(acc), .{ .status = @backingInt(status), .reason = code, .message = message, .request_id = id }) catch {};
     try request.respond(w.buffered(), .{
         .status = status,
-        .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "x-omnigate-request-id", .value = id },
+            .{ .name = "x-request-id", .value = id },
+            .{ .name = "request-id", .value = id },
+        },
     });
 }
 
-/// The routes this key may use.
-fn respondModels(acc: *logging.Access, arena: std.mem.Allocator, request: *http.Server.Request, snapshot: *const config.Snapshot, key: *const config.Key) !void {
-    acc.status = 200;
-    const Model = struct { id: []const u8, object: []const u8 = "model", owned_by: []const u8 = "omnigate" };
-    var models: std.ArrayList(Model) = .empty;
+/// The models this key may use, or one of them (`one`), in the list shape of
+/// the client's protocol (see models.zig).
+fn respondModels(
+    app: *App,
+    acc: *logging.Access,
+    arena: std.mem.Allocator,
+    request: *http.Server.Request,
+    snapshot: *const config.Snapshot,
+    key: *const config.Key,
+    one: ?[]const u8,
+) !void {
+    var ids: std.ArrayList([]const u8) = .empty;
     for (snapshot.routes) |r| {
-        if (key.allows(r.model)) try models.append(arena, .{ .id = r.model });
+        if (key.allows(r.model)) try ids.append(arena, r.model);
     }
     // Media job models are served by the control plane (POST /v1/jobs); they
     // are listed so that clients can discover them.
     for (snapshot.media_models orelse &.{}) |name| {
         if (!key.allows(name) or snapshot.findRoute(name) != null) continue;
-        try models.append(arena, .{ .id = name });
+        try ids.append(arena, name);
     }
-    const json = try std.json.Stringify.valueAlloc(arena, .{ .object = "list", .data = models.items }, .{});
-    try request.respond(json, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+
+    const protocol = protocolOf(acc);
+    var out: Io.Writer.Allocating = .init(arena);
+    if (one) |id| {
+        const known = for (ids.items) |m| {
+            if (std.mem.eql(u8, m, id)) break true;
+        } else false;
+        // One answer for a model that does not exist and for one this key may
+        // not use, so the reply does not reveal which other models exist.
+        if (!known) return respondError(acc, request, .not_found, "model_not_found", "no such model");
+        try models.writeOne(&out.writer, protocol, id, app.started_unix_s);
+    } else {
+        try models.writeList(&out.writer, protocol, ids.items, app.started_unix_s);
+    }
+
+    acc.status = 200;
+    const request_id = acc.request_id.get();
+    try request.respond(out.written(), .{
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "x-omnigate-request-id", .value = request_id },
+            .{ .name = "x-request-id", .value = request_id },
+            .{ .name = "request-id", .value = request_id },
+        },
+    });
 }

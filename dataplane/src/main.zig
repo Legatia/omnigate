@@ -94,6 +94,9 @@ pub const App = struct {
     stream_idle_timeout_ms: u32,
     max_connections: u32,
     config_cache_path: ?[]const u8,
+    /// When this process started (Unix seconds); reported as the creation
+    /// time of every model in `/v1/models`.
+    started_unix_s: i64,
 };
 
 // ---------------------------------------------------------------------------
@@ -152,7 +155,9 @@ fn watchdogTask(app: *App) Io.Cancelable!void {
     return app.watchdog.run(app.io);
 }
 
-const overloaded_body = "{\"error\":{\"type\":\"overloaded\",\"message\":\"too many connections; try again shortly\"}}";
+// Sent before the request is read, so the client's protocol is unknown: the
+// OpenAI shape, which is also the gateway's default (see errors.zig).
+const overloaded_body = "{\"error\":{\"message\":\"too many connections; try again shortly\",\"type\":\"server_error\",\"param\":null,\"code\":\"overloaded\"}}";
 const overloaded_response = std.fmt.comptimePrint(
     "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\nretry-after: 1\r\nconnection: close\r\ncontent-length: {d}\r\n\r\n{s}",
     .{ overloaded_body.len, overloaded_body },
@@ -281,6 +286,7 @@ pub fn main(init: std.process.Init) !void {
         .stream_idle_timeout_ms = stream_idle_timeout_ms,
         .max_connections = max_connections,
         .config_cache_path = config_cache_path,
+        .started_unix_s = @divTrunc(Io.Timestamp.now(io, .real).toMilliseconds(), 1000),
     };
 
     control.syncOnce(&app) catch |err| {
@@ -383,6 +389,8 @@ test {
     _ = cache;
     _ = counters;
     _ = @import("headers.zig");
+    _ = @import("errors.zig");
+    _ = @import("models.zig");
     _ = quirks;
     _ = logging;
     _ = watchdog;

@@ -4,6 +4,7 @@
       "name": "my-app",
       "key_sha256": "<sha256 hex of the gateway key you hand to the app>",
       "budget_usd": 25.0,
+      "budget_period": "monthly",
       "rpm": 600,
       "disabled": false,
       "models": [
@@ -51,6 +52,7 @@
           "upstream": "anthropic",
           "model": "claude-sonnet-5-5",
           "price_in_per_mtok": 2.0,
+          "price_cached_in_per_mtok": 0.1,
           "price_out_per_mtok": 10.0
         }
       ]
@@ -264,6 +266,7 @@
   },
   "retention": {
     "jobs_days": 30,
-    "ledger_ids_days": 7
+    "ledger_ids_days": 7,
+    "delete_bucket_objects": true
   }
 }

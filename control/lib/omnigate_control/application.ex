@@ -5,11 +5,28 @@ defmodule OmnigateControl.Application do
 
   @impl true
   def start(_type, _args) do
+    # Without it every data-plane call would be refused: better not to start
+    # than to look healthy and serve nothing.
+    if is_nil(OmnigateControl.internal_token()) do
+      message =
+        "OMNIGATE_INTERNAL_TOKEN is not set (or is empty). It is the shared secret between the data plane and " <>
+          "the control plane; set it to the same long random value for both, then start again."
+
+      Logger.error(message)
+      {:error, message}
+    else
+      start_children()
+    end
+  end
+
+  defp start_children do
     OmnigateControl.AdminAuth.setup()
+    OmnigateControl.Rejections.setup()
     ip = bind_address()
 
     children = [
       {OmnigateControl.ConfigStore, path: config_path()},
+      {OmnigateControl.Audit, path: audit_path()},
       {OmnigateControl.Keys, path: keys_path()},
       {OmnigateControl.Ledger, path: ledger_path()},
       {OmnigateControl.Jobs.Store, path: jobs_path()},
@@ -39,6 +56,12 @@ defmodule OmnigateControl.Application do
     System.get_env("OMNIGATE_KEYS") ||
       Application.get_env(:omnigate_control, :keys_path) ||
       Path.expand("data/keys.json", File.cwd!())
+  end
+
+  defp audit_path do
+    System.get_env("OMNIGATE_AUDIT_LOG") ||
+      Application.get_env(:omnigate_control, :audit_path) ||
+      Path.expand("data/audit.jsonl", File.cwd!())
   end
 
   defp jobs_path do

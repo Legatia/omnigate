@@ -5,7 +5,7 @@ defmodule OmnigateControl.Admin do
   Nothing here ever contains a gateway key, its hash, a provider key or a
   webhook secret. Upstreams are shown by host only.
   """
-  alias OmnigateControl.{ConfigStore, Jobs, Keys, Ledger}
+  alias OmnigateControl.{Audit, ConfigStore, Jobs, Keys, Ledger, Rejections}
 
   @doc "One key as the admin API and the dashboard show it."
   def key_view(key) do
@@ -16,6 +16,10 @@ defmodule OmnigateControl.Admin do
       source: key |> Map.get(:source, :file) |> to_string(),
       created_at: Map.get(key, :created_at),
       budget_usd: key.budget_usd,
+      # What the budget covers, how much of it is used, and when it starts over.
+      budget_period: Keys.budget_period(key),
+      period_spend_usd: Keys.period_spend(key),
+      period_resets_at: Keys.period_resets_at(key),
       rpm: Map.get(key, :rpm, 0),
       models: Map.get(key, :models),
       disabled: Keys.disabled?(key),
@@ -25,7 +29,10 @@ defmodule OmnigateControl.Admin do
       requests: totals.requests,
       errors: totals.errors,
       input_tokens: totals.input_tokens,
+      cached_input_tokens: totals.cached_input_tokens,
+      cache_write_input_tokens: totals.cache_write_input_tokens,
       output_tokens: totals.output_tokens,
+      cached_responses: totals.cached_responses,
       jobs: totals.jobs,
       cost_usd: totals.cost_usd
     }
@@ -38,11 +45,15 @@ defmodule OmnigateControl.Admin do
   The dashboard's data, also served as `GET /admin/overview`:
 
       generated_at  ISO 8601 time
-      totals, today {requests, errors, input_tokens, output_tokens, jobs, cost_usd}
-                    (today = the current UTC day)
+      totals, today {requests, errors, input_tokens, cached_input_tokens,
+                    cache_write_input_tokens, output_tokens, cached_responses,
+                    jobs, cost_usd}  (today = the current UTC day)
       keys          [key_view]
       requests      recent text requests, newest first
       jobs          recent media jobs, newest first
+      rejected      requests data planes refused before routing, by key and
+                    reason, since this control plane started
+      audit         the latest admin actions, newest first
       config        {upstreams, routes, media: {upstreams, routes, storage,
                     public_base_url}, retention}
   """
@@ -57,6 +68,8 @@ defmodule OmnigateControl.Admin do
       keys: Enum.map(config.keys, &key_view/1),
       requests: Ledger.recent() |> Enum.reject(&(&1["kind"] == "media")) |> Enum.take(25) |> Enum.map(&request_view(&1, names)),
       jobs: Enum.map(Jobs.Store.recent(25), &job_view(&1, names)),
+      rejected: Enum.take(Rejections.all(), 50),
+      audit: Audit.recent(10),
       config: config_view(config)
     }
   end
@@ -74,7 +87,11 @@ defmodule OmnigateControl.Admin do
       status: e["status"],
       stream: e["stream"] == true,
       input_tokens: e["input_tokens"] || 0,
+      cached_input_tokens: e["cached_input_tokens"] || 0,
+      cache_write_input_tokens: e["cache_write_input_tokens"] || 0,
       output_tokens: e["output_tokens"] || 0,
+      # Answered from the data plane's response cache, at no cost.
+      cached: e["cached"] == true,
       latency_ms: e["latency_ms"],
       cost_usd: e["cost_usd"] || 0.0,
       attempts: attempts(e["attempts"])
@@ -116,6 +133,7 @@ defmodule OmnigateControl.Admin do
           %{
             model: r.model,
             strategy: Map.get(r, :strategy, "failover"),
+            cache_ttl_s: Map.get(r, :cache_ttl_s, 0),
             targets: Enum.map(r.targets, &%{upstream: &1.upstream, model: &1.model, weight: Map.get(&1, :weight, 1)})
           }
         end),
@@ -132,7 +150,7 @@ defmodule OmnigateControl.Admin do
             _ -> %{kind: "local"}
           end
       },
-      retention: Map.get(config, :retention, %{jobs_days: 0, ledger_ids_days: 0})
+      retention: Map.merge(%{jobs_days: 0, ledger_ids_days: 0, delete_bucket_objects: true}, Map.get(config, :retention, %{}))
     }
   end
 

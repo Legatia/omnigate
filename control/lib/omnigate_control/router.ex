@@ -4,6 +4,7 @@ defmodule OmnigateControl.Router do
 
     * `GET  /internal/config` — snapshot for data planes (internal token)
     * `POST /internal/usage/batch` — usage events from data planes (internal token)
+    * `POST /internal/counters` — counts of requests data planes refused (internal token)
     * `/internal/v1/jobs...`, `/internal/v1/files/...` — the media job API. Data
       planes authenticate the gateway key and forward `/v1/jobs*` and
       `/v1/files*` here, naming the key in `x-omnigate-key-sha256`.
@@ -11,6 +12,7 @@ defmodule OmnigateControl.Router do
     * `GET  /admin/overview`  — everything the dashboard shows, as JSON
     * `GET/POST /admin/keys`, `PATCH/DELETE /admin/keys/:name`,
       `POST /admin/keys/:name/rotate` — managed gateway keys, see `Keys`
+    * `GET  /admin/audit`     — the latest admin actions, see `Audit`
     * `GET  /`                — dashboard (session; redirects to `/login`)
     * `GET/POST /login`, `POST /logout` — dashboard sessions, see `AdminAuth`
     * `GET  /metrics`         — Prometheus metrics (admin token or session)
@@ -22,14 +24,14 @@ defmodule OmnigateControl.Router do
   """
   use Plug.Router
 
-  alias OmnigateControl.{Admin, AdminAuth, ConfigStore, Dashboard, Jobs, Keys, Ledger, Metrics, Storage, UrlSigner}
+  alias OmnigateControl.{Admin, AdminAuth, Audit, ConfigStore, Dashboard, Jobs, Keys, Ledger, Metrics, Rejections, Storage, UrlSigner}
 
-  plug :match
-  plug Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"]
-  plug :internal_auth
-  plug :admin_auth
-  plug :csrf
-  plug :dispatch
+  plug(:match)
+  plug(Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"])
+  plug(:internal_auth)
+  plug(:admin_auth)
+  plug(:csrf)
+  plug(:dispatch)
 
   get "/healthz" do
     conn |> put_resp_content_type("text/plain") |> send_resp(200, "ok\n")
@@ -53,6 +55,18 @@ defmodule OmnigateControl.Router do
 
       _ ->
         send_json(conn, 400, %{error: "expected {\"events\": [...]}"})
+    end
+  end
+
+  # Requests refused before routing never become usage events; data planes
+  # report how many there were, by key name and reason.
+  post "/internal/counters" do
+    case conn.body_params do
+      %{"counters" => counters} when is_list(counters) ->
+        send_json(conn, 200, %{accepted: Rejections.record(counters)})
+
+      _ ->
+        send_json(conn, 400, %{error: "expected {\"counters\": [...]}"})
     end
   end
 
@@ -149,7 +163,11 @@ defmodule OmnigateControl.Router do
   end
 
   post "/admin/keys" do
-    case Keys.create(json_object(conn)) do
+    attrs = json_object(conn)
+    result = Keys.create(attrs)
+    Audit.record(conn, "key.create", audit_name(attrs["name"]), outcome(result))
+
+    case result do
       # The only response that ever contains the key itself.
       {:ok, key, raw} -> send_json(conn, 201, key |> Admin.key_view() |> Map.put(:key, raw))
       {:error, status, type, message} -> send_error(conn, status, type, message)
@@ -157,24 +175,47 @@ defmodule OmnigateControl.Router do
   end
 
   patch "/admin/keys/:name" do
-    case Keys.update(name, json_object(conn)) do
+    attrs = json_object(conn)
+    result = Keys.update(name, attrs)
+    # Which fields were sent, never their values (one of them is a secret).
+    Audit.record(conn, "key.update", audit_name(name), outcome(result), fields: attrs |> Map.keys() |> Enum.sort() |> Enum.take(20))
+
+    case result do
       {:ok, key} -> send_json(conn, 200, Admin.key_view(key))
       {:error, status, type, message} -> send_error(conn, status, type, message)
     end
   end
 
   post "/admin/keys/:name/rotate" do
-    case Keys.rotate(name) do
+    result = Keys.rotate(name)
+    Audit.record(conn, "key.rotate", audit_name(name), outcome(result))
+
+    case result do
       {:ok, key, raw} -> send_json(conn, 200, key |> Admin.key_view() |> Map.put(:key, raw))
       {:error, status, type, message} -> send_error(conn, status, type, message)
     end
   end
 
   delete "/admin/keys/:name" do
-    case Keys.delete(name) do
+    result = Keys.delete(name)
+    Audit.record(conn, "key.delete", audit_name(name), outcome(result))
+
+    case result do
       :ok -> send_json(conn, 200, %{deleted: name})
       {:error, status, type, message} -> send_error(conn, status, type, message)
     end
+  end
+
+  get "/admin/audit" do
+    conn = fetch_query_params(conn)
+
+    limit =
+      case Integer.parse(conn.query_params["limit"] || "") do
+        {n, ""} -> n |> max(1) |> min(500)
+        _ -> 50
+      end
+
+    send_json(conn, 200, %{entries: Audit.recent(limit)})
   end
 
   get "/" do
@@ -200,10 +241,12 @@ defmodule OmnigateControl.Router do
 
     cond do
       AdminAuth.throttled?(address) ->
+        Audit.record(conn, "login", nil, "throttled", auth: "password")
         send_html(conn, 429, login_page("Too many failed attempts. Wait a minute and try again."))
 
       AdminAuth.valid_token?(conn.body_params["password"]) ->
         AdminAuth.clear_failures(address)
+        Audit.record(conn, "login", nil, "ok", auth: "password")
 
         conn
         |> put_resp_cookie(AdminAuth.cookie_name(), AdminAuth.issue_session(),
@@ -216,11 +259,15 @@ defmodule OmnigateControl.Router do
 
       true ->
         AdminAuth.note_failure(address)
+        Audit.record(conn, "login", nil, "denied", auth: "password")
         send_html(conn, 401, login_page("That is not the admin token."))
     end
   end
 
   post "/logout" do
+    # Only a logout that ends a session is worth a line.
+    if AdminAuth.session(conn), do: Audit.record(conn, "logout", nil, "ok")
+
     conn
     |> delete_resp_cookie(AdminAuth.cookie_name(), http_only: true, same_site: "Strict", secure: secure_cookie?(conn))
     |> redirect("/login")
@@ -244,8 +291,16 @@ defmodule OmnigateControl.Router do
       upstreams: config.upstreams,
       routes:
         Enum.map(config.routes, fn r ->
-          %{model: r.model, strategy: r.strategy, targets: Enum.map(r.targets, &Map.take(&1, [:upstream, :model, :weight]))}
-        end)
+          %{
+            model: r.model,
+            strategy: r.strategy,
+            # Seconds the data plane may answer identical requests from its own cache; 0 = never.
+            cache_ttl_s: Map.get(r, :cache_ttl_s, 0),
+            targets: Enum.map(r.targets, &Map.take(&1, [:upstream, :model, :weight]))
+          }
+        end),
+      # Names only: media jobs are routed here, but data planes list them in /v1/models.
+      media_models: Enum.map(config.media.routes, & &1.model)
     }
 
     # Version changes whenever anything the data plane sees changes,
@@ -266,6 +321,15 @@ defmodule OmnigateControl.Router do
 
   # A job belongs to a key under its current secret or one from before a rotation.
   defp own_job(key, id), do: Enum.find_value(Keys.hashes(key), &Jobs.get(&1, id))
+
+  defp outcome({:ok, _key}), do: "ok"
+  defp outcome({:ok, _key, _raw}), do: "ok"
+  defp outcome(:ok), do: "ok"
+  defp outcome({:error, _status, type, _message}), do: type
+
+  # Whatever was sent as a name goes into the audit log, cut to a sane length.
+  defp audit_name(name) when is_binary(name), do: String.slice(name, 0, 64)
+  defp audit_name(_), do: nil
 
   # A JSON object body, or an empty map for anything else (validated downstream).
   defp json_object(conn) do
@@ -343,7 +407,7 @@ defmodule OmnigateControl.Router do
   end
 
   defp internal_auth(%{path_info: ["internal" | _]} = conn, _opts) do
-    expected = System.get_env("OMNIGATE_INTERNAL_TOKEN") || ""
+    expected = OmnigateControl.internal_token() || ""
 
     case get_req_header(conn, "x-omnigate-internal") do
       [token] when expected != "" ->

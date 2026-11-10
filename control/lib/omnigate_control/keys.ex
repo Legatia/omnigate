@@ -24,6 +24,7 @@ defmodule OmnigateControl.Keys do
   alias OmnigateControl.{ConfigStore, Ledger}
 
   @name_format ~r/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+  @fields [:budget_usd, :budget_period, :rpm, :models, :webhook_secret, :disabled]
   @max_old_hashes 50
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -34,7 +35,7 @@ defmodule OmnigateControl.Keys do
   @doc "Create a key. Returns `{:ok, key, raw_key}`; the raw key is not kept."
   def create(attrs) when is_map(attrs), do: GenServer.call(__MODULE__, {:create, attrs})
 
-  @doc "Change `budget_usd`, `rpm`, `models`, `disabled` or `webhook_secret` of a managed key."
+  @doc "Change `budget_usd`, `budget_period`, `rpm`, `models`, `disabled` or `webhook_secret` of a managed key."
   def update(name, attrs) when is_map(attrs), do: GenServer.call(__MODULE__, {:update, name, attrs})
 
   @doc "Give a managed key a new secret. Returns `{:ok, key, raw_key}`; the old secret stops working."
@@ -65,9 +66,30 @@ defmodule OmnigateControl.Keys do
     |> Enum.reduce(fn t, sum -> Map.merge(sum, t, fn _field, a, b -> a + b end) end)
   end
 
-  @doc "True when the key has a budget and has spent it."
-  def over_budget?(%{budget_usd: nil}), do: false
-  def over_budget?(key), do: totals(key).cost_usd >= key.budget_usd
+  @doc "`total`, `monthly` or `daily`: what the key's budget covers."
+  def budget_period(key), do: Map.get(key, :budget_period) || "total"
+
+  @doc "Spend in the key's current budget period (its whole history for a total budget), across rotations."
+  def period_spend(key, now \\ DateTime.utc_now()) do
+    period = budget_period(key)
+    key |> hashes() |> Enum.map(&Ledger.period_spend(&1, period, now)) |> Enum.sum()
+  end
+
+  @doc "ISO 8601 time at which the key's budget period ends, or nil for a total budget."
+  def period_resets_at(key, now \\ DateTime.utc_now()) do
+    case Ledger.period_resets_at(budget_period(key), now) do
+      nil -> nil
+      at -> DateTime.to_iso8601(at)
+    end
+  end
+
+  @doc """
+  True when the key has a budget and has spent it in the current period. A
+  monthly or daily key therefore unblocks by itself when the period turns.
+  """
+  def over_budget?(key, now \\ DateTime.utc_now())
+  def over_budget?(%{budget_usd: nil}, _now), do: false
+  def over_budget?(key, now), do: period_spend(key, now) >= key.budget_usd
 
   def disabled?(key), do: Map.get(key, :disabled, false) == true
 
@@ -95,7 +117,7 @@ defmodule OmnigateControl.Keys do
   def handle_call({:create, attrs}, _from, state) do
     with {:ok, name} <- validate_name(attrs["name"]),
          :ok <- unused(name, state),
-         {:ok, fields} <- validate_fields(attrs, [:budget_usd, :rpm, :models, :webhook_secret, :disabled]) do
+         {:ok, fields} <- validate_fields(attrs, @fields) do
       raw = new_secret()
 
       key =
@@ -104,6 +126,7 @@ defmodule OmnigateControl.Keys do
             name: name,
             key_sha256: OmnigateControl.sha256_hex(raw),
             budget_usd: nil,
+            budget_period: "total",
             rpm: 0,
             models: nil,
             webhook_secret: nil,
@@ -123,7 +146,7 @@ defmodule OmnigateControl.Keys do
 
   def handle_call({:update, name, attrs}, _from, state) do
     with {:ok, key} <- managed_key(name, state),
-         {:ok, fields} <- validate_fields(attrs, [:budget_usd, :rpm, :models, :webhook_secret, :disabled]) do
+         {:ok, fields} <- validate_fields(attrs, @fields) do
       updated = Map.merge(key, fields)
       commit(state, replace(state.keys, updated), {:ok, updated})
     else
@@ -222,6 +245,12 @@ defmodule OmnigateControl.Keys do
   defp validate(:budget_usd, n) when is_number(n) and n >= 0, do: {:ok, n * 1.0}
   defp validate(:budget_usd, _), do: invalid("budget_usd must be a number of dollars, 0 or more, or null for no budget")
 
+  defp validate(:budget_period, nil), do: {:ok, "total"}
+
+  defp validate(:budget_period, p) do
+    if p in ConfigStore.budget_periods(), do: {:ok, p}, else: invalid("budget_period must be \"total\", \"monthly\" or \"daily\"")
+  end
+
   defp validate(:rpm, nil), do: {:ok, 0}
   defp validate(:rpm, n) when is_integer(n) and n >= 0, do: {:ok, n}
   defp validate(:rpm, _), do: invalid("rpm must be a whole number of requests per minute, or 0 for no limit")
@@ -258,6 +287,7 @@ defmodule OmnigateControl.Keys do
           name: name,
           key_sha256: hash,
           budget_usd: if(is_number(k["budget_usd"]), do: k["budget_usd"] * 1.0),
+          budget_period: if(k["budget_period"] in ConfigStore.budget_periods(), do: k["budget_period"], else: "total"),
           rpm: if(is_integer(k["rpm"]), do: k["rpm"], else: 0),
           models: if(is_list(k["models"]), do: k["models"]),
           webhook_secret: k["webhook_secret"],

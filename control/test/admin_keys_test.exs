@@ -278,7 +278,10 @@ defmodule OmnigateControl.AdminKeysTest do
       assert %{"generated_at" => _, "totals" => totals, "today" => today, "keys" => [_ | _], "requests" => requests, "jobs" => jobs, "config" => config} = o
       for part <- [totals, today], field <- ~w(requests errors input_tokens output_tokens jobs cost_usd), do: assert(is_number(part[field]))
       assert is_list(requests) and is_list(jobs)
-      assert %{"upstreams" => [_ | _], "routes" => [_ | _], "media" => %{"upstreams" => _, "routes" => _, "storage" => %{"kind" => _}}, "retention" => _} = config
+
+      assert %{"upstreams" => [_ | _], "routes" => [_ | _], "media" => %{"upstreams" => _, "routes" => _, "storage" => %{"kind" => _}}, "retention" => _} =
+               config
+
       assert %{"name" => _, "kind" => _, "host" => _} = hd(config["upstreams"])
       assert %{"model" => _, "strategy" => _, "targets" => [%{"upstream" => _, "model" => _, "weight" => _} | _]} = hd(config["routes"])
 

@@ -41,13 +41,20 @@ defmodule OmnigateControl.RetentionMetricsTest do
           "routes" => [
             %{"model" => "chat", "targets" => [%{"upstream" => "u", "model" => "a"}]},
             %{"model" => "spread", "strategy" => "round_robin", "targets" => [%{"upstream" => "u", "model" => "a"}, %{"upstream" => "u", "model" => "b"}]},
-            %{"model" => "split", "strategy" => "weighted", "targets" => [%{"upstream" => "u", "model" => "a", "weight" => 9}, %{"upstream" => "u", "model" => "b", "weight" => 0}]}
+            %{
+              "model" => "split",
+              "strategy" => "weighted",
+              "targets" => [%{"upstream" => "u", "model" => "a", "weight" => 9}, %{"upstream" => "u", "model" => "b", "weight" => 0}]
+            }
           ]
         })
 
       assert [%{models: nil}, %{models: ["chat", "image"]}] = config.keys
-      assert [%{strategy: "failover", targets: [%{weight: 1}]}, %{strategy: "round_robin"}, %{strategy: "weighted", targets: [%{weight: 9}, %{weight: 0}]}] = config.routes
-      assert config.retention == %{jobs_days: 0, ledger_ids_days: 0}
+
+      assert [%{strategy: "failover", targets: [%{weight: 1}]}, %{strategy: "round_robin"}, %{strategy: "weighted", targets: [%{weight: 9}, %{weight: 0}]}] =
+               config.routes
+
+      assert config.retention == %{jobs_days: 0, ledger_ids_days: 0, delete_bucket_objects: true}
     end
 
     test "bad values are refused with a message that names the problem" do
@@ -61,8 +68,15 @@ defmodule OmnigateControl.RetentionMetricsTest do
 
       assert_raise ArgumentError, ~r/"weight" must be a non-negative integer/, fn -> ConfigStore.normalize(route.(%{}, %{"weight" => -1})) end
       assert_raise ArgumentError, ~r/"weight" must be a non-negative integer/, fn -> ConfigStore.normalize(route.(%{}, %{"weight" => 1.5})) end
-      assert_raise ArgumentError, ~r/needs at least one target with a weight above 0/, fn -> ConfigStore.normalize(route.(%{"strategy" => "weighted"}, %{"weight" => 0})) end
-      assert_raise ArgumentError, ~r/"models" must be a list of model names/, fn -> ConfigStore.normalize(%{"keys" => [%{"name" => "k", "key" => "x", "models" => "chat"}]}) end
+
+      assert_raise ArgumentError, ~r/needs at least one target with a weight above 0/, fn ->
+        ConfigStore.normalize(route.(%{"strategy" => "weighted"}, %{"weight" => 0}))
+      end
+
+      assert_raise ArgumentError, ~r/"models" must be a list of model names/, fn ->
+        ConfigStore.normalize(%{"keys" => [%{"name" => "k", "key" => "x", "models" => "chat"}]})
+      end
+
       assert_raise ArgumentError, ~r/retention.jobs_days must be a number of days/, fn -> ConfigStore.normalize(%{"retention" => %{"jobs_days" => "30"}}) end
     end
 
@@ -231,7 +245,12 @@ defmodule OmnigateControl.RetentionMetricsTest do
       File.mkdir_p!(dir)
       outside = Path.join(dir, "keep-#{unique()}.txt")
       File.write!(outside, "keep")
-      job = %{"id" => job_id(), "outputs" => [%{"name" => "../" <> Path.basename(outside), "storage" => "local"}, %{"name" => "x.png", "storage" => "s3", "key" => "k"}]}
+
+      job = %{
+        "id" => job_id(),
+        "outputs" => [%{"name" => "../" <> Path.basename(outside), "storage" => "local"}, %{"name" => "x.png", "storage" => "s3", "key" => "k"}]
+      }
+
       assert Storage.delete_local(job) == 0
       assert File.exists?(outside)
       assert Storage.delete_local(%{job | "id" => "../etc"}) == 0
@@ -290,7 +309,16 @@ defmodule OmnigateControl.RetentionMetricsTest do
       name = ~s(team "a"\\b\nline)
       hash = OmnigateControl.sha256_hex("metrics-#{unique()}")
       key = %{name: name, key_sha256: hash, budget_usd: 0.5, rpm: 0, models: nil, webhook_secret: nil}
-      plain = %{name: "plain-#{unique()}", key_sha256: OmnigateControl.sha256_hex("plain-#{unique()}"), budget_usd: nil, rpm: 0, models: nil, webhook_secret: nil}
+
+      plain = %{
+        name: "plain-#{unique()}",
+        key_sha256: OmnigateControl.sha256_hex("plain-#{unique()}"),
+        budget_usd: nil,
+        rpm: 0,
+        models: nil,
+        webhook_secret: nil
+      }
+
       put_config(%{original | keys: [key, plain]})
 
       {:ok, %{accepted: 2}} =

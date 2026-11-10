@@ -4,7 +4,7 @@ defmodule OmnigateControl.Retention do
   section. Everything is off unless configured, so an upgrade never deletes
   anything by itself.
 
-      "retention": { "jobs_days": 30, "ledger_ids_days": 7 }
+      "retention": { "jobs_days": 30, "ledger_ids_days": 7, "delete_bucket_objects": true }
 
     * `jobs_days`: finished jobs (succeeded, failed, canceled) that finished
       more than this many days ago are removed from the job store and from
@@ -13,8 +13,13 @@ defmodule OmnigateControl.Retention do
       can no longer be fetched, replayed by idempotency key, or used as a
       cache hit.
 
-      Outputs stored in an S3 bucket are NOT deleted by the gateway. Expire
-      those with the bucket's own lifecycle rules.
+      Outputs stored in an S3-compatible bucket are deleted too, object by
+      object, unless `delete_bucket_objects` is false (the default is true).
+      This is best effort: an object that could not be deleted is logged and
+      left behind, so a lifecycle rule on the bucket is still a good backstop.
+      Only objects under this gateway's own key layout are ever deleted, and
+      an object a remaining job still points at (a cache hit shares the
+      original's object) is kept.
 
     * `ledger_ids_days`: the ledger forgets event ids it recorded more than
       this many days ago (see `OmnigateControl.Ledger`). Spend totals and the
@@ -38,19 +43,28 @@ defmodule OmnigateControl.Retention do
 
   @doc """
   Run one sweep now and return what it removed:
-  `%{jobs: n, files: n, ledger_ids: n}`.
+  `%{jobs: n, files: n, bucket_objects: n, ledger_ids: n}`.
   """
   def sweep(retention \\ ConfigStore.get().retention, now_ms \\ System.os_time(:millisecond)) do
-    {jobs, files} =
+    {jobs, files, objects} =
       case cutoff(retention[:jobs_days], now_ms) do
         nil ->
-          {0, 0}
+          {0, 0, 0}
 
         cutoff_ms ->
           removed = Store.purge_finished_before(cutoff_ms)
           # Files go after the log no longer mentions their jobs: a crash in
           # between leaves a stray file, never a job whose file is missing.
-          {length(removed), removed |> Enum.map(&Storage.delete_local/1) |> Enum.sum()}
+          files = removed |> Enum.map(&Storage.delete_local/1) |> Enum.sum()
+
+          objects =
+            if removed != [] and Map.get(retention, :delete_bucket_objects, true) != false do
+              Storage.delete_remote(removed, Store.all())
+            else
+              0
+            end
+
+          {length(removed), files, objects}
       end
 
     ledger_ids =
@@ -59,10 +73,10 @@ defmodule OmnigateControl.Retention do
         cutoff_ms -> Ledger.prune_ids(cutoff_ms)
       end
 
-    result = %{jobs: jobs, files: files, ledger_ids: ledger_ids}
+    result = %{jobs: jobs, files: files, bucket_objects: objects, ledger_ids: ledger_ids}
 
-    if jobs + files + ledger_ids > 0 do
-      Logger.info("retention sweep removed #{jobs} finished jobs, #{files} stored files, #{ledger_ids} ledger dedup ids")
+    if jobs + files + objects + ledger_ids > 0 do
+      Logger.info("retention sweep removed #{jobs} finished jobs, #{files} stored files, #{objects} bucket objects, #{ledger_ids} ledger dedup ids")
     end
 
     result

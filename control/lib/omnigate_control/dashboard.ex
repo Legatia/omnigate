@@ -17,16 +17,36 @@ defmodule OmnigateControl.Dashboard do
     [
       ~s(<!doctype html><html lang="en"><head><meta charset="utf-8">),
       ~s(<meta name="viewport" content="width=device-width, initial-scale=1">),
-      ~s(<meta name="csrf" content="), h(csrf), ~s("><link rel="icon" href="data:,">),
-      ~s(<title>omnigate control plane</title><style nonce="), nonce, ~s(">), css(), ~s(</style></head><body>),
+      ~s(<meta name="csrf" content="),
+      h(csrf),
+      ~s("><link rel="icon" href="data:,">),
+      ~s(<title>omnigate control plane</title><style nonce="),
+      nonce,
+      ~s(">),
+      css(),
+      ~s(</style></head><body>),
       ~s(<header class="top"><div class="brand">omnigate <span>control plane</span></div>),
       ~s(<nav aria-label="Sections"><a href="#overview">Overview</a><a href="#keys">Keys</a>),
-      ~s(<a href="#requests">Requests</a><a href="#jobs">Jobs</a><a href="#config">Configuration</a></nav>),
-      ~s(<div class="right"><span id="updated" class="muted" role="status">Updated ), h(clock(o.generated_at)), ~s( UTC</span>),
-      ~s(<form method="post" action="/logout"><input type="hidden" name="_csrf" value="), h(csrf),
+      ~s(<a href="#requests">Requests</a><a href="#jobs">Jobs</a><a href="#refused">Refused</a><a href="#activity">Activity</a>),
+      ~s(<a href="#config">Configuration</a></nav>),
+      ~s(<div class="right"><span id="updated" class="muted" role="status">Updated ),
+      h(clock(o.generated_at)),
+      ~s( UTC</span>),
+      ~s(<form method="post" action="/logout"><input type="hidden" name="_csrf" value="),
+      h(csrf),
       ~s("><button type="submit" class="ghost">Sign out</button></form></div></header><main>),
-      overview(o), keys(o), requests(o), jobs(o), config(o.config),
-      ~s(</main><script nonce="), nonce, ~s(">), js(), ~s(</script></body></html>)
+      overview(o),
+      keys(o),
+      requests(o),
+      jobs(o),
+      refused(o),
+      activity(o),
+      config(o.config),
+      ~s(</main><script nonce="),
+      nonce,
+      ~s(">),
+      js(),
+      ~s(</script></body></html>)
     ]
     |> IO.iodata_to_binary()
   end
@@ -49,9 +69,16 @@ defmodule OmnigateControl.Dashboard do
         key = String.to_existing_atom(field)
 
         [
-          ~s(<div class="card"><div class="label">), label, ~s(</div><div class="value" data-total="), field, ~s(">),
+          ~s(<div class="card"><div class="label">),
+          label,
+          ~s(</div><div class="value" data-total="),
+          field,
+          ~s(">),
           fmt(kind, Map.get(o.totals, key, 0)),
-          ~s(</div><div class="sub">today <span data-today="), field, ~s(">), fmt(kind, Map.get(o.today, key, 0)),
+          ~s(</div><div class="sub">today <span data-today="),
+          field,
+          ~s(">),
+          fmt(kind, Map.get(o.today, key, 0)),
           ~s(</span></div></div>)
         ]
       end,
@@ -76,6 +103,8 @@ defmodule OmnigateControl.Dashboard do
       ~s(<form id="create" class="panel" autocomplete="off"><h3>Create a key</h3><div class="fields">),
       ~s(<label>Name<input name="name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\\-]*" placeholder="my-app"></label>),
       ~s(<label>Budget in USD <span class="muted">optional</span><input name="budget_usd" type="number" min="0" step="any" inputmode="decimal"></label>),
+      ~s(<label>Budget covers<select name="budget_period"><option value="total">everything, never resets</option>),
+      ~s(<option value="monthly">each calendar month, UTC</option><option value="daily">each day, UTC</option></select></label>),
       ~s(<label>Requests per minute <span class="muted">optional</span><input name="rpm" type="number" min="0" step="1" inputmode="numeric"></label>),
       ~s(<label>Models <span class="muted">optional, comma-separated</span><input name="models" placeholder="all models"></label>),
       ~s(</div><div class="row"><button type="submit">Create key</button><span id="create-status" role="status" aria-live="polite"></span></div>),
@@ -88,27 +117,62 @@ defmodule OmnigateControl.Dashboard do
     managed = k.source == "managed"
 
     [
-      ~s(<tr><td><span class="name">), h(k.name), ~s(</span> <span class="tag">), h(k.source), ~s(</span></td><td>),
-      pill(k.state, state_class(k.state)), ~s(</td><td class="spend">), fmt(:usd, k.cost_usd),
+      ~s(<tr><td><span class="name">),
+      h(k.name),
+      ~s(</span> <span class="tag">),
+      h(k.source),
+      ~s(</span></td><td>),
+      pill(k.state, state_class(k.state)),
+      ~s(</td><td class="spend">),
       case k.budget_usd do
         nil ->
-          ~s( <span class="muted">no budget</span>)
+          [fmt(:usd, k.cost_usd), ~s( <span class="muted">no budget</span>)]
 
         budget ->
+          # Against a monthly or daily budget, what counts is this period's spend.
+          spent = if k.budget_period == "total", do: k.cost_usd, else: k.period_spend_usd
+
           [
-            ~s( <span class="muted">of ), fmt(:usd, budget), ~s(</span><progress max="100" value="), Integer.to_string(percent(k.cost_usd, budget)),
-            ~s(">), Integer.to_string(percent(k.cost_usd, budget)), ~s(%</progress>)
+            fmt(:usd, spent),
+            ~s( <span class="muted">of ),
+            fmt(:usd, budget),
+            " ",
+            period_label(k.budget_period),
+            ~s(</span><progress max="100" value="),
+            Integer.to_string(percent(spent, budget)),
+            ~s(">),
+            Integer.to_string(percent(spent, budget)),
+            ~s(%</progress>),
+            if(k.budget_period == "total", do: "", else: [~s(<span class="muted sub">), fmt(:usd, k.cost_usd), ~s( in total</span>)])
           ]
       end,
-      ~s(</td><td class="num">), fmt(:int, k.requests), ~s(</td><td class="num">), fmt(:int, k.errors),
-      ~s(</td><td class="num">), fmt(:int, k.input_tokens), " / ", fmt(:int, k.output_tokens),
-      ~s(</td><td class="num">), fmt(:int, k.jobs), ~s(</td><td class="num">), if(k.rpm > 0, do: fmt(:int, k.rpm), else: "—"),
-      ~s(</td><td class="models">), if(k.models, do: h(Enum.join(k.models, ", ")), else: ~s(<span class="muted">all</span>)), ~s(</td><td class="actions">),
+      ~s(</td><td class="num">),
+      fmt(:int, k.requests),
+      ~s(</td><td class="num">),
+      fmt(:int, k.errors),
+      ~s(</td><td class="num">),
+      fmt(:int, k.input_tokens),
+      " / ",
+      fmt(:int, k.output_tokens),
+      cache_note(k.cached_input_tokens, k.cache_write_input_tokens),
+      ~s(</td><td class="num">),
+      fmt(:int, k.jobs),
+      ~s(</td><td class="num">),
+      if(k.rpm > 0, do: fmt(:int, k.rpm), else: "—"),
+      ~s(</td><td class="models">),
+      if(k.models, do: h(Enum.join(k.models, ", ")), else: ~s(<span class="muted">all</span>)),
+      ~s(</td><td class="actions">),
       if managed do
         [
-          ~s(<button type="button" class="small" data-action="toggle" data-name="), h(k.name), ~s(">), if(k.disabled, do: "Enable", else: "Disable"),
-          ~s(</button><button type="button" class="small" data-action="rotate" data-name="), h(k.name),
-          ~s(">Rotate</button><button type="button" class="small danger" data-action="delete" data-name="), h(k.name), ~s(">Delete</button>)
+          ~s(<button type="button" class="small" data-action="toggle" data-name="),
+          h(k.name),
+          ~s(">),
+          if(k.disabled, do: "Enable", else: "Disable"),
+          ~s(</button><button type="button" class="small" data-action="rotate" data-name="),
+          h(k.name),
+          ~s(">Rotate</button><button type="button" class="small danger" data-action="delete" data-name="),
+          h(k.name),
+          ~s(">Delete</button>)
         ]
       else
         ~s(<span class="muted">in config file</span>)
@@ -129,12 +193,30 @@ defmodule OmnigateControl.Dashboard do
         list ->
           for r <- list do
             [
-              ~s(<tr><td class="mono">), h(stamp(r.ts)), ~s(</td><td>), h(r.key || "—"), ~s(</td><td>), h(r.model),
+              ~s(<tr><td class="mono">),
+              h(stamp(r.ts)),
+              ~s(</td><td>),
+              h(r.key || "—"),
+              ~s(</td><td>),
+              h(r.model),
               if(r.stream, do: ~s( <span class="tag">stream</span>), else: ""),
-              ~s(</td><td>), h(r.upstream || "—"), ~s(</td><td>), pill(to_string(r.status), http_class(r.status)),
-              ~s(</td><td class="num">), fmt(:int, r.input_tokens), " / ", fmt(:int, r.output_tokens),
-              ~s(</td><td class="num">), if(r.latency_ms, do: [fmt(:int, r.latency_ms), " ms"], else: "—"),
-              ~s(</td><td class="num">), fmt(:usd, r.cost_usd), ~s(</td><td class="mono small-text">), h(trail(r.attempts)), ~s(</td></tr>)
+              if(r.cached, do: ~s( <span class="tag">cached</span>), else: ""),
+              ~s(</td><td>),
+              h(r.upstream || "—"),
+              ~s(</td><td>),
+              pill(to_string(r.status), http_class(r.status)),
+              ~s(</td><td class="num">),
+              fmt(:int, r.input_tokens),
+              " / ",
+              fmt(:int, r.output_tokens),
+              cache_note(r.cached_input_tokens, r.cache_write_input_tokens),
+              ~s(</td><td class="num">),
+              if(r.latency_ms, do: [fmt(:int, r.latency_ms), " ms"], else: "—"),
+              ~s(</td><td class="num">),
+              fmt(:usd, r.cost_usd),
+              ~s(</td><td class="mono small-text">),
+              h(trail(r.attempts)),
+              ~s(</td></tr>)
             ]
           end
       end,
@@ -154,10 +236,22 @@ defmodule OmnigateControl.Dashboard do
         list ->
           for j <- list do
             [
-              ~s(<tr><td class="mono">), h(stamp(j.created_at)), ~s(</td><td class="mono small-text">), h(j.id), ~s(</td><td>), h(j.key || "—"),
-              ~s(</td><td>), h(j.model), ~s(</td><td>), pill(j.status, job_class(j.status)),
+              ~s(<tr><td class="mono">),
+              h(stamp(j.created_at)),
+              ~s(</td><td class="mono small-text">),
+              h(j.id),
+              ~s(</td><td>),
+              h(j.key || "—"),
+              ~s(</td><td>),
+              h(j.model),
+              ~s(</td><td>),
+              pill(j.status, job_class(j.status)),
               if(j.cached, do: ~s( <span class="tag">cached</span>), else: ""),
-              ~s(</td><td>), h(j.upstream || "—"), ~s(</td><td class="num">), fmt(:usd, j.cost_usd), ~s(</td><td>),
+              ~s(</td><td>),
+              h(j.upstream || "—"),
+              ~s(</td><td class="num">),
+              fmt(:usd, j.cost_usd),
+              ~s(</td><td>),
               case j.outputs do
                 [] ->
                   ~s(<span class="muted">—</span>)
@@ -189,13 +283,86 @@ defmodule OmnigateControl.Dashboard do
     ]
   end
 
+  defp refused(o) do
+    [
+      ~s(<section id="refused" aria-labelledby="h-refused"><h2 id="h-refused">Refused requests</h2>),
+      ~s(<p class="muted">Requests the gateway turned away before routing them, counted since this control plane started. They are not billed and do not appear above.</p>),
+      ~s(<div class="scroll"><table><thead><tr><th>Key</th><th>Reason</th><th class="num">Count</th></tr></thead><tbody id="refused-body">),
+      case o.rejected do
+        [] ->
+          empty(3, "None reported.")
+
+        list ->
+          for r <- list,
+              do: [~s(<tr><td>), h(key_label(r.key)), ~s(</td><td class="mono">), h(r.reason), ~s(</td><td class="num">), fmt(:int, r.count), ~s(</td></tr>)]
+      end,
+      ~s(</tbody></table></div></section>)
+    ]
+  end
+
+  defp activity(o) do
+    [
+      ~s(<section id="activity" aria-labelledby="h-activity"><h2 id="h-activity">Admin activity</h2>),
+      ~s(<p class="muted">The latest sign-ins and key changes. The full record is the audit log file, also served at <code>/admin/audit</code>.</p>),
+      ~s(<div class="scroll"><table><thead><tr><th>Time, UTC</th><th>Action</th><th>Target</th><th>Outcome</th><th>Signed in by</th><th>Address</th></tr></thead>),
+      ~s(<tbody id="activity-body">),
+      case o.audit do
+        [] ->
+          empty(6, "Nothing recorded yet.")
+
+        list ->
+          for a <- list do
+            [
+              ~s(<tr><td class="mono">),
+              h(stamp(a["ts"])),
+              ~s(</td><td>),
+              h(a["action"]),
+              ~s(</td><td>),
+              h(a["target"] || "—"),
+              ~s(</td><td>),
+              pill(a["outcome"], if(a["outcome"] == "ok", do: "ok", else: "warn")),
+              ~s(</td><td>),
+              h(a["auth"]),
+              ~s(</td><td class="mono">),
+              h(a["address"] || "—"),
+              ~s(</td></tr>)
+            ]
+          end
+      end,
+      ~s(</tbody></table></div></section>)
+    ]
+  end
+
+  defp key_label("-"), do: "(no valid key)"
+  defp key_label(name), do: name
+
+  defp period_label("monthly"), do: "this month"
+  defp period_label("daily"), do: "today"
+  defp period_label(_), do: ""
+
+  # "+ 1,200 cache read" under a token count, when a provider's prompt cache
+  # was involved. One line per kind keeps the column narrow.
+  defp cache_note(read, write) when read > 0 or write > 0 do
+    [
+      if(read > 0, do: [~s(<span class="muted sub">+ ), fmt(:int, read), ~s( cache read</span>)], else: ""),
+      if(write > 0, do: [~s(<span class="muted sub">+ ), fmt(:int, write), ~s( cache write</span>)], else: "")
+    ]
+  end
+
+  defp cache_note(_read, _write), do: ""
+
   defp config(c) do
     [
       ~s(<section id="config" aria-labelledby="h-config"><h2 id="h-config">Configuration</h2>),
       ~s(<p class="muted">Read from the config file, which is reloaded when it changes. Secrets are never shown.</p><div class="grid">),
-      ~s(<div class="panel"><h3>Text upstreams</h3>), kv_table(["Name", "Protocol", "Host"], Enum.map(c.upstreams, &[&1.name, &1.kind, &1.host])), ~s(</div>),
+      ~s(<div class="panel"><h3>Text upstreams</h3>),
+      kv_table(["Name", "Protocol", "Host"], Enum.map(c.upstreams, &[&1.name, &1.kind, &1.host])),
+      ~s(</div>),
       ~s(<div class="panel"><h3>Text routes</h3>),
-      kv_table(["Model", "Strategy", "Targets"], Enum.map(c.routes, &[&1.model, &1.strategy, targets(&1.targets, &1.strategy)])),
+      kv_table(
+        ["Model", "Strategy", "Cache", "Targets"],
+        Enum.map(c.routes, &[&1.model, &1.strategy, if(&1.cache_ttl_s > 0, do: "#{&1.cache_ttl_s} s", else: "off"), targets(&1.targets, &1.strategy)])
+      ),
       ~s(</div><div class="panel"><h3>Media upstreams</h3>),
       kv_table(["Name", "Kind", "Host"], Enum.map(c.media.upstreams, &[&1.name, &1.kind, &1.host])),
       ~s(</div><div class="panel"><h3>Media routes</h3>),
@@ -208,7 +375,8 @@ defmodule OmnigateControl.Dashboard do
         ["Output storage", storage(c.media.storage)],
         ["Public base URL", c.media.public_base_url],
         ["Finished jobs kept", days(c.retention.jobs_days)],
-        ["Ledger ids kept", days(c.retention.ledger_ids_days)]
+        ["Ledger ids kept", days(c.retention.ledger_ids_days)],
+        ["Expired jobs' bucket objects", if(c.retention.delete_bucket_objects, do: "deleted with the job", else: "left in the bucket")]
       ]),
       ~s(</div></div></section>)
     ]
@@ -231,7 +399,9 @@ defmodule OmnigateControl.Dashboard do
 
   defp kv_table(heads, rows) do
     [
-      ~s(<div class="scroll"><table><thead><tr>), Enum.map(heads, &[~s(<th>), &1, ~s(</th>)]), ~s(</tr></thead><tbody>),
+      ~s(<div class="scroll"><table><thead><tr>),
+      Enum.map(heads, &[~s(<th>), &1, ~s(</th>)]),
+      ~s(</tr></thead><tbody>),
       Enum.map(rows, fn row -> [~s(<tr>), Enum.map(row, &[~s(<td>), h(&1), ~s(</td>)]), ~s(</tr>)] end),
       ~s(</tbody></table></div>)
     ]
@@ -316,12 +486,14 @@ defmodule OmnigateControl.Dashboard do
     .pill.ok{color:var(--ok);background:var(--ok-bg)}.pill.warn{color:var(--warn);background:var(--warn-bg)}.pill.bad{color:var(--bad);background:var(--bad-bg)}
     .pill.info{color:var(--info);background:var(--info-bg)}.pill.off{color:var(--off);background:var(--off-bg)}
     .spend progress{display:block;width:100px;height:6px;margin-top:5px;accent-color:var(--accent)}
+    .sub{display:block;font-size:12px}
+    select{display:block;width:100%;margin-top:5px;font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 9px}
     a{color:var(--accent)}
     button{font:inherit;cursor:pointer;border:1px solid var(--accent);background:var(--accent);color:var(--accent-text);border-radius:6px;padding:7px 14px}
     button.ghost,button.small{background:transparent;color:var(--text);border-color:var(--line)}
     button.small{padding:3px 8px;font-size:12.5px;margin-right:4px}button.danger{color:var(--bad)}
     button.armed{background:var(--bad-bg);color:var(--bad);border-color:var(--bad)}
-    button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+    button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     button:disabled{opacity:.55;cursor:default}
     .actions button:last-child{margin-right:0}.models{white-space:normal;max-width:220px}
     .panel table{min-width:0}.panel td{white-space:normal;overflow-wrap:anywhere}
@@ -356,6 +528,9 @@ defmodule OmnigateControl.Dashboard do
     function jobClass(s){return s==='succeeded'?'ok':s==='failed'?'bad':s==='canceled'?'off':'info'}
     function hookClass(s){return s==='delivered'?'ok':s==='failed'?'bad':s==='retrying'?'warn':'info'}
     function trail(a){return (a||[]).map(function(x){return x.upstream+': '+x.outcome}).join(' → ')}
+    function periodLabel(p){return p==='monthly'?' this month':p==='daily'?' today':''}
+    function cacheNote(cell,read,write){if(read>0)cell.appendChild(el('span','muted sub','+ '+int(read)+' cache read'));
+      if(write>0)cell.appendChild(el('span','muted sub','+ '+int(write)+' cache write'))}
     function emptyRow(cols,text){var r=el('tr'),c=el('td','muted empty',text);c.colSpan=cols;r.appendChild(c);return r}
     function fill(body,rows){body.replaceChildren.apply(body,rows)}
 
@@ -366,12 +541,15 @@ defmodule OmnigateControl.Dashboard do
     function keyRow(k){
       var r=el('tr'),n=td('');n.appendChild(el('span','name',k.name));n.appendChild(document.createTextNode(' '));n.appendChild(el('span','tag',k.source));r.appendChild(n);
       r.appendChild(td('',pill(k.state,stateClass(k.state))));
-      var s=td('spend');s.appendChild(document.createTextNode(usd(k.cost_usd)+' '));
-      if(k.budget_usd==null){s.appendChild(muted('no budget'))}
-      else{s.appendChild(muted('of '+usd(k.budget_usd)));var p=el('progress');p.max=100;var pc=k.budget_usd<=0?100:Math.min(100,Math.round(k.cost_usd/k.budget_usd*100));p.value=pc;p.textContent=pc+'%';s.appendChild(p)}
+      var s=td('spend');
+      if(k.budget_usd==null){s.appendChild(document.createTextNode(usd(k.cost_usd)+' '));s.appendChild(muted('no budget'))}
+      else{var total=k.budget_period==='total'||!k.budget_period,spent=total?k.cost_usd:k.period_spend_usd;
+        s.appendChild(document.createTextNode(usd(spent)+' '));s.appendChild(muted('of '+usd(k.budget_usd)+periodLabel(k.budget_period)));
+        var p=el('progress');p.max=100;var pc=k.budget_usd<=0?100:Math.min(100,Math.round(spent/k.budget_usd*100));p.value=pc;p.textContent=pc+'%';s.appendChild(p);
+        if(!total)s.appendChild(el('span','muted sub',usd(k.cost_usd)+' in total'))}
       r.appendChild(s);
       r.appendChild(td('num',int(k.requests)));r.appendChild(td('num',int(k.errors)));
-      r.appendChild(td('num',int(k.input_tokens)+' / '+int(k.output_tokens)));r.appendChild(td('num',int(k.jobs)));
+      var tk=td('num',int(k.input_tokens)+' / '+int(k.output_tokens));cacheNote(tk,k.cached_input_tokens,k.cache_write_input_tokens);r.appendChild(tk);r.appendChild(td('num',int(k.jobs)));
       r.appendChild(td('num',k.rpm>0?int(k.rpm):'—'));
       r.appendChild(k.models?td('models',k.models.join(', ')):td('models',muted('all')));
       var a=td('actions');
@@ -385,9 +563,10 @@ defmodule OmnigateControl.Dashboard do
 
     function requestRow(q){
       var r=el('tr');r.appendChild(td('mono',stamp(q.ts)));r.appendChild(td('',q.key||'—'));
-      var m=td('',q.model||'—');if(q.stream){m.appendChild(document.createTextNode(' '));m.appendChild(el('span','tag','stream'))}r.appendChild(m);
+      var m=td('',q.model||'—');if(q.stream){m.appendChild(document.createTextNode(' '));m.appendChild(el('span','tag','stream'))}
+      if(q.cached){m.appendChild(document.createTextNode(' '));m.appendChild(el('span','tag','cached'))}r.appendChild(m);
       r.appendChild(td('',q.upstream||'—'));r.appendChild(td('',pill(q.status,httpClass(q.status))));
-      r.appendChild(td('num',int(q.input_tokens)+' / '+int(q.output_tokens)));
+      var qt=td('num',int(q.input_tokens)+' / '+int(q.output_tokens));cacheNote(qt,q.cached_input_tokens,q.cache_write_input_tokens);r.appendChild(qt);
       r.appendChild(td('num',q.latency_ms==null?'—':int(q.latency_ms)+' ms'));r.appendChild(td('num',usd(q.cost_usd)));
       r.appendChild(td('mono small-text',trail(q.attempts)));return r}
 
@@ -406,6 +585,10 @@ defmodule OmnigateControl.Dashboard do
       var w=td('');if(!j.webhook){w.appendChild(muted('—'))}else{w.appendChild(pill(j.webhook.status,hookClass(j.webhook.status)));w.appendChild(document.createTextNode(' '));w.appendChild(muted(j.webhook.attempts+' tries'))}
       r.appendChild(w);return r}
 
+    function refusedRow(x){var r=el('tr');r.appendChild(td('',x.key==='-'?'(no valid key)':x.key));r.appendChild(td('mono',x.reason));r.appendChild(td('num',int(x.count)));return r}
+    function activityRow(a){var r=el('tr');r.appendChild(td('mono',stamp(a.ts)));r.appendChild(td('',a.action));r.appendChild(td('',a.target||'—'));
+      r.appendChild(td('',pill(a.outcome,a.outcome==='ok'?'ok':'warn')));r.appendChild(td('',a.auth||''));r.appendChild(td('mono',a.address||'—'));return r}
+
     var last=null;
     function render(d){
       last=d;
@@ -414,6 +597,9 @@ defmodule OmnigateControl.Dashboard do
       fill($('keys-body'),d.keys.length?d.keys.map(keyRow):[emptyRow(10,'No keys yet. Create one below, or add one to the config file.')]);
       fill($('requests-body'),d.requests.length?d.requests.map(requestRow):[emptyRow(9,'No requests recorded since the control plane started.')]);
       fill($('jobs-body'),d.jobs.length?d.jobs.map(jobRow):[emptyRow(9,'No media jobs in the job store.')]);
+      var rj=d.rejected||[],au=d.audit||[];
+      fill($('refused-body'),rj.length?rj.map(refusedRow):[emptyRow(3,'None reported.')]);
+      fill($('activity-body'),au.length?au.map(activityRow):[emptyRow(6,'Nothing recorded yet.')]);
       $('updated').textContent='Updated '+d.generated_at.slice(11,19)+' UTC'}
 
     function refresh(){
@@ -459,7 +645,7 @@ defmodule OmnigateControl.Dashboard do
 
     $('create').addEventListener('submit',function(ev){
       ev.preventDefault();var f=ev.target,body={name:f.elements.name.value.trim()};
-      if(f.elements.budget_usd.value!=='')body.budget_usd=Number(f.elements.budget_usd.value);
+      if(f.elements.budget_usd.value!==''){body.budget_usd=Number(f.elements.budget_usd.value);body.budget_period=f.elements.budget_period.value}
       if(f.elements.rpm.value!=='')body.rpm=Number(f.elements.rpm.value);
       var models=f.elements.models.value.split(',').map(function(s){return s.trim()}).filter(Boolean);if(models.length)body.models=models;
       var submit=f.querySelector('button[type=submit]');submit.disabled=true;status('Creating…',false);

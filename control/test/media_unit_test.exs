@@ -176,10 +176,12 @@ defmodule OmnigateControl.MediaUnitTest do
 
       pcm = <<1, 0, 2, 0, 3, 0, 4, 0>>
       assert {:done, [{:binary, wav, "audio/wav"}]} = Gemini.outputs(response.([part.("audio/L16;codec=pcm;rate=24000", pcm)]))
-      assert <<"RIFF", 44::little-32, "WAVE", "fmt ", 16::little-32, 1::little-16, 1::little-16, 24_000::little-32,
-               48_000::little-32, 2::little-16, 16::little-16, "data", 8::little-32, ^pcm::binary>> = wav
+
+      assert <<"RIFF", 44::little-32, "WAVE", "fmt ", 16::little-32, 1::little-16, 1::little-16, 24_000::little-32, 48_000::little-32, 2::little-16,
+               16::little-16, "data", 8::little-32, ^pcm::binary>> = wav
 
       assert {:error, "no_output: prompt blocked (SAFETY)"} = Gemini.outputs(%{"promptFeedback" => %{"blockReason" => "SAFETY"}})
+
       assert {:error, "no_output: generation stopped (IMAGE_SAFETY)"} =
                Gemini.outputs(%{"candidates" => [%{"content" => %{"parts" => []}, "finishReason" => "IMAGE_SAFETY"}]})
     end
@@ -191,6 +193,7 @@ defmodule OmnigateControl.MediaUnitTest do
       # A native body is kept, with the route's model.
       assert {:ok, %{"model" => "m", "input" => [%{"type" => "text"}], "background" => true}} =
                GI.request_body(%{"input" => [%{"type" => "text"}], "background" => true, "model" => "ignored"}, "m")
+
       assert {:error, "invalid_input" <> _} = GI.request_body(%{}, "m")
 
       video = %{"type" => "video", "mime_type" => "video/mp4", "data" => Base.encode64("MP4DATA")}

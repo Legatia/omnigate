@@ -138,7 +138,14 @@ defmodule OmnigateControl.Webhooks do
         change =
           case result do
             {:ok, code} when code in 200..299 ->
-              %{"status" => "delivered", "last_status" => code, "last_error" => nil, "delivered_at" => Store.now_iso(), "next_attempt_ms" => nil, "next_attempt_at" => nil}
+              %{
+                "status" => "delivered",
+                "last_status" => code,
+                "last_error" => nil,
+                "delivered_at" => Store.now_iso(),
+                "next_attempt_ms" => nil,
+                "next_attempt_at" => nil
+              }
 
             failure ->
               {code, error} =

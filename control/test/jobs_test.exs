@@ -9,9 +9,9 @@ defmodule OmnigateControl.JobsTest.Stub do
 
   @table :omnigate_test_stub
 
-  plug :match
-  plug Plug.Parsers, parsers: [:json], json_decoder: JSON, pass: ["*/*"], body_reader: {__MODULE__, :read_body, []}
-  plug :dispatch
+  plug(:match)
+  plug(Plug.Parsers, parsers: [:json], json_decoder: JSON, pass: ["*/*"], body_reader: {__MODULE__, :read_body, []})
+  plug(:dispatch)
 
   # Keep the exact bytes: webhook signatures are over the raw body.
   def read_body(conn, opts) do
@@ -386,7 +386,10 @@ defmodule OmnigateControl.JobsTest do
     assert replayed["status"] == "succeeded"
     assert replayed["outputs"] == job["outputs"]
     assert replayed["webhook"]["status"] == "retrying"
-    assert {:existing, %{"id" => id}} = Jobs.create(key, %{"model" => "img-good", "input" => %{"prompt" => "durable"}, "webhook_url" => base <> "/hook"}, "idem-durable")
+
+    assert {:existing, %{"id" => id}} =
+             Jobs.create(key, %{"model" => "img-good", "input" => %{"prompt" => "durable"}, "webhook_url" => base <> "/hook"}, "idem-durable")
+
     assert id == job["id"]
     assert Stub.count({"good", :submit}) == 1
 
@@ -468,13 +471,19 @@ defmodule OmnigateControl.JobsTest do
 
     test "create, read, list, cancel and download through the router" do
       assert {401, _} = call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{}}) |> json()
-      assert {401, %{"error" => %{"type" => "invalid_api_key"}}} = call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{}}, internal("deadbeef")) |> json()
+
+      assert {401, %{"error" => %{"type" => "invalid_api_key"}}} =
+               call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{}}, internal("deadbeef")) |> json()
+
       assert {404, %{"error" => %{"type" => "model_not_found"}}} = call(:post, "/internal/v1/jobs", %{"model" => "nope", "input" => %{}}, internal()) |> json()
 
       idem = [{"idempotency-key", "http-#{System.unique_integer([:positive])}"}]
       assert {202, created} = call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{"prompt" => "via http"}}, internal() ++ idem) |> json()
       assert created["object"] == "job" and created["status"] in ["queued", "running"]
-      assert {200, %{"id" => same}} = call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{"prompt" => "via http"}}, internal() ++ idem) |> json()
+
+      assert {200, %{"id" => same}} =
+               call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{"prompt" => "via http"}}, internal() ++ idem) |> json()
+
       assert same == created["id"]
       assert {409, _} = call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{"prompt" => "changed"}}, internal() ++ idem) |> json()
 
@@ -517,7 +526,9 @@ defmodule OmnigateControl.JobsTest do
     test "a key over budget cannot create jobs" do
       dev = OmnigateControl.sha256_hex("og-dev-key")
       {:ok, _} = Ledger.record_media(%{"id" => "job_budget#{System.unique_integer([:positive])}", "key_sha256" => dev, "status" => 200, "cost_usd" => 5.0})
-      assert {402, %{"error" => %{"type" => "budget_exceeded"}}} = call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{}}, internal(dev)) |> json()
+
+      assert {402, %{"error" => %{"type" => "budget_exceeded"}}} =
+               call(:post, "/internal/v1/jobs", %{"model" => "img-good", "input" => %{}}, internal(dev)) |> json()
     end
   end
 end

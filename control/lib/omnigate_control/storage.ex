@@ -9,6 +9,8 @@ defmodule OmnigateControl.Storage do
   `%{"name", "content_type", "bytes", "sha256", "storage" => "local" | "s3", "key" (s3 only)}`.
   """
 
+  require Logger
+
   alias OmnigateControl.ConfigStore
   alias OmnigateControl.Storage.{Local, S3}
 
@@ -47,8 +49,7 @@ defmodule OmnigateControl.Storage do
 
   @doc """
   Delete a job's outputs that are stored on local disk; returns how many
-  files were removed. Outputs in an S3 bucket are deliberately left alone:
-  expire those with the bucket's own lifecycle rules.
+  files were removed. Outputs in a bucket are handled by `delete_remote/2`.
   """
   def delete_local(%{"id" => id} = job) do
     with %{kind: "local"} = config <- ConfigStore.get().media.storage,
@@ -69,6 +70,64 @@ defmodule OmnigateControl.Storage do
       _ -> 0
     end
   end
+
+  @doc """
+  Delete from the bucket the objects of jobs that were just removed; returns
+  how many objects were deleted. Best effort: a failure is logged and the
+  sweep goes on (the object then stays until the bucket's own rules or a
+  later manual clean-up remove it).
+
+  Two rules keep this from ever touching anything else in the bucket:
+
+    * an object is deleted only if its key is exactly the key this gateway
+      would have written for that job and file name under the configured
+      prefix, so a hand-edited job record cannot point it elsewhere;
+    * an object still referenced by a job that remains (a cache hit shares
+      the original job's object) is kept.
+
+  Does nothing unless storage is currently S3.
+  """
+  def delete_remote(removed_jobs, remaining_jobs) do
+    case ConfigStore.get().media.storage do
+      %{kind: "s3"} = config ->
+        in_use =
+          for job <- remaining_jobs, %{"storage" => "s3", "key" => key} <- job["outputs"] || [], into: MapSet.new(), do: key
+
+        removed_jobs
+        |> Enum.flat_map(&own_objects(config, &1))
+        |> Enum.uniq()
+        |> Enum.reject(&MapSet.member?(in_use, &1))
+        |> Enum.count(fn key ->
+          case S3.delete(config, key) do
+            :ok ->
+              true
+
+            {:error, reason} ->
+              Logger.warning("retention: could not delete bucket object #{key}: #{reason}")
+              false
+          end
+        end)
+
+      _ ->
+        0
+    end
+  end
+
+  # Keys of a job's S3 outputs that sit where this gateway puts them.
+  defp own_objects(config, %{"id" => id} = job) when is_binary(id) do
+    if id =~ ~r/^job_[0-9a-f]+$/ do
+      for %{"storage" => "s3", "name" => name} = output <- job["outputs"] || [],
+          is_binary(name) and Path.basename(name) == name,
+          key = S3.object_key(config, id, name),
+          output["key"] in [nil, key] do
+        key
+      end
+    else
+      []
+    end
+  end
+
+  defp own_objects(_config, _job), do: []
 
   @doc "Directory for in-flight downloads."
   def tmp_dir do

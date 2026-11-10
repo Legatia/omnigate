@@ -18,6 +18,24 @@ defmodule OmnigateControl.Ledger do
   after its id was pruned is counted a second time. Totals and the log file
   are never touched by pruning.
 
+  ## Tokens and cost
+
+  A text event counts three kinds of input: `input_tokens` (uncached),
+  `cached_input_tokens` (read from the provider's prompt cache) and
+  `cache_write_input_tokens` (written to it), plus `output_tokens`. Each is
+  priced separately; the two cache prices default to the input price, so a
+  config that does not mention them bills exactly as before. An event marked
+  `"cached": true` was answered from the data plane's own response cache: it
+  counts as a request and costs nothing.
+
+  ## Budget periods
+
+  Besides the per-key totals, spend is kept per key per UTC month and per UTC
+  day (by the event's own time), so a key with a monthly or daily budget can
+  be checked cheaply and unblocks by itself when the period turns. These rows
+  are rebuilt on replay like everything else; rows of past periods are
+  dropped from memory after a while (the log file keeps the events).
+
   Next step: replicate events across control-plane nodes so budgets are
   enforced cluster-wide.
   """
@@ -25,6 +43,7 @@ defmodule OmnigateControl.Ledger do
   require Logger
 
   @table :omnigate_ledger_totals
+  @prune_periods_ms 3_600_000
   @seen :omnigate_ledger_seen
   @recent 50
 
@@ -58,7 +77,7 @@ defmodule OmnigateControl.Ledger do
     :ets.foldl(
       fn
         {key, totals}, sum when is_binary(key) -> Map.merge(sum, totals, fn _field, a, b -> a + b end)
-        _day_row, sum -> sum
+        _day_or_period_row, sum -> sum
       end,
       empty_totals(),
       @table
@@ -84,6 +103,39 @@ defmodule OmnigateControl.Ledger do
   @doc "Spend in USD for one key hash."
   def spend(key_sha256), do: totals(key_sha256).cost_usd
 
+  @doc """
+  Spend in USD for one key hash in the current budget period: `"monthly"`
+  (this UTC month), `"daily"` (this UTC day), anything else the whole ledger.
+  """
+  def period_spend(key_sha256, period, now \\ DateTime.utc_now())
+
+  def period_spend(key_sha256, period, now) when period in ["monthly", "daily"] do
+    case :ets.lookup(@table, {:period, key_sha256, period_id(period, now)}) do
+      [{_, cost}] -> cost
+      [] -> 0.0
+    end
+  end
+
+  def period_spend(key_sha256, _total, _now), do: spend(key_sha256)
+
+  @doc "The id of the period `now` falls in: `\"2026-11\"` for monthly, `\"2026-11-10\"` for daily."
+  def period_id("monthly", %DateTime{} = now), do: now |> DateTime.to_iso8601() |> binary_part(0, 7)
+  def period_id("daily", %DateTime{} = now), do: now |> DateTime.to_iso8601() |> binary_part(0, 10)
+
+  @doc "When the period `now` falls in ends (the next UTC month or day), or nil for a total budget."
+  def period_resets_at(period, now \\ DateTime.utc_now())
+
+  def period_resets_at("monthly", %DateTime{year: y, month: m}) do
+    {y, m} = if m == 12, do: {y + 1, 1}, else: {y, m + 1}
+    DateTime.new!(Date.new!(y, m, 1), ~T[00:00:00], "Etc/UTC")
+  end
+
+  def period_resets_at("daily", %DateTime{} = now) do
+    DateTime.new!(now |> DateTime.to_date() |> Date.add(1), ~T[00:00:00], "Etc/UTC")
+  end
+
+  def period_resets_at(_total, _now), do: nil
+
   @doc "Most recent events, newest first."
   def recent, do: GenServer.call(__MODULE__, :recent)
 
@@ -92,10 +144,20 @@ defmodule OmnigateControl.Ledger do
     (input_tokens * price_in + output_tokens * price_out) / 1_000_000
   end
 
+  @doc """
+  Cost in USD of token counts `%{input, cached_input, cache_write, output}`
+  at prices per 1M tokens `%{in, cached_in, cache_write, out}`.
+  """
+  def cost(tokens, prices) when is_map(tokens) and is_map(prices) do
+    (tokens.input * prices.in + tokens.cached_input * prices.cached_in + tokens.cache_write * prices.cache_write +
+       tokens.output * prices.out) / 1_000_000
+  end
+
   @doc "True when an event has the fields the ledger needs."
   def valid?(%{"key_sha256" => key, "status" => status} = event)
       when is_binary(key) and is_integer(status) do
     tokens_ok?(event["input_tokens"]) and tokens_ok?(event["output_tokens"]) and
+      tokens_ok?(event["cached_input_tokens"]) and tokens_ok?(event["cache_write_input_tokens"]) and
       (is_nil(event["id"]) or is_binary(event["id"]))
   end
 
@@ -117,7 +179,34 @@ defmodule OmnigateControl.Ledger do
     if replayed > 0, do: Logger.info("ledger replayed #{replayed} events from #{path}")
 
     file = File.open!(path, [:append, :binary])
+    Process.send_after(self(), :prune_periods, @prune_periods_ms)
     {:ok, %{file: file, recent: []}}
+  end
+
+  # Only the current period is ever read; the one before it is kept as a
+  # margin for clocks and late events. Older rows would otherwise pile up at
+  # one per key per day.
+  @impl true
+  def handle_info(:prune_periods, state) do
+    prune_periods(DateTime.utc_now())
+    Process.send_after(self(), :prune_periods, @prune_periods_ms)
+    {:noreply, state}
+  end
+
+  @doc "Drop the per-period spend rows of periods long past. Runs hourly by itself."
+  def prune_period_rows(now \\ DateTime.utc_now()), do: GenServer.call(__MODULE__, {:prune_periods, now})
+
+  # Runs in the ledger process: the table is protected.
+  defp prune_periods(now) do
+    keep_month = now |> DateTime.add(-32 * 86_400, :second) |> then(&period_id("monthly", &1))
+    keep_day = now |> DateTime.add(-2 * 86_400, :second) |> then(&period_id("daily", &1))
+
+    for {{:period, _key, id} = row, _cost} <- :ets.tab2list(@table),
+        (byte_size(id) == 7 and id < keep_month) or (byte_size(id) == 10 and id < keep_day) do
+      :ets.delete(@table, row)
+    end
+
+    :ok
   end
 
   @impl true
@@ -136,6 +225,8 @@ defmodule OmnigateControl.Ledger do
   end
 
   def handle_call(:recent, _from, state), do: {:reply, state.recent, state}
+
+  def handle_call({:prune_periods, now}, _from, state), do: {:reply, prune_periods(now), state}
 
   def handle_call({:prune_ids, cutoff_ms}, _from, state) do
     dropped = :ets.select_delete(@seen, [{{:_, :"$1"}, [{:<, :"$1", cutoff_ms}], [true]}])
@@ -176,13 +267,20 @@ defmodule OmnigateControl.Ledger do
   defp enrich(usage, :text) do
     # Only the control plane may mark an event as media.
     usage = Map.delete(usage, "kind")
-    input = usage["input_tokens"] || 0
-    output = usage["output_tokens"] || 0
+
+    tokens = %{
+      input: usage["input_tokens"] || 0,
+      cached_input: usage["cached_input_tokens"] || 0,
+      cache_write: usage["cache_write_input_tokens"] || 0,
+      output: usage["output_tokens"] || 0
+    }
 
     cost =
-      case usage["upstream"] do
-        nil -> 0.0
-        up -> cost(input, output, OmnigateControl.ConfigStore.price(usage["route_model"], up, usage["target_model"]))
+      cond do
+        # Served from the data plane's response cache: no provider was paid.
+        usage["cached"] == true -> 0.0
+        is_nil(usage["upstream"]) -> 0.0
+        true -> cost(tokens, OmnigateControl.ConfigStore.prices(usage["route_model"], usage["upstream"], usage["target_model"]))
       end
 
     usage |> Map.put("cost_usd", cost) |> stamp()
@@ -209,11 +307,29 @@ defmodule OmnigateControl.Ledger do
 
     add(event["key_sha256"], event)
 
-    # One extra row per UTC day (of the event's own time), for "today" figures.
+    # One extra row per UTC day (of the event's own time), for "today" figures,
+    # and the key's spend in that month and that day, for budget periods.
     case event["ts"] do
-      <<day::binary-size(10), _rest::binary>> -> add({:day, day}, event)
-      _ -> :ok
+      <<month::binary-size(7), _dash, _d::binary-size(2), _rest::binary>> = ts ->
+        day = binary_part(ts, 0, 10)
+        add({:day, day}, event)
+        cost = event["cost_usd"] || 0.0
+        add_period({:period, event["key_sha256"], month}, cost)
+        add_period({:period, event["key_sha256"], day}, cost)
+
+      _ ->
+        :ok
     end
+  end
+
+  defp add_period(row, cost) do
+    current =
+      case :ets.lookup(@table, row) do
+        [{_, c}] -> c
+        [] -> 0.0
+      end
+
+    :ets.insert(@table, {row, current + cost})
   end
 
   defp add(row, event) do
@@ -231,7 +347,10 @@ defmodule OmnigateControl.Ledger do
          | requests: t.requests + 1,
            errors: t.errors + if(event["status"] >= 400, do: 1, else: 0),
            input_tokens: t.input_tokens + (event["input_tokens"] || 0),
+           cached_input_tokens: t.cached_input_tokens + (event["cached_input_tokens"] || 0),
+           cache_write_input_tokens: t.cache_write_input_tokens + (event["cache_write_input_tokens"] || 0),
            output_tokens: t.output_tokens + (event["output_tokens"] || 0),
+           cached_responses: t.cached_responses + if(event["cached"] == true, do: 1, else: 0),
            jobs: t.jobs + if(event["kind"] == "media", do: 1, else: 0),
            cost_usd: t.cost_usd + (event["cost_usd"] || 0.0)
        }}
@@ -270,6 +389,17 @@ defmodule OmnigateControl.Ledger do
     end
   end
 
-  defp empty_totals,
-    do: %{requests: 0, errors: 0, input_tokens: 0, output_tokens: 0, jobs: 0, cost_usd: 0.0}
+  defp empty_totals do
+    %{
+      requests: 0,
+      errors: 0,
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 0,
+      cached_responses: 0,
+      jobs: 0,
+      cost_usd: 0.0
+    }
+  end
 end

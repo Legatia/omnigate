@@ -49,6 +49,32 @@ defmodule OmnigateControl.ConfigStore do
     end
   end
 
+  @doc """
+  All four prices for a (route model, upstream, target model) triple, in USD
+  per 1M tokens: `%{in, cached_in, cache_write, out}`. Cached input and cache
+  writes cost the input price unless the target says otherwise.
+  """
+  def prices(route_model, upstream, target_model) do
+    target =
+      case Enum.find(get().routes, &(&1.model == route_model)) do
+        nil -> nil
+        route -> Enum.find(route.targets, &(&1.upstream == upstream and &1.model == target_model))
+      end
+
+    case target do
+      nil ->
+        %{in: 0.0, cached_in: 0.0, cache_write: 0.0, out: 0.0}
+
+      t ->
+        %{
+          in: t.price_in_per_mtok,
+          cached_in: Map.get(t, :price_cached_in_per_mtok, t.price_in_per_mtok),
+          cache_write: Map.get(t, :price_cache_write_per_mtok, t.price_in_per_mtok),
+          out: t.price_out_per_mtok
+        }
+    end
+  end
+
   # -- server --------------------------------------------------------------
 
   @impl true
@@ -110,6 +136,9 @@ defmodule OmnigateControl.ConfigStore do
             name: Map.fetch!(k, "name"),
             key_sha256: k["key_sha256"] || OmnigateControl.sha256_hex(Map.fetch!(k, "key")),
             budget_usd: to_float(k["budget_usd"]),
+            # What the budget covers: everything ever ("total"), or the
+            # current UTC month or day, after which the key unblocks again.
+            budget_period: budget_period!(k["budget_period"], k["name"]),
             # Requests per minute enforced by the data plane; 0 = unlimited.
             rpm: to_int(k["rpm"], 0),
             # Route model names (text or media) this key may use; nil = all.
@@ -141,17 +170,30 @@ defmodule OmnigateControl.ConfigStore do
 
           targets =
             Enum.map(Map.fetch!(r, "targets"), fn t ->
+              price_in = to_float(t["price_in_per_mtok"] || 0)
+
               %{
                 upstream: Map.fetch!(t, "upstream"),
                 model: Map.fetch!(t, "model"),
                 # Share of traffic under the "weighted" strategy.
                 weight: weight(t["weight"], model),
-                price_in_per_mtok: to_float(t["price_in_per_mtok"] || 0),
+                price_in_per_mtok: price_in,
+                # Input read from, and written to, the provider's prompt cache.
+                # Both cost the plain input price unless given.
+                price_cached_in_per_mtok: price!(t["price_cached_in_per_mtok"], price_in, model),
+                price_cache_write_per_mtok: price!(t["price_cache_write_per_mtok"], price_in, model),
                 price_out_per_mtok: to_float(t["price_out_per_mtok"] || 0)
               }
             end)
 
-          %{model: model, strategy: strategy(r["strategy"], model, targets), targets: targets}
+          %{
+            model: model,
+            strategy: strategy(r["strategy"], model, targets),
+            # How long the data plane may answer identical requests from its
+            # own response cache; 0 = never.
+            cache_ttl_s: cache_ttl!(r["cache_ttl_s"], model),
+            targets: targets
+          }
         end),
       media: normalize_media(raw["media"] || %{}),
       retention: normalize_retention(raw["retention"] || %{})
@@ -191,6 +233,33 @@ defmodule OmnigateControl.ConfigStore do
           "route #{inspect(model)}: \"strategy\" must be one of #{Enum.join(@strategies, ", ")}, got #{inspect(other)}"
   end
 
+  defp price!(nil, default, _model), do: default
+  defp price!(n, _default, _model) when is_number(n) and n >= 0, do: n * 1.0
+
+  defp price!(other, _default, model) do
+    raise ArgumentError, "route #{inspect(model)}: a price must be a number of dollars per 1M tokens, 0 or more, got #{inspect(other)}"
+  end
+
+  defp cache_ttl!(nil, _model), do: 0
+  defp cache_ttl!(n, _model) when is_integer(n) and n >= 0, do: n
+
+  defp cache_ttl!(other, model) do
+    raise ArgumentError, "route #{inspect(model)}: \"cache_ttl_s\" must be a whole number of seconds, 0 or more, got #{inspect(other)}"
+  end
+
+  @budget_periods ~w(total monthly daily)
+
+  @doc false
+  def budget_periods, do: @budget_periods
+
+  defp budget_period!(nil, _name), do: "total"
+  defp budget_period!(p, _name) when p in @budget_periods, do: p
+
+  defp budget_period!(other, name) do
+    raise ArgumentError,
+          "key #{inspect(name)}: \"budget_period\" must be one of #{Enum.join(@budget_periods, ", ")}, got #{inspect(other)}"
+  end
+
   defp weight(nil, _model), do: 1
   defp weight(n, _model) when is_integer(n) and n >= 0, do: n
 
@@ -200,7 +269,18 @@ defmodule OmnigateControl.ConfigStore do
 
   # How long finished things are kept, in days. 0 (the default) keeps them forever.
   defp normalize_retention(r) do
-    %{jobs_days: days(r["jobs_days"], "jobs_days"), ledger_ids_days: days(r["ledger_ids_days"], "ledger_ids_days")}
+    %{
+      jobs_days: days(r["jobs_days"], "jobs_days"),
+      ledger_ids_days: days(r["ledger_ids_days"], "ledger_ids_days"),
+      # Also delete a removed job's objects from the bucket. On unless
+      # switched off; it only ever does anything when jobs_days is set.
+      delete_bucket_objects:
+        case r["delete_bucket_objects"] do
+          nil -> true
+          b when is_boolean(b) -> b
+          other -> raise ArgumentError, "retention.delete_bucket_objects must be true or false, got #{inspect(other)}"
+        end
+    }
   end
 
   defp days(nil, _name), do: 0

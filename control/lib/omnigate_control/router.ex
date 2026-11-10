@@ -10,6 +10,7 @@ defmodule OmnigateControl.Router do
     * `GET  /admin/usage`     — per-key totals as JSON (admin token or session)
     * `GET  /`                — dashboard (session; redirects to `/login`)
     * `GET/POST /login`, `POST /logout` — dashboard sessions, see `AdminAuth`
+    * `GET  /metrics`         — Prometheus metrics (admin token or session)
     * `GET  /healthz`         — liveness, no authentication
 
   Three audiences, three credentials: data planes use the internal token,
@@ -18,7 +19,7 @@ defmodule OmnigateControl.Router do
   """
   use Plug.Router
 
-  alias OmnigateControl.{AdminAuth, ConfigStore, Jobs, Ledger, Storage, UrlSigner}
+  alias OmnigateControl.{AdminAuth, ConfigStore, Jobs, Ledger, Metrics, Storage, UrlSigner}
 
   plug :match
   plug Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"]
@@ -28,6 +29,12 @@ defmodule OmnigateControl.Router do
 
   get "/healthz" do
     conn |> put_resp_content_type("text/plain") |> send_resp(200, "ok\n")
+  end
+
+  get "/metrics" do
+    conn
+    |> put_resp_header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+    |> send_resp(200, Metrics.render())
   end
 
   get "/internal/config" do
@@ -49,7 +56,8 @@ defmodule OmnigateControl.Router do
 
   post "/internal/v1/jobs" do
     with {:ok, key} <- gateway_key(conn),
-         :ok <- within_budget(key) do
+         :ok <- within_budget(key),
+         :ok <- model_allowed(key, conn.body_params["model"]) do
       idempotency_key = conn |> get_req_header("idempotency-key") |> List.first()
 
       case Jobs.create(key.key_sha256, conn.body_params, idempotency_key) do
@@ -167,12 +175,12 @@ defmodule OmnigateControl.Router do
     body = %{
       keys:
         Enum.map(config.keys, fn k ->
-          %{key_sha256: k.key_sha256, name: k.name, blocked: blocked?(k), rpm: k.rpm}
+          %{key_sha256: k.key_sha256, name: k.name, blocked: blocked?(k), rpm: k.rpm, models: k.models}
         end),
       upstreams: config.upstreams,
       routes:
         Enum.map(config.routes, fn r ->
-          %{model: r.model, targets: Enum.map(r.targets, &Map.take(&1, [:upstream, :model]))}
+          %{model: r.model, strategy: r.strategy, targets: Enum.map(r.targets, &Map.take(&1, [:upstream, :model, :weight]))}
         end)
     }
 
@@ -194,6 +202,18 @@ defmodule OmnigateControl.Router do
   # The data plane also checks this, but its view lags by one poll interval.
   defp within_budget(key) do
     if blocked?(key), do: {:error, 402, "budget_exceeded", "this key has exhausted its budget"}, else: :ok
+  end
+
+  # A key may be limited to a list of models. The data plane applies the same
+  # list to text routes; media jobs are checked here.
+  defp model_allowed(%{models: nil}, _model), do: :ok
+
+  defp model_allowed(%{models: models}, model) do
+    if model in models do
+      :ok
+    else
+      {:error, 403, "model_not_allowed", "this key is not allowed to use the model #{inspect(model)}"}
+    end
   end
 
   defp file_access(conn, job_id, name) do
@@ -272,7 +292,7 @@ defmodule OmnigateControl.Router do
   # `/admin/*` is an API: answer 401. The dashboard is a page: send the
   # browser to the login form. Everything else here is either public
   # (`/healthz`, `/login`) or guarded by `internal_auth` above.
-  defp admin_auth(%{path_info: ["admin" | _]} = conn, _opts) do
+  defp admin_auth(%{path_info: [first | _]} = conn, _opts) when first in ["admin", "metrics"] do
     if AdminAuth.authorized?(conn) do
       conn
     else

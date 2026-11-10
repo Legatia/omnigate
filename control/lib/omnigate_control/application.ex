@@ -16,6 +16,7 @@ defmodule OmnigateControl.Application do
       OmnigateControl.Webhooks,
       # One-shot: continue jobs and webhooks left unfinished by the last run.
       Supervisor.child_spec({Task, &OmnigateControl.Jobs.resume_all/0}, id: :jobs_resume, restart: :temporary),
+      OmnigateControl.Retention,
       {Bandit, plug: OmnigateControl.Router, ip: ip, port: port()}
     ]
 

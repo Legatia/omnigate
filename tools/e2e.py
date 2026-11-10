@@ -42,6 +42,7 @@ KEY_MAIN = "og-e2e-main"
 KEY_BUDGET = "og-e2e-budget"
 KEY_RPM = "og-e2e-rpm"
 KEY_OTHER = "og-e2e-other"
+KEY_LIMITED = "og-e2e-limited"
 WEBHOOK_SECRET = "e2e-webhook-secret"
 
 results = []
@@ -228,6 +229,8 @@ def text_config():
             {"name": "budget", "key": KEY_BUDGET, "budget_usd": 0.01},
             {"name": "rpm", "key": KEY_RPM, "rpm": 3},
             {"name": "other", "key": KEY_OTHER},
+            # May use the "direct" route and nothing else.
+            {"name": "limited", "key": KEY_LIMITED, "models": ["direct"]},
         ],
         "upstreams": [
             {"name": "mock-flaky", "kind": "openai", "base_url": "http://127.0.0.1:9001", "api_key_env": "MOCK_API_KEY"},
@@ -243,6 +246,11 @@ def text_config():
             {"model": "direct", "targets": [dict(upstream="mock-ok", model="ok-1", **price)]},
             {"model": "compat", "targets": [dict(upstream="mock-compat", model="ok-1", **price)]},
             {"model": "signed", "targets": [dict(upstream="mock-ok", model="sig-1", **price)]},
+            # The same mock under two upstream names, so the response header tells them apart.
+            {"model": "spread", "strategy": "round_robin", "targets": [dict(upstream="mock-ok", model="ok-1", **price),
+                                                                       dict(upstream="mock-compat", model="ok-1", **price)]},
+            {"model": "skewed", "strategy": "weighted", "targets": [dict(upstream="mock-ok", model="ok-1", weight=0, **price),
+                                                                    dict(upstream="mock-compat", model="ok-1", weight=5, **price)]},
             {"model": "claude", "targets": [dict(upstream="mock-anthropic", model="mock-claude", **price)]},
             {"model": "slow", "targets": [dict(upstream="mock-slow", model="slow-1", **price),
                                           dict(upstream="mock-ok", model="ok-1", **price)]},
@@ -401,6 +409,15 @@ def login_checks():
     status, _, _ = control_raw("GET", "/", {"cookie": session + "x"})
     check("an altered session cookie is refused", status == 302, status)
 
+    status, _, _ = control_raw("GET", "/metrics")
+    check("metrics refuse anonymous requests (401)", status == 401, status)
+    status, headers, text = control_raw("GET", "/metrics", {"authorization": "Bearer " + ADMIN_TOKEN})
+    lines = [l for l in text.splitlines() if l and not l.startswith("#")]
+    check("metrics are served in Prometheus text format to the admin token",
+          status == 200 and headers.get("content-type", "").startswith("text/plain")
+          and any(l.startswith("omnigate_build_info") for l in lines) and any('key="main"' in l for l in lines)
+          and all(len(l.rsplit(" ", 1)) == 2 for l in lines), (status, headers.get("content-type"), lines[:3]))
+
     status, _, _ = call("GET", GATEWAY + "/admin/usage", key=KEY_MAIN)
     check("the public gateway port does not serve the admin API", status == 404, status)
     status, _, _ = call("GET", GATEWAY + "/admin/usage", key=ADMIN_TOKEN)
@@ -440,6 +457,22 @@ def text_checks(stack):
     elapsed = time.time() - t0
     check("an upstream that takes 3 s is abandoned at its 0.5 s timeout",
           status == 200 and headers.get("x-omnigate-upstream") == "mock-ok" and elapsed < 2.5, f"{status} in {elapsed:.2f}s")
+
+    section("load balancing and per-key model limits")
+    served = [chat("spread")[1].get("x-omnigate-upstream") for _ in range(4)]
+    main_calls += 4
+    check("a round-robin route alternates between its targets",
+          sorted(served[:2]) == ["mock-compat", "mock-ok"] and served[:2] == served[2:], served)
+    served = [chat("skewed")[1].get("x-omnigate-upstream") for _ in range(4)]
+    main_calls += 4
+    check("a weighted route never starts with a weight-0 target", served == ["mock-compat"] * 4, served)
+    status, _, body = chat("chat", key=KEY_LIMITED)
+    check("a key limited to one model is refused another (403)",
+          status == 403 and body.get("error", {}).get("type") == "model_not_allowed", (status, body))
+    status, _, _ = chat("direct", key=KEY_LIMITED)
+    check("... and can use the model it is allowed", status == 200, status)
+    status, _, body = jcall("GET", GATEWAY + "/v1/models", key=KEY_LIMITED)
+    check("... and its model list shows only that model", [m["id"] for m in body.get("data", [])] == ["direct"], body)
 
     section("streaming")
     status, events, spread = sse("/v1/chat/completions", KEY_MAIN, dict(CHAT, model="chat", stream=True))
@@ -688,6 +721,10 @@ def media_checks(stack):
     check("another key cannot download it (404)", status == 404, status)
     status, _, other = jcall("GET", f"{GATEWAY}/v1/jobs/{job_id}", key=KEY_OTHER)
     check("another key cannot see the job (404)", status == 404, (status, other))
+
+    status, _, refused = create_job({"model": "image", "input": {"prompt": "x"}}, key=KEY_LIMITED)
+    check("a key limited to other models cannot create this job (403)",
+          status == 403 and refused.get("error", {}).get("type") == "model_not_allowed", (status, refused))
 
     section("webhooks")
     def delivered():

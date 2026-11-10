@@ -45,6 +45,31 @@ defmodule OmnigateControl.Storage do
 
   def share(_from, _to, output), do: {:ok, output}
 
+  @doc """
+  Delete a job's outputs that are stored on local disk; returns how many
+  files were removed. Outputs in an S3 bucket are deliberately left alone:
+  expire those with the bucket's own lifecycle rules.
+  """
+  def delete_local(%{"id" => id} = job) do
+    with %{kind: "local"} = config <- ConfigStore.get().media.storage,
+         # Paths are built from these, so only well-formed ones are trusted.
+         true <- is_binary(id) and id =~ ~r/^job_[0-9a-f]+$/ do
+      removed =
+        for %{"storage" => "local", "name" => name} <- job["outputs"] || [],
+            is_binary(name) and Path.basename(name) == name,
+            File.rm(Local.path(config, id, name)) == :ok,
+            reduce: 0 do
+          count -> count + 1
+        end
+
+      # Gone only if nothing else is in it.
+      File.rmdir(Path.join(config.dir, id))
+      removed
+    else
+      _ -> 0
+    end
+  end
+
   @doc "Directory for in-flight downloads."
   def tmp_dir do
     dir =

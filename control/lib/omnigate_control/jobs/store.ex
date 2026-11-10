@@ -7,6 +7,9 @@ defmodule OmnigateControl.Jobs.Store do
   go to directly. On boot the log is replayed (last snapshot per job wins)
   and rewritten compacted, so it does not grow across restarts.
 
+  `purge_finished_before/1` removes old finished jobs for good and compacts
+  the log again, which is how `OmnigateControl.Retention` keeps it bounded.
+
   Jobs are JSON-shaped maps with string keys. All writes go through this
   process, so `update/2` functions run one at a time.
   """
@@ -53,6 +56,19 @@ defmodule OmnigateControl.Jobs.Store do
     all() |> Enum.sort_by(& &1["created_ms"], :desc) |> Enum.take(limit)
   end
 
+  @doc """
+  Forget every finished job that finished before `cutoff_ms` (unix
+  milliseconds) and rewrite the log without them. Returns the removed jobs so
+  the caller can delete their files.
+
+  Only jobs with nothing left to do are removed: terminal, already in the
+  ledger, and with no webhook delivery still pending. Their idempotency keys
+  and cache entries go with them, so neither can point at a job that is gone.
+  """
+  def purge_finished_before(cutoff_ms) when is_integer(cutoff_ms) do
+    GenServer.call(__MODULE__, {:purge, cutoff_ms}, 120_000)
+  end
+
   @doc "Id of the latest succeeded, non-cached job stored under `cache_key`, with its finish time."
   def cache_lookup(cache_key) do
     case :ets.lookup(@index, {:cache, cache_key}) do
@@ -74,7 +90,7 @@ defmodule OmnigateControl.Jobs.Store do
     if count > 0, do: Logger.info("job store replayed #{count} jobs from #{path}")
     compact(path)
 
-    {:ok, %{file: File.open!(path, [:append, :binary])}}
+    {:ok, %{path: path, file: File.open!(path, [:append, :binary])}}
   end
 
   @impl true
@@ -107,6 +123,43 @@ defmodule OmnigateControl.Jobs.Store do
             {:reply, {:ok, new}, state}
         end
     end
+  end
+
+  def handle_call({:purge, cutoff_ms}, _from, state) do
+    case Enum.filter(all(), &purgeable?(&1, cutoff_ms)) do
+      [] ->
+        {:reply, [], state}
+
+      doomed ->
+        Enum.each(doomed, &unindex/1)
+        # The log must lose them too, or a restart would bring them back. The
+        # rewrite is atomic (temp file, then rename); if we crash before it,
+        # the old log is replayed and the next sweep removes them again.
+        File.close(state.file)
+        compact(state.path)
+        {:reply, doomed, %{state | file: File.open!(state.path, [:append, :binary])}}
+    end
+  end
+
+  defp purgeable?(job, cutoff_ms) do
+    job["status"] in ~w(succeeded failed canceled) and is_integer(job["finished_ms"]) and
+      job["finished_ms"] < cutoff_ms and job["ledgered"] == true and
+      not match?(%{"status" => s} when s in ["pending", "retrying"], job["webhook"])
+  end
+
+  defp unindex(job) do
+    id = job["id"]
+    :ets.delete(@table, id)
+
+    idem = idem_key(job)
+    if idem && :ets.lookup(@index, idem) == [{idem, id}], do: :ets.delete(@index, idem)
+
+    with key when is_binary(key) <- job["cache_key"],
+         [{_, ^id, _}] <- :ets.lookup(@index, {:cache, key}) do
+      :ets.delete(@index, {:cache, key})
+    end
+
+    :ok
   end
 
   defp persist(state, job) do

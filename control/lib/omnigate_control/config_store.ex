@@ -16,6 +16,9 @@ defmodule OmnigateControl.ConfigStore do
   @doc "The normalized config map."
   def get, do: :persistent_term.get({__MODULE__, :config})
 
+  @doc "When the config was last (re)loaded, and how many reloads succeeded since boot."
+  def meta, do: :persistent_term.get({__MODULE__, :meta}, %{reloads: 0, loaded_at_ms: 0})
+
   @doc "Price for a (route model, upstream, target model) triple, in USD per 1M tokens."
   def price(route_model, upstream, target_model) do
     get().routes
@@ -39,6 +42,7 @@ defmodule OmnigateControl.ConfigStore do
     path = Keyword.fetch!(opts, :path)
     {:ok, config, mtime} = load!(path)
     :persistent_term.put({__MODULE__, :config}, config)
+    :persistent_term.put({__MODULE__, :meta}, %{reloads: 0, loaded_at_ms: System.os_time(:millisecond)})
     Logger.info("loaded config #{path}: #{length(config.routes)} routes, #{length(config.keys)} keys")
     schedule()
     {:ok, %{path: path, mtime: mtime}}
@@ -52,6 +56,7 @@ defmodule OmnigateControl.ConfigStore do
           case safe_load(state.path) do
             {:ok, config, mtime} ->
               :persistent_term.put({__MODULE__, :config}, config)
+              :persistent_term.put({__MODULE__, :meta}, %{reloads: meta().reloads + 1, loaded_at_ms: System.os_time(:millisecond)})
               Logger.info("reloaded config #{state.path}")
               %{state | mtime: mtime}
 
@@ -93,6 +98,8 @@ defmodule OmnigateControl.ConfigStore do
             budget_usd: to_float(k["budget_usd"]),
             # Requests per minute enforced by the data plane; 0 = unlimited.
             rpm: to_int(k["rpm"], 0),
+            # Route model names (text or media) this key may use; nil = all.
+            models: models(k["models"]),
             webhook_secret: secret(k, "webhook_secret")
           }
         end),
@@ -111,22 +118,75 @@ defmodule OmnigateControl.ConfigStore do
         end),
       routes:
         Enum.map(raw["routes"] || [], fn r ->
-          %{
-            model: Map.fetch!(r, "model"),
-            targets:
-              Enum.map(Map.fetch!(r, "targets"), fn t ->
-                %{
-                  upstream: Map.fetch!(t, "upstream"),
-                  model: Map.fetch!(t, "model"),
-                  price_in_per_mtok: to_float(t["price_in_per_mtok"] || 0),
-                  price_out_per_mtok: to_float(t["price_out_per_mtok"] || 0)
-                }
-              end)
-          }
+          model = Map.fetch!(r, "model")
+
+          targets =
+            Enum.map(Map.fetch!(r, "targets"), fn t ->
+              %{
+                upstream: Map.fetch!(t, "upstream"),
+                model: Map.fetch!(t, "model"),
+                # Share of traffic under the "weighted" strategy.
+                weight: weight(t["weight"], model),
+                price_in_per_mtok: to_float(t["price_in_per_mtok"] || 0),
+                price_out_per_mtok: to_float(t["price_out_per_mtok"] || 0)
+              }
+            end)
+
+          %{model: model, strategy: strategy(r["strategy"], model, targets), targets: targets}
         end),
-      media: normalize_media(raw["media"] || %{})
+      media: normalize_media(raw["media"] || %{}),
+      retention: normalize_retention(raw["retention"] || %{})
     }
   end
+
+  defp models(nil), do: nil
+
+  defp models(list) when is_list(list) do
+    if Enum.all?(list, &is_binary/1) do
+      list
+    else
+      raise ArgumentError, "a key's \"models\" must be a list of model names, got #{inspect(list)}"
+    end
+  end
+
+  defp models(other), do: raise(ArgumentError, "a key's \"models\" must be a list of model names, got #{inspect(other)}")
+
+  @strategies ~w(failover round_robin weighted)
+
+  # How the data plane orders a route's targets: in config order (failover),
+  # rotating (round_robin), or at random in proportion to target weights.
+  defp strategy(nil, _model, _targets), do: "failover"
+
+  defp strategy("weighted", model, targets) do
+    if Enum.any?(targets, &(&1.weight > 0)) do
+      "weighted"
+    else
+      raise ArgumentError, "route #{inspect(model)}: strategy \"weighted\" needs at least one target with a weight above 0"
+    end
+  end
+
+  defp strategy(s, _model, _targets) when s in @strategies, do: s
+
+  defp strategy(other, model, _targets) do
+    raise ArgumentError,
+          "route #{inspect(model)}: \"strategy\" must be one of #{Enum.join(@strategies, ", ")}, got #{inspect(other)}"
+  end
+
+  defp weight(nil, _model), do: 1
+  defp weight(n, _model) when is_integer(n) and n >= 0, do: n
+
+  defp weight(other, model) do
+    raise ArgumentError, "route #{inspect(model)}: a target's \"weight\" must be a non-negative integer, got #{inspect(other)}"
+  end
+
+  # How long finished things are kept, in days. 0 (the default) keeps them forever.
+  defp normalize_retention(r) do
+    %{jobs_days: days(r["jobs_days"], "jobs_days"), ledger_ids_days: days(r["ledger_ids_days"], "ledger_ids_days")}
+  end
+
+  defp days(nil, _name), do: 0
+  defp days(n, _name) when is_number(n) and n >= 0, do: n
+  defp days(other, name), do: raise(ArgumentError, "retention.#{name} must be a number of days (0 = keep forever), got #{inspect(other)}")
 
   @default_retry_schedule_ms [5_000, 30_000, 120_000, 600_000, 1_800_000, 7_200_000, 21_600_000]
 

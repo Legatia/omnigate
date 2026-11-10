@@ -5,6 +5,12 @@
       "key_sha256": "<sha256 hex of the gateway key you hand to the app>",
       "budget_usd": 25.0,
       "rpm": 600,
+      "models": [
+        "claude",
+        "gpt",
+        "gemini",
+        "image"
+      ],
       "webhook_secret_env": "MY_APP_WEBHOOK_SECRET"
     }
   ],
@@ -247,5 +253,9 @@
       ],
       "max_attempts": 8
     }
+  },
+  "retention": {
+    "jobs_days": 30,
+    "ledger_ids_days": 7
   }
 }

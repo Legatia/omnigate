@@ -12,6 +12,7 @@
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
+const balance = @import("balance.zig");
 const config = @import("config.zig");
 const control = @import("control.zig");
 const quirks = @import("quirks.zig");
@@ -116,26 +117,22 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
         return respondError(request, .payment_required, "budget_exceeded", "this key has exhausted its budget");
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/models")) {
-        return respondModels(arena, request, snapshot);
+        return respondModels(arena, request, snapshot, key);
     }
 
     const endpoint: ?Endpoint = if (method == .POST) Endpoint.forPath(path) else null;
     const is_job_create = method == .POST and std.mem.eql(u8, path, "/v1/jobs");
 
-    // --- rate limit -------------------------------------------------------
-    // Only requests that start work count; polling a job does not.
-    if ((endpoint != null and endpoint.?.metered) or is_job_create) {
-        const now_ms = Io.Timestamp.now(app.io, .awake).toMilliseconds();
-        switch (app.limiter.check(app.gpa, app.io, &key_hash, key.rpm, now_ms)) {
-            .allowed => {},
-            .retry_after_s => |secs| return respondRateLimited(request, secs),
-        }
-    }
-
     // --- async media jobs: owned by the control plane ---------------------
+    // (which also applies the key's model limits to them)
     if (is_jobs or is_files) {
         if (method != .GET and method != .POST)
             return respondError(request, .method_not_allowed, "method_not_allowed", "use GET or POST");
+        // Only requests that start work count against the rate limit;
+        // polling a job does not.
+        if (is_job_create) {
+            if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(request, secs);
+        }
         const job_body: ?[]u8 = if (method == .POST)
             (try readBody(arena, request)) orelse
                 return respondError(request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB")
@@ -164,6 +161,18 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
         return respondError(request, .bad_request, "missing_model", "\"model\" must be a string");
     const route_model = try arena.dupe(u8, model_val.string);
     const is_stream = if (obj.get("stream")) |s| s == .bool and s.bool else false;
+
+    // --- model limits -------------------------------------------------------
+    // Checked before the rate limit, so a refused model costs the key nothing,
+    // and before the route lookup, so the answer does not reveal which other
+    // models exist.
+    if (!key.allows(route_model))
+        return respondError(request, .forbidden, "model_not_allowed", "this key may not use this model");
+
+    // --- rate limit ---------------------------------------------------------
+    if (ep.metered) {
+        if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(request, secs);
+    }
 
     const route = snapshot.findRoute(route_model) orelse
         return respondError(request, .not_found, "model_not_found", "no route for this model");
@@ -195,22 +204,27 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
     app.io.random(&raw_id);
     const req_id = std.fmt.bytesToHex(raw_id, .lower);
 
-    // Healthy upstreams first, in config order; ones that are cooling down
-    // after repeated failures only as a last resort.
+    // The order to try the targets in: the route's strategy picks who goes
+    // first (see balance.zig); upstreams that are cooling down after repeated
+    // failures go last whatever the strategy, as a last resort.
     const now_ms = Io.Timestamp.now(app.io, .awake).toMilliseconds();
-    var order: std.ArrayList(*const config.Target) = .empty;
-    var cooling: std.ArrayList(*const config.Target) = .empty;
-    for (route.targets) |*t| {
-        if (app.health.isCooling(app.io, t.upstream, now_ms)) {
-            try cooling.append(arena, t);
-        } else {
-            try order.append(arena, t);
-        }
+    const cooling = try arena.alloc(bool, route.targets.len);
+    for (route.targets, cooling) |*t, *c| c.* = app.health.isCooling(app.io, t.upstream, now_ms);
+
+    const strategy = balance.parseStrategy(route.strategy);
+    const counter: u64 = if (strategy == .round_robin) app.balancer.next(app.gpa, app.io, route.model) else 0;
+    var random: u64 = 0;
+    if (strategy == .weighted) {
+        var bytes: [8]u8 = undefined;
+        app.io.random(&bytes);
+        random = std.mem.readInt(u64, &bytes, .little);
     }
-    try order.appendSlice(arena, cooling.items);
+    const order = try arena.alloc(usize, route.targets.len);
+    balance.order(order, route.targets, cooling, strategy, counter, random);
 
     var tried: u32 = 0;
-    for (order.items) |t| {
+    for (order) |target_index| {
+        const t = &route.targets[target_index];
         const up = snapshot.findUpstream(t.upstream) orelse {
             try attempts.append(arena, .{ .upstream = t.upstream, .outcome = "unknown_upstream" });
             continue;
@@ -391,6 +405,16 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
             .{ .name = "x-omnigate-request-id", .value = &req_id },
         },
     });
+}
+
+/// Seconds to wait if this key is over its requests-per-minute limit, else
+/// null. Counts the request against the limit when it is allowed.
+fn rateLimited(app: *App, key_hash: *const [64]u8, key: *const config.Key) ?u32 {
+    const now_ms = Io.Timestamp.now(app.io, .awake).toMilliseconds();
+    return switch (app.limiter.check(app.gpa, app.io, key_hash, key.rpm, now_ms)) {
+        .allowed => null,
+        .retry_after_s => |secs| secs,
+    };
 }
 
 fn noteFailure(app: *App, upstream: []const u8) void {
@@ -862,10 +886,13 @@ fn respondError(request: *http.Server.Request, status: http.Status, code: []cons
     });
 }
 
-fn respondModels(arena: std.mem.Allocator, request: *http.Server.Request, snapshot: *const config.Snapshot) !void {
+/// The routes this key may use.
+fn respondModels(arena: std.mem.Allocator, request: *http.Server.Request, snapshot: *const config.Snapshot, key: *const config.Key) !void {
     const Model = struct { id: []const u8, object: []const u8 = "model", owned_by: []const u8 = "omnigate" };
     var models: std.ArrayList(Model) = .empty;
-    for (snapshot.routes) |r| try models.append(arena, .{ .id = r.model });
+    for (snapshot.routes) |r| {
+        if (key.allows(r.model)) try models.append(arena, .{ .id = r.model });
+    }
     const json = try std.json.Stringify.valueAlloc(arena, .{ .object = "list", .data = models.items }, .{});
     try request.respond(json, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
 }

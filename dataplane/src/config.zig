@@ -45,11 +45,18 @@ test "upstreamPath replaces only a leading /v1" {
 pub const Target = struct {
     upstream: []const u8,
     model: []const u8,
+    /// Share of first attempts under the `weighted` strategy. 0 means never
+    /// first, but still used as a fallback. Other strategies ignore it.
+    weight: u32 = 1,
 };
 
 pub const Route = struct {
     model: []const u8,
     targets: []const Target,
+    /// "failover" (default), "round_robin" or "weighted"; see balance.zig.
+    /// Kept as text so that a name this build does not know degrades to
+    /// failover instead of making the whole snapshot unparseable.
+    strategy: ?[]const u8 = null,
 };
 
 pub const Key = struct {
@@ -58,7 +65,58 @@ pub const Key = struct {
     blocked: bool = false,
     /// Requests per minute; 0 means unlimited.
     rpm: u32 = 0,
+    /// Route models this key may use; null means all of them.
+    models: ?[]const []const u8 = null,
+
+    pub fn allows(key: *const Key, route_model: []const u8) bool {
+        const allowed = key.models orelse return true;
+        for (allowed) |m| if (std.mem.eql(u8, m, route_model)) return true;
+        return false;
+    }
 };
+
+test "key model limits: null allows everything, a list only its members" {
+    const open: Key = .{ .key_sha256 = "h", .name = "open" };
+    try std.testing.expect(open.allows("anything"));
+
+    const limited: Key = .{ .key_sha256 = "h", .name = "limited", .models = &.{ "chat", "claude" } };
+    try std.testing.expect(limited.allows("chat"));
+    try std.testing.expect(limited.allows("claude"));
+    try std.testing.expect(!limited.allows("Chat"));
+    try std.testing.expect(!limited.allows("chat-2"));
+
+    // An empty list is a key that may use no model at all.
+    const none: Key = .{ .key_sha256 = "h", .name = "none", .models = &.{} };
+    try std.testing.expect(!none.allows("chat"));
+}
+
+test "snapshots parse with and without the newer optional fields" {
+    const gpa = std.testing.allocator;
+
+    var old = try parse(gpa,
+        \\{"version":"v1","keys":[{"key_sha256":"aa","name":"k"}],
+        \\ "upstreams":[{"name":"u","kind":"openai","base_url":"http://x","api_key_env":"K"}],
+        \\ "routes":[{"model":"m","targets":[{"upstream":"u","model":"real"}]}]}
+    );
+    defer old.deinit();
+    try std.testing.expectEqual(@as(?[]const []const u8, null), old.value.keys[0].models);
+    try std.testing.expectEqual(@as(?[]const u8, null), old.value.routes[0].strategy);
+    try std.testing.expectEqual(@as(u32, 1), old.value.routes[0].targets[0].weight);
+
+    var new = try parse(gpa,
+        \\{"version":"v2","keys":[{"key_sha256":"aa","name":"k","models":["m"]},{"key_sha256":"bb","name":"all","models":null}],
+        \\ "upstreams":[{"name":"u","kind":"openai","base_url":"http://x","api_key_env":"K"}],
+        \\ "routes":[{"model":"m","strategy":"weighted","targets":[{"upstream":"u","model":"a","weight":3},{"upstream":"u","model":"b","weight":0}]},
+        \\           {"model":"n","strategy":"something_new","targets":[]}]}
+    );
+    defer new.deinit();
+    try std.testing.expect(new.value.keys[0].allows("m") and !new.value.keys[0].allows("n"));
+    try std.testing.expect(new.value.keys[1].allows("n"));
+    try std.testing.expectEqualStrings("weighted", new.value.routes[0].strategy.?);
+    try std.testing.expectEqual(@as(u32, 3), new.value.routes[0].targets[0].weight);
+    try std.testing.expectEqual(@as(u32, 0), new.value.routes[0].targets[1].weight);
+    try std.testing.expectEqualStrings("something_new", new.value.routes[1].strategy.?);
+}
 
 pub const Snapshot = struct {
     version: []const u8,

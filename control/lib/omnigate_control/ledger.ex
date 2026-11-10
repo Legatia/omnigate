@@ -11,8 +11,15 @@ defmodule OmnigateControl.Ledger do
   acknowledgement is lost. Every event carries a unique `id`, and an event
   whose id was already recorded is skipped, so resends never double-bill.
 
-  Next steps: bound the seen-id set (it grows with the log), and replicate
-  events across control-plane nodes so budgets are enforced cluster-wide.
+  The set of seen ids lives in memory and would grow with the log, so
+  `prune_ids/1` (driven by `retention.ledger_ids_days`) drops ids recorded
+  before a cutoff. An id only matters while a data plane might still resend
+  its event, which is minutes to hours. The trade is explicit: an event resent
+  after its id was pruned is counted a second time. Totals and the log file
+  are never touched by pruning.
+
+  Next step: replicate events across control-plane nodes so budgets are
+  enforced cluster-wide.
   """
   use GenServer
   require Logger
@@ -37,6 +44,17 @@ defmodule OmnigateControl.Ledger do
   token) and uses the job id as its id, so recording a job twice is a no-op.
   """
   def record_media(%{"id" => _} = event), do: GenServer.call(__MODULE__, {:record_batch, [event], :media})
+
+  @doc "Forget dedup ids recorded before `cutoff_ms` (unix milliseconds). Returns how many were dropped."
+  def prune_ids(cutoff_ms) when is_integer(cutoff_ms), do: GenServer.call(__MODULE__, {:prune_ids, cutoff_ms}, 60_000)
+
+  @doc "Counts for monitoring: events recorded since the log began, and dedup ids currently held."
+  def stats do
+    %{
+      events: :ets.foldl(fn {_key, totals}, sum -> sum + totals.requests end, 0, @table),
+      dedup_ids: :ets.info(@seen, :size)
+    }
+  end
 
   @doc "Totals for one key hash."
   def totals(key_sha256) do
@@ -102,6 +120,11 @@ defmodule OmnigateControl.Ledger do
 
   def handle_call(:recent, _from, state), do: {:reply, state.recent, state}
 
+  def handle_call({:prune_ids, cutoff_ms}, _from, state) do
+    dropped = :ets.select_delete(@seen, [{{:_, :"$1"}, [{:<, :"$1", cutoff_ms}], [true]}])
+    {:reply, dropped, state}
+  end
+
   # Splits a batch into events to record, in order, plus duplicate/invalid counts.
   defp classify(events, kind) do
     {accepted, _ids, counts} =
@@ -164,7 +187,8 @@ defmodule OmnigateControl.Ledger do
   end
 
   defp apply_event(event) do
-    if id = event["id"], do: :ets.insert(@seen, {id})
+    # Kept with the time we recorded it, so old ids can be pruned.
+    if id = event["id"], do: :ets.insert(@seen, {id, recorded_ms(event)})
 
     key = event["key_sha256"]
     t = totals(key)
@@ -182,6 +206,15 @@ defmodule OmnigateControl.Ledger do
            cost_usd: t.cost_usd + (event["cost_usd"] || 0.0)
        }}
     )
+  end
+
+  defp recorded_ms(event) do
+    with at when is_binary(at) <- event["received_at"],
+         {:ok, dt, _offset} <- DateTime.from_iso8601(at) do
+      DateTime.to_unix(dt, :millisecond)
+    else
+      _ -> System.os_time(:millisecond)
+    end
   end
 
   defp replay(path) do

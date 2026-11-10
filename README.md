@@ -38,6 +38,8 @@ under production load.** See [Known gaps](#known-gaps).
 - **Failover** to the next target on connection errors, timeouts, 429 and 5xx, before any byte reaches the client. One retry on a fresh connection first, in case a pooled connection went stale.
 - **Timeouts.** Max wait for response headers, global or per upstream.
 - **Cooldowns.** An upstream that fails five times in a row is tried last for 30 seconds, so a dead provider costs one timeout, not one per request.
+- **Load balancing.** A route tries its targets in order by default; set `strategy` to `round_robin` to rotate the starting target, or `weighted` to pick it in proportion to each target's `weight`. The other targets remain as failover either way.
+- **Per-key model limits.** A key can be restricted to a list of models (`models`); anything else is a 403, and its model list shows only what it may use. The same list applies to media jobs.
 - **Rate limits** per key (requests per minute), answered with 429 and `Retry-After`.
 - **Budgets** per key: the control plane marks an overspent key blocked and the data plane answers 402.
 - **Usage metering** from the response stream without buffering it. If the client did not ask for the OpenAI usage chunk, the gateway asks for it anyway and hides it from the client.
@@ -51,6 +53,8 @@ under production load.** See [Known gaps](#known-gaps).
 - **Admin API.** `/admin/*` takes the same token as `Authorization: Bearer`.
 - **Never open by default.** If `OMNIGATE_ADMIN_TOKEN` is not set, a random one is generated at startup and written to the log.
 - **Guessing is slowed.** Five failed logins from one address lock that address out for a minute.
+- **Metrics.** `GET /metrics` serves Prometheus text format behind the admin token: per-key requests, errors, tokens, jobs, cost, budget and blocked state; media jobs by status; webhook deliveries by state; ledger size; config reloads; uptime.
+- **Retention.** With a `retention` section in the config, finished jobs and their locally stored files are removed after `jobs_days`, and the ledger's duplicate-detection ids after `ledger_ids_days`. Off by default: nothing is deleted unless you set it.
 - **Separate credentials.** Gateway keys, the data planes' internal token and the admin token do not work in each other's place.
 
 ### Media jobs
@@ -91,7 +95,7 @@ gateway on their own ports with state in a temp directory, runs its checks
 (failover, timeouts, streaming, translation, rate limits, budgets, an outage
 with a gateway restart, media jobs with failover, webhooks, cache, a
 control-plane restart mid-job, bucket storage) and exits non-zero if any fail.
-It currently runs 88 checks.
+It currently runs 96 checks.
 
 ### Run the pieces by hand
 
@@ -175,9 +179,10 @@ budgets live in LiteLLM's database and are not imported.
 One JSON file, hot-reloaded by the control plane every 2 s. See
 `config/omnigate.example.json` for a real-provider template.
 
-- `keys[]`: `name`, `key` (raw; hashed on load) or `key_sha256`, `budget_usd`, `rpm`, `webhook_secret` or `webhook_secret_env`.
+- `keys[]`: `name`, `key` (raw; hashed on load) or `key_sha256`, `budget_usd`, `rpm`, `models` (list of route names the key may use; absent = all), `webhook_secret` or `webhook_secret_env`.
 - `upstreams[]`: `name`, `kind` (`openai` or `anthropic`), `base_url`, `api_key_env`, `timeout_ms`, `v1_path` (only for providers whose API is not under `/v1`).
-- `routes[]`: `model`, ordered `targets[]` of `upstream`, `model`, `price_in_per_mtok`, `price_out_per_mtok`.
+- `routes[]`: `model`, `strategy` (`failover` by default, `round_robin` or `weighted`), ordered `targets[]` of `upstream`, `model`, `weight` (for `weighted`; default 1), `price_in_per_mtok`, `price_out_per_mtok`.
+- `retention`: `jobs_days`, `ledger_ids_days` (days, fractions allowed; absent or 0 = keep forever).
 - `media`: `public_base_url`, `upstreams[]` (`kind`: `replicate`, `fal`, `openai_images`, `elevenlabs`, `gemini`, `gemini_interactions`, `xai_video`), `routes[]` (`targets[].price` with `per_job_usd`, `per_output_usd`, `per_second_usd`, `per_input_char_usd`; `cache_ttl_s`; `timeout_s`), `storage` (`local` or `s3`), `webhooks` (`secret`, `retry_schedule_ms`, `max_attempts`, `allow_private`).
 
 Provider secrets are never in the file: each upstream names an environment
@@ -275,7 +280,7 @@ Where the others are ahead today, plainly:
 
 - **Provider coverage.** They speak to dozens or hundreds of providers natively. omnigate speaks two text protocols (which reaches every OpenAI-compatible provider, Gemini included) and seven media shapes. Azure, Bedrock and Vertex are not reachable.
 - **Production mileage.** They run real traffic. omnigate has passed a few dozen checks against two real providers and nothing more.
-- **Features not here yet:** load balancing across targets, response caching for text, guardrails, team and SSO management, observability integrations, realtime voice, an admin UI beyond a read-only dashboard.
+- **Features not here yet:** latency- or cost-aware routing, response caching for text, guardrails, team and SSO management, tracing and log-export integrations (there is a Prometheus endpoint), realtime voice, an admin UI beyond a read-only dashboard.
 
 ### Measured on this machine
 
@@ -329,7 +334,8 @@ Through the gateway, over TLS, with real keys:
 **Text gateway**
 
 - Rate limits and cooldowns are per data-plane process and reset on restart. Budgets are enforced after the fact, with up to one poll interval of lag, on a single control-plane node, and cannot newly block a key during a control-plane outage.
-- No load balancing, no response caching, no idle timeout once a response has started streaming.
+- Load balancing is round-robin or weighted only, with state per data-plane process; nothing is latency-aware. No response caching, no idle timeout once a response has started streaming.
+- For text endpoints the request body is now read before the rate-limit check (so that a disallowed model is a 403, not a 429), which means a key over its limit still costs one body read.
 - Translation drops what the other protocol cannot express (thinking blocks, cache control, `response_format`, penalties and similar) and rejects audio and file parts. `/v1/embeddings`, `/v1/responses` and `/v1/completions` are not translated.
 - Cached-token and reasoning-token prices are not modelled; cost is input and output tokens only.
 - Spool appends are not fsynced, so a power loss can drop the last few usage events. The spool holds at most 100,000 undelivered events.
@@ -338,7 +344,8 @@ Through the gateway, over TLS, with real keys:
 
 - A crash between a provider accepting a job and its id reaching disk, or during a synchronous provider call, resubmits that job.
 - Cost is the configured price of the target that delivered. Provider charges for failed attempts are not recorded or reconciled.
-- Jobs, the ledger's id set and stored files grow without bound; nothing is expired or deleted.
+- Retention is off unless configured. When on, it removes finished jobs, their local files and old ledger ids; it does not delete objects in a bucket (use the bucket's lifecycle rules) and does not trim the ledger file itself. A data-plane resend older than `ledger_ids_days` would be counted twice.
+- Each metrics scrape scans the whole job store; the output has been checked by tests, not by a real Prometheus server.
 - The cache is shared across gateway keys. Two identical cacheable jobs submitted at the same moment both run.
 - No per-upstream concurrency limits. Output downloads send no provider credentials. No transcoding.
 - Job requests need the control plane: during an outage `/v1/jobs` answers 503.
@@ -354,6 +361,6 @@ Through the gateway, over TLS, with real keys:
 1. Run the fal adapter against the real service; test bucket storage on Amazon S3; test with the official SDKs as clients
 2. Test ARM images and a real-domain certificate
 3. Cluster-wide budgets and rate limits across control-plane nodes
-4. Retention: expire jobs, files and ledger ids
+4. Ledger rotation, and deleting expired objects from buckets
 5. More provider shapes (Veo, Kling, Runway, BFL), then transcoding
 6. Realtime voice through a partner stack (LiveKit, Pipecat)

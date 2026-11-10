@@ -4,10 +4,10 @@ A self-hostable AI gateway in two small processes. It fronts OpenAI- and
 Anthropic-style text APIs and wraps image, video and speech providers in one
 async job API.
 
-**Status: the text gateway and the OpenAI image and ElevenLabs speech adapters
-have been checked against the real APIs (November 2026). The Replicate and fal
-adapters and bucket storage have only met mocks, and nothing has run under
-production load.** See [Known gaps](#known-gaps).
+**Status: the text gateway and the OpenAI image, ElevenLabs speech and
+Replicate adapters have been checked against the real APIs (November 2026).
+The fal adapter and bucket storage have only met mocks, and nothing has run
+under production load.** See [Known gaps](#known-gaps).
 
 ```
  apps ──▶ dataplane (Zig) ──────────▶ LLM providers (OpenAI-style, Anthropic-style)
@@ -296,12 +296,13 @@ Through the gateway, over TLS, with real keys:
 - Translation both ways: text, system prompts, streaming, tool calls, tool-result round trips, streamed tool calls, error shapes, refused sampling parameters.
 - Failover from a dead OpenAI-style upstream to Claude; ledger token totals equal to what the providers reported.
 - One media job on OpenAI's image API (`gpt-image-1-mini`): generated, re-hosted, downloaded, webhook retried and delivered.
+- Replicate (`black-forest-labs/flux-1.1-pro`): prediction created and polled to completion, the image copied off Replicate and downloaded from the gateway, webhook delivered; an unknown model and an out-of-credit model failed with Replicate's own reasons.
 - ElevenLabs text-to-speech (`eleven_flash_v2_5`): real MP3 generated, re-hosted and downloaded; an identical request served from cache; an unknown voice failed with the provider's reason.
 
 **Not verified**
 
-- Replicate: the real API accepted the key and the request and its errors were reported correctly, but the account had no credit, so no prediction ran. Polling and output download have only met the mock.
 - The fal adapter and S3 storage have only run against mocks written from public documentation; expect details to differ.
+- Replicate's `owner/name:version` form and job cancellation at a real provider.
 - Images in translated requests, long conversations, large payloads, and the official OpenAI and Anthropic SDKs as clients (the checks used plain HTTP).
 - Sustained or concurrent load against real providers.
 - Platforms other than Windows 11 and x86-64 Linux containers.
@@ -338,7 +339,7 @@ Through the gateway, over TLS, with real keys:
 
 ## Next
 
-1. Run the Replicate and fal adapters and S3 storage against the real services; test with the official SDKs as clients
+1. Run the fal adapter and S3 storage against the real services; test with the official SDKs as clients
 2. Test ARM images and a real-domain certificate
 3. Cluster-wide budgets and rate limits across control-plane nodes
 4. Retention: expire jobs, files and ledger ids

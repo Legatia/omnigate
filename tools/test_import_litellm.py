@@ -38,6 +38,10 @@ model_list:
       api_version: "2024-02-01"
   - model_name: bare
     litellm_params: {model: gpt-4o-mini}
+  - model_name: flash
+    litellm_params:
+      model: gemini/gemini-3.5-flash
+      api_key: os.environ/GEMINI_API_KEY
 
 router_settings:
   fallbacks: [{"gpt-4o": ["claude"]}, {"claude": ["missing"]}]
@@ -116,6 +120,13 @@ class Convert(unittest.TestCase):
     def test_unsupported_provider_is_reported_not_guessed(self):
         self.assertNotIn("azure-gpt", self.routes)
         self.assertTrue(any(name == "azure-gpt" for name, _ in self.report["skipped"]))
+
+    def test_gemini_uses_its_openai_compatible_path(self):
+        up = self.upstreams[self.routes["flash"][0]["upstream"]]
+        self.assertEqual(up["kind"], "openai")
+        self.assertEqual(up["base_url"], "https://generativelanguage.googleapis.com")
+        self.assertEqual(up["v1_path"], "/v1beta/openai")
+        self.assertEqual(self.routes["flash"][0]["model"], "gemini-3.5-flash")
 
     def test_bare_model_names_default_to_openai(self):
         self.assertEqual(self.routes["bare"][0], {

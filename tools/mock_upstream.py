@@ -58,12 +58,28 @@ class Flaky(Base):
         self.send_json(503, {"error": {"message": "mock overloaded", "type": "overloaded"}})
 
 
+OPENAI_ENDPOINTS = ("/chat/completions", "/completions", "/embeddings", "/responses")
+
+
 class OpenAIOk(Base):
     def do_POST(self):
         req = self.read_json()
+        # Served under /v1 and, like Gemini's compatibility layer, under
+        # /v1beta/openai. Anything else is a 404, as at a real provider.
+        path = self.path.split("?")[0]
+        if not any(path == prefix + ep for prefix in ("/v1", "/v1beta/openai") for ep in OPENAI_ENDPOINTS):
+            return self.send_json(404, {"error": {"message": f"unknown path {path}", "type": "not_found"}})
         auth = self.headers.get("authorization", "")
         if not auth.startswith("Bearer "):
             return self.send_json(401, {"error": {"message": "missing bearer token"}})
+        # The model "sig-1" behaves like Gemini 3: earlier tool calls must carry
+        # a thought signature.
+        if req.get("model") == "sig-1":
+            for message in req.get("messages", []):
+                for tool_call in message.get("tool_calls") or []:
+                    if not tool_call.get("extra_content", {}).get("google", {}).get("thought_signature"):
+                        return self.send_json(400, {"error": {"message": "Function call is missing a thought_signature in functionCall parts.",
+                                                              "type": "invalid_request_error"}})
         usage = {"prompt_tokens": 11, "completion_tokens": len(WORDS), "total_tokens": 11 + len(WORDS)}
         if not req.get("stream"):
             return self.send_json(200, {

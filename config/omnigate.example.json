@@ -9,20 +9,58 @@
     }
   ],
   "upstreams": [
-    { "name": "anthropic", "kind": "anthropic", "base_url": "https://api.anthropic.com", "api_key_env": "ANTHROPIC_API_KEY" },
-    { "name": "openai", "kind": "openai", "base_url": "https://api.openai.com", "api_key_env": "OPENAI_API_KEY" }
+    {
+      "name": "anthropic",
+      "kind": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "api_key_env": "ANTHROPIC_API_KEY"
+    },
+    {
+      "name": "openai",
+      "kind": "openai",
+      "base_url": "https://api.openai.com",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "name": "gemini",
+      "kind": "openai",
+      "base_url": "https://generativelanguage.googleapis.com",
+      "api_key_env": "GEMINI_API_KEY",
+      "v1_path": "/v1beta/openai"
+    }
   ],
   "routes": [
     {
       "model": "claude",
       "targets": [
-        { "upstream": "anthropic", "model": "claude-sonnet-5-5", "price_in_per_mtok": 2.0, "price_out_per_mtok": 10.0 }
+        {
+          "upstream": "anthropic",
+          "model": "claude-sonnet-5-5",
+          "price_in_per_mtok": 2.0,
+          "price_out_per_mtok": 10.0
+        }
       ]
     },
     {
       "model": "gpt",
       "targets": [
-        { "upstream": "openai", "model": "<openai model id>", "price_in_per_mtok": 0.0, "price_out_per_mtok": 0.0 }
+        {
+          "upstream": "openai",
+          "model": "<openai model id>",
+          "price_in_per_mtok": 0.0,
+          "price_out_per_mtok": 0.0
+        }
+      ]
+    },
+    {
+      "model": "gemini",
+      "targets": [
+        {
+          "upstream": "gemini",
+          "model": "<gemini model id>",
+          "price_in_per_mtok": 0.0,
+          "price_out_per_mtok": 0.0
+        }
       ]
     }
   ],
@@ -31,38 +69,88 @@
     "poll_interval_ms": 2000,
     "max_output_bytes": 536870912,
     "upstreams": [
-      { "name": "replicate", "kind": "replicate", "base_url": "https://api.replicate.com", "api_key_env": "REPLICATE_API_TOKEN" },
-      { "name": "fal", "kind": "fal", "base_url": "https://queue.fal.run", "api_key_env": "FAL_KEY" },
-      { "name": "openai-images", "kind": "openai_images", "base_url": "https://api.openai.com", "api_key_env": "OPENAI_API_KEY" },
-      { "name": "elevenlabs", "kind": "elevenlabs", "base_url": "https://api.elevenlabs.io", "api_key_env": "ELEVENLABS_API_KEY" }
+      {
+        "name": "replicate",
+        "kind": "replicate",
+        "base_url": "https://api.replicate.com",
+        "api_key_env": "REPLICATE_API_TOKEN"
+      },
+      {
+        "name": "fal",
+        "kind": "fal",
+        "base_url": "https://queue.fal.run",
+        "api_key_env": "FAL_KEY"
+      },
+      {
+        "name": "openai-images",
+        "kind": "openai_images",
+        "base_url": "https://api.openai.com",
+        "api_key_env": "OPENAI_API_KEY"
+      },
+      {
+        "name": "elevenlabs",
+        "kind": "elevenlabs",
+        "base_url": "https://api.elevenlabs.io",
+        "api_key_env": "ELEVENLABS_API_KEY"
+      }
     ],
     "routes": [
       {
         "model": "image",
         "timeout_s": 300,
         "targets": [
-          { "upstream": "fal", "model": "<fal model id, e.g. owner/model>", "price": { "per_output_usd": 0.0 } },
-          { "upstream": "replicate", "model": "<owner/name or owner/name:version>", "price": { "per_output_usd": 0.0 } }
+          {
+            "upstream": "fal",
+            "model": "<fal model id, e.g. owner/model>",
+            "price": {
+              "per_output_usd": 0.0
+            }
+          },
+          {
+            "upstream": "replicate",
+            "model": "<owner/name or owner/name:version>",
+            "price": {
+              "per_output_usd": 0.0
+            }
+          }
         ]
       },
       {
         "model": "video",
         "timeout_s": 900,
         "targets": [
-          { "upstream": "fal", "model": "<fal video model id>", "price": { "per_second_usd": 0.0 } }
+          {
+            "upstream": "fal",
+            "model": "<fal video model id>",
+            "price": {
+              "per_second_usd": 0.0
+            }
+          }
         ]
       },
       {
         "model": "image-sync",
         "targets": [
-          { "upstream": "openai-images", "model": "<openai image model id>", "price": { "per_output_usd": 0.0 } }
+          {
+            "upstream": "openai-images",
+            "model": "<openai image model id>",
+            "price": {
+              "per_output_usd": 0.0
+            }
+          }
         ]
       },
       {
         "model": "speech",
         "cache_ttl_s": 2592000,
         "targets": [
-          { "upstream": "elevenlabs", "model": "<elevenlabs model_id>", "price": { "per_input_char_usd": 0.0 } }
+          {
+            "upstream": "elevenlabs",
+            "model": "<elevenlabs model_id>",
+            "price": {
+              "per_input_char_usd": 0.0
+            }
+          }
         ]
       }
     ],
@@ -79,7 +167,15 @@
     "webhooks": {
       "secret_env": "OMNIGATE_WEBHOOK_SECRET",
       "allow_private": false,
-      "retry_schedule_ms": [5000, 30000, 120000, 600000, 1800000, 7200000, 21600000],
+      "retry_schedule_ms": [
+        5000,
+        30000,
+        120000,
+        600000,
+        1800000,
+        7200000,
+        21600000
+      ],
       "max_attempts": 8
     }
   }

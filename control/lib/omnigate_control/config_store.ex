@@ -104,7 +104,9 @@ defmodule OmnigateControl.ConfigStore do
             base_url: Map.fetch!(u, "base_url"),
             api_key_env: Map.fetch!(u, "api_key_env"),
             # Max wait for response headers; 0 = the data plane's default.
-            timeout_ms: to_int(u["timeout_ms"], 0)
+            timeout_ms: to_int(u["timeout_ms"], 0),
+            # Where the provider serves the API when not under /v1 (nil = /v1).
+            v1_path: u["v1_path"]
           }
         end),
       routes:

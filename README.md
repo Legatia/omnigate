@@ -32,7 +32,8 @@ under production load.** See [Known gaps](#known-gaps).
 
 - `POST /v1/chat/completions` and `POST /v1/messages`, streaming and non-streaming. Also `/v1/embeddings`, `/v1/responses`, `/v1/completions` and `/v1/messages/count_tokens` as same-protocol passthrough. `GET /v1/models`, `GET /healthz`.
 - **Protocol translation.** An OpenAI client can use a route served by an Anthropic upstream and the reverse, including streaming, tools and images. A route can mix both kinds as failover targets.
-- **Parameter mismatches handled.** Current Claude models and some OpenAI models refuse `temperature` and `top_p`. When a translated request is refused for that reason, the gateway retries without them and remembers it for that model.
+- **OpenAI-compatible providers at any path.** Gemini, Groq, Mistral, OpenRouter and others speak the OpenAI protocol; an upstream's `v1_path` covers the ones that do not serve it under `/v1` (Gemini uses `/v1beta/openai`).
+- **Provider quirks handled for translated requests.** Current Claude models refuse `temperature` and `top_p`; Gemini 3 and later demand a "thought signature" on earlier tool calls. A client speaking the other protocol cannot know either rule, so when a translated request is refused for one of them the gateway retries with the fix and remembers it for that model.
 - **Failover** to the next target on connection errors, timeouts, 429 and 5xx, before any byte reaches the client. One retry on a fresh connection first, in case a pooled connection went stale.
 - **Timeouts.** Max wait for response headers, global or per upstream.
 - **Cooldowns.** An upstream that fails five times in a row is tried last for 30 seconds, so a dead provider costs one timeout, not one per request.
@@ -89,7 +90,7 @@ gateway on their own ports with state in a temp directory, runs its checks
 (failover, timeouts, streaming, translation, rate limits, budgets, an outage
 with a gateway restart, media jobs with failover, webhooks, cache, a
 control-plane restart mid-job, bucket storage) and exits non-zero if any fail.
-It currently runs 79 checks.
+It currently runs 81 checks.
 
 ### Run the pieces by hand
 
@@ -160,10 +161,12 @@ python tools/import_litellm.py litellm.yaml -o config/omnigate.json --generate-k
 ```
 
 Converts `model_list` to routes (entries sharing a `model_name` become ordered
-failover targets), `fallbacks`, per-token prices and timeouts. Literal API keys
+failover targets), `fallbacks`, per-token prices and timeouts. OpenAI,
+Anthropic, Gemini, Groq, Mistral, DeepSeek, OpenRouter, Together, Fireworks,
+xAI and Perplexity entries are mapped. Literal API keys
 in the YAML are never copied: the tool prints the environment variable to set
-instead. Providers that are not OpenAI- or Anthropic-shaped at a `/v1` path
-(Azure, Bedrock, Vertex and so on) are listed as skipped. Virtual keys and
+instead. Providers with their own API shape (Azure, Bedrock, Vertex and so
+on) are listed as skipped. Virtual keys and
 budgets live in LiteLLM's database and are not imported.
 
 ## Configuration
@@ -172,7 +175,7 @@ One JSON file, hot-reloaded by the control plane every 2 s. See
 `config/omnigate.example.json` for a real-provider template.
 
 - `keys[]`: `name`, `key` (raw; hashed on load) or `key_sha256`, `budget_usd`, `rpm`, `webhook_secret` or `webhook_secret_env`.
-- `upstreams[]`: `name`, `kind` (`openai` or `anthropic`), `base_url`, `api_key_env`, `timeout_ms`.
+- `upstreams[]`: `name`, `kind` (`openai` or `anthropic`), `base_url`, `api_key_env`, `timeout_ms`, `v1_path` (only for providers whose API is not under `/v1`).
 - `routes[]`: `model`, ordered `targets[]` of `upstream`, `model`, `price_in_per_mtok`, `price_out_per_mtok`.
 - `media`: `public_base_url`, `upstreams[]` (`kind`: `replicate`, `fal`, `openai_images`, `elevenlabs`), `routes[]` (`targets[].price` with `per_job_usd`, `per_output_usd`, `per_second_usd`, `per_input_char_usd`; `cache_ttl_s`; `timeout_s`), `storage` (`local` or `s3`), `webhooks` (`secret`, `retry_schedule_ms`, `max_attempts`, `allow_private`).
 
@@ -269,7 +272,7 @@ on a row.
 
 Where the others are ahead today, plainly:
 
-- **Provider coverage.** They speak to dozens or hundreds of providers. omnigate speaks two text protocols and four media shapes.
+- **Provider coverage.** They speak to dozens or hundreds of providers natively. omnigate speaks two text protocols (which reaches every OpenAI-compatible provider, Gemini included) and four media shapes. Azure, Bedrock and Vertex are not reachable.
 - **Production mileage.** They run real traffic. omnigate has passed a few dozen checks against two real providers and nothing more.
 - **Features not here yet:** load balancing across targets, response caching for text, guardrails, team and SSO management, observability integrations, realtime voice, an admin UI beyond a read-only dashboard.
 
@@ -294,6 +297,7 @@ Through the gateway, over TLS, with real keys:
 - OpenAI: chat completions (`gpt-4o-mini`, `gpt-5.4-mini`), streaming, embeddings, the Responses API, provider errors.
 - Anthropic: messages (`claude-haiku-5-5`, `claude-opus-5-5` with thinking on), streaming, token counting, provider errors.
 - Translation both ways: text, system prompts, streaming, tool calls, tool-result round trips, streamed tool calls, error shapes, refused sampling parameters.
+- Gemini (`gemini-3.5-flash-lite`, `gemini-embedding-001`) through Google's OpenAI-compatible endpoint: chat, streaming, tool calls and round trips, embeddings, provider errors, failover to it, metering; and the same from an Anthropic-style client, translated.
 - Failover from a dead OpenAI-style upstream to Claude; ledger token totals equal to what the providers reported.
 - One media job on OpenAI's image API (`gpt-image-1-mini`): generated, re-hosted, downloaded, webhook retried and delivered.
 - Replicate (`black-forest-labs/flux-1.1-pro`): prediction created and polled to completion, the image copied off Replicate and downloaded from the gateway, webhook delivered; an unknown model and an out-of-credit model failed with Replicate's own reasons.

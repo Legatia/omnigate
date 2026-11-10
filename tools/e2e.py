@@ -234,11 +234,15 @@ def text_config():
             {"name": "mock-ok", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY"},
             {"name": "mock-anthropic", "kind": "anthropic", "base_url": "http://127.0.0.1:9003", "api_key_env": "MOCK_API_KEY"},
             {"name": "mock-slow", "kind": "openai", "base_url": "http://127.0.0.1:9004", "api_key_env": "MOCK_API_KEY", "timeout_ms": 500},
+            # A provider whose OpenAI-compatible API is not under /v1 (Gemini's layout).
+            {"name": "mock-compat", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY", "v1_path": "/v1beta/openai"},
         ],
         "routes": [
             {"model": "chat", "targets": [dict(upstream="mock-flaky", model="flaky-1", **price),
                                           dict(upstream="mock-ok", model="ok-1", **price)]},
             {"model": "direct", "targets": [dict(upstream="mock-ok", model="ok-1", **price)]},
+            {"model": "compat", "targets": [dict(upstream="mock-compat", model="ok-1", **price)]},
+            {"model": "signed", "targets": [dict(upstream="mock-ok", model="sig-1", **price)]},
             {"model": "claude", "targets": [dict(upstream="mock-anthropic", model="mock-claude", **price)]},
             {"model": "slow", "targets": [dict(upstream="mock-slow", model="slow-1", **price),
                                           dict(upstream="mock-ok", model="ok-1", **price)]},
@@ -426,6 +430,10 @@ def text_checks(stack):
     check("answer is intact and has a request id",
           body.get("choices", [{}])[0].get("message", {}).get("content") == MOCK_TEXT
           and len(headers.get("x-omnigate-request-id", "")) == 32, body)
+    status, headers, body = chat("compat")
+    main_calls += 1
+    check("an upstream whose API is not under /v1 is reached at its own path (v1_path)",
+          status == 200 and headers.get("x-omnigate-upstream") == "mock-compat", (status, body))
     t0 = time.time()
     status, headers, _ = chat("slow")
     main_calls += 1
@@ -482,6 +490,13 @@ def text_checks(stack):
     main_calls += 1
     check("... but a same-protocol client gets the provider's own error, untouched",
           status == 400 and body.get("type") == "error", (status, body))
+    history = [{"role": "user", "content": "weather?"},
+               {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}]},
+               {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "21C"}]}]
+    status, _, body = jcall("POST", GATEWAY + "/v1/messages", key=KEY_MAIN, body=dict(msg, model="signed", messages=history))
+    main_calls += 1
+    check("a model that demands thought signatures on tool calls gets placeholders and answers",
+          status == 200 and body.get("content", [{}])[0].get("text") == MOCK_TEXT, (status, body))
     amsg = dict(msg, model="direct")
     status, headers, body = jcall("POST", GATEWAY + "/v1/messages", key=KEY_MAIN, body=amsg)
     main_calls += 1

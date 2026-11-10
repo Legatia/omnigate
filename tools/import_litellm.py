@@ -43,11 +43,17 @@ PROVIDERS = {
     "together_ai": ("openai", "https://api.together.xyz", "TOGETHERAI_API_KEY"),
     "fireworks_ai": ("openai", "https://api.fireworks.ai/inference", "FIREWORKS_API_KEY"),
     "xai": ("openai", "https://api.x.ai", "XAI_API_KEY"),
+    "gemini": ("openai", "https://generativelanguage.googleapis.com", "GEMINI_API_KEY"),
+    "perplexity": ("openai", "https://api.perplexity.ai", "PERPLEXITYAI_API_KEY"),
     # OpenAI-compatible servers the user points at with api_base.
     "hosted_vllm": ("openai", None, None),
     "ollama": ("openai", "http://127.0.0.1:11434", None),
     "lm_studio": ("openai", "http://127.0.0.1:1234", None),
 }
+
+
+# Providers whose OpenAI-compatible API is not served under /v1.
+V1_PATHS = {"gemini": "/v1beta/openai", "perplexity": ""}
 
 
 # --------------------------------------------------------------------------
@@ -293,6 +299,8 @@ def convert(doc):
             while any(u["name"] == up_name for u in upstreams.values()):
                 up_name, n = f"{base_name}-{n}", n + 1
             up = {"name": up_name, "kind": kind, "base_url": base_url, "api_key_env": key_env}
+            if provider in V1_PATHS and not api_base:
+                up["v1_path"] = V1_PATHS[provider]
             if timeout_ms:
                 up["timeout_ms"] = timeout_ms
             upstreams[ident] = up

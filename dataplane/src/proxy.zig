@@ -262,6 +262,10 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
             if (try quirks.stripSampling(arena, out_body)) |stripped| out_body = stripped;
             mode.translate.sampling_stripped = true;
         }
+        if (mode == .translate and app.quirks.needsThoughtSignature(app.io, up.name, t.model)) {
+            if (try quirks.addThoughtSignatures(arena, out_body)) |signed| out_body = signed;
+            mode.translate.signatures_added = true;
+        }
 
         tried += 1;
         var committed = false;
@@ -278,6 +282,19 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
                     if (try quirks.stripSampling(arena, out_body)) |stripped| {
                         log.info("{s}/{s} rejects sampling parameters; retrying without them", .{ up.name, t.model });
                         out_body = stripped;
+                    }
+                    tries = 0;
+                    continue;
+                }
+                if (r == .add_thought_signature) {
+                    // The model wants a signature on earlier tool calls that the
+                    // client's protocol cannot carry. Remember it and resend
+                    // with the placeholder the provider documents for this.
+                    app.quirks.noteNeedsThoughtSignature(app.gpa, app.io, up.name, t.model);
+                    mode.translate.signatures_added = true;
+                    if (try quirks.addThoughtSignatures(arena, out_body)) |signed| {
+                        log.info("{s}/{s} requires thought signatures on tool calls; retrying with placeholders", .{ up.name, t.model });
+                        out_body = signed;
                     }
                     tries = 0;
                     continue;
@@ -324,8 +341,8 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
                 log.warn("upstream {s} returned {d}, failing over", .{ up.name, @backingInt(status) });
                 noteFailure(app, up.name);
             },
-            // Handled inside the loop above; it never escapes it.
-            .drop_sampling => unreachable,
+            // Handled inside the loop above; they never escape it.
+            .drop_sampling, .add_thought_signature => unreachable,
             .done => |status| {
                 app.health.recordSuccess(app.io, up.name);
                 try attempts.append(arena, .{ .upstream = up.name, .outcome = "ok" });
@@ -468,6 +485,9 @@ const ForwardResult = union(enum) {
     /// A translated request was refused (400) because of a sampling
     /// parameter. Nothing was sent to the client; retry without them.
     drop_sampling,
+    /// A translated request was refused (400) for lacking thought signatures
+    /// on tool calls. Nothing was sent to the client; retry with placeholders.
+    add_thought_signature,
 };
 
 fn isRetryable(status: http.Status) bool {
@@ -560,6 +580,8 @@ const Translation = struct {
     include_usage: bool,
     /// Sampling parameters have already been removed from the request.
     sampling_stripped: bool = false,
+    /// Placeholder thought signatures have already been added to the request.
+    signatures_added: bool = false,
 };
 
 /// What to do with the upstream's response body on its way to the client.
@@ -600,7 +622,7 @@ fn forward(
     attempt_no: u32,
 ) !ForwardResult {
     const base = std.mem.trimEnd(u8, up.base_url, "/");
-    const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, path });
+    const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, try config.upstreamPath(arena, up.v1_path, path) });
     const uri = try std.Uri.parse(url);
     const secret = app.env.get(up.api_key_env) orelse "";
 
@@ -673,6 +695,8 @@ fn forward(
             else => |e| return e,
         };
         if (@backingInt(status) == 400 and !x.sampling_stripped and quirks.mentionsSampling(raw)) return .drop_sampling;
+        if (@backingInt(status) == 400 and !x.signatures_added and x.dir == .anthropic_to_openai and
+            quirks.mentionsThoughtSignature(raw)) return .add_thought_signature;
         usage.feed(raw);
         const now_s = @divTrunc(Io.Timestamp.now(app.io, .real).toMilliseconds(), 1000);
         const converted = translate.translateResponseAt(arena, x.dir, @backingInt(status), raw, x.route_model, now_s) catch |err| switch (err) {

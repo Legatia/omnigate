@@ -16,7 +16,31 @@ pub const Upstream = struct {
     api_key_env: []const u8,
     /// Max time to wait for response headers; 0 uses the gateway default.
     timeout_ms: u32 = 0,
+    /// Where this provider serves the API if not under `/v1`: the leading
+    /// `/v1` of the client's path is replaced by this. Gemini's
+    /// OpenAI-compatible endpoint, for example, is `/v1beta/openai`.
+    v1_path: ?[]const u8 = null,
 };
+
+/// The client's path as an upstream spells it.
+pub fn upstreamPath(arena: std.mem.Allocator, v1_path: ?[]const u8, path: []const u8) ![]const u8 {
+    const prefix = v1_path orelse return path;
+    if (!std.mem.startsWith(u8, path, "/v1/")) return path;
+    return std.fmt.allocPrint(arena, "{s}{s}", .{ std.mem.trimEnd(u8, prefix, "/"), path["/v1".len..] });
+}
+
+test "upstreamPath replaces only a leading /v1" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings("/v1/chat/completions", try upstreamPath(arena, null, "/v1/chat/completions"));
+    try std.testing.expectEqualStrings("/v1beta/openai/chat/completions", try upstreamPath(arena, "/v1beta/openai", "/v1/chat/completions"));
+    try std.testing.expectEqualStrings("/v1beta/openai/embeddings", try upstreamPath(arena, "/v1beta/openai/", "/v1/embeddings"));
+    // A provider with the API at its root.
+    try std.testing.expectEqualStrings("/chat/completions", try upstreamPath(arena, "", "/v1/chat/completions"));
+    try std.testing.expectEqualStrings("/healthz", try upstreamPath(arena, "/x", "/healthz"));
+}
 
 pub const Target = struct {
     upstream: []const u8,

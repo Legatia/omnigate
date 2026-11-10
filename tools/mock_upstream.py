@@ -3,6 +3,7 @@
   :9001  OpenAI-shaped, always answers 503   (forces failover)
   :9002  OpenAI-shaped, works (JSON and SSE)
   :9003  Anthropic-shaped, works (JSON and SSE)
+  :9004  OpenAI-shaped, works but waits 3 s before answering (forces a timeout)
 
 Run:  python tools/mock_upstream.py
 """
@@ -106,12 +107,18 @@ class AnthropicOk(Base):
         self.end_sse()
 
 
+class Slow(OpenAIOk):
+    def do_POST(self):
+        time.sleep(3)
+        super().do_POST()
+
+
 def serve(port, handler):
     ThreadingHTTPServer(("127.0.0.1", port), handler).serve_forever()
 
 
 if __name__ == "__main__":
-    for port, handler in [(9001, Flaky), (9002, OpenAIOk), (9003, AnthropicOk)]:
+    for port, handler in [(9001, Flaky), (9002, OpenAIOk), (9003, AnthropicOk), (9004, Slow)]:
         threading.Thread(target=serve, args=(port, handler), daemon=True).start()
-    print("mock upstreams on :9001 (503), :9002 (openai), :9003 (anthropic)", flush=True)
+    print("mock upstreams on :9001 (503), :9002 (openai), :9003 (anthropic), :9004 (slow openai)", flush=True)
     threading.Event().wait()

@@ -1,26 +1,213 @@
 {
   "keys": [
-    { "name": "dev", "key": "og-dev-key", "budget_usd": 0.01 },
-    { "name": "unlimited", "key": "og-unlimited-key" }
+    {
+      "name": "dev",
+      "key": "og-dev-key",
+      "budget_usd": 0.01
+    },
+    {
+      "name": "unlimited",
+      "key": "og-unlimited-key"
+    },
+    {
+      "name": "ratelimited",
+      "key": "og-ratelimited-key",
+      "rpm": 5
+    }
   ],
   "upstreams": [
-    { "name": "mock-flaky", "kind": "openai", "base_url": "http://127.0.0.1:9001", "api_key_env": "MOCK_API_KEY" },
-    { "name": "mock-ok", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY" },
-    { "name": "mock-anthropic", "kind": "anthropic", "base_url": "http://127.0.0.1:9003", "api_key_env": "MOCK_API_KEY" }
+    {
+      "name": "mock-flaky",
+      "kind": "openai",
+      "base_url": "http://127.0.0.1:9001",
+      "api_key_env": "MOCK_API_KEY"
+    },
+    {
+      "name": "mock-ok",
+      "kind": "openai",
+      "base_url": "http://127.0.0.1:9002",
+      "api_key_env": "MOCK_API_KEY"
+    },
+    {
+      "name": "mock-anthropic",
+      "kind": "anthropic",
+      "base_url": "http://127.0.0.1:9003",
+      "api_key_env": "MOCK_API_KEY"
+    },
+    {
+      "name": "mock-slow",
+      "kind": "openai",
+      "base_url": "http://127.0.0.1:9004",
+      "api_key_env": "MOCK_API_KEY",
+      "timeout_ms": 1000
+    }
   ],
   "routes": [
     {
       "model": "demo-chat",
       "targets": [
-        { "upstream": "mock-flaky", "model": "flaky-1", "price_in_per_mtok": 100.0, "price_out_per_mtok": 300.0 },
-        { "upstream": "mock-ok", "model": "ok-1", "price_in_per_mtok": 100.0, "price_out_per_mtok": 300.0 }
+        {
+          "upstream": "mock-flaky",
+          "model": "flaky-1",
+          "price_in_per_mtok": 100.0,
+          "price_out_per_mtok": 300.0
+        },
+        {
+          "upstream": "mock-ok",
+          "model": "ok-1",
+          "price_in_per_mtok": 100.0,
+          "price_out_per_mtok": 300.0
+        }
       ]
     },
     {
       "model": "demo-claude",
       "targets": [
-        { "upstream": "mock-anthropic", "model": "mock-claude", "price_in_per_mtok": 100.0, "price_out_per_mtok": 300.0 }
+        {
+          "upstream": "mock-anthropic",
+          "model": "mock-claude",
+          "price_in_per_mtok": 100.0,
+          "price_out_per_mtok": 300.0
+        }
+      ]
+    },
+    {
+      "model": "demo-direct",
+      "targets": [
+        {
+          "upstream": "mock-ok",
+          "model": "ok-1",
+          "price_in_per_mtok": 100.0,
+          "price_out_per_mtok": 300.0
+        }
+      ]
+    },
+    {
+      "model": "demo-slow",
+      "targets": [
+        {
+          "upstream": "mock-slow",
+          "model": "slow-1",
+          "price_in_per_mtok": 100.0,
+          "price_out_per_mtok": 300.0
+        },
+        {
+          "upstream": "mock-ok",
+          "model": "ok-1",
+          "price_in_per_mtok": 100.0,
+          "price_out_per_mtok": 300.0
+        }
       ]
     }
-  ]
+  ],
+  "media": {
+    "public_base_url": "http://127.0.0.1:8080",
+    "poll_interval_ms": 500,
+    "upstreams": [
+      {
+        "name": "mock-replicate-broken",
+        "kind": "replicate",
+        "base_url": "http://127.0.0.1:9102",
+        "api_key_env": "MOCK_API_KEY"
+      },
+      {
+        "name": "mock-replicate",
+        "kind": "replicate",
+        "base_url": "http://127.0.0.1:9101",
+        "api_key_env": "MOCK_API_KEY"
+      },
+      {
+        "name": "mock-fal",
+        "kind": "fal",
+        "base_url": "http://127.0.0.1:9103",
+        "api_key_env": "MOCK_API_KEY"
+      },
+      {
+        "name": "mock-openai-images",
+        "kind": "openai_images",
+        "base_url": "http://127.0.0.1:9104",
+        "api_key_env": "MOCK_API_KEY"
+      },
+      {
+        "name": "mock-elevenlabs",
+        "kind": "elevenlabs",
+        "base_url": "http://127.0.0.1:9105",
+        "api_key_env": "MOCK_API_KEY"
+      }
+    ],
+    "routes": [
+      {
+        "model": "demo-image",
+        "targets": [
+          {
+            "upstream": "mock-replicate-broken",
+            "model": "mock/broken-image",
+            "price": {
+              "per_output_usd": 0.004
+            }
+          },
+          {
+            "upstream": "mock-replicate",
+            "model": "mock/image",
+            "price": {
+              "per_output_usd": 0.003
+            }
+          }
+        ]
+      },
+      {
+        "model": "demo-video",
+        "timeout_s": 120,
+        "targets": [
+          {
+            "upstream": "mock-fal",
+            "model": "mock/video/text-to-video",
+            "price": {
+              "per_second_usd": 0.1
+            }
+          }
+        ]
+      },
+      {
+        "model": "demo-image-sync",
+        "targets": [
+          {
+            "upstream": "mock-openai-images",
+            "model": "mock-image-1",
+            "price": {
+              "per_output_usd": 0.05
+            }
+          }
+        ]
+      },
+      {
+        "model": "demo-tts",
+        "cache_ttl_s": 86400,
+        "targets": [
+          {
+            "upstream": "mock-elevenlabs",
+            "model": "mock_multilingual_v2",
+            "price": {
+              "per_input_char_usd": 3e-05
+            }
+          }
+        ]
+      }
+    ],
+    "storage": {
+      "kind": "local",
+      "url_ttl_s": 3600
+    },
+    "webhooks": {
+      "secret": "whsec_b21uaWdhdGUtZGV2LXdlYmhvb2stc2VjcmV0LTAwMDE=",
+      "allow_private": true,
+      "retry_schedule_ms": [
+        1000,
+        2000,
+        5000,
+        10000
+      ],
+      "max_attempts": 5
+    }
+  }
 }

@@ -7,6 +7,11 @@ defmodule OmnigateControl.Application do
     children = [
       {OmnigateControl.ConfigStore, path: config_path()},
       {OmnigateControl.Ledger, path: ledger_path()},
+      {OmnigateControl.Jobs.Store, path: jobs_path()},
+      {Task.Supervisor, name: OmnigateControl.Jobs.TaskSup},
+      OmnigateControl.Webhooks,
+      # One-shot: continue jobs and webhooks left unfinished by the last run.
+      Supervisor.child_spec({Task, &OmnigateControl.Jobs.resume_all/0}, id: :jobs_resume, restart: :temporary),
       {Bandit, plug: OmnigateControl.Router, ip: {127, 0, 0, 1}, port: port()}
     ]
 
@@ -22,6 +27,12 @@ defmodule OmnigateControl.Application do
     System.get_env("OMNIGATE_LEDGER") ||
       Application.get_env(:omnigate_control, :ledger_path) ||
       Path.expand("data/ledger.jsonl", File.cwd!())
+  end
+
+  defp jobs_path do
+    System.get_env("OMNIGATE_JOBS") ||
+      Application.get_env(:omnigate_control, :jobs_path) ||
+      Path.expand("data/jobs.jsonl", File.cwd!())
   end
 
   defp port do

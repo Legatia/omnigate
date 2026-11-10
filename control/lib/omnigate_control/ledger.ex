@@ -29,7 +29,14 @@ defmodule OmnigateControl.Ledger do
   Returns `{:ok, %{accepted: n, duplicates: n, invalid: n}}` once every
   accepted event is on disk.
   """
-  def record_batch(events) when is_list(events), do: GenServer.call(__MODULE__, {:record_batch, events})
+  def record_batch(events) when is_list(events), do: GenServer.call(__MODULE__, {:record_batch, events, :text})
+
+  @doc """
+  Record the cost of one finished media job. The event carries its own
+  `cost_usd` (jobs are priced per output, second or character, not per
+  token) and uses the job id as its id, so recording a job twice is a no-op.
+  """
+  def record_media(%{"id" => _} = event), do: GenServer.call(__MODULE__, {:record_batch, [event], :media})
 
   @doc "Totals for one key hash."
   def totals(key_sha256) do
@@ -79,8 +86,8 @@ defmodule OmnigateControl.Ledger do
   end
 
   @impl true
-  def handle_call({:record_batch, events}, _from, state) do
-    {accepted, counts} = classify(events)
+  def handle_call({:record_batch, events, kind}, _from, state) do
+    {accepted, counts} = classify(events, kind)
 
     if accepted != [] do
       # Write-ahead: the whole batch is on disk before totals change or we ack.
@@ -96,7 +103,7 @@ defmodule OmnigateControl.Ledger do
   def handle_call(:recent, _from, state), do: {:reply, state.recent, state}
 
   # Splits a batch into events to record, in order, plus duplicate/invalid counts.
-  defp classify(events) do
+  defp classify(events, kind) do
     {accepted, _ids, counts} =
       Enum.reduce(events, {[], MapSet.new(), %{duplicates: 0, invalid: 0}}, fn event, {acc, ids, counts} ->
         id = is_map(event) && event["id"]
@@ -110,14 +117,25 @@ defmodule OmnigateControl.Ledger do
 
           true ->
             ids = if id, do: MapSet.put(ids, id), else: ids
-            {[enrich(event) | acc], ids, counts}
+            {[enrich(event, kind) | acc], ids, counts}
         end
       end)
 
     {Enum.reverse(accepted), counts}
   end
 
-  defp enrich(usage) do
+  # Media job events are priced by the job runner; only timestamps are added.
+  defp enrich(event, :media) do
+    cost = if is_number(event["cost_usd"]) and event["cost_usd"] >= 0, do: event["cost_usd"] * 1.0, else: 0.0
+
+    event
+    |> Map.merge(%{"kind" => "media", "cost_usd" => cost})
+    |> stamp()
+  end
+
+  defp enrich(usage, :text) do
+    # Only the control plane may mark an event as media.
+    usage = Map.delete(usage, "kind")
     input = usage["input_tokens"] || 0
     output = usage["output_tokens"] || 0
 
@@ -127,16 +145,19 @@ defmodule OmnigateControl.Ledger do
         up -> cost(input, output, OmnigateControl.ConfigStore.price(usage["route_model"], up, usage["target_model"]))
       end
 
-    # `ts` is when the request finished on the data plane, not when the event
-    # reached us: events can arrive late after an outage.
+    usage |> Map.put("cost_usd", cost) |> stamp()
+  end
+
+  # `ts` is when the request finished on the data plane, not when the event
+  # reached us: events can arrive late after an outage.
+  defp stamp(event) do
     ts =
-      case usage["ts_ms"] do
+      case event["ts_ms"] do
         ms when is_integer(ms) -> DateTime.from_unix!(ms, :millisecond)
         _ -> DateTime.utc_now()
       end
 
-    Map.merge(usage, %{
-      "cost_usd" => cost,
+    Map.merge(event, %{
       "ts" => DateTime.to_iso8601(ts),
       "received_at" => DateTime.utc_now() |> DateTime.to_iso8601()
     })
@@ -157,6 +178,7 @@ defmodule OmnigateControl.Ledger do
            errors: t.errors + if(event["status"] >= 400, do: 1, else: 0),
            input_tokens: t.input_tokens + (event["input_tokens"] || 0),
            output_tokens: t.output_tokens + (event["output_tokens"] || 0),
+           jobs: t.jobs + if(event["kind"] == "media", do: 1, else: 0),
            cost_usd: t.cost_usd + (event["cost_usd"] || 0.0)
        }}
     )
@@ -186,5 +208,5 @@ defmodule OmnigateControl.Ledger do
   end
 
   defp empty_totals,
-    do: %{requests: 0, errors: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0.0}
+    do: %{requests: 0, errors: 0, input_tokens: 0, output_tokens: 0, jobs: 0, cost_usd: 0.0}
 end

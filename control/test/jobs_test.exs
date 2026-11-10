@@ -508,8 +508,9 @@ defmodule OmnigateControl.JobsTest do
       assert {200, %{"status" => "succeeded"}} = call(:post, "/internal/v1/jobs/#{created["id"]}/cancel", nil, internal()) |> json()
       assert {404, _} = call(:post, "/internal/v1/jobs/#{created["id"]}/cancel", nil, internal(@other)) |> json()
 
-      # The dashboard lists the job.
-      assert {200, html, _} = call(:get, "/")
+      # The dashboard lists the job (to a signed-in operator only).
+      assert {302, _, _} = call(:get, "/")
+      assert {200, html, _} = call(:get, "/", nil, [{"authorization", "Bearer test-admin-token-0123456789"}])
       assert html =~ created["id"]
     end
 

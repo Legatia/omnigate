@@ -206,6 +206,14 @@ defmodule OmnigateControl.ConfigStore do
     }
   end
 
+  defp normalize_storage(s) do
+    %{
+      kind: "local",
+      dir: s["dir"] || Application.get_env(:omnigate_control, :media_dir) || Path.expand("data/media", File.cwd!()),
+      url_ttl_s: to_int(s["url_ttl_s"], 3_600)
+    }
+  end
+
   # "outputs" and "/outputs/" both mean the key prefix "outputs/".
   defp normalize_prefix(nil), do: ""
 
@@ -214,14 +222,6 @@ defmodule OmnigateControl.ConfigStore do
       "" -> ""
       trimmed -> trimmed <> "/"
     end
-  end
-
-  defp normalize_storage(s) do
-    %{
-      kind: "local",
-      dir: s["dir"] || Application.get_env(:omnigate_control, :media_dir) || Path.expand("data/media", File.cwd!()),
-      url_ttl_s: to_int(s["url_ttl_s"], 3_600)
-    }
   end
 
   # A secret given inline (`name`) or as the name of an env var (`name_env`).

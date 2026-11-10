@@ -7,19 +7,28 @@ defmodule OmnigateControl.Router do
     * `/internal/v1/jobs...`, `/internal/v1/files/...` — the media job API. Data
       planes authenticate the gateway key and forward `/v1/jobs*` and
       `/v1/files*` here, naming the key in `x-omnigate-key-sha256`.
-    * `GET  /admin/usage`     — per-key totals as JSON
-    * `GET  /`                — minimal dashboard (LiveView comes later)
+    * `GET  /admin/usage`     — per-key totals as JSON (admin token or session)
+    * `GET  /`                — dashboard (session; redirects to `/login`)
+    * `GET/POST /login`, `POST /logout` — dashboard sessions, see `AdminAuth`
+    * `GET  /healthz`         — liveness, no authentication
 
-  Binds to 127.0.0.1 only. Put it behind auth before exposing it.
+  Three audiences, three credentials: data planes use the internal token,
+  operators use the admin token (or a session bought with it), and
+  applications never talk to this port at all.
   """
   use Plug.Router
 
-  alias OmnigateControl.{ConfigStore, Jobs, Ledger, Storage, UrlSigner}
+  alias OmnigateControl.{AdminAuth, ConfigStore, Jobs, Ledger, Storage, UrlSigner}
 
   plug :match
-  plug Plug.Parsers, parsers: [:json], json_decoder: JSON, pass: ["*/*"]
+  plug Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"]
   plug :internal_auth
+  plug :admin_auth
   plug :dispatch
+
+  get "/healthz" do
+    conn |> put_resp_content_type("text/plain") |> send_resp(200, "ok\n")
+  end
 
   get "/internal/config" do
     send_json(conn, 200, snapshot())
@@ -109,9 +118,42 @@ defmodule OmnigateControl.Router do
   end
 
   get "/" do
+    send_html(conn, 200, dashboard())
+  end
+
+  get "/login" do
+    if AdminAuth.authorized?(conn), do: redirect(conn, "/"), else: send_html(conn, 200, login_page(nil))
+  end
+
+  post "/login" do
+    address = conn.remote_ip
+
+    cond do
+      AdminAuth.throttled?(address) ->
+        send_html(conn, 429, login_page("Too many failed attempts. Wait a minute and try again."))
+
+      AdminAuth.valid_token?(conn.body_params["password"]) ->
+        AdminAuth.clear_failures(address)
+
+        conn
+        |> put_resp_cookie(AdminAuth.cookie_name(), AdminAuth.issue_session(),
+          http_only: true,
+          same_site: "Strict",
+          secure: secure_cookie?(conn),
+          max_age: AdminAuth.session_ttl_s()
+        )
+        |> redirect("/")
+
+      true ->
+        AdminAuth.note_failure(address)
+        send_html(conn, 401, login_page("That is not the admin token."))
+    end
+  end
+
+  post "/logout" do
     conn
-    |> put_resp_content_type("text/html")
-    |> send_resp(200, dashboard())
+    |> delete_resp_cookie(AdminAuth.cookie_name(), http_only: true, same_site: "Strict", secure: secure_cookie?(conn))
+    |> redirect("/login")
   end
 
   match _ do
@@ -227,6 +269,66 @@ defmodule OmnigateControl.Router do
 
   defp deny(conn), do: conn |> send_json(401, %{error: "unauthorized"}) |> halt()
 
+  # `/admin/*` is an API: answer 401. The dashboard is a page: send the
+  # browser to the login form. Everything else here is either public
+  # (`/healthz`, `/login`) or guarded by `internal_auth` above.
+  defp admin_auth(%{path_info: ["admin" | _]} = conn, _opts) do
+    if AdminAuth.authorized?(conn) do
+      conn
+    else
+      conn
+      |> put_resp_header("www-authenticate", "Bearer")
+      |> send_json(401, %{error: %{type: "unauthorized", message: "send Authorization: Bearer <admin token>"}})
+      |> halt()
+    end
+  end
+
+  defp admin_auth(%{path_info: []} = conn, _opts) do
+    if AdminAuth.authorized?(conn), do: conn, else: conn |> redirect("/login") |> halt()
+  end
+
+  defp admin_auth(conn, _opts), do: conn
+
+  defp redirect(conn, to) do
+    conn |> put_resp_header("location", to) |> send_resp(302, "")
+  end
+
+  # Mark the cookie Secure whenever the browser reached us over TLS, directly
+  # or through a proxy that says so, or when the operator insists.
+  defp secure_cookie?(conn) do
+    System.get_env("OMNIGATE_COOKIE_SECURE") == "1" or conn.scheme == :https or
+      get_req_header(conn, "x-forwarded-proto") == ["https"]
+  end
+
+  defp send_html(conn, status, html) do
+    conn
+    |> put_resp_content_type("text/html")
+    |> put_resp_header("cache-control", "no-store")
+    |> put_resp_header("x-frame-options", "DENY")
+    |> put_resp_header("referrer-policy", "no-referrer")
+    |> put_resp_header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+    |> send_resp(status, html)
+  end
+
+  defp login_page(error) do
+    message = if error, do: "<p class=\"err\">#{h(error)}</p>", else: ""
+
+    """
+    <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>omnigate · sign in</title>
+    <style>body{font:14px system-ui;margin:0;min-height:100vh;display:grid;place-items:center;color:#222;background:#fafafa}
+    form{background:#fff;border:1px solid #ddd;border-radius:8px;padding:24px;width:min(320px,calc(100vw - 32px));box-sizing:border-box}
+    h1{font-size:18px;margin:0 0 16px}label{display:block;margin-bottom:6px}
+    input{width:100%;box-sizing:border-box;padding:8px;border:1px solid #bbb;border-radius:4px;font:inherit}
+    button{margin-top:12px;width:100%;padding:8px;border:0;border-radius:4px;background:#222;color:#fff;font:inherit;cursor:pointer}
+    .err{color:#b00020;margin:0 0 12px}</style></head>
+    <body><form method="post" action="/login"><h1>omnigate control plane</h1>#{message}
+    <label for="password">Admin token</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+    <button type="submit">Sign in</button></form></body></html>
+    """
+  end
+
   defp send_json(conn, status, body) do
     conn
     |> put_resp_content_type("application/json")
@@ -269,8 +371,10 @@ defmodule OmnigateControl.Router do
     <!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2">
     <title>omnigate</title>
     <style>body{font:14px system-ui;margin:24px;color:#222}table{border-collapse:collapse;margin-bottom:24px}
-    td,th{border:1px solid #ddd;padding:4px 8px;text-align:left}th{background:#f5f5f5}</style></head>
-    <body><h1>omnigate control plane</h1>
+    td,th{border:1px solid #ddd;padding:4px 8px;text-align:left}th{background:#f5f5f5}
+    .top{display:flex;justify-content:space-between;align-items:center}.top button{font:inherit;padding:4px 10px;cursor:pointer}</style></head>
+    <body><div class="top"><h1>omnigate control plane</h1>
+    <form method="post" action="/logout"><button type="submit">Sign out</button></form></div>
     <h2>Keys</h2><table><tr><th>Key</th><th>Requests</th><th>Errors</th><th>In tok</th><th>Out tok</th>
     <th>Jobs</th><th>Spend</th><th>Budget</th><th>State</th></tr>#{rows}</table>
     <h2>Recent requests</h2><table><tr><th>Time</th><th>Model</th><th>Served by</th><th>Status</th>

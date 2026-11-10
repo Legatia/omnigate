@@ -36,6 +36,7 @@ GATEWAY_PORT = 18080
 CONTROL = f"http://127.0.0.1:{CONTROL_PORT}"
 GATEWAY = f"http://127.0.0.1:{GATEWAY_PORT}"
 TOKEN = "e2e-internal-token"
+ADMIN_TOKEN = "e2e-admin-token-0123456789"
 
 KEY_MAIN = "og-e2e-main"
 KEY_BUDGET = "og-e2e-budget"
@@ -208,7 +209,7 @@ def sha(text):
 
 
 def usage_row(key_name):
-    _, _, body = jcall("GET", CONTROL + "/admin/usage")
+    _, _, body = jcall("GET", CONTROL + "/admin/usage", key=ADMIN_TOKEN)
     for row in body.get("keys", []):
         if row.get("name") == key_name:
             return row
@@ -260,6 +261,7 @@ class Stack:
             self.env["PATH"] = os.pathsep.join(extra + [self.env.get("PATH", "")])
         self.env.update({
             "OMNIGATE_INTERNAL_TOKEN": TOKEN,
+            "OMNIGATE_ADMIN_TOKEN": ADMIN_TOKEN,
             "MOCK_API_KEY": "mock-secret",
             "MOCK_WEBHOOK_SECRET": WEBHOOK_SECRET,  # read by tools/mock_media.py
             "PYTHONUNBUFFERED": "1",
@@ -352,6 +354,53 @@ def main_row_with(requests):
     row = usage_row("main")
     # Media jobs are counted in `requests` too; leave them out.
     return row if row.get("requests", 0) - row.get("jobs", 0) == requests else None
+
+
+def control_raw(method, path, headers=None, form=None):
+    """One request to the control plane without following redirects."""
+    conn = http.client.HTTPConnection("127.0.0.1", CONTROL_PORT, timeout=15)
+    h = dict(headers or {})
+    body = None
+    if form is not None:
+        body = "&".join(f"{k}={v}" for k, v in form.items())
+        h["content-type"] = "application/x-www-form-urlencoded"
+    conn.request(method, path, body=body, headers=h)
+    resp = conn.getresponse()
+    data = resp.read().decode("utf-8", "replace")
+    out = (resp.status, {k.lower(): v for k, v in resp.getheaders()}, data)
+    conn.close()
+    return out
+
+
+def login_checks():
+    section("control-plane login")
+    status, _, _ = control_raw("GET", "/healthz")
+    check("health endpoint needs no credentials", status == 200)
+    status, _, _ = control_raw("GET", "/admin/usage")
+    check("the admin API refuses anonymous requests (401)", status == 401, status)
+    status, _, _ = control_raw("GET", "/admin/usage", {"authorization": "Bearer " + TOKEN})
+    check("the data planes' internal token is not an admin credential", status == 401, status)
+    status, _, body = control_raw("GET", "/admin/usage", {"authorization": "Bearer " + ADMIN_TOKEN})
+    check("the admin token opens the admin API", status == 200 and "keys" in body, status)
+
+    status, headers, _ = control_raw("GET", "/")
+    check("an anonymous browser is sent to the login page", status == 302 and headers.get("location") == "/login", (status, headers))
+    status, headers, _ = control_raw("POST", "/login", form={"password": "wrong-token"})
+    check("a wrong token gets no session", status == 401 and "set-cookie" not in headers, (status, headers))
+    status, headers, _ = control_raw("POST", "/login", form={"password": ADMIN_TOKEN})
+    cookie = headers.get("set-cookie", "")
+    check("the right token gets a session cookie that scripts cannot read",
+          status == 302 and "HttpOnly" in cookie and "SameSite=Strict" in cookie and ADMIN_TOKEN not in cookie, (status, cookie))
+    session = cookie.split(";")[0]
+    status, _, page = control_raw("GET", "/", {"cookie": session})
+    check("the session opens the dashboard", status == 200 and "Sign out" in page, status)
+    status, _, _ = control_raw("GET", "/", {"cookie": session + "x"})
+    check("an altered session cookie is refused", status == 302, status)
+
+    status, _, _ = call("GET", GATEWAY + "/admin/usage", key=KEY_MAIN)
+    check("the public gateway port does not serve the admin API", status == 404, status)
+    status, _, _ = call("GET", GATEWAY + "/admin/usage", key=ADMIN_TOKEN)
+    check("... and the admin token is not a gateway key", status == 401, status)
 
 
 def text_checks(stack):
@@ -753,6 +802,7 @@ def main():
         stack.start_gateway()
         if not wait_until(lambda: call("GET", GATEWAY + "/v1/models", key=KEY_MAIN)[0] == 200, 15):
             stack.fail("gateway never received its config from the control plane", "gateway")
+        login_checks()
         if run_media:
             media_checks(stack)
         if run_text:

@@ -42,6 +42,14 @@ has run under production load.** See [Known gaps](#known-gaps).
 - **Keeps serving without the control plane**, including after a data-plane restart (last config is cached on disk).
 - Response headers: `x-omnigate-upstream`, `x-omnigate-attempts`, `x-omnigate-request-id`.
 
+### Control plane access
+
+- **Dashboard login.** The dashboard asks for the admin token once and then uses a signed session cookie (12 hours, `HttpOnly`, `SameSite=Strict`).
+- **Admin API.** `/admin/*` takes the same token as `Authorization: Bearer`.
+- **Never open by default.** If `OMNIGATE_ADMIN_TOKEN` is not set, a random one is generated at startup and written to the log.
+- **Guessing is slowed.** Five failed logins from one address lock that address out for a minute.
+- **Separate credentials.** Gateway keys, the data planes' internal token and the admin token do not work in each other's place.
+
 ### Media jobs
 
 One API for providers that each have a different one:
@@ -80,7 +88,7 @@ gateway on their own ports with state in a temp directory, runs its checks
 (failover, timeouts, streaming, translation, rate limits, budgets, an outage
 with a gateway restart, media jobs with failover, webhooks, cache, a
 control-plane restart mid-job, bucket storage) and exits non-zero if any fail.
-It currently runs 68 checks.
+It currently runs 79 checks.
 
 ### Run the pieces by hand
 
@@ -101,7 +109,7 @@ python tools/mock_media.py
 ```
 
 ```powershell
-cd control; $env:OMNIGATE_INTERNAL_TOKEN='dev-internal-token'; $env:MOCK_API_KEY='mock-secret'; mix run --no-halt
+cd control; $env:OMNIGATE_INTERNAL_TOKEN='dev-internal-token'; $env:OMNIGATE_ADMIN_TOKEN='dev-admin-token-change-me'; $env:MOCK_API_KEY='mock-secret'; mix run --no-halt
 ```
 
 ```powershell
@@ -118,7 +126,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-u
 curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer og-unlimited-key" -d '{"model":"demo-image","input":{"prompt":"a lighthouse"}}'
 ```
 
-Dashboard: <http://127.0.0.1:4000/>. Demo routes in `config/omnigate.dev.json`:
+Dashboard: <http://127.0.0.1:4000/>, signing in with the admin token set above. Demo routes in `config/omnigate.dev.json`:
 
 | Route | Shows |
 |---|---|
@@ -183,12 +191,29 @@ and bucket credentials by the control plane.
 | `OMNIGATE_COOLDOWN_MS` | data plane | `30000` |
 | `OMNIGATE_SPOOL` | data plane | `omnigate-usage.spool`; `off` keeps usage in memory only |
 | `OMNIGATE_CONFIG_CACHE` | data plane | `omnigate-config.cache.json`; `off` disables |
+| `OMNIGATE_ADMIN_TOKEN` | control plane | generated and logged at startup if unset; dashboard password and `/admin` API token |
+| `OMNIGATE_CONTROL_BIND` | control plane | `127.0.0.1`; set an address such as `0.0.0.0` to accept connections from other machines |
+| `OMNIGATE_COOKIE_SECURE` | control plane | unset; `1` always marks the session cookie `Secure` (automatic behind a proxy that sends `X-Forwarded-Proto: https`) |
 | `OMNIGATE_CONTROL_PORT` | control plane | `4000` |
 | `OMNIGATE_CONFIG` | control plane | `../config/omnigate.dev.json` |
 | `OMNIGATE_LEDGER` | control plane | `data/ledger.jsonl` |
 | `OMNIGATE_JOBS` | control plane | `data/jobs.jsonl` |
 | `OMNIGATE_SIGNING_SECRET` | control plane | derived from the internal token; signs file URLs |
 | `OMNIGATE_WEBHOOK_SECRET` | control plane | last-resort webhook signing secret |
+
+## Running it on a server
+
+The control plane now authenticates everything it serves, so it can listen
+beyond localhost. It still speaks plain HTTP, so:
+
+1. Set `OMNIGATE_ADMIN_TOKEN` and `OMNIGATE_INTERNAL_TOKEN` to long random values.
+2. Put a TLS-terminating reverse proxy (Caddy, nginx, a cloud load balancer) in front of both ports. Only the data plane's port needs to be public.
+3. Keep the control plane on a private network if you can. Set `OMNIGATE_CONTROL_BIND` only when the data plane or your browser reaches it from another machine.
+4. If data plane and control plane are on different machines, the internal token crosses the network between them: use a private network or TLS there too.
+
+This has been checked on one Windows machine only, binding to all interfaces
+and reaching it through the LAN address. No Linux build, container image or
+TLS setup has been tested.
 
 ## How it compares
 
@@ -249,8 +274,9 @@ Through the gateway, over TLS, with real keys:
 
 **Security**
 
-- The control plane binds to localhost and `/admin` and `/` have no authentication. Do not expose it.
-- No TLS listener; put the data plane behind a reverse proxy.
+- No TLS listener on either process; both need a reverse proxy in front for anything beyond localhost. Data-plane-to-control-plane traffic over HTTPS is untested.
+- One shared admin token: no user accounts, roles or audit log. Sessions cannot be revoked individually; changing the token ends all of them.
+- The login lockout counts per client address and lives in memory. Behind a reverse proxy all clients share one address.
 - Webhook targets are checked against private addresses when the job is submitted only, so DNS rebinding is not closed.
 
 **Text gateway**
@@ -279,7 +305,7 @@ Through the gateway, over TLS, with real keys:
 ## Next
 
 1. Run the Replicate, fal and ElevenLabs adapters and S3 storage against the real services; test with the official SDKs as clients
-2. Authentication on the control plane; TLS
+2. A Linux build and container image; a tested TLS setup
 3. Cluster-wide budgets and rate limits across control-plane nodes
 4. Retention: expire jobs, files and ledger ids
 5. More provider shapes (Veo, Kling, Runway, BFL), then transcoding

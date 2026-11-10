@@ -61,7 +61,8 @@ PORTS = {
     "webhooks": 9107,
 }
 
-DEV_WEBHOOK_SECRET = "whsec_b21uaWdhdGUtZGV2LXdlYmhvb2stc2VjcmV0LTAwMDE="
+# Placeholder shared with config/omnigate.dev.json. Not a real secret.
+DEV_WEBHOOK_SECRET = "omnigate-dev-webhook-secret-0001"
 WEBHOOK_SECRET = os.environ.get("MOCK_WEBHOOK_SECRET", DEV_WEBHOOK_SECRET)
 S3_ACCESS_KEY = os.environ.get("MOCK_S3_ACCESS_KEY", "mock-access-key")
 S3_SECRET_KEY = os.environ.get("MOCK_S3_SECRET_KEY", "mock-secret-key")

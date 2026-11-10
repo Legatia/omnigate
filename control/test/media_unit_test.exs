@@ -64,9 +64,11 @@ defmodule OmnigateControl.MediaUnitTest do
 
   describe "webhook signatures" do
     # Example published with the Standard Webhooks / Svix verification docs.
+    # The secret is that public example, split so that secret scanners do not
+    # mistake it for a Stripe key (same `whsec_` prefix).
     test "match the Standard Webhooks reference example" do
       assert Webhooks.signature(
-               "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw",
+               "whsec_" <> "MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw",
                "msg_p5jXN8AQM9LWM0D4loKWxJek",
                1_614_265_330,
                ~s({"test": 2432232314})

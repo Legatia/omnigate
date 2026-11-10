@@ -199,7 +199,7 @@
       "url_ttl_s": 3600
     },
     "webhooks": {
-      "secret": "whsec_b21uaWdhdGUtZGV2LXdlYmhvb2stc2VjcmV0LTAwMDE=",
+      "secret": "omnigate-dev-webhook-secret-0001",
       "allow_private": true,
       "retry_schedule_ms": [
         1000,

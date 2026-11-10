@@ -50,7 +50,11 @@ import uuid
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HOST = "127.0.0.1"
+# Where the servers listen, and the host name they put in the URLs they hand
+# out. Both default to loopback; the container test sets them so that other
+# containers can reach the mocks by name.
+BIND = os.environ.get("MOCK_BIND", "127.0.0.1")
+HOST = os.environ.get("MOCK_PUBLIC_HOST", BIND)
 PORTS = {
     "replicate_ok": 9101,
     "replicate_fail": 9102,
@@ -631,7 +635,7 @@ def main():
         ("webhooks", Webhooks),
     ]
     for name, handler in servers:
-        httpd = ThreadingHTTPServer((HOST, PORTS[name]), handler)
+        httpd = ThreadingHTTPServer((BIND, PORTS[name]), handler)
         httpd.daemon_threads = True
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         print("mock %-15s http://%s:%d" % (name, HOST, PORTS[name]), flush=True)

@@ -1,0 +1,52 @@
+# omnigate control plane: an Elixir release on Alpine.
+#
+#   docker build -t omnigate-control control
+
+FROM elixir:1.20.5-otp-29-alpine AS build
+ENV MIX_ENV=prod
+WORKDIR /src
+
+RUN mix local.hex --force && mix local.rebar --force
+
+# Dependencies first, so they are cached until mix.exs or mix.lock change.
+COPY mix.exs mix.lock ./
+RUN mix deps.get --only prod && mix deps.compile
+
+COPY config ./config
+COPY lib ./lib
+RUN mix release --path /out
+
+# Remember which Alpine the runtime was built against; the final stage must match.
+RUN cut -d. -f1,2 /etc/alpine-release > /alpine-version
+
+
+FROM alpine:3.24
+# Shared libraries the Erlang runtime links against, and root certificates
+# for TLS to providers and buckets.
+RUN apk add --no-cache libstdc++ libgcc ncurses-libs openssl ca-certificates \
+ && adduser -D -u 10001 -h /data omnigate
+
+COPY --from=build /out /app
+COPY --from=build /alpine-version /app/alpine-version
+RUN test "$(cut -d. -f1,2 /etc/alpine-release)" = "$(cat /app/alpine-version)" \
+ || { echo "runtime Alpine $(cat /etc/alpine-release) does not match build Alpine $(cat /app/alpine-version): change the FROM line" >&2; exit 1; }
+
+USER 10001:10001
+WORKDIR /data
+VOLUME /data
+
+# Inside a container "all interfaces" means the container's own network; what
+# the outside world can reach is decided by which ports are published.
+ENV OMNIGATE_CONTROL_BIND=0.0.0.0 \
+    OMNIGATE_CONFIG=/config/omnigate.json \
+    OMNIGATE_LEDGER=/data/ledger.jsonl \
+    OMNIGATE_JOBS=/data/jobs.jsonl \
+    OMNIGATE_MEDIA_DIR=/data/media \
+    RELEASE_DISTRIBUTION=none \
+    LANG=C.UTF-8
+EXPOSE 4000
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+  CMD wget -q -O /dev/null http://127.0.0.1:4000/healthz || exit 1
+
+CMD ["/app/bin/omnigate_control", "start"]

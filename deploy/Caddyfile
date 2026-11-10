@@ -1,0 +1,24 @@
+# TLS in front of omnigate.
+#
+# Two host names: one for applications (the gateway), one for operators (the
+# dashboard and /admin API). With real DNS names Caddy obtains and renews
+# Let's Encrypt certificates by itself. With the defaults below (localhost
+# names) it issues certificates from its own local CA, which is what you want
+# for a trial on one machine.
+
+# Applications: the data plane.
+{$OMNIGATE_API_HOST:localhost} {
+	reverse_proxy dataplane:8080 {
+		# Pass streamed tokens through as they arrive.
+		flush_interval -1
+	}
+}
+
+# Operators: the control plane's dashboard and admin API.
+{$OMNIGATE_ADMIN_HOST:admin.localhost} {
+	# The internal API is for data planes on the private network only.
+	@internal path /internal /internal/*
+	respond @internal 404
+
+	reverse_proxy control:4000
+}

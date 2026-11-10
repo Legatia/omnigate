@@ -209,7 +209,9 @@ defmodule OmnigateControl.ConfigStore do
   defp normalize_storage(s) do
     %{
       kind: "local",
-      dir: s["dir"] || Application.get_env(:omnigate_control, :media_dir) || Path.expand("data/media", File.cwd!()),
+      dir:
+        s["dir"] || System.get_env("OMNIGATE_MEDIA_DIR") || Application.get_env(:omnigate_control, :media_dir) ||
+          Path.expand("data/media", File.cwd!()),
       url_ttl_s: to_int(s["url_ttl_s"], 3_600)
     }
   end

@@ -4,10 +4,10 @@ A self-hostable AI gateway in two small processes. It fronts OpenAI- and
 Anthropic-style text APIs and wraps image, video and speech providers in one
 async job API.
 
-**Status: the text gateway and the OpenAI image adapter have been checked
-against the real OpenAI and Anthropic APIs (37 checks, November 2026). The
-other three media adapters and bucket storage have only met mocks, and nothing
-has run under production load.** See [Known gaps](#known-gaps).
+**Status: the text gateway and the OpenAI image and ElevenLabs speech adapters
+have been checked against the real APIs (November 2026). The Replicate and fal
+adapters and bucket storage have only met mocks, and nothing has run under
+production load.** See [Known gaps](#known-gaps).
 
 ```
  apps ──▶ dataplane (Zig) ──────────▶ LLM providers (OpenAI-style, Anthropic-style)
@@ -23,7 +23,8 @@ has run under production load.** See [Known gaps](#known-gaps).
 | `dataplane/` | Zig 0.17 | The public port. Authenticates keys, rate-limits, routes, fails over, translates protocols, streams, meters tokens |
 | `control/` | Elixir 1.20 / OTP 29 | Config, prices, budgets, the usage ledger, media jobs, output storage, webhooks, dashboard |
 | `config/` | JSON | Keys, upstreams, routes, media section |
-| `tools/` | Python (stdlib) | Mock providers, end-to-end test, benchmark, LiteLLM config importer |
+| `tools/` | Python (stdlib) | Mock providers, end-to-end test, container test, benchmark, LiteLLM config importer |
+| `compose.yaml`, `deploy/` | Docker | Both images plus a Caddy proxy for TLS |
 
 ## What it does
 
@@ -197,23 +198,51 @@ and bucket credentials by the control plane.
 | `OMNIGATE_CONTROL_PORT` | control plane | `4000` |
 | `OMNIGATE_CONFIG` | control plane | `../config/omnigate.dev.json` |
 | `OMNIGATE_LEDGER` | control plane | `data/ledger.jsonl` |
+| `OMNIGATE_MEDIA_DIR` | control plane | `data/media`; where local output storage keeps files unless the config names a `dir` |
 | `OMNIGATE_JOBS` | control plane | `data/jobs.jsonl` |
 | `OMNIGATE_SIGNING_SECRET` | control plane | derived from the internal token; signs file URLs |
 | `OMNIGATE_WEBHOOK_SECRET` | control plane | last-resort webhook signing secret |
 
 ## Running it on a server
 
-The control plane now authenticates everything it serves, so it can listen
-beyond localhost. It still speaks plain HTTP, so:
+Container images and a Compose file with TLS in front are included.
 
-1. Set `OMNIGATE_ADMIN_TOKEN` and `OMNIGATE_INTERNAL_TOKEN` to long random values.
-2. Put a TLS-terminating reverse proxy (Caddy, nginx, a cloud load balancer) in front of both ports. Only the data plane's port needs to be public.
-3. Keep the control plane on a private network if you can. Set `OMNIGATE_CONTROL_BIND` only when the data plane or your browser reaches it from another machine.
-4. If data plane and control plane are on different machines, the internal token crosses the network between them: use a private network or TLS there too.
+```bash
+cp .env.example .env
+```
 
-This has been checked on one Windows machine only, binding to all interfaces
-and reaching it through the LAN address. No Linux build, container image or
-TLS setup has been tested.
+```bash
+cp config/omnigate.example.json config/omnigate.json
+```
+
+Fill in both files (two long random tokens, your host names, provider keys, routes), then:
+
+```bash
+docker compose up -d --build
+```
+
+What you get:
+
+- **`proxy`** (Caddy) is the only container with published ports. It serves the gateway at `https://$OMNIGATE_API_HOST` and the dashboard at `https://$OMNIGATE_ADMIN_HOST`. Real DNS names get Let's Encrypt certificates automatically; the `localhost` defaults get certificates from Caddy's own CA.
+- **`dataplane`** is a 13 MB image: one static binary and a CA bundle on an empty base, running as a non-root user.
+- **`control`** is a 57 MB Alpine image with the Elixir release, running as a non-root user, with a health check.
+- **State** (ledger, jobs, stored outputs, usage spool, config cache) lives in named volumes and survives restarts.
+- **The internal API** between the two is reachable only on the private Docker network; the proxy answers 404 for `/internal/*`.
+
+`python3 tools/container_test.py` builds both images, starts them with mock
+providers behind the proxy, and runs 22 checks through TLS: certificate
+verification, failover, incremental streaming through the proxy, translation,
+a media job with a signed `https` download and a retried webhook, dashboard
+login with a `Secure` cookie, and restarts with the control plane down.
+
+Tested with Docker 29 on Ubuntu 24.04 (x86-64, under WSL 2). Not tested: the
+Compose file itself (the test drives the same images and Caddyfile with plain
+`docker` commands, because Compose was not installed there), ARM, Let's
+Encrypt issuance with a real domain, and Kubernetes.
+
+Without containers, the same rules apply: set both tokens, keep the control
+plane on a private address (`OMNIGATE_CONTROL_BIND`), and put TLS in front of
+both ports.
 
 ## How it compares
 
@@ -264,17 +293,18 @@ Through the gateway, over TLS, with real keys:
 - Translation both ways: text, system prompts, streaming, tool calls, tool-result round trips, streamed tool calls, error shapes, refused sampling parameters.
 - Failover from a dead OpenAI-style upstream to Claude; ledger token totals equal to what the providers reported.
 - One media job on OpenAI's image API (`gpt-image-1-mini`): generated, re-hosted, downloaded, webhook retried and delivered.
+- ElevenLabs text-to-speech (`eleven_flash_v2_5`): real MP3 generated, re-hosted and downloaded; an identical request served from cache; an unknown voice failed with the provider's reason.
 
 **Not verified**
 
-- The Replicate, fal and ElevenLabs adapters and S3 storage have only run against mocks written from public documentation; expect details to differ.
+- The Replicate and fal adapters and S3 storage have only run against mocks written from public documentation; expect details to differ.
 - Images in translated requests, long conversations, large payloads, and the official OpenAI and Anthropic SDKs as clients (the checks used plain HTTP).
 - Sustained or concurrent load against real providers.
-- Any platform other than Windows 11.
+- Platforms other than Windows 11 and x86-64 Linux containers.
 
 **Security**
 
-- No TLS listener on either process; both need a reverse proxy in front for anything beyond localhost. Data-plane-to-control-plane traffic over HTTPS is untested.
+- No TLS listener on either process; the included Caddy proxy (or another) provides it. Data-plane-to-control-plane traffic over HTTPS is untested; keep it on a private network.
 - One shared admin token: no user accounts, roles or audit log. Sessions cannot be revoked individually; changing the token ends all of them.
 - The login lockout counts per client address and lives in memory. Behind a reverse proxy all clients share one address.
 - Webhook targets are checked against private addresses when the job is submitted only, so DNS rebinding is not closed.
@@ -304,8 +334,8 @@ Through the gateway, over TLS, with real keys:
 
 ## Next
 
-1. Run the Replicate, fal and ElevenLabs adapters and S3 storage against the real services; test with the official SDKs as clients
-2. A Linux build and container image; a tested TLS setup
+1. Run the Replicate and fal adapters and S3 storage against the real services; test with the official SDKs as clients
+2. Test the Compose file, ARM images and a real-domain certificate
 3. Cluster-wide budgets and rate limits across control-plane nodes
 4. Retention: expire jobs, files and ledger ids
 5. More provider shapes (Veo, Kling, Runway, BFL), then transcoding

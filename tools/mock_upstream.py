@@ -9,6 +9,7 @@ Run:  python tools/mock_upstream.py
 """
 
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -118,7 +119,8 @@ class Slow(OpenAIOk):
 
 
 def serve(port, handler):
-    ThreadingHTTPServer(("127.0.0.1", port), handler).serve_forever()
+    # MOCK_BIND=0.0.0.0 lets other containers reach the mocks (container test).
+    ThreadingHTTPServer((os.environ.get("MOCK_BIND", "127.0.0.1"), port), handler).serve_forever()
 
 
 if __name__ == "__main__":

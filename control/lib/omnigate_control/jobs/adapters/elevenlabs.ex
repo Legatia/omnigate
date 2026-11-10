@@ -8,7 +8,7 @@ defmodule OmnigateControl.Jobs.Adapters.ElevenLabs do
   `output_format` (default `mp3_44100_128`); every other field is passed
   through in the body. `model_id` is set to the route target's model.
 
-  Not yet exercised against the real service.
+  Checked against the real service with `eleven_flash_v2_5` (November 2026).
   """
   @behaviour OmnigateControl.Jobs.Adapter
 

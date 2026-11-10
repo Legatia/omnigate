@@ -1,0 +1,53 @@
+# omnigate with TLS in front.
+#
+#   cp .env.example .env        # then edit it
+#   cp config/omnigate.example.json config/omnigate.json   # then edit it
+#   docker compose up -d --build
+#
+# Only the proxy publishes ports. The gateway is at https://$OMNIGATE_API_HOST,
+# the dashboard at https://$OMNIGATE_ADMIN_HOST.
+
+services:
+  control:
+    build: ./control
+    restart: unless-stopped
+    # .env carries the two omnigate tokens plus the keys of media providers
+    # and buckets named in the config.
+    env_file: .env
+    volumes:
+      - ./config/omnigate.json:/config/omnigate.json:ro
+      - control-data:/data
+
+  dataplane:
+    build: ./dataplane
+    restart: unless-stopped
+    # .env carries the internal token plus the keys of the text providers
+    # named in the config (api_key_env).
+    env_file: .env
+    volumes:
+      - dataplane-data:/data
+    depends_on:
+      - control
+
+  proxy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      OMNIGATE_API_HOST: ${OMNIGATE_API_HOST:-localhost}
+      OMNIGATE_ADMIN_HOST: ${OMNIGATE_ADMIN_HOST:-admin.localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - dataplane
+      - control
+
+volumes:
+  control-data:
+  dataplane-data:
+  caddy-data:
+  caddy-config:

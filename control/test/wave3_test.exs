@@ -14,8 +14,16 @@ defmodule OmnigateControl.Wave3Test do
 
   describe "error shapes" do
     test "a body that is not JSON is a 400 with the gateway's error object" do
+      # Credentials are checked before the body is parsed, so each call carries its own.
+      creds = fn
+        "/internal" <> _ -> [{"x-omnigate-internal", OmnigateControl.internal_token()}]
+        "/admin" <> _ -> [{"authorization", "Bearer test-admin-token-0123456789"}]
+        _ -> []
+      end
+
       for path <- ["/internal/v1/jobs", "/internal/usage/batch", "/admin/keys", "/login"] do
-        conn = conn(:post, path, ~s({"model": "x", )) |> as_json() |> call()
+        conn = conn(:post, path, ~s({"model": "x", )) |> as_json()
+        conn = Enum.reduce(creds.(path), conn, fn {k, v}, c -> put_req_header(c, k, v) end) |> call()
         assert conn.status == 400, path
         assert %{"error" => %{"type" => "invalid_json", "message" => message}} = json(conn)
         assert is_binary(message)
@@ -25,8 +33,12 @@ defmodule OmnigateControl.Wave3Test do
 
     test "a body over the limit is a 413 in the same shape" do
       big = ~s({"x":") <> String.duplicate("a", 8_100_000) <> ~s("})
-      conn = conn(:post, "/internal/usage/batch", big) |> as_json() |> call()
+      conn = conn(:post, "/internal/usage/batch", big) |> as_json() |> put_req_header("x-omnigate-internal", OmnigateControl.internal_token()) |> call()
       assert conn.status == 413
+
+      # Without credentials the body is never parsed at all.
+      anonymous = conn(:post, "/internal/usage/batch", big) |> as_json() |> call()
+      assert anonymous.status == 401
       assert %{"error" => %{"type" => "payload_too_large"}} = json(conn)
     end
 

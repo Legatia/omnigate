@@ -410,6 +410,11 @@ def login_checks():
     status, _, _ = control_raw("GET", "/", {"cookie": session + "x"})
     check("an altered session cookie is refused", status == 302, status)
 
+    codes = [control_raw("GET", path)[0] for path in ("/%61dmin/keys", "/adm%69n/overview", "/%6Detrics", "/%69nternal/config")]
+    status, _, body = control_raw("POST", "/%61dmin/keys", {"content-type": "application/json"}, raw=json.dumps({"name": "bypass-probe"}))
+    check("percent-encoded spellings of protected paths are refused, not routed",
+          codes == [400, 400, 400, 400] and status == 400 and "og-" not in body, (codes, status, body[:80]))
+
     status, _, _ = control_raw("GET", "/metrics")
     check("metrics refuse anonymous requests (401)", status == 401, status)
     status, headers, text = control_raw("GET", "/metrics", {"authorization": "Bearer " + ADMIN_TOKEN})

@@ -29,10 +29,18 @@ defmodule OmnigateControl.Router do
 
   require Logger
 
+  # Order matters. The guards below decide by `conn.path_info`, which is the
+  # path exactly as sent, while the router matches on the percent-DECODED
+  # path: `/%61dmin/keys` used to slip past every guard and still reach the
+  # `/admin/keys` handler. `plain_path` makes the two views identical before
+  # anything else runs, and the guards refuse whatever they do not recognise.
+  # Authentication also comes before body parsing, so an anonymous caller
+  # cannot make this process parse megabytes of JSON.
+  plug(:plain_path)
   plug(:match)
-  plug(Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"])
   plug(:internal_auth)
   plug(:admin_auth)
+  plug(Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"])
   plug(:csrf)
   plug(:dispatch)
 
@@ -518,7 +526,27 @@ defmodule OmnigateControl.Router do
     if AdminAuth.authorized?(conn), do: conn, else: conn |> redirect("/login") |> halt()
   end
 
-  defp admin_auth(conn, _opts), do: conn
+  # Everything else must be one of the few paths that are public on purpose.
+  # An unknown first segment is refused here rather than left to the router,
+  # so a route added later is closed until someone decides who may call it.
+  defp admin_auth(%{path_info: [first | _]} = conn, _opts) when first in ["internal", "healthz", "readyz", "login", "logout", "__test"], do: conn
+
+  defp admin_auth(conn, _opts) do
+    conn |> send_json(404, %{error: %{type: "not_found", message: "no such endpoint"}}) |> halt()
+  end
+
+  # No route here needs a percent-encoded character (ids, names and file
+  # names are all plain), so any `%` in the path is refused outright, as is
+  # anything that would decode differently from how it was sent.
+  defp plain_path(conn, _opts) do
+    plain = fn segment -> not String.contains?(segment, ["%", "\\", <<0>>]) and segment not in [".", ".."] end
+
+    if Enum.all?(conn.path_info, plain) and not String.contains?(conn.request_path, "%") do
+      conn
+    else
+      conn |> send_json(400, %{error: %{type: "invalid_request", message: "the request path must not contain encoded characters"}}) |> halt()
+    end
+  end
 
   # Cross-site request forgery: a page on another site can make the browser
   # send a request here with the session cookie attached. Anything that

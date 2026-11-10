@@ -124,6 +124,34 @@ defmodule OmnigateControl.AdminAuthTest do
       assert session_cookie(conn).max_age == 0
     end
 
+    test "a percent-encoded path cannot slip past the guards" do
+      # The router matches the decoded path; the guards used to see the raw one.
+      for path <- ["/%61dmin/keys", "/adm%69n/keys", "/%61dmin/overview", "/%6Detrics", "/%69nternal/config", "/admin%2Fkeys", "/admin/%6Beys"] do
+        conn = conn(:get, path) |> call()
+        assert conn.status == 400, "GET #{path} answered #{conn.status}"
+        refute conn.resp_body =~ "keys\":["
+      end
+
+      conn =
+        conn(:post, "/%61dmin/keys", JSON.encode!(%{"name" => "bypass-probe"}))
+        |> put_req_header("content-type", "application/json")
+        |> call()
+
+      assert conn.status == 400
+      refute conn.resp_body =~ "og-"
+
+      # With the admin token the same odd spelling is still refused: it is not a valid path at all.
+      conn = conn(:get, "/%61dmin/keys") |> put_req_header("authorization", "Bearer " <> @token) |> call()
+      assert conn.status == 400
+
+      # An unknown top-level path is closed, not left to whatever route may exist.
+      assert (conn(:get, "/debug") |> call()).status == 404
+      # And the plain spellings behave as before.
+      assert (conn(:get, "/admin/keys") |> call()).status == 401
+      assert (conn(:get, "/internal/config") |> call()).status == 401
+      assert (conn(:get, "/metrics") |> call()).status == 401
+    end
+
     test "repeated failures from one address are refused for a while" do
       ip = {10, 0, 0, 99}
       AdminAuth.clear_failures(ip)

@@ -510,7 +510,8 @@ defmodule OmnigateControl.JobsTest do
       assert {401, _, _} = call(:get, internal_path, nil, internal(nil))
       assert {403, _, _} = call(:get, internal_path <> "?" <> String.replace(query, ~r/sig=../, "sig=00"), nil, internal(nil))
       assert {403, _, _} = call(:get, internal_path <> "?exp=1&sig=" <> String.duplicate("0", 64), nil, internal(nil))
-      assert {404, _, _} = call(:get, "/internal/v1/files/#{created["id"]}/..%2F..%2Fsecret?" <> query, nil, internal())
+      # An encoded path is refused before any lookup.
+      assert {400, _, _} = call(:get, "/internal/v1/files/#{created["id"]}/..%2F..%2Fsecret?" <> query, nil, internal())
       # Without the internal token nothing is reachable.
       assert {401, _, _} = call(:get, internal_path <> "?" <> query, nil, [])
 

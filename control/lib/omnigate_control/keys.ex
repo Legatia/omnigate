@@ -187,7 +187,10 @@ defmodule OmnigateControl.Keys do
     end
   end
 
-  defp publish(keys), do: :persistent_term.put({__MODULE__, :managed}, keys)
+  defp publish(keys) do
+    :persistent_term.put({__MODULE__, :managed}, keys)
+    ConfigStore.warn_shadowed()
+  end
 
   defp replace(keys, updated), do: Enum.map(keys, &if(&1.name == updated.name, do: updated, else: &1))
 

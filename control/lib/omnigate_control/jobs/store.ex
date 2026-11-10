@@ -5,7 +5,11 @@ defmodule OmnigateControl.Jobs.Store do
   Every change to a job appends its full snapshot to a JSONL log and syncs it
   to disk before the change is visible, then updates an ETS table that reads
   go to directly. On boot the log is replayed (last snapshot per job wins)
-  and rewritten compacted, so it does not grow across restarts.
+  and rewritten compacted, so it does not grow across restarts. While
+  running, the log is compacted again whenever it holds well over twice as
+  many lines as there are jobs, so a process that never restarts does not
+  leave a long history for the next boot either. Boot therefore reads a file
+  proportional to the jobs that are kept, not to every state change made.
 
   `purge_finished_before/1` removes old finished jobs for good and compacts
   the log again, which is how `OmnigateControl.Retention` keeps it bounded.
@@ -86,12 +90,42 @@ defmodule OmnigateControl.Jobs.Store do
     :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
     :ets.new(@index, [:named_table, :set, :protected, read_concurrency: true])
 
-    count = replay(path)
+    {count, lines} = replay(path)
     if count > 0, do: Logger.info("job store replayed #{count} jobs from #{path}")
-    compact(path)
+    # Rewriting a file that already has one line per job would only cost time.
+    if lines != count, do: compact(path)
+    Process.put(:appended, 0)
+    Process.send_after(self(), :maybe_compact, compact_check_ms())
 
     {:ok, %{path: path, file: File.open!(path, [:append, :binary])}}
   end
+
+  # Every job change appends a line. Once the lines written since the last
+  # compaction outnumber the jobs twice over (and a floor, so small stores are
+  # left alone), rewrite the log down to one line per job.
+  @impl true
+  def handle_info(:maybe_compact, state) do
+    appended = Process.get(:appended, 0)
+    floor = Application.get_env(:omnigate_control, :jobs_compact_min_lines, 5_000)
+
+    state =
+      if appended > max(floor, 2 * :ets.info(@table, :size)) do
+        File.close(state.file)
+        compact(state.path)
+        Process.put(:appended, 0)
+        Logger.info("job store compacted its log (#{appended} lines since the last time)")
+        %{state | file: File.open!(state.path, [:append, :binary])}
+      else
+        state
+      end
+
+    Process.send_after(self(), :maybe_compact, compact_check_ms())
+    {:noreply, state}
+  end
+
+  def handle_info(_other, state), do: {:noreply, state}
+
+  defp compact_check_ms, do: Application.get_env(:omnigate_control, :jobs_compact_check_ms, 60_000)
 
   @impl true
   def handle_call({:create, job}, _from, state) do
@@ -166,6 +200,7 @@ defmodule OmnigateControl.Jobs.Store do
     # Write-ahead: on disk before anyone can observe the change.
     :ok = IO.binwrite(state.file, [JSON.encode!(job), ?\n])
     :ok = :file.datasync(state.file)
+    Process.put(:appended, Process.get(:appended, 0) + 1)
     index(job)
   end
 
@@ -187,17 +222,19 @@ defmodule OmnigateControl.Jobs.Store do
       |> File.stream!()
       |> Stream.map(&String.trim/1)
       |> Stream.reject(&(&1 == ""))
-      |> Enum.each(fn line ->
-        # A torn final line (crash mid-write) is skipped, not fatal.
+      |> Enum.reduce(0, fn line, lines ->
+        # A torn final line (crash mid-write) is skipped, not fatal. It still
+        # counts as a line, so the file is rewritten without it.
         case JSON.decode(line) do
           {:ok, %{"id" => _} = job} -> index(job)
           _ -> Logger.warning("job store: skipping unreadable line during replay")
         end
-      end)
 
-      :ets.info(@table, :size)
+        lines + 1
+      end)
+      |> then(&{:ets.info(@table, :size), &1})
     else
-      0
+      {0, 0}
     end
   end
 

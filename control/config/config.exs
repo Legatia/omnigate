@@ -16,5 +16,7 @@ if config_env() == :test do
     internal_token: "test-internal-token-from-app-env",
     media_dir: Path.join(System.tmp_dir!(), "omnigate-test-media-#{stamp}"),
     signing_secret: "test-signing-secret",
-    admin_token: "test-admin-token-0123456789"
+    admin_token: "test-admin-token-0123456789",
+    # Compiles a route that raises, for the error-shape test.
+    test_routes: true
 end

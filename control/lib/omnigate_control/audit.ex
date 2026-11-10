@@ -33,6 +33,8 @@ defmodule OmnigateControl.Audit do
   require Logger
 
   @keep 500
+  # Rotated files kept next to the live one: audit.jsonl.1 (newest) to .3.
+  @generations 3
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -67,17 +69,48 @@ defmodule OmnigateControl.Audit do
     path = Keyword.fetch!(opts, :path)
     File.mkdir_p!(Path.dirname(path))
     recent = tail(path)
-    {:ok, %{file: File.open!(path, [:append, :binary]), path: path, recent: recent}}
+    {:ok, %{path: path, recent: recent, max_bytes: max_bytes()}}
+  end
+
+  # `OMNIGATE_AUDIT_MAX_MB` (default 50). 0 turns rotation off.
+  defp max_bytes do
+    case Application.get_env(:omnigate_control, :audit_max_bytes) do
+      n when is_integer(n) ->
+        n
+
+      _ ->
+        case Float.parse(System.get_env("OMNIGATE_AUDIT_MAX_MB") || "50") do
+          {mb, _} when mb >= 0 -> round(mb * 1_048_576)
+          _ -> 50 * 1_048_576
+        end
+    end
+  end
+
+  # audit.jsonl -> .1 -> .2 -> .3; the oldest falls off.
+  defp rotate(path) do
+    File.rm(path <> ".#{@generations}")
+    for n <- (@generations - 1)..1//-1, do: File.rename(path <> ".#{n}", path <> ".#{n + 1}")
+    File.rename(path, path <> ".1")
   end
 
   @impl true
   def handle_call({:record, entry}, _from, state) do
     # An action that cannot be recorded is still carried out: refusing to
     # revoke a key because a disk is full would be worse. But say so loudly.
-    with :ok <- IO.binwrite(state.file, [JSON.encode!(entry), ?\n]),
-         :ok <- :file.datasync(state.file) do
-      :ok
-    else
+    # The file is opened for each entry (they are rare), so it can be moved
+    # or rotated from outside at any time without this process holding on to
+    # the old one.
+    line = JSON.encode!(entry) <> "\n"
+
+    if state.max_bytes > 0 do
+      case File.stat(state.path) do
+        {:ok, %{size: size}} when size + byte_size(line) > state.max_bytes -> rotate(state.path)
+        _ -> :ok
+      end
+    end
+
+    case File.write(state.path, line, [:append, :sync]) do
+      :ok -> :ok
       error -> Logger.error("audit log #{state.path} could not be written: #{inspect(error)}")
     end
 

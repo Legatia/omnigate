@@ -687,7 +687,13 @@ defmodule OmnigateControl.Wave2Test do
     end
 
     test "retention.delete_bucket_objects is on by default and must be a boolean" do
-      assert ConfigStore.normalize(%{"retention" => %{"jobs_days" => 30}}).retention == %{jobs_days: 30, ledger_ids_days: 0, delete_bucket_objects: true}
+      assert ConfigStore.normalize(%{"retention" => %{"jobs_days" => 30}}).retention == %{
+               jobs_days: 30,
+               ledger_ids_days: 0,
+               ledger_days: 0,
+               delete_bucket_objects: true
+             }
+
       assert ConfigStore.normalize(%{"retention" => %{"delete_bucket_objects" => false}}).retention.delete_bucket_objects == false
 
       assert_raise ArgumentError, ~r/retention.delete_bucket_objects must be true or false/, fn ->

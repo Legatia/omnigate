@@ -20,7 +20,34 @@ defmodule OmnigateControl.ConfigStore do
   """
   def get do
     config = :persistent_term.get({__MODULE__, :config})
-    %{config | keys: only_file(config.keys) ++ OmnigateControl.Keys.managed()}
+    file = only_file(config.keys)
+    names = MapSet.new(file, & &1.name)
+    # A name can belong to one key only. The file wins; a managed key of the
+    # same name is shadowed (see `shadowed_keys/0`) until one of them is renamed
+    # or removed.
+    %{config | keys: file ++ Enum.reject(OmnigateControl.Keys.managed(), &MapSet.member?(names, &1.name))}
+  end
+
+  @doc "Managed keys that are out of use because the config file defines a key with the same name."
+  def shadowed_keys do
+    names = MapSet.new(file_keys(), & &1.name)
+    Enum.filter(OmnigateControl.Keys.managed(), &MapSet.member?(names, &1.name))
+  end
+
+  @doc "Log a warning for each managed key that has just become shadowed. Cheap; called when either source changes."
+  def warn_shadowed do
+    now = shadowed_keys() |> Enum.map(& &1.name) |> Enum.sort()
+    before = :persistent_term.get({__MODULE__, :shadow_warned}, [])
+
+    for name <- now -- before do
+      Logger.warning(
+        "key #{inspect(name)} is defined in the config file and also exists as a managed key: the file's key is in use, " <>
+          "the managed one is shadowed and its secret no longer works. Rename one of them or delete the managed key."
+      )
+    end
+
+    if now != before, do: :persistent_term.put({__MODULE__, :shadow_warned}, now)
+    :ok
   end
 
   @doc "Only the keys written in the config file."
@@ -84,6 +111,7 @@ defmodule OmnigateControl.ConfigStore do
     :persistent_term.put({__MODULE__, :config}, config)
     :persistent_term.put({__MODULE__, :meta}, %{reloads: 0, loaded_at_ms: System.os_time(:millisecond)})
     Logger.info("loaded config #{path}: #{length(config.routes)} routes, #{length(config.keys)} keys")
+    warn_shadowed()
     schedule()
     {:ok, %{path: path, mtime: mtime}}
   end
@@ -98,6 +126,7 @@ defmodule OmnigateControl.ConfigStore do
               :persistent_term.put({__MODULE__, :config}, config)
               :persistent_term.put({__MODULE__, :meta}, %{reloads: meta().reloads + 1, loaded_at_ms: System.os_time(:millisecond)})
               Logger.info("reloaded config #{state.path}")
+              warn_shadowed()
               %{state | mtime: mtime}
 
             {:error, reason} ->
@@ -272,6 +301,9 @@ defmodule OmnigateControl.ConfigStore do
     %{
       jobs_days: days(r["jobs_days"], "jobs_days"),
       ledger_ids_days: days(r["ledger_ids_days"], "ledger_ids_days"),
+      # Ledger segments (the event history) older than this are deleted;
+      # totals are kept in the ledger's snapshots.
+      ledger_days: days(r["ledger_days"], "ledger_days"),
       # Also delete a removed job's objects from the bucket. On unless
       # switched off; it only ever does anything when jobs_days is set.
       delete_bucket_objects:

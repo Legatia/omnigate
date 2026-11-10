@@ -54,7 +54,7 @@ defmodule OmnigateControl.RetentionMetricsTest do
       assert [%{strategy: "failover", targets: [%{weight: 1}]}, %{strategy: "round_robin"}, %{strategy: "weighted", targets: [%{weight: 9}, %{weight: 0}]}] =
                config.routes
 
-      assert config.retention == %{jobs_days: 0, ledger_ids_days: 0, delete_bucket_objects: true}
+      assert config.retention == %{jobs_days: 0, ledger_ids_days: 0, ledger_days: 0, delete_bucket_objects: true}
     end
 
     test "bad values are refused with a message that names the problem" do

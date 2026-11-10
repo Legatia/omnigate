@@ -75,7 +75,7 @@ defmodule OmnigateControl.Dashboard do
           field,
           ~s(">),
           fmt(kind, Map.get(o.totals, key, 0)),
-          ~s(</div><div class="sub">today <span data-today="),
+          ~s{</div><div class="sub">today (UTC) <span data-today="},
           field,
           ~s(">),
           fmt(kind, Map.get(o.today, key, 0)),
@@ -194,7 +194,7 @@ defmodule OmnigateControl.Dashboard do
           for r <- list do
             [
               ~s(<tr><td class="mono">),
-              h(stamp(r.ts)),
+              time_tag(r.ts),
               ~s(</td><td>),
               h(r.key || "—"),
               ~s(</td><td>),
@@ -237,7 +237,7 @@ defmodule OmnigateControl.Dashboard do
           for j <- list do
             [
               ~s(<tr><td class="mono">),
-              h(stamp(j.created_at)),
+              time_tag(j.created_at),
               ~s(</td><td class="mono small-text">),
               h(j.id),
               ~s(</td><td>),
@@ -314,7 +314,7 @@ defmodule OmnigateControl.Dashboard do
           for a <- list do
             [
               ~s(<tr><td class="mono">),
-              h(stamp(a["ts"])),
+              time_tag(a["ts"]),
               ~s(</td><td>),
               h(a["action"]),
               ~s(</td><td>),
@@ -336,8 +336,8 @@ defmodule OmnigateControl.Dashboard do
   defp key_label("-"), do: "(no valid key)"
   defp key_label(name), do: name
 
-  defp period_label("monthly"), do: "this month"
-  defp period_label("daily"), do: "today"
+  defp period_label("monthly"), do: "this month (UTC)"
+  defp period_label("daily"), do: "today (UTC)"
   defp period_label(_), do: ""
 
   # "+ 1,200 cache read" under a token count, when a provider's prompt cache
@@ -376,6 +376,7 @@ defmodule OmnigateControl.Dashboard do
         ["Public base URL", c.media.public_base_url],
         ["Finished jobs kept", days(c.retention.jobs_days)],
         ["Ledger ids kept", days(c.retention.ledger_ids_days)],
+        ["Usage history kept", days(c.retention.ledger_days)],
         ["Expired jobs' bucket objects", if(c.retention.delete_bucket_objects, do: "deleted with the job", else: "left in the bucket")]
       ]),
       ~s(</div></div></section>)
@@ -439,6 +440,11 @@ defmodule OmnigateControl.Dashboard do
   # "2026-11-10T17:59:00.123Z" -> "2026-11-10 17:59:00"
   defp stamp(<<date::binary-size(10), _t, time::binary-size(8), _rest::binary>>), do: date <> " " <> time
   defp stamp(other), do: other || "—"
+
+  # Rendered in UTC and labelled so; the page's script rewrites it in the
+  # viewer's own time zone, and without JavaScript the UTC text stays.
+  defp time_tag(iso) when is_binary(iso), do: [~s(<time datetime="), h(iso), ~s(" data-local>), h(stamp(iso)), ~s( UTC</time>)]
+  defp time_tag(_), do: "—"
 
   defp clock(<<_date::binary-size(10), _t, time::binary-size(8), _rest::binary>>), do: time
   defp clock(other), do: other
@@ -519,7 +525,10 @@ defmodule OmnigateControl.Dashboard do
     function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
     function int(n){return Math.round(n||0).toLocaleString('en-US')}
     function usd(n){return '$'+(n||0).toFixed(4)}
-    function stamp(s){return s&&s.length>=19?s.slice(0,10)+' '+s.slice(11,19):(s||'—')}
+    function two(n){return n<10?'0'+n:''+n}
+    function stamp(s){if(!s)return '—';var d=new Date(s);if(isNaN(d.getTime()))return s;
+      return d.getFullYear()+'-'+two(d.getMonth()+1)+'-'+two(d.getDate())+' '+two(d.getHours())+':'+two(d.getMinutes())+':'+two(d.getSeconds())}
+    function localTimes(){var t=document.querySelectorAll('time[data-local]');for(var i=0;i<t.length;i++){t[i].textContent=stamp(t[i].getAttribute('datetime'));t[i].title=t[i].getAttribute('datetime')}}
     function pill(text,cls){return el('span','pill '+cls,String(text))}
     function td(cls,child){var c=el('td',cls||'');if(child!=null){if(typeof child==='string')c.textContent=child;else c.appendChild(child)}return c}
     function muted(t){return el('span','muted',t)}
@@ -528,7 +537,7 @@ defmodule OmnigateControl.Dashboard do
     function jobClass(s){return s==='succeeded'?'ok':s==='failed'?'bad':s==='canceled'?'off':'info'}
     function hookClass(s){return s==='delivered'?'ok':s==='failed'?'bad':s==='retrying'?'warn':'info'}
     function trail(a){return (a||[]).map(function(x){return x.upstream+': '+x.outcome}).join(' → ')}
-    function periodLabel(p){return p==='monthly'?' this month':p==='daily'?' today':''}
+    function periodLabel(p){return p==='monthly'?' this month (UTC)':p==='daily'?' today (UTC)':''}
     function cacheNote(cell,read,write){if(read>0)cell.appendChild(el('span','muted sub','+ '+int(read)+' cache read'));
       if(write>0)cell.appendChild(el('span','muted sub','+ '+int(write)+' cache write'))}
     function emptyRow(cols,text){var r=el('tr'),c=el('td','muted empty',text);c.colSpan=cols;r.appendChild(c);return r}
@@ -652,7 +661,7 @@ defmodule OmnigateControl.Dashboard do
       api('POST','/admin/keys',body).then(function(res){f.reset();status('Created.',false);showSecret(res.name,res.key,'New');return refresh()})
         .catch(function(e){status(e.message,true)}).finally(function(){submit.disabled=false})});
 
-    setInterval(refresh,4000);document.addEventListener('visibilitychange',function(){if(!document.hidden)refresh()});refresh();
+    localTimes();setInterval(refresh,4000);document.addEventListener('visibilitychange',function(){if(!document.hidden)refresh()});refresh();
     })();
     """
   end

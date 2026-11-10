@@ -43,7 +43,7 @@ defmodule OmnigateControl.Retention do
 
   @doc """
   Run one sweep now and return what it removed:
-  `%{jobs: n, files: n, bucket_objects: n, ledger_ids: n}`.
+  `%{jobs: n, files: n, bucket_objects: n, ledger_ids: n, ledger_segments: n}`.
   """
   def sweep(retention \\ ConfigStore.get().retention, now_ms \\ System.os_time(:millisecond)) do
     {jobs, files, objects} =
@@ -73,10 +73,21 @@ defmodule OmnigateControl.Retention do
         cutoff_ms -> Ledger.prune_ids(cutoff_ms)
       end
 
-    result = %{jobs: jobs, files: files, bucket_objects: objects, ledger_ids: ledger_ids}
+    # Old event history goes segment by segment; the totals it contributed
+    # stay in the ledger's snapshots.
+    ledger_segments =
+      case cutoff(retention[:ledger_days], now_ms) do
+        nil -> 0
+        cutoff_ms -> Ledger.prune_segments(cutoff_ms)
+      end
 
-    if jobs + files + objects + ledger_ids > 0 do
-      Logger.info("retention sweep removed #{jobs} finished jobs, #{files} stored files, #{objects} bucket objects, #{ledger_ids} ledger dedup ids")
+    result = %{jobs: jobs, files: files, bucket_objects: objects, ledger_ids: ledger_ids, ledger_segments: ledger_segments}
+
+    if jobs + files + objects + ledger_ids + ledger_segments > 0 do
+      Logger.info(
+        "retention sweep removed #{jobs} finished jobs, #{files} stored files, #{objects} bucket objects, " <>
+          "#{ledger_ids} ledger dedup ids, #{ledger_segments} ledger segments"
+      )
     end
 
     result

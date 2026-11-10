@@ -36,18 +36,65 @@ defmodule OmnigateControl.Ledger do
   are rebuilt on replay like everything else; rows of past periods are
   dropped from memory after a while (the log file keeps the events).
 
+  ## Snapshots, segments and rotation
+
+  Boot does not replay the whole history. The process writes a snapshot of
+  its tables every so many events, every few minutes, after a rotation and at
+  a clean stop; boot loads the newest valid one and replays only the events
+  written after it. The log is split into segments (by size, and at the turn
+  of the UTC day), and `retention.ledger_days` deletes segments older than
+  that. Their contribution stays in the snapshots, so lifetime and period
+  totals are unaffected. See `OmnigateControl.Ledger.Files` for the files and
+  for why a crash at any step loses nothing.
+
+  The consequence of deleting segments: the snapshots then hold the only copy
+  of those totals. Two generations are kept, and a segment is deleted only
+  once both cover it. If both were ever lost, boot would rebuild from the
+  segments that remain and say so loudly.
+
   Next step: replicate events across control-plane nodes so budgets are
   enforced cluster-wide.
   """
   use GenServer
   require Logger
 
+  alias OmnigateControl.Ledger.Files
+
   @table :omnigate_ledger_totals
   @prune_periods_ms 3_600_000
   @seen :omnigate_ledger_seen
   @recent 50
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  # `name: nil` and `tables: {totals, seen}` exist for tests, which run extra
+  # ledgers on scratch directories next to the application's own.
+  def start_link(opts) do
+    case Keyword.get(opts, :name, __MODULE__) do
+      nil -> GenServer.start_link(__MODULE__, opts)
+      name -> GenServer.start_link(__MODULE__, opts, name: name)
+    end
+  end
+
+  @doc "Write a snapshot now. Returns `:ok` or `{:error, reason}`."
+  def snapshot(server \\ __MODULE__), do: GenServer.call(server, :snapshot, 120_000)
+
+  @doc "Seal the active segment and start a new one (then snapshot)."
+  def rotate(server \\ __MODULE__), do: GenServer.call(server, :rotate, 120_000)
+
+  @doc """
+  Delete sealed segments whose last event is older than `cutoff_ms`, as far as
+  both snapshot generations cover them. Returns how many were deleted.
+  """
+  def prune_segments(cutoff_ms, server \\ __MODULE__) when is_integer(cutoff_ms), do: GenServer.call(server, {:prune_segments, cutoff_ms}, 120_000)
+
+  @doc "For readiness checks: `%{ready, writable, segment, offset, events_since_snapshot, snapshot_ms}`, or `{:error, reason}`."
+  def status(server \\ __MODULE__) do
+    GenServer.call(server, :status, 2_000)
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  @doc false
+  def dump(server), do: GenServer.call(server, :dump, 120_000)
 
   @doc """
   Record a batch of usage events from a data plane.
@@ -171,16 +218,106 @@ defmodule OmnigateControl.Ledger do
   @impl true
   def init(opts) do
     path = Keyword.fetch!(opts, :path)
-    File.mkdir_p!(Path.dirname(path))
-    :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
-    :ets.new(@seen, [:named_table, :set, :protected])
+    {table, seen} = Keyword.get(opts, :tables, {@table, @seen})
+    Process.put(:ledger_tables, {table, seen})
+    Process.flag(:trap_exit, true)
 
-    replayed = replay(path)
-    if replayed > 0, do: Logger.info("ledger replayed #{replayed} events from #{path}")
+    :ets.new(table, [:named_table, :set, :protected, read_concurrency: true])
+    :ets.new(seen, [:named_table, :set, :protected])
+
+    offset = Files.repair_active(path)
+    started = System.monotonic_time(:millisecond)
+
+    {covered, recent, generations} =
+      case Files.load_snapshot(path) do
+        {:ok, snapshot, which} ->
+          :ets.insert(table, snapshot.totals)
+          :ets.insert(seen, snapshot.seen)
+
+          if which == :prev do
+            Logger.warning("ledger: using the previous snapshot; the newest one was unusable")
+            # Remove the bad one, or the next snapshot would move it over the
+            # good spare we are running from.
+            File.rm(Files.snapshot_path(path))
+          end
+
+          {seq, _} = snapshot.covered
+          # The snapshot just read is the only one vouched for. Segments are
+          # deleted only when two validated generations cover them: this one
+          # and the next one this run writes.
+          {snapshot.covered, Map.get(snapshot, :recent, []), {seq, nil}}
+
+        :none ->
+          warn_if_history_missing(path)
+          {nil, [], {nil, nil}}
+      end
+
+    {replayed, recent} =
+      Enum.reduce(Files.tail(path, covered), {0, recent}, fn {file, from}, acc ->
+        Files.fold(file, from, acc, fn event, {n, recent} ->
+          apply_event(event)
+          {n + 1, Enum.take([event | recent], @recent)}
+        end)
+      end)
+
+    took = System.monotonic_time(:millisecond) - started
+
+    if replayed > 0 or covered do
+      from = if covered, do: "a snapshot plus #{replayed} later events", else: "#{replayed} events"
+      Logger.info("ledger ready in #{took} ms from #{from} (#{path})")
+    end
 
     file = File.open!(path, [:append, :binary])
+    {current, prev} = generations
+
+    state = %{
+      path: path,
+      file: file,
+      recent: recent,
+      segment: Files.active_seq(path),
+      offset: offset,
+      # UTC day the active segment's first event was written, for daily sealing.
+      segment_day: if(offset > 0, do: file_day(path), else: nil),
+      since_snapshot: replayed,
+      snapshot_ms: nil,
+      # Segment numbers the two snapshot generations cover up to (nil = none).
+      covered: current,
+      covered_prev: prev,
+      snapshot_every: Keyword.get(opts, :snapshot_every, env(:ledger_snapshot_every, 50_000)),
+      segment_bytes: Keyword.get(opts, :segment_bytes, env(:ledger_segment_bytes, 64 * 1024 * 1024)),
+      tick_ms: Keyword.get(opts, :tick_ms, env(:ledger_snapshot_interval_ms, 300_000))
+    }
+
+    # A boot that had to replay leaves a snapshot behind, so the next one does not.
+    state = if replayed > 0 or is_nil(covered), do: take_snapshot(state), else: state
+
     Process.send_after(self(), :prune_periods, @prune_periods_ms)
-    {:ok, %{file: file, recent: []}}
+    Process.send_after(self(), :tick, state.tick_ms)
+    {:ok, state}
+  end
+
+  defp env(key, default), do: Application.get_env(:omnigate_control, key, default)
+
+  # Segments are numbered from 1. If the oldest one left is not number 1 and no
+  # snapshot vouches for the deleted ones, their totals are gone.
+  defp warn_if_history_missing(path) do
+    case Files.sealed(path) do
+      [{first, _} | _] when first > 1 ->
+        Logger.error(
+          "ledger: no usable snapshot, and segments before #{first} were deleted by retention. " <>
+            "Totals are being rebuilt from the remaining segments only; spend recorded before them is lost."
+        )
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp file_day(path) do
+    case File.stat(path, time: :posix) do
+      {:ok, %{mtime: seconds}} -> seconds |> DateTime.from_unix!() |> DateTime.to_date() |> Date.to_iso8601()
+      _ -> nil
+    end
   end
 
   # Only the current period is ever read; the one before it is kept as a
@@ -193,6 +330,32 @@ defmodule OmnigateControl.Ledger do
     {:noreply, state}
   end
 
+  # Periodic: seal a segment that belongs to an earlier UTC day, and snapshot
+  # if anything was recorded since the last one.
+  def handle_info(:tick, state) do
+    today = Date.utc_today() |> Date.to_iso8601()
+
+    state =
+      cond do
+        state.offset > 0 and state.segment_day not in [nil, today] -> state |> seal() |> take_snapshot()
+        state.since_snapshot > 0 -> take_snapshot(state)
+        true -> state
+      end
+
+    Process.send_after(self(), :tick, state.tick_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(_other, state), do: {:noreply, state}
+
+  # A clean stop leaves a snapshot, so the next boot replays nothing.
+  @impl true
+  def terminate(_reason, state) do
+    if state.since_snapshot > 0, do: take_snapshot(state)
+    File.close(state.file)
+    :ok
+  end
+
   @doc "Drop the per-period spend rows of periods long past. Runs hourly by itself."
   def prune_period_rows(now \\ DateTime.utc_now()), do: GenServer.call(__MODULE__, {:prune_periods, now})
 
@@ -201,9 +364,9 @@ defmodule OmnigateControl.Ledger do
     keep_month = now |> DateTime.add(-32 * 86_400, :second) |> then(&period_id("monthly", &1))
     keep_day = now |> DateTime.add(-2 * 86_400, :second) |> then(&period_id("daily", &1))
 
-    for {{:period, _key, id} = row, _cost} <- :ets.tab2list(@table),
+    for {{:period, _key, id} = row, _cost} <- :ets.tab2list(tab()),
         (byte_size(id) == 7 and id < keep_month) or (byte_size(id) == 10 and id < keep_day) do
-      :ets.delete(@table, row)
+      :ets.delete(tab(), row)
     end
 
     :ok
@@ -213,15 +376,33 @@ defmodule OmnigateControl.Ledger do
   def handle_call({:record_batch, events, kind}, _from, state) do
     {accepted, counts} = classify(events, kind)
 
-    if accepted != [] do
-      # Write-ahead: the whole batch is on disk before totals change or we ack.
-      :ok = IO.binwrite(state.file, Enum.map(accepted, &[JSON.encode!(&1), ?\n]))
-      :ok = :file.datasync(state.file)
-      Enum.each(accepted, &apply_event/1)
-    end
+    state =
+      if accepted != [] do
+        # Write-ahead: the whole batch is on disk before totals change or we ack.
+        bytes = IO.iodata_to_binary(Enum.map(accepted, &[JSON.encode!(&1), ?\n]))
+        :ok = IO.binwrite(state.file, bytes)
+        :ok = :file.datasync(state.file)
+        Enum.each(accepted, &apply_event/1)
 
-    recent = Enum.take(Enum.reverse(accepted) ++ state.recent, @recent)
-    {:reply, {:ok, Map.put(counts, :accepted, length(accepted))}, %{state | recent: recent}}
+        %{
+          state
+          | offset: state.offset + byte_size(bytes),
+            since_snapshot: state.since_snapshot + length(accepted),
+            segment_day: state.segment_day || Date.utc_today() |> Date.to_iso8601(),
+            recent: Enum.take(Enum.reverse(accepted) ++ state.recent, @recent)
+        }
+      else
+        state
+      end
+
+    state =
+      cond do
+        state.offset >= state.segment_bytes -> state |> seal() |> take_snapshot()
+        state.since_snapshot >= state.snapshot_every -> take_snapshot(state)
+        true -> state
+      end
+
+    {:reply, {:ok, Map.put(counts, :accepted, length(accepted))}, state}
   end
 
   def handle_call(:recent, _from, state), do: {:reply, state.recent, state}
@@ -229,9 +410,84 @@ defmodule OmnigateControl.Ledger do
   def handle_call({:prune_periods, now}, _from, state), do: {:reply, prune_periods(now), state}
 
   def handle_call({:prune_ids, cutoff_ms}, _from, state) do
-    dropped = :ets.select_delete(@seen, [{{:_, :"$1"}, [{:<, :"$1", cutoff_ms}], [true]}])
+    dropped = :ets.select_delete(seen_tab(), [{{:_, :"$1"}, [{:<, :"$1", cutoff_ms}], [true]}])
+    # The snapshot would bring them back at the next boot otherwise.
+    state = if dropped > 0, do: %{state | since_snapshot: max(state.since_snapshot, 1)}, else: state
     {:reply, dropped, state}
   end
+
+  def handle_call(:snapshot, _from, state) do
+    state = take_snapshot(state)
+    {:reply, if(state.since_snapshot == 0, do: :ok, else: {:error, :snapshot_failed}), state}
+  end
+
+  def handle_call(:rotate, _from, state) do
+    state = if state.offset > 0, do: state |> seal() |> take_snapshot(), else: state
+    {:reply, {:ok, state.segment}, state}
+  end
+
+  # A segment goes only when BOTH snapshot generations cover it: then either
+  # one alone still reproduces the totals it contributed.
+  def handle_call({:prune_segments, cutoff_ms}, _from, state) do
+    state = if state.since_snapshot > 0, do: take_snapshot(state), else: state
+
+    deleted =
+      case {state.covered, state.covered_prev} do
+        {current, prev} when is_integer(current) and is_integer(prev) -> Files.delete_segments(state.path, min(current, prev), cutoff_ms)
+        _ -> 0
+      end
+
+    {:reply, deleted, state}
+  end
+
+  def handle_call(:status, _from, state) do
+    writable = match?({:ok, %{access: access}} when access in [:read_write, :write], File.stat(state.path))
+
+    {:reply,
+     %{
+       ready: true,
+       writable: writable,
+       segment: state.segment,
+       offset: state.offset,
+       events_since_snapshot: state.since_snapshot,
+       snapshot_ms: state.snapshot_ms
+     }, state}
+  end
+
+  def handle_call(:dump, _from, state) do
+    {:reply, %{totals: Enum.sort(:ets.tab2list(tab())), ids: seen_tab() |> :ets.tab2list() |> Enum.map(&elem(&1, 0)) |> Enum.sort()}, state}
+  end
+
+  # Close the active file under its number and start the next one.
+  defp seal(state) do
+    File.close(state.file)
+    segment = Files.seal(state.path)
+    Logger.info("ledger: sealed segment #{segment - 1} (#{state.offset} bytes)")
+    %{state | file: File.open!(state.path, [:append, :binary]), segment: segment, offset: 0, segment_day: nil}
+  end
+
+  # Never fatal: a snapshot that cannot be written costs boot time later, and
+  # recording usage must go on.
+  defp take_snapshot(state) do
+    snapshot = %{
+      version: 1,
+      covered: {state.segment, state.offset},
+      totals: :ets.tab2list(tab()),
+      seen: :ets.tab2list(seen_tab()),
+      recent: state.recent,
+      taken_ms: System.os_time(:millisecond)
+    }
+
+    Files.write_snapshot(state.path, snapshot)
+    %{state | since_snapshot: 0, snapshot_ms: snapshot.taken_ms, covered: state.segment, covered_prev: state.covered}
+  rescue
+    e ->
+      Logger.error("ledger: snapshot failed: #{Exception.message(e)}")
+      state
+  end
+
+  defp tab, do: Process.get(:ledger_tables) |> elem(0)
+  defp seen_tab, do: Process.get(:ledger_tables) |> elem(1)
 
   # Splits a batch into events to record, in order, plus duplicate/invalid counts.
   defp classify(events, kind) do
@@ -243,7 +499,7 @@ defmodule OmnigateControl.Ledger do
           not valid?(event) ->
             {acc, ids, %{counts | invalid: counts.invalid + 1}}
 
-          id && (MapSet.member?(ids, id) or :ets.member(@seen, id)) ->
+          id && (MapSet.member?(ids, id) or :ets.member(seen_tab(), id)) ->
             {acc, ids, %{counts | duplicates: counts.duplicates + 1}}
 
           true ->
@@ -303,7 +559,7 @@ defmodule OmnigateControl.Ledger do
 
   defp apply_event(event) do
     # Kept with the time we recorded it, so old ids can be pruned.
-    if id = event["id"], do: :ets.insert(@seen, {id, recorded_ms(event)})
+    if id = event["id"], do: :ets.insert(seen_tab(), {id, recorded_ms(event)})
 
     add(event["key_sha256"], event)
 
@@ -324,23 +580,23 @@ defmodule OmnigateControl.Ledger do
 
   defp add_period(row, cost) do
     current =
-      case :ets.lookup(@table, row) do
+      case :ets.lookup(tab(), row) do
         [{_, c}] -> c
         [] -> 0.0
       end
 
-    :ets.insert(@table, {row, current + cost})
+    :ets.insert(tab(), {row, current + cost})
   end
 
   defp add(row, event) do
     t =
-      case :ets.lookup(@table, row) do
+      case :ets.lookup(tab(), row) do
         [{_, totals}] -> totals
         [] -> empty_totals()
       end
 
     :ets.insert(
-      @table,
+      tab(),
       {row,
        %{
          t
@@ -363,29 +619,6 @@ defmodule OmnigateControl.Ledger do
       DateTime.to_unix(dt, :millisecond)
     else
       _ -> System.os_time(:millisecond)
-    end
-  end
-
-  defp replay(path) do
-    if File.exists?(path) do
-      path
-      |> File.stream!()
-      |> Stream.map(&String.trim/1)
-      |> Stream.reject(&(&1 == ""))
-      |> Enum.reduce(0, fn line, n ->
-        # A torn final line (crash mid-write) is skipped, not fatal.
-        case JSON.decode(line) do
-          {:ok, event} ->
-            apply_event(event)
-            n + 1
-
-          {:error, _} ->
-            Logger.warning("ledger: skipping unreadable line during replay")
-            n
-        end
-      end)
-    else
-      0
     end
   end
 

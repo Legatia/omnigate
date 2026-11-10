@@ -267,6 +267,7 @@
   "retention": {
     "jobs_days": 30,
     "ledger_ids_days": 7,
-    "delete_bucket_objects": true
+    "delete_bucket_objects": true,
+    "ledger_days": 90
   }
 }

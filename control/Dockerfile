@@ -49,6 +49,6 @@ ENV OMNIGATE_CONTROL_BIND=0.0.0.0 \
 EXPOSE 4000
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
-  CMD wget -q -O /dev/null http://127.0.0.1:4000/healthz || exit 1
+  CMD wget -q -O /dev/null http://127.0.0.1:4000/readyz || exit 1
 
 CMD ["/app/bin/omnigate_control", "start"]

@@ -17,6 +17,7 @@ defmodule OmnigateControl.Router do
     * `GET/POST /login`, `POST /logout` — dashboard sessions, see `AdminAuth`
     * `GET  /metrics`         — Prometheus metrics (admin token or session)
     * `GET  /healthz`         — liveness, no authentication
+    * `GET  /readyz`          — readiness: config loaded, ledger and job store up and writable
 
   Three audiences, three credentials: data planes use the internal token,
   operators use the admin token (or a session bought with it), and
@@ -26,6 +27,8 @@ defmodule OmnigateControl.Router do
 
   alias OmnigateControl.{Admin, AdminAuth, Audit, ConfigStore, Dashboard, Jobs, Keys, Ledger, Metrics, Rejections, Storage, UrlSigner}
 
+  require Logger
+
   plug(:match)
   plug(Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"])
   plug(:internal_auth)
@@ -33,8 +36,59 @@ defmodule OmnigateControl.Router do
   plug(:csrf)
   plug(:dispatch)
 
+  # Every failure leaves here as the same JSON error object, whatever raised
+  # it: a body that is not JSON, a body that is too large, or a bug.
+  def call(conn, opts) do
+    super(conn, opts)
+  rescue
+    error ->
+      {conn, error} =
+        case error do
+          %Plug.Conn.WrapperError{conn: inner, reason: reason} -> {inner, reason}
+          other -> {conn, other}
+        end
+
+      if conn.state in [:sent, :chunked, :file] do
+        reraise error, __STACKTRACE__
+      else
+        failure(conn, error, __STACKTRACE__)
+      end
+  end
+
+  defp failure(conn, %Plug.Parsers.ParseError{}, _stack), do: send_error(conn, 400, "invalid_json", "the request body is not valid JSON")
+
+  defp failure(conn, %Plug.Parsers.RequestTooLargeError{}, _stack),
+    do: send_error(conn, 413, "payload_too_large", "the request body is larger than the control plane accepts")
+
+  defp failure(conn, %Plug.Parsers.BadEncodingError{}, _stack), do: send_error(conn, 400, "invalid_request", "the request body is not valid UTF-8")
+
+  defp failure(conn, error, stack) do
+    # The id ties the client's error to this log line; nothing else about the
+    # failure leaves the process.
+    id = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+    Logger.error("request #{id} #{conn.method} #{conn.request_path} failed: " <> Exception.format(:error, error, stack))
+
+    send_json(conn, 500, %{error: %{type: "internal_error", message: "the control plane failed to handle this request", request_id: id}})
+  end
+
   get "/healthz" do
     conn |> put_resp_content_type("text/plain") |> send_resp(200, "ok\n")
+  end
+
+  # Only in the test build: a route that fails, to check what a failure looks like from outside.
+  if Application.compile_env(:omnigate_control, :test_routes, false) do
+    get "/__test/raise" do
+      _ = conn
+      raise "secret detail that must stay in the log"
+    end
+  end
+
+  # Liveness says the process answers; readiness says it can do its job.
+  get "/readyz" do
+    case readiness() do
+      :ok -> send_json(conn, 200, %{status: "ready"})
+      {:error, reason} -> send_json(conn, 503, %{status: "not_ready", reason: reason})
+    end
   end
 
   get "/metrics" do
@@ -274,7 +328,31 @@ defmodule OmnigateControl.Router do
   end
 
   match _ do
-    send_json(conn, 404, %{error: "not_found"})
+    send_error(conn, 404, "not_found", "no such endpoint")
+  end
+
+  @doc "`:ok`, or `{:error, reason}` naming the first thing that is not ready."
+  def readiness do
+    cond do
+      not config_loaded?() ->
+        {:error, "config is not loaded"}
+
+      is_nil(Process.whereis(OmnigateControl.Jobs.Store)) ->
+        {:error, "job store is not running"}
+
+      true ->
+        case Ledger.status() do
+          %{ready: true, writable: true} -> :ok
+          %{ready: true} -> {:error, "ledger file is not writable"}
+          _ -> {:error, "ledger is not running (it may still be replaying)"}
+        end
+    end
+  end
+
+  defp config_loaded? do
+    is_map(ConfigStore.get())
+  rescue
+    _ -> false
   end
 
   @doc "Data-plane view of the config: no budgets, no prices, no secrets."
@@ -420,7 +498,7 @@ defmodule OmnigateControl.Router do
 
   defp internal_auth(conn, _opts), do: conn
 
-  defp deny(conn), do: conn |> send_json(401, %{error: "unauthorized"}) |> halt()
+  defp deny(conn), do: conn |> send_error(401, "unauthorized", "missing or wrong internal token") |> halt()
 
   # `/admin/*` is an API: answer 401. The dashboard is a page: send the
   # browser to the login form. Everything else here is either public

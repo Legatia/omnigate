@@ -25,6 +25,8 @@ defmodule OmnigateControl.Admin do
       disabled: Keys.disabled?(key),
       blocked: Keys.over_budget?(key),
       state: Keys.state(key),
+      # True for a managed key that a config-file key of the same name has put out of use.
+      shadowed: false,
       has_webhook_secret: Map.get(key, :webhook_secret) != nil,
       requests: totals.requests,
       errors: totals.errors,
@@ -38,8 +40,11 @@ defmodule OmnigateControl.Admin do
     }
   end
 
-  @doc "Every key, file keys first."
-  def keys, do: Enum.map(ConfigStore.get().keys, &key_view/1)
+  @doc "Every key, file keys first, then managed ones; shadowed managed keys last, marked as such."
+  def keys do
+    Enum.map(ConfigStore.get().keys, &key_view/1) ++
+      Enum.map(ConfigStore.shadowed_keys(), &(&1 |> key_view() |> Map.merge(%{state: "shadowed", shadowed: true, blocked: false})))
+  end
 
   @doc """
   The dashboard's data, also served as `GET /admin/overview`:
@@ -150,7 +155,7 @@ defmodule OmnigateControl.Admin do
             _ -> %{kind: "local"}
           end
       },
-      retention: Map.merge(%{jobs_days: 0, ledger_ids_days: 0, delete_bucket_objects: true}, Map.get(config, :retention, %{}))
+      retention: Map.merge(%{jobs_days: 0, ledger_ids_days: 0, ledger_days: 0, delete_bucket_objects: true}, Map.get(config, :retention, %{}))
     }
   end
 

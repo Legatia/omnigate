@@ -26,6 +26,8 @@ gateway with failover, streaming, usage metering and budgets.
 - Failover to the next target on connection errors, 429 and 5xx, before any byte is sent to the client
 - Token usage read from the response stream without buffering it
 - Usage ledger appended and fsynced before it is acknowledged; totals are rebuilt from it on restart
+- Usage delivery that survives outages: events are queued and spooled to disk on the data plane, sent in batches, retried with backoff, and reloaded after a data-plane restart
+- Resent events are dropped by event id, so a retry never bills twice
 - Budgets per key: the control plane marks a key blocked and the data plane answers 402
 - Config file hot reload (control plane, every 2 s) and config polling (data plane, every 2 s)
 - The data plane keeps serving its last good config when the control plane is down
@@ -77,6 +79,8 @@ cd control; mix test
 | `OMNIGATE_LISTEN` | data plane | `127.0.0.1:8080` |
 | `OMNIGATE_CONTROL_URL` | data plane | `http://127.0.0.1:4000` |
 | `OMNIGATE_POLL_MS` | data plane | `2000` |
+| `OMNIGATE_FLUSH_MS` | data plane | `500`; how often queued usage is sent |
+| `OMNIGATE_SPOOL` | data plane | `omnigate-usage.spool`; `off` keeps usage in memory only |
 | `OMNIGATE_CONTROL_PORT` | control plane | `4000` |
 | `OMNIGATE_CONFIG` | control plane | `../config/omnigate.dev.json` |
 | `OMNIGATE_LEDGER` | control plane | `data/ledger.jsonl` |
@@ -92,8 +96,10 @@ real providers yet.
 ## Known gaps
 
 - A route can only use upstreams that speak the client's protocol; there is no OpenAI ↔ Anthropic translation yet.
-- Usage events are sent one at a time, best effort. Events are lost while the control plane is down.
-- Budgets are enforced after the fact, with up to one poll interval of lag, and on a single control-plane node.
+- Spool appends are not fsynced, so a power loss can drop the last few usage events. A process crash or restart does not.
+- The data plane holds at most 100,000 undelivered events; beyond that, new ones are dropped and counted in the log.
+- The ledger keeps every event id in memory for deduplication, so that set grows with the log.
+- Budgets are enforced after the fact, with up to one poll interval of lag, and on a single control-plane node. During a control-plane outage no key can be newly blocked.
 - No rate limiting, no caching, no TLS listener, no request timeouts.
 - The control plane binds to localhost and `/admin` and `/` have no authentication.
 - Cached-token and reasoning-token prices are not modelled; cost is input and output tokens only.
@@ -101,7 +107,7 @@ real providers yet.
 
 ## Next
 
-1. Batched, retried usage reporting with a local spool
-2. Cluster-wide budgets and rate limits across control-plane nodes
-3. LiteLLM config import
+1. Cluster-wide budgets and rate limits across control-plane nodes
+2. LiteLLM config import
+3. Request timeouts and a retry on a fresh connection before failing over
 4. Phase 1: async image and video jobs

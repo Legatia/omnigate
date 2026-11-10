@@ -4,12 +4,10 @@ defmodule OmnigateControl.Application do
 
   @impl true
   def start(_type, _args) do
-    port = env_int("OMNIGATE_CONTROL_PORT", 4000)
-
     children = [
       {OmnigateControl.ConfigStore, path: config_path()},
       {OmnigateControl.Ledger, path: ledger_path()},
-      {Bandit, plug: OmnigateControl.Router, ip: {127, 0, 0, 1}, port: port}
+      {Bandit, plug: OmnigateControl.Router, ip: {127, 0, 0, 1}, port: port()}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: OmnigateControl.Supervisor)
@@ -21,12 +19,14 @@ defmodule OmnigateControl.Application do
   end
 
   defp ledger_path do
-    System.get_env("OMNIGATE_LEDGER") || Path.expand("data/ledger.jsonl", File.cwd!())
+    System.get_env("OMNIGATE_LEDGER") ||
+      Application.get_env(:omnigate_control, :ledger_path) ||
+      Path.expand("data/ledger.jsonl", File.cwd!())
   end
 
-  defp env_int(name, default) do
-    case System.get_env(name) do
-      nil -> default
+  defp port do
+    case System.get_env("OMNIGATE_CONTROL_PORT") do
+      nil -> Application.get_env(:omnigate_control, :port, 4000)
       v -> String.to_integer(v)
     end
   end

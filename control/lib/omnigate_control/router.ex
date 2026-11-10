@@ -3,7 +3,7 @@ defmodule OmnigateControl.Router do
   HTTP API.
 
     * `GET  /internal/config` — snapshot for data planes (internal token)
-    * `POST /internal/usage`  — usage events from data planes (internal token)
+    * `POST /internal/usage/batch` — usage events from data planes (internal token)
     * `GET  /admin/usage`     — per-key totals as JSON
     * `GET  /`                — minimal dashboard (LiveView comes later)
 
@@ -22,9 +22,15 @@ defmodule OmnigateControl.Router do
     send_json(conn, 200, snapshot())
   end
 
-  post "/internal/usage" do
-    {:ok, _cost} = Ledger.record(conn.body_params)
-    send_resp(conn, 204, "")
+  post "/internal/usage/batch" do
+    case conn.body_params do
+      %{"events" => events} when is_list(events) ->
+        {:ok, counts} = Ledger.record_batch(events)
+        send_json(conn, 200, counts)
+
+      _ ->
+        send_json(conn, 400, %{error: "expected {\"events\": [...]}"})
+    end
   end
 
   get "/admin/usage" do

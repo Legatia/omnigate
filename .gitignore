@@ -10,3 +10,6 @@ erl_crash.dump
 
 # Local secrets
 .env
+
+# Data plane usage spool
+*.spool

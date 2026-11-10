@@ -111,14 +111,21 @@ pub fn pollLoop(app: *App) Io.Cancelable!void {
     }
 }
 
-/// POST a usage record (already JSON-encoded). Best effort: failures are logged.
-/// TODO: buffer + batch + retry so usage is never lost when the control plane is down.
-pub fn reportUsage(app: *App, json: []const u8) void {
-    const status = call(app, .POST, "/internal/usage", json, null) catch |err| {
-        log.warn("usage report failed: {t}", .{err});
-        return;
+pub const BatchOutcome = enum {
+    /// Recorded (or recognised as duplicates). Safe to forget the events.
+    accepted,
+    /// The control plane says the batch itself is unacceptable; resending
+    /// the same bytes cannot succeed.
+    rejected,
+};
+
+/// POST a `{"events":[...]}` usage batch. An error means "try again later".
+pub fn postUsageBatch(app: *App, body: []const u8) !BatchOutcome {
+    const status = try call(app, .POST, "/internal/usage/batch", body, null);
+    return switch (status) {
+        .ok => .accepted,
+        .bad_request, .payload_too_large, .unprocessable_entity => .rejected,
+        // 401 (token mismatch), 5xx, anything else: keep the events and retry.
+        else => error.BadStatus,
     };
-    if (status != .ok and status != .accepted and status != .no_content) {
-        log.warn("usage report returned {d}", .{@backingInt(status)});
-    }
 }

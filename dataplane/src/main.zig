@@ -5,6 +5,9 @@
 //!   OMNIGATE_CONTROL_URL     control plane base URL        (default http://127.0.0.1:4000)
 //!   OMNIGATE_INTERNAL_TOKEN  shared secret for /internal/* (required)
 //!   OMNIGATE_POLL_MS         config poll interval in ms    (default 2000)
+//!   OMNIGATE_FLUSH_MS        usage flush interval in ms    (default 500)
+//!   OMNIGATE_SPOOL           usage spool file              (default omnigate-usage.spool;
+//!                            set to "off" for memory-only)
 //!   <api_key_env>            provider keys named by each upstream in the config
 
 const std = @import("std");
@@ -12,6 +15,7 @@ const Io = std.Io;
 const config = @import("config.zig");
 const control = @import("control.zig");
 const proxy = @import("proxy.zig");
+const reporter = @import("reporter.zig");
 
 const log = std.log.scoped(.main);
 
@@ -20,10 +24,12 @@ pub const App = struct {
     io: Io,
     client: *std.http.Client,
     store: *config.Store,
+    reporter: *reporter.Reporter,
     env: *const std.process.Environ.Map,
     control_url: []const u8,
     internal_token: []const u8,
     poll_interval_ms: i64,
+    flush_interval_ms: i64,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -38,6 +44,9 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingInternalToken;
     };
     const poll_ms: i64 = if (env.get("OMNIGATE_POLL_MS")) |s| try std.fmt.parseInt(i64, s, 10) else 2000;
+    const flush_ms: i64 = if (env.get("OMNIGATE_FLUSH_MS")) |s| try std.fmt.parseInt(i64, s, 10) else 500;
+    const spool_env = env.get("OMNIGATE_SPOOL") orelse "omnigate-usage.spool";
+    const spool_path: ?[]const u8 = if (std.mem.eql(u8, spool_env, "off")) null else spool_env;
 
     const colon = std.mem.findScalarLast(u8, listen, ':') orelse return error.InvalidListenAddress;
     const port = try std.fmt.parseInt(u16, listen[colon + 1 ..], 10);
@@ -49,15 +58,23 @@ pub fn main(init: std.process.Init) !void {
     var store: config.Store = .{};
     defer store.deinit(gpa);
 
+    var usage_reporter = reporter.Reporter.init(gpa, io, Io.Dir.cwd(), spool_path) catch |err| {
+        log.err("cannot open usage spool {s}: {t}", .{ spool_env, err });
+        return err;
+    };
+    defer usage_reporter.deinit();
+
     var app: App = .{
         .gpa = gpa,
         .io = io,
         .client = &client,
         .store = &store,
+        .reporter = &usage_reporter,
         .env = env,
         .control_url = control_url,
         .internal_token = internal_token,
         .poll_interval_ms = poll_ms,
+        .flush_interval_ms = flush_ms,
     };
 
     control.syncOnce(&app) catch |err| {
@@ -72,6 +89,7 @@ pub fn main(init: std.process.Init) !void {
     defer group.cancel(io);
 
     try group.concurrent(io, control.pollLoop, .{&app});
+    try group.concurrent(io, reporter.flushLoop, .{&app});
 
     while (true) {
         const stream = server.accept(io) catch |err| {
@@ -87,5 +105,6 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = config;
+    _ = reporter;
     _ = @import("usage.zig");
 }

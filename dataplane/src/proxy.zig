@@ -223,11 +223,27 @@ const UsageReport = struct {
     output_tokens: u64,
     latency_ms: i64,
     attempts: []const Attempt,
+    /// Filled in by `report`.
+    id: []const u8 = "",
+    ts_ms: i64 = 0,
 };
 
+/// Queue a usage event. Returns immediately: delivery (batching, retries, the
+/// on-disk spool) is the reporter's job, so requests never wait on the
+/// control plane.
 fn report(app: *App, arena: std.mem.Allocator, r: UsageReport) void {
-    const json = std.json.Stringify.valueAlloc(arena, r, .{}) catch return;
-    control.reportUsage(app, json);
+    // Unique id: delivery is at-least-once and the ledger dedups on it.
+    var raw: [16]u8 = undefined;
+    app.io.random(&raw);
+    const id = std.fmt.bytesToHex(raw, .lower);
+
+    var event = r;
+    event.id = &id;
+    // When the request finished here, not when the event reaches the ledger.
+    event.ts_ms = Io.Timestamp.now(app.io, .real).toMilliseconds();
+
+    const json = std.json.Stringify.valueAlloc(arena, event, .{}) catch return;
+    app.reporter.enqueue(json);
 }
 
 const ForwardResult = union(enum) {

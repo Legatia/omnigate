@@ -15,9 +15,11 @@ const http = std.http;
 const balance = @import("balance.zig");
 const config = @import("config.zig");
 const control = @import("control.zig");
+const logging = @import("logging.zig");
 const quirks = @import("quirks.zig");
 const translate = @import("translate.zig");
 const usage_mod = @import("usage.zig");
+const watchdog = @import("watchdog.zig");
 const Usage = usage_mod.Usage;
 const App = @import("main.zig").App;
 
@@ -30,7 +32,14 @@ const control_timeout_ms = 30_000;
 /// Cap on an upstream response that must be buffered to be translated.
 const max_translated_body = 64 * 1024 * 1024;
 
-pub fn handleConnection(app: *App, stream: Io.net.Stream) void {
+pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
+    // `guard` lets the watchdog cancel this task when the client (or, during
+    // a stream, the upstream) stalls. It is freed by the watchdog once `done`
+    // is set, so that must be the last thing this task does.
+    defer guard.done.store(true, .release);
+    // Counted by the accept loop before this task was spawned.
+    defer _ = app.active_connections.fetchSub(1, .acq_rel);
+    const stream = guard.stream;
     defer stream.close(app.io);
 
     var recv_buf: [16 * 1024]u8 = undefined;
@@ -40,6 +49,13 @@ pub fn handleConnection(app: *App, stream: Io.net.Stream) void {
     var server = http.Server.init(&stream_reader.interface, &stream_writer.interface);
 
     while (true) {
+        // Between requests nothing is lost by closing: mark the connection
+        // idle before looking at the shutdown flag, so that shutdown either
+        // sees the mark or we see the flag.
+        guard.idle.store(true, .release);
+        if (app.shutting_down.load(.acquire)) return;
+        guard.arm(app.io, app.client_timeout_ms);
+
         var request = server.receiveHead() catch |err| switch (err) {
             error.HttpConnectionClosing => return,
             else => {
@@ -47,10 +63,23 @@ pub fn handleConnection(app: *App, stream: Io.net.Stream) void {
                 return;
             },
         };
-        handleRequest(app, &request) catch |err| {
-            log.warn("request aborted: {t}", .{err});
-            return;
-        };
+        guard.idle.store(false, .release);
+        // The rest of the request (its body) gets a fresh allowance.
+        guard.arm(app.io, app.client_timeout_ms);
+
+        var acc: logging.Access = .{};
+        const started = Io.Timestamp.now(app.io, .awake);
+        const outcome = handleRequest(app, &request, guard, &acc);
+        acc.latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds();
+        if (outcome) |_| {} else |err| {
+            // The watchdog cancels the task; say what that meant.
+            acc.aborted = if (!guard.timedOut()) err else if (acc.status == 0) error.ClientTimeout else error.StreamIdleTimeout;
+            if (acc.status == 0 and guard.timedOut()) acc.status = 408;
+        }
+        const is_probe = acc.status == 200 and std.mem.eql(u8, acc.path.get(), "/healthz");
+        logging.access(&acc, if (is_probe) .debug else .info);
+        outcome catch return;
+        guard.disarm();
     }
 }
 
@@ -61,7 +90,7 @@ const ClientHeaders = struct {
     idempotency_key: ?[]const u8 = null,
 };
 
-fn handleRequest(app: *App, request: *http.Server.Request) !void {
+fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn, acc: *logging.Access) !void {
     var arena_state: std.heap.ArenaAllocator = .init(app.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -70,6 +99,10 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
     const target = try arena.dupe(u8, request.head.target);
     const path = target[0 .. std.mem.findScalar(u8, target, '?') orelse target.len];
     const query = if (path.len < target.len) target[path.len + 1 ..] else "";
+    acc.method = @tagName(method);
+    acc.path.set(path);
+    // Nothing more to wait for from a request without a body.
+    if (!method.requestHasBody()) guard.disarm();
 
     // Header strings are invalidated once the body reader is created; copy now.
     var hdrs: ClientHeaders = .{};
@@ -93,31 +126,33 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
     }
 
     if (method == .GET and std.mem.eql(u8, path, "/healthz")) {
+        acc.status = 200;
         return request.respond("ok\n", .{ .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }} });
     }
 
     const snapshot = app.store.get(app.io) orelse
-        return respondError(request, .service_unavailable, "gateway_not_ready", "no config from control plane yet");
+        return respondError(acc, request, .service_unavailable, "gateway_not_ready", "no config from control plane yet");
 
     const is_files = std.mem.startsWith(u8, path, "/v1/files/");
     const is_jobs = std.mem.eql(u8, path, "/v1/jobs") or std.mem.startsWith(u8, path, "/v1/jobs/");
 
     // A signed output URL carries its own proof; the control plane checks it.
     if (is_files and method == .GET and hdrs.api_key == null and hasQueryParam(query, "sig")) {
-        return forwardToControl(app, arena, request, method, target, null, hdrs, null);
+        return forwardToControl(app, acc, arena, request, method, target, null, hdrs, null);
     }
 
     // --- authentication -------------------------------------------------
     const presented = hdrs.api_key orelse
-        return respondError(request, .unauthorized, "missing_api_key", "send Authorization: Bearer <key> or x-api-key");
+        return respondError(acc, request, .unauthorized, "missing_api_key", "send Authorization: Bearer <key> or x-api-key");
     const key_hash = config.sha256Hex(presented);
     const key = snapshot.findKey(&key_hash) orelse
-        return respondError(request, .unauthorized, "invalid_api_key", "unknown gateway key");
+        return respondError(acc, request, .unauthorized, "invalid_api_key", "unknown gateway key");
+    acc.key.set(key.name);
     if (key.blocked)
-        return respondError(request, .payment_required, "budget_exceeded", "this key has exhausted its budget");
+        return respondError(acc, request, .payment_required, "budget_exceeded", "this key has exhausted its budget");
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/models")) {
-        return respondModels(arena, request, snapshot, key);
+        return respondModels(acc, arena, request, snapshot, key);
     }
 
     const endpoint: ?Endpoint = if (method == .POST) Endpoint.forPath(path) else null;
@@ -127,39 +162,40 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
     // (which also applies the key's model limits to them)
     if (is_jobs or is_files) {
         if (method != .GET and method != .POST)
-            return respondError(request, .method_not_allowed, "method_not_allowed", "use GET or POST");
+            return respondError(acc, request, .method_not_allowed, "method_not_allowed", "use GET or POST");
         // Only requests that start work count against the rate limit;
         // polling a job does not.
         if (is_job_create) {
-            if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(request, secs);
+            if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(acc, request, secs);
         }
         const job_body: ?[]u8 = if (method == .POST)
-            (try readBody(arena, request)) orelse
-                return respondError(request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB")
+            (try readBody(arena, request, guard)) orelse
+                return respondError(acc, request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB")
         else
             null;
-        return forwardToControl(app, arena, request, method, target, job_body, hdrs, &key_hash);
+        return forwardToControl(app, acc, arena, request, method, target, job_body, hdrs, &key_hash);
     }
 
     const ep = endpoint orelse
-        return respondError(request, .not_found, "not_found", "unsupported endpoint");
+        return respondError(acc, request, .not_found, "not_found", "unsupported endpoint");
     const kind = ep.kind;
 
     // --- body -------------------------------------------------------------
-    const body = (try readBody(arena, request)) orelse
-        return respondError(request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB");
+    const body = (try readBody(arena, request, guard)) orelse
+        return respondError(acc, request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB");
 
     var parsed = std.json.parseFromSlice(std.json.Value, arena, body, .{}) catch
-        return respondError(request, .bad_request, "invalid_json", "request body is not valid JSON");
+        return respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON");
     if (parsed.value != .object)
-        return respondError(request, .bad_request, "invalid_json", "request body must be a JSON object");
+        return respondError(acc, request, .bad_request, "invalid_json", "request body must be a JSON object");
     const obj = &parsed.value.object;
 
     const model_val = obj.get("model") orelse
-        return respondError(request, .bad_request, "missing_model", "request has no \"model\" field");
+        return respondError(acc, request, .bad_request, "missing_model", "request has no \"model\" field");
     if (model_val != .string)
-        return respondError(request, .bad_request, "missing_model", "\"model\" must be a string");
+        return respondError(acc, request, .bad_request, "missing_model", "\"model\" must be a string");
     const route_model = try arena.dupe(u8, model_val.string);
+    acc.model.set(route_model);
     const is_stream = if (obj.get("stream")) |s| s == .bool and s.bool else false;
 
     // --- model limits -------------------------------------------------------
@@ -167,15 +203,15 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
     // and before the route lookup, so the answer does not reveal which other
     // models exist.
     if (!key.allows(route_model))
-        return respondError(request, .forbidden, "model_not_allowed", "this key may not use this model");
+        return respondError(acc, request, .forbidden, "model_not_allowed", "this key may not use this model");
 
     // --- rate limit ---------------------------------------------------------
     if (ep.metered) {
-        if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(request, secs);
+        if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(acc, request, secs);
     }
 
     const route = snapshot.findRoute(route_model) orelse
-        return respondError(request, .not_found, "model_not_found", "no route for this model");
+        return respondError(acc, request, .not_found, "model_not_found", "no route for this model");
 
     // OpenAI only reports usage on streams when asked to. If the client did
     // not ask, we do (to meter the call) and hide the extra chunk from it.
@@ -203,6 +239,7 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
     var raw_id: [16]u8 = undefined;
     app.io.random(&raw_id);
     const req_id = std.fmt.bytesToHex(raw_id, .lower);
+    acc.request_id.set(&req_id);
 
     // The order to try the targets in: the route's strategy picks who goes
     // first (see balance.zig); upstreams that are cooling down after repeated
@@ -286,7 +323,7 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
         var maybe_result: ?ForwardResult = null;
         var tries: u8 = 0;
         while (tries < 2) : (tries += 1) {
-            if (forward(app, arena, request, up, upstream_path, out_body, hdrs, &usage, &req_id, &committed, mode, tried)) |r| {
+            if (forward(app, arena, request, guard, up, upstream_path, out_body, hdrs, &usage, &req_id, &committed, mode, tried)) |r| {
                 if (r == .drop_sampling) {
                     // The model refused temperature/top_p/top_k, which a client
                     // of the other protocol could not have known. Remember it
@@ -320,6 +357,11 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
                     // The client already has part of the response; all we can
                     // do is bill what was metered and drop the connection.
                     try attempts.append(arena, .{ .upstream = up.name, .outcome = "stream_aborted" });
+                    acc.status = 499;
+                    acc.upstream.set(up.name);
+                    acc.attempts = tried;
+                    acc.input_tokens = usage.input_tokens;
+                    acc.output_tokens = usage.output_tokens;
                     if (ep.metered) report(app, arena, .{
                         .id = &req_id,
                         .key_sha256 = &key_hash,
@@ -359,6 +401,11 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
             .drop_sampling, .add_thought_signature => unreachable,
             .done => |status| {
                 app.health.recordSuccess(app.io, up.name);
+                acc.status = @backingInt(status);
+                acc.upstream.set(up.name);
+                acc.attempts = tried;
+                acc.input_tokens = usage.input_tokens;
+                acc.output_tokens = usage.output_tokens;
                 try attempts.append(arena, .{ .upstream = up.name, .outcome = "ok" });
                 if (ep.metered) report(app, arena, .{
                     .id = &req_id,
@@ -391,6 +438,8 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
         .latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds(),
         .attempts = attempts.items,
     });
+    acc.status = 502;
+    acc.attempts = tried;
     const detail = try std.json.Stringify.valueAlloc(arena, .{
         .@"error" = .{
             .type = "all_upstreams_failed",
@@ -425,12 +474,14 @@ fn noteFailure(app: *App, upstream: []const u8) void {
 }
 
 /// Read the whole request body; null when it exceeds `max_request_body`.
-fn readBody(arena: std.mem.Allocator, request: *http.Server.Request) !?[]u8 {
+/// The client timeout armed on `guard` covers the read and ends with it.
+fn readBody(arena: std.mem.Allocator, request: *http.Server.Request, guard: *watchdog.Conn) !?[]u8 {
+    defer guard.disarm();
     var body_buf: [8 * 1024]u8 = undefined;
     const body_reader = try request.readerExpectContinue(&body_buf);
     return body_reader.allocRemaining(arena, .limited(max_request_body)) catch |err| switch (err) {
         error.StreamTooLong => return null,
-        else => return err,
+        else => return if (guard.timedOut()) error.ClientTimeout else err,
     };
 }
 
@@ -620,6 +671,7 @@ const ForwardMode = union(enum) {
 fn worthRetrying(err: anyerror) bool {
     return switch (err) {
         error.UpstreamTimeout,
+        error.StreamIdleTimeout,
         error.UpstreamUnparseable,
         error.ConnectionRefused,
         error.OutOfMemory,
@@ -633,6 +685,8 @@ fn forward(
     app: *App,
     arena: std.mem.Allocator,
     request: *http.Server.Request,
+    /// The connection's deadline (see watchdog.zig).
+    guard: *watchdog.Conn,
     up: *const config.Upstream,
     path: []const u8,
     out_body: []u8,
@@ -690,6 +744,12 @@ fn forward(
     const timeout_ms = if (up.timeout_ms != 0) up.timeout_ms else app.upstream_timeout_ms;
     var response = try call.openWithTimeout(app.io, timeout_ms);
 
+    // From here on bytes have to keep moving: if the upstream goes silent, or
+    // the client stops reading, for the idle timeout, the watchdog cancels
+    // this task and the read or write below fails.
+    guard.arm(app.io, app.stream_idle_timeout_ms);
+    defer guard.disarm();
+
     const status = response.head.status;
     if (isRetryable(status)) return .{ .retry = status };
 
@@ -714,7 +774,7 @@ fn forward(
     if (mode == .translate and !is_sse) {
         const x = mode.translate;
         const raw = upstream_body.allocRemaining(arena, .limited(max_translated_body)) catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+            error.ReadFailed => return if (guard.timedOut()) error.StreamIdleTimeout else (response.bodyErr() orelse error.ReadFailed),
             error.StreamTooLong => return error.UpstreamUnparseable,
             else => |e| return e,
         };
@@ -761,7 +821,7 @@ fn forward(
         var vec = [_][]u8{&chunk};
         const n = upstream_body.readVec(&vec) catch |err| switch (err) {
             error.EndOfStream => break,
-            error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+            error.ReadFailed => return if (guard.timedOut()) error.StreamIdleTimeout else (response.bodyErr() orelse error.ReadFailed),
         };
         if (n == 0) continue;
         usage.feed(chunk[0..n]);
@@ -777,6 +837,7 @@ fn forward(
         // (`BodyWriter.flush` alone only does the second half).
         try body_writer.writer.flush();
         try body_writer.flush();
+        guard.arm(app.io, app.stream_idle_timeout_ms);
     }
     if (translator) |*tr| try tr.finish(&body_writer.writer);
     if (mode == .hide_usage_chunk and is_sse) try usage_filter.finish(&body_writer.writer);
@@ -789,6 +850,7 @@ fn forward(
 /// null only for signed file URLs, which the control plane verifies itself.
 fn forwardToControl(
     app: *App,
+    acc: *logging.Access,
     arena: std.mem.Allocator,
     request: *http.Server.Request,
     method: http.Method,
@@ -800,7 +862,7 @@ fn forwardToControl(
     const base = std.mem.trimEnd(u8, app.control_url, "/");
     const url = try std.fmt.allocPrint(arena, "{s}/internal{s}", .{ base, target });
     const uri = std.Uri.parse(url) catch
-        return respondError(request, .bad_request, "invalid_request", "malformed request path");
+        return respondError(acc, request, .bad_request, "invalid_request", "malformed request path");
 
     var extra: std.ArrayList(http.Header) = .empty;
     try extra.append(arena, .{ .name = control.internal_header, .value = app.internal_token });
@@ -829,10 +891,11 @@ fn forwardToControl(
 
     var response = call.openWithTimeout(app.io, control_timeout_ms) catch |err| {
         log.warn("control plane request {s} failed: {t}", .{ target, err });
-        return respondError(request, .service_unavailable, "control_plane_unavailable", "media jobs need the control plane, which is not reachable");
+        return respondError(acc, request, .service_unavailable, "control_plane_unavailable", "media jobs need the control plane, which is not reachable");
     };
 
     const status = response.head.status;
+    acc.status = @backingInt(status);
     const content_type = try arena.dupe(u8, response.head.content_type orelse "application/json");
     const content_length = response.head.content_length;
 
@@ -862,7 +925,8 @@ fn forwardToControl(
     try body_writer.end();
 }
 
-fn respondRateLimited(request: *http.Server.Request, retry_after_s: u32) !void {
+fn respondRateLimited(acc: *logging.Access, request: *http.Server.Request, retry_after_s: u32) !void {
+    acc.status = 429;
     var num: [16]u8 = undefined;
     const secs = std.fmt.bufPrint(&num, "{d}", .{retry_after_s}) catch unreachable;
     try request.respond(
@@ -876,7 +940,8 @@ fn respondRateLimited(request: *http.Server.Request, retry_after_s: u32) !void {
     });
 }
 
-fn respondError(request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) !void {
+fn respondError(acc: *logging.Access, request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) !void {
+    acc.status = @backingInt(status);
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     std.json.Stringify.value(.{ .@"error" = .{ .type = code, .message = message } }, .{}, &w) catch {};
@@ -887,7 +952,8 @@ fn respondError(request: *http.Server.Request, status: http.Status, code: []cons
 }
 
 /// The routes this key may use.
-fn respondModels(arena: std.mem.Allocator, request: *http.Server.Request, snapshot: *const config.Snapshot, key: *const config.Key) !void {
+fn respondModels(acc: *logging.Access, arena: std.mem.Allocator, request: *http.Server.Request, snapshot: *const config.Snapshot, key: *const config.Key) !void {
+    acc.status = 200;
     const Model = struct { id: []const u8, object: []const u8 = "model", owned_by: []const u8 = "omnigate" };
     var models: std.ArrayList(Model) = .empty;
     for (snapshot.routes) |r| {

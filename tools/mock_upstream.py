@@ -4,6 +4,8 @@
   :9002  OpenAI-shaped, works (JSON and SSE)
   :9003  Anthropic-shaped, works (JSON and SSE)
   :9004  OpenAI-shaped, works but waits 3 s before answering (forces a timeout)
+  :9005  OpenAI-shaped, starts a stream, sends one chunk, then goes silent
+         (forces the gateway's stream idle timeout)
 
 Run:  python tools/mock_upstream.py
 """
@@ -134,13 +136,36 @@ class Slow(OpenAIOk):
         super().do_POST()
 
 
+class Stall(Base):
+    def do_POST(self):
+        self.read_json()
+        self.start_sse()
+        self.sse('data: {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "Hel"}}]}\n\n')
+        # Say nothing more; give up after a minute or when the peer goes away.
+        deadline = time.time() + 60
+        try:
+            while time.time() < deadline:
+                time.sleep(0.5)
+                self.wfile.write(b"")
+        except OSError:
+            pass
+        self.close_connection = True
+
+
+class Server(ThreadingHTTPServer):
+    # The default backlog of 5 makes the mock, not the gateway, the bottleneck
+    # as soon as a few dozen connections open at once.
+    request_queue_size = 512
+    daemon_threads = True
+
+
 def serve(port, handler):
     # MOCK_BIND=0.0.0.0 lets other containers reach the mocks (container test).
-    ThreadingHTTPServer((os.environ.get("MOCK_BIND", "127.0.0.1"), port), handler).serve_forever()
+    Server((os.environ.get("MOCK_BIND", "127.0.0.1"), port), handler).serve_forever()
 
 
 if __name__ == "__main__":
-    for port, handler in [(9001, Flaky), (9002, OpenAIOk), (9003, AnthropicOk), (9004, Slow)]:
+    for port, handler in [(9001, Flaky), (9002, OpenAIOk), (9003, AnthropicOk), (9004, Slow), (9005, Stall)]:
         threading.Thread(target=serve, args=(port, handler), daemon=True).start()
-    print("mock upstreams on :9001 (503), :9002 (openai), :9003 (anthropic), :9004 (slow openai)", flush=True)
+    print("mock upstreams on :9001 (503), :9002 (openai), :9003 (anthropic), :9004 (slow openai), :9005 (stalling openai)", flush=True)
     threading.Event().wait()

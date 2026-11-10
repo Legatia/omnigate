@@ -26,6 +26,8 @@ pub const batch_max = 500;
 pub const queue_max = 100_000;
 const max_backoff_ms = 10_000;
 const max_spool_bytes = 256 * 1024 * 1024;
+/// Buffer kept allocated while the queue is empty.
+const idle_capacity_max = 1024 * 1024;
 
 pub const Batch = struct {
     body: []u8,
@@ -36,8 +38,16 @@ pub const Reporter = struct {
     gpa: std.mem.Allocator,
     io: Io,
     mutex: Io.Mutex = .init,
-    /// Owned lines, each ending in '\n' exactly as stored in the spool file.
-    queue: std.ArrayList([]u8) = .empty,
+    /// The undelivered events, oldest first, as one run of bytes: each event
+    /// is a line of JSON ending in '\n', exactly as in the spool file. One
+    /// buffer that is reused, rather than one allocation per event that a
+    /// request thread makes and the flush thread frees: that pattern makes
+    /// memory creep under a thread-caching allocator.
+    bytes: std.ArrayList(u8) = .empty,
+    /// Offset in `bytes` of the oldest undelivered event.
+    head: usize = 0,
+    /// Events in `bytes[head..]`.
+    count: usize = 0,
     file: ?Io.File = null,
     file_len: u64 = 0,
     dropped: u64 = 0,
@@ -47,6 +57,7 @@ pub const Reporter = struct {
     /// With `path == null` the spool is memory-only.
     pub fn init(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: ?[]const u8) !Reporter {
         var r: Reporter = .{ .gpa = gpa, .io = io };
+        errdefer r.bytes.deinit(gpa);
         const p = path orelse return r;
 
         const file = try dir.createFile(io, p, .{ .read = true, .truncate = false });
@@ -68,45 +79,38 @@ pub const Reporter = struct {
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            if (r.queue.items.len >= queue_max or !(try std.json.validate(gpa, line))) {
+            if (r.count >= queue_max or !(try std.json.validate(gpa, line))) {
                 damaged = true;
                 continue;
             }
-            const owned = try gpa.alloc(u8, line.len + 1);
-            @memcpy(owned[0..line.len], line);
-            owned[line.len] = '\n';
-            try r.queue.append(gpa, owned);
+            try r.bytes.ensureUnusedCapacity(gpa, line.len + 1);
+            r.bytes.appendSliceAssumeCapacity(line);
+            r.bytes.appendAssumeCapacity('\n');
+            r.count += 1;
         }
 
         if (damaged) {
             log.warn("spool had damaged or excess data; rewriting it", .{});
             try file.setLength(io, 0);
-            var off: u64 = 0;
-            for (r.queue.items) |line| {
-                try file.writePositionalAll(io, line, off);
-                off += line.len;
-            }
-            r.file_len = off;
-        } else {
-            r.file_len = n;
+            try file.writePositionalAll(io, r.bytes.items, 0);
         }
+        r.file_len = if (damaged) r.bytes.items.len else n;
 
-        if (r.queue.items.len > 0) {
-            log.info("reloaded {d} undelivered usage events from spool", .{r.queue.items.len});
+        if (r.count > 0) {
+            log.info("reloaded {d} undelivered usage events from spool", .{r.count});
         }
         return r;
     }
 
     pub fn deinit(r: *Reporter) void {
-        for (r.queue.items) |line| r.gpa.free(line);
-        r.queue.deinit(r.gpa);
+        r.bytes.deinit(r.gpa);
         if (r.file) |f| f.close(r.io);
     }
 
     pub fn pending(r: *Reporter) usize {
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
-        return r.queue.items.len;
+        return r.count;
     }
 
     /// Queue one JSON-encoded event. Never blocks on the network.
@@ -114,17 +118,16 @@ pub const Reporter = struct {
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
 
-        if (r.queue.items.len >= queue_max) return r.drop("queue full");
+        if (r.count >= queue_max) return r.drop("queue full");
 
-        const line = r.gpa.alloc(u8, json.len + 1) catch return r.drop("out of memory");
-        @memcpy(line[0..json.len], json);
-        line[json.len] = '\n';
-        r.queue.append(r.gpa, line) catch {
-            r.gpa.free(line);
-            return r.drop("out of memory");
-        };
+        r.bytes.ensureUnusedCapacity(r.gpa, json.len + 1) catch return r.drop("out of memory");
+        const start = r.bytes.items.len;
+        r.bytes.appendSliceAssumeCapacity(json);
+        r.bytes.appendAssumeCapacity('\n');
+        r.count += 1;
 
         if (r.file) |f| {
+            const line = r.bytes.items[start..];
             if (f.writePositionalAll(r.io, line, r.file_len)) |_| {
                 r.file_len += line.len;
             } else |err| {
@@ -148,15 +151,20 @@ pub const Reporter = struct {
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
 
-        const count = @min(r.queue.items.len, batch_max);
+        const count = @min(r.count, batch_max);
         if (count == 0) return null;
 
         var out: Io.Writer.Allocating = .init(gpa);
         errdefer out.deinit();
         try out.writer.writeAll("{\"events\":[");
-        for (r.queue.items[0..count], 0..) |line, i| {
+        var rest: []const u8 = r.bytes.items[r.head..];
+        for (0..count) |i| {
+            // Always found: every queued event ends in '\n', and JSON text
+            // never contains a raw one.
+            const end = std.mem.findScalar(u8, rest, '\n').?;
             if (i != 0) try out.writer.writeByte(',');
-            try out.writer.writeAll(line[0 .. line.len - 1]);
+            try out.writer.writeAll(rest[0..end]);
+            rest = rest[end + 1 ..];
         }
         try out.writer.writeAll("]}");
         return .{ .body = try out.toOwnedSlice(), .count = count };
@@ -167,10 +175,16 @@ pub const Reporter = struct {
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
 
-        for (r.queue.items[0..count]) |line| r.gpa.free(line);
-        r.queue.replaceRangeAssumeCapacity(0, count, &.{});
+        for (0..count) |_| {
+            const end = std.mem.findScalar(u8, r.bytes.items[r.head..], '\n').?;
+            r.head += end + 1;
+        }
+        r.count -= count;
 
-        if (r.queue.items.len == 0) {
+        if (r.count == 0) {
+            r.head = 0;
+            // Keep a modest buffer for reuse; give back what an outage piled up.
+            if (r.bytes.capacity > idle_capacity_max) r.bytes.clearAndFree(r.gpa) else r.bytes.clearRetainingCapacity();
             if (r.file) |f| {
                 if (f.setLength(r.io, 0)) |_| {
                     r.file_len = 0;
@@ -179,6 +193,13 @@ pub const Reporter = struct {
                     log.warn("spool truncate failed: {t}", .{err});
                 }
             }
+        } else if (r.head >= r.bytes.items.len / 2) {
+            // Slide the remaining events to the front so the delivered part
+            // of the buffer is reused instead of growing behind us.
+            const remaining = r.bytes.items.len - r.head;
+            std.mem.copyForwards(u8, r.bytes.items[0..remaining], r.bytes.items[r.head..]);
+            r.bytes.shrinkRetainingCapacity(remaining);
+            r.head = 0;
         }
     }
 };
@@ -216,6 +237,22 @@ pub fn flushLoop(app: *App) Io.Cancelable!void {
     }
 }
 
+/// One last, bounded attempt to hand over what is queued. For shutdown, after
+/// the flush task has stopped (two senders would send the same batch twice).
+/// Returns how many events are still waiting; with a spool file they are
+/// picked up again at the next start.
+pub fn drain(app: *App, max_batches: usize) usize {
+    const r = app.reporter;
+    var sent: usize = 0;
+    while (sent < max_batches) : (sent += 1) {
+        const batch = (r.nextBatch(app.gpa) catch null) orelse break;
+        defer app.gpa.free(batch.body);
+        _ = control.postUsageBatch(app, batch.body) catch break;
+        r.ack(batch.count);
+    }
+    return r.pending();
+}
+
 const testing = std.testing;
 
 test "events are batched in order and removed on ack" {
@@ -241,6 +278,42 @@ test "events are batched in order and removed on ack" {
     const rest = (try r.nextBatch(testing.allocator)).?;
     defer testing.allocator.free(rest.body);
     try testing.expectEqualStrings("{\"events\":[{\"id\":\"d\"}]}", rest.body);
+}
+
+test "delivered events are forgotten while new ones keep arriving" {
+    var r = try Reporter.init(testing.allocator, testing.io, Io.Dir.cwd(), null);
+    defer r.deinit();
+
+    // Many rounds of: queue some, deliver fewer, so the buffer both slides
+    // and wraps its bookkeeping many times.
+    var next_id: usize = 0;
+    var next_expected: usize = 0;
+    var buf: [48]u8 = undefined;
+    for (0..200) |round| {
+        for (0..7) |_| {
+            r.enqueue(try std.fmt.bufPrint(&buf, "{{\"id\":{d}}}", .{next_id}));
+            next_id += 1;
+        }
+        const take = 3 + round % 5;
+        const batch = (try r.nextBatch(testing.allocator)).?;
+        defer testing.allocator.free(batch.body);
+        // The batch starts with the oldest undelivered event.
+        const first = try std.fmt.bufPrint(&buf, "{{\"events\":[{{\"id\":{d}}}", .{next_expected});
+        try testing.expect(std.mem.startsWith(u8, batch.body, first));
+        const n = @min(take, batch.count);
+        r.ack(n);
+        next_expected += n;
+        try testing.expectEqual(next_id - next_expected, r.pending());
+    }
+    // The buffer holds what is pending, not everything that ever passed through.
+    try testing.expect(r.bytes.items.len < 64 * 1024);
+
+    while (try r.nextBatch(testing.allocator)) |batch| {
+        defer testing.allocator.free(batch.body);
+        r.ack(batch.count);
+    }
+    try testing.expectEqual(@as(usize, 0), r.pending());
+    try testing.expectEqual(@as(usize, 0), r.bytes.items.len);
 }
 
 test "a batch is capped at batch_max" {

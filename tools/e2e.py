@@ -246,6 +246,7 @@ def text_config():
             {"model": "direct", "targets": [dict(upstream="mock-ok", model="ok-1", **price)]},
             {"model": "compat", "targets": [dict(upstream="mock-compat", model="ok-1", **price)]},
             {"model": "signed", "targets": [dict(upstream="mock-ok", model="sig-1", **price)]},
+            {"model": "cached", "cache_ttl_s": 60, "targets": [dict(upstream="mock-ok", model="ok-1", **price)]},
             # The same mock under two upstream names, so the response header tells them apart.
             {"model": "spread", "strategy": "round_robin", "targets": [dict(upstream="mock-ok", model="ok-1", **price),
                                                                        dict(upstream="mock-compat", model="ok-1", **price)]},
@@ -463,11 +464,21 @@ def key_checks():
     on = wait_until(lambda: chat("direct", key=fresh)[0] == 200, 6, 0.2)
     check("... and works again when re-enabled", status == 200 and bool(on), status)
 
+    status, _, patched = admin("PATCH", f"/admin/keys/{name}", {"budget_usd": 5, "budget_period": "monthly"})
+    check("a key can be given a monthly budget, with the reset time shown",
+          status == 200 and patched.get("budget_period") == "monthly" and str(patched.get("period_resets_at", "")).endswith("-01T00:00:00Z"), patched)
+
     status, _, _ = admin("DELETE", f"/admin/keys/{name}")
     gone = wait_until(lambda: chat("direct", key=fresh)[0] == 401, 6, 0.2)
     _, _, listing = admin("GET", "/admin/keys")
     check("a deleted key is gone from the list and refused by the gateway",
           status == 200 and bool(gone) and not any(k.get("name") == name for k in listing.get("keys", [])), status)
+
+    status, _, audit = admin("GET", "/admin/audit?limit=50")
+    actions = [(e.get("action"), e.get("target")) for e in audit.get("entries", [])]
+    check("every key change is in the admin audit log, without secrets",
+          status == 200 and all((a, name) in actions for a in ("key.create", "key.rotate", "key.update", "key.delete"))
+          and secret not in json.dumps(audit) and fresh not in json.dumps(audit), actions[:8])
 
     # A browser session must present a CSRF token for changes; the bearer token above did not need one.
     _, headers, _ = control_raw("POST", "/login", form={"password": ADMIN_TOKEN})
@@ -530,6 +541,23 @@ def text_checks(stack):
     check("... and can use the model it is allowed", status == 200, status)
     status, _, body = jcall("GET", GATEWAY + "/v1/models", key=KEY_LIMITED)
     check("... and its model list shows only that model", [m["id"] for m in body.get("data", [])] == ["direct"], body)
+
+    section("response cache")
+    # Let earlier calls reach the ledger first, so the difference below is only these two.
+    base = wait_until(lambda: main_row_with(main_calls), 10) or usage_row("main")
+    before, hits_before = base.get("cost_usd", 0), base.get("cached_responses", 0)
+    status, h1, b1 = chat("cached")
+    status2, h2, b2 = chat("cached")
+    main_calls += 2
+    check("on a route with a cache TTL, an identical request is answered from the cache",
+          status == 200 and status2 == 200 and h1.get("x-omnigate-cache") == "miss" and h2.get("x-omnigate-cache") == "hit" and b1 == b2,
+          (h1.get("x-omnigate-cache"), h2.get("x-omnigate-cache")))
+    status, h3, _ = chat("cached", key=KEY_OTHER)
+    check("... but never across gateway keys", status == 200 and h3.get("x-omnigate-cache") == "miss", h3.get("x-omnigate-cache"))
+    row = wait_until(lambda: main_row_with(main_calls), 10) or usage_row("main")
+    check("... and the cached answer is counted but not billed",
+          row.get("requests", 0) - row.get("jobs", 0) == main_calls and abs(row.get("cost_usd", 0) - before - 0.0029) < 1e-9
+          and row.get("cached_responses", 0) - hits_before == 1, (before, hits_before, row))
 
     section("streaming")
     status, events, spread = sse("/v1/chat/completions", KEY_MAIN, dict(CHAT, model="chat", stream=True))
@@ -613,10 +641,10 @@ def text_checks(stack):
     row = wait_until(lambda: main_row_with(main_calls), 10)
     check(f"ledger has exactly the {main_calls} metered calls of the main key", bool(row), usage_row("main"))
     row = row or usage_row("main")
-    # Every call but one used at least 11 input tokens; the call the provider
-    # refused with a 400 is in the ledger with none.
+    # Every call but two used at least 11 input tokens: the one the provider
+    # refused with a 400 and the one served from the response cache have none.
     check("tokens and cost are recorded",
-          row.get("input_tokens", 0) >= 11 * (main_calls - 1) and row.get("cost_usd", 0) > 0 and row.get("errors", 0) >= 1, row)
+          row.get("input_tokens", 0) >= 11 * (main_calls - 2) and row.get("cost_usd", 0) > 0 and row.get("errors", 0) >= 1, row)
 
     codes = [chat("direct", key=KEY_BUDGET)[0] for _ in range(4)]
     blocked = wait_until(lambda: chat("direct", key=KEY_BUDGET)[0] == 402, 10, 0.3)
@@ -624,6 +652,16 @@ def text_checks(stack):
     status, _, _ = chat("direct")
     main_calls += 1
     check("other keys keep working", status == 200)
+    status, _, body = jcall("GET", GATEWAY + "/v1/models", key=KEY_BUDGET)
+    check("the over-budget key can still read (model list), it just cannot start work", status == 200 and body.get("data"), status)
+
+    def refused():
+        _, _, text = control_raw("GET", "/metrics", {"authorization": "Bearer " + ADMIN_TOKEN})
+        lines = [l for l in text.splitlines() if l.startswith("omnigate_rejected_requests_total")]
+        return lines if any('reason="rate_limit_exceeded"' in l and 'key="rpm"' in l for l in lines) \
+            and any('reason="budget_exceeded"' in l and 'key="budget"' in l for l in lines) else None
+    lines = wait_until(refused, 10) or []
+    check("requests refused before routing are counted per key and reason in the metrics", bool(lines), lines[:4])
 
     section("control-plane outage")
     stack.stop("control")
@@ -782,6 +820,10 @@ def media_checks(stack):
     status, _, refused = create_job({"model": "image", "input": {"prompt": "x"}}, key=KEY_LIMITED)
     check("a key limited to other models cannot create this job (403)",
           status == 403 and refused.get("error", {}).get("type") == "model_not_allowed", (status, refused))
+
+    _, _, models = jcall("GET", GATEWAY + "/v1/models", key=KEY_MAIN)
+    ids = {m["id"] for m in models.get("data", [])}
+    check("job models are listed next to text models", {"image", "video", "tts", "chat"} <= ids, sorted(ids))
 
     section("webhooks")
     def delivered():

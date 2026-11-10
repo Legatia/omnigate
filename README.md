@@ -1,5 +1,7 @@
 # omnigate
 
+[![CI](https://github.com/Legatia/omnigate/actions/workflows/ci.yml/badge.svg)](https://github.com/Legatia/omnigate/actions/workflows/ci.yml)
+
 A self-hostable AI gateway in two small processes. It fronts OpenAI- and
 Anthropic-style text APIs and wraps image, video and speech providers in one
 async job API.
@@ -357,7 +359,7 @@ Through the gateway, over TLS, with real keys:
 - Gemini's Veo models, which have their own job API and no adapter yet (the test key had no access to them); background interactions on Gemini's Interactions API; xAI video with an input image, and its failed and expired states.
 - Images in translated requests, long conversations, large payloads, and the official OpenAI and Anthropic SDKs as clients (the checks used plain HTTP).
 - Sustained or concurrent load against real providers.
-- Platforms other than Windows 11 and x86-64 Linux containers.
+- Platforms other than Windows 11 and x86-64 Linux (CI runs the unit, end-to-end and container suites on Ubuntu 24.04 for every push). macOS and ARM are untried.
 
 **Security**
 

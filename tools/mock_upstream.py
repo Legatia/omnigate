@@ -10,8 +10,10 @@
 Run:  python tools/mock_upstream.py
 """
 
+import base64
 import json
 import os
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -82,22 +84,81 @@ class OpenAIOk(Base):
                     if not tool_call.get("extra_content", {}).get("google", {}).get("thought_signature"):
                         return self.send_json(400, {"error": {"message": "Function call is missing a thought_signature in functionCall parts.",
                                                               "type": "invalid_request_error"}})
+        if path.endswith("/embeddings"):
+            return self.embeddings_api(req)
+        if path.endswith("/responses"):
+            return self.responses_api(req)
         usage = {"prompt_tokens": 11, "completion_tokens": len(WORDS), "total_tokens": 11 + len(WORDS)}
+        created = int(time.time())
         if not req.get("stream"):
             return self.send_json(200, {
-                "id": "chatcmpl-mock", "object": "chat.completion", "model": req.get("model"),
+                "id": "chatcmpl-mock", "object": "chat.completion", "created": created, "model": req.get("model"),
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(WORDS)},
                              "finish_reason": "stop"}],
                 "usage": usage,
             })
+        # As at the provider: the role first, one chunk per token, then a chunk
+        # that carries only the finish_reason, then (if asked for) usage alone.
+        head = {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": created, "model": req.get("model")}
+        deltas = [({"role": "assistant", "content": ""}, None)] + [({"content": w}, None) for w in WORDS] + [({}, "stop")]
         self.start_sse()
-        for w in WORDS:
-            chunk = {"id": "chatcmpl-mock", "object": "chat.completion.chunk",
-                     "choices": [{"index": 0, "delta": {"content": w}}]}
+        for delta, finish in deltas:
+            chunk = dict(head, choices=[{"index": 0, "delta": delta, "finish_reason": finish}])
             self.sse(f"data: {json.dumps(chunk)}\n\n")
         if (req.get("stream_options") or {}).get("include_usage"):
-            self.sse(f"data: {json.dumps({'id': 'chatcmpl-mock', 'choices': [], 'usage': usage})}\n\n")
+            self.sse(f"data: {json.dumps(dict(head, choices=[], usage=usage))}\n\n")
         self.sse("data: [DONE]\n\n")
+        self.end_sse()
+
+    def embeddings_api(self, req):
+        """POST /embeddings: one small made-up vector per input, as floats or base64 float32."""
+        inputs = req.get("input")
+        if isinstance(inputs, str) or (isinstance(inputs, list) and inputs and isinstance(inputs[0], int)):
+            inputs = [inputs]
+        if not isinstance(inputs, list) or not inputs:
+            return self.send_json(400, {"error": {"message": "`input` must be a string or a non-empty array.",
+                                                  "type": "invalid_request_error", "param": "input", "code": None}})
+        dims = int(req.get("dimensions") or 8)
+        data = []
+        for i in range(len(inputs)):
+            vector = [((i + 1) * (j + 3) % 17) / 16 - 0.5 for j in range(dims)]  # exact in float32
+            if req.get("encoding_format") == "base64":
+                vector = base64.b64encode(struct.pack(f"<{dims}f", *vector)).decode()
+            data.append({"object": "embedding", "index": i, "embedding": vector})
+        tokens = 3 * len(inputs)
+        self.send_json(200, {"object": "list", "data": data, "model": req.get("model"),
+                             "usage": {"prompt_tokens": tokens, "total_tokens": tokens}})
+
+    def responses_api(self, req):
+        """POST /responses: the Responses API shape, as JSON or as its typed event stream."""
+        text = "".join(WORDS)
+        usage = {"input_tokens": 11, "input_tokens_details": {"cached_tokens": 0},
+                 "output_tokens": len(WORDS), "output_tokens_details": {"reasoning_tokens": 0},
+                 "total_tokens": 11 + len(WORDS)}
+        part = {"type": "output_text", "text": text, "annotations": []}
+        item = {"id": "msg_mock", "type": "message", "status": "completed", "role": "assistant", "content": [part]}
+        base = {"id": "resp_mock", "object": "response", "created_at": int(time.time()), "model": req.get("model"),
+                "error": None, "incomplete_details": None, "instructions": req.get("instructions"), "metadata": {},
+                "parallel_tool_calls": True, "tool_choice": "auto", "tools": []}
+        done = dict(base, status="completed", output=[item], usage=usage)
+        if not req.get("stream"):
+            return self.send_json(200, done)
+        started = dict(base, status="in_progress", output=[], usage=None)
+        where = {"item_id": "msg_mock", "output_index": 0, "content_index": 0}
+        events = [
+            {"type": "response.created", "response": started},
+            {"type": "response.in_progress", "response": started},
+            {"type": "response.output_item.added", "output_index": 0, "item": dict(item, status="in_progress", content=[])},
+            dict(where, type="response.content_part.added", part=dict(part, text="")),
+        ] + [dict(where, type="response.output_text.delta", delta=w) for w in WORDS] + [
+            dict(where, type="response.output_text.done", text=text),
+            dict(where, type="response.content_part.done", part=part),
+            {"type": "response.output_item.done", "output_index": 0, "item": item},
+            {"type": "response.completed", "response": done},
+        ]
+        self.start_sse()
+        for number, event in enumerate(events):
+            self.sse(f"event: {event['type']}\ndata: {json.dumps(dict(event, sequence_number=number))}\n\n")
         self.end_sse()
 
 
@@ -111,22 +172,34 @@ class AnthropicOk(Base):
             # Current Claude models refuse sampling parameters.
             return self.send_json(400, {"type": "error", "error": {"type": "invalid_request_error",
                                                                   "message": "`temperature` is deprecated for this model."}})
+        if self.path.split("?")[0].endswith("/messages/count_tokens"):
+            return self.send_json(200, {"input_tokens": 13})
         if not req.get("stream"):
             return self.send_json(200, {
                 "id": "msg_mock", "type": "message", "role": "assistant", "model": req.get("model"),
-                "content": [{"type": "text", "text": "".join(WORDS)}], "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "".join(WORDS)}], "stop_reason": "end_turn", "stop_sequence": None,
                 "usage": {"input_tokens": 13, "output_tokens": len(WORDS)},
             })
+        # The documented event flow: the empty message, the content block
+        # opened, a ping, its text deltas, the block closed, then the stop
+        # reason with the final output count.
+        events = [
+            {"type": "message_start", "message": {
+                "id": "msg_mock", "type": "message", "role": "assistant", "model": req.get("model"), "content": [],
+                "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 13, "output_tokens": 1}}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "ping"},
+        ] + [
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": w}} for w in WORDS
+        ] + [
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+             "usage": {"output_tokens": len(WORDS)}},
+            {"type": "message_stop"},
+        ]
         self.start_sse()
-        start = {"type": "message_start", "message": {"id": "msg_mock", "role": "assistant",
-                                                      "usage": {"input_tokens": 13, "output_tokens": 1}}}
-        self.sse(f"event: message_start\ndata: {json.dumps(start)}\n\n")
-        for w in WORDS:
-            delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": w}}
-            self.sse(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n")
-        end = {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": len(WORDS)}}
-        self.sse(f"event: message_delta\ndata: {json.dumps(end)}\n\n")
-        self.sse('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+        for event in events:
+            self.sse(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n")
         self.end_sse()
 
 
@@ -165,7 +238,10 @@ def serve(port, handler):
 
 
 if __name__ == "__main__":
-    for port, handler in [(9001, Flaky), (9002, OpenAIOk), (9003, AnthropicOk), (9004, Slow), (9005, Stall)]:
+    # MOCK_PORT_OFFSET shifts every port, so two copies can run side by side.
+    offset = int(os.environ.get("MOCK_PORT_OFFSET", "0"))
+    for port, handler in [(9001 + offset, Flaky), (9002 + offset, OpenAIOk), (9003 + offset, AnthropicOk), (9004 + offset, Slow), (9005 + offset, Stall)]:
         threading.Thread(target=serve, args=(port, handler), daemon=True).start()
-    print("mock upstreams on :9001 (503), :9002 (openai), :9003 (anthropic), :9004 (slow openai), :9005 (stalling openai)", flush=True)
+    print("mock upstreams on :%d (503), :%d (openai), :%d (anthropic), :%d (slow openai), :%d (stalling openai)"
+          % tuple(9001 + offset + i for i in range(5)), flush=True)
     threading.Event().wait()

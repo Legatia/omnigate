@@ -81,6 +81,13 @@ pub const Access = struct {
     request_id: Text(32) = .{},
     /// Why the request ended without a normal response, if it did.
     aborted: ?anyerror = null,
+    /// Input tokens the provider served from (or wrote to) its prompt cache.
+    cached_input_tokens: u64 = 0,
+    /// Answered from the gateway's own response cache, without an upstream.
+    cache_hit: bool = false,
+    /// The error `type` the gateway answered with when it refused the request
+    /// itself. Not printed here (the status says it); proxy.zig counts these.
+    rejected: ?[]const u8 = null,
 };
 
 /// A short string copied into the struct, so it outlives the request arena.
@@ -123,6 +130,8 @@ fn writeAccessText(w: *Io.Writer, a: *const Access) Io.Writer.Error!void {
     if (a.model.len > 0) try w.print(" model={s}", .{a.model.get()});
     if (a.upstream.len > 0) try w.print(" upstream={s} attempts={d}", .{ a.upstream.get(), a.attempts });
     if (a.input_tokens != 0 or a.output_tokens != 0) try w.print(" in={d} out={d}", .{ a.input_tokens, a.output_tokens });
+    if (a.cached_input_tokens != 0) try w.print(" cached_in={d}", .{a.cached_input_tokens});
+    if (a.cache_hit) try w.writeAll(" cache=hit");
     try w.print(" {d}ms", .{a.latency_ms});
     if (a.request_id.len > 0) try w.print(" id={s}", .{a.request_id.get()});
     if (a.aborted) |err| try w.print(" aborted={t}", .{err});
@@ -148,6 +157,8 @@ fn writeAccessJson(w: *Io.Writer, a: *const Access) Io.Writer.Error!void {
         try w.print(",\"attempts\":{d}", .{a.attempts});
     }
     try w.print(",\"input_tokens\":{d},\"output_tokens\":{d},\"latency_ms\":{d}", .{ a.input_tokens, a.output_tokens, a.latency_ms });
+    if (a.cached_input_tokens != 0) try w.print(",\"cached_input_tokens\":{d}", .{a.cached_input_tokens});
+    if (a.cache_hit) try w.writeAll(",\"cache\":\"hit\"");
     if (a.request_id.len > 0) {
         try w.writeAll(",\"request_id\":");
         try std.json.Stringify.value(a.request_id.get(), .{}, w);

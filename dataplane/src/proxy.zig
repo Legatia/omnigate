@@ -13,8 +13,10 @@ const std = @import("std");
 const Io = std.Io;
 const http = std.http;
 const balance = @import("balance.zig");
+const cache = @import("cache.zig");
 const config = @import("config.zig");
 const control = @import("control.zig");
+const headers_mod = @import("headers.zig");
 const logging = @import("logging.zig");
 const quirks = @import("quirks.zig");
 const translate = @import("translate.zig");
@@ -75,6 +77,13 @@ pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
             // The watchdog cancels the task; say what that meant.
             acc.aborted = if (!guard.timedOut()) err else if (acc.status == 0) error.ClientTimeout else error.StreamIdleTimeout;
             if (acc.status == 0 and guard.timedOut()) acc.status = 408;
+        }
+        // Requests the gateway refused itself never become usage events;
+        // count them so the control plane can still show them.
+        if (acc.rejected) |reason| {
+            app.counters.count(app.gpa, app.io, acc.key.get(), reason);
+        } else if (acc.status == 408) {
+            app.counters.count(app.gpa, app.io, acc.key.get(), "client_timeout");
         }
         const is_probe = acc.status == 200 and std.mem.eql(u8, acc.path.get(), "/healthz");
         logging.access(&acc, if (is_probe) .debug else .info);
@@ -148,15 +157,19 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     const key = snapshot.findKey(&key_hash) orelse
         return respondError(acc, request, .unauthorized, "invalid_api_key", "unknown gateway key");
     acc.key.set(key.name);
-    if (key.blocked)
+
+    const endpoint: ?Endpoint = if (method == .POST) Endpoint.forPath(path) else null;
+    const is_job_create = method == .POST and std.mem.eql(u8, path, "/v1/jobs");
+
+    // A key over its budget may not start anything new. It keeps access to
+    // what it already has: the model list, the state and files of its jobs,
+    // and cancelling a job (which only saves money).
+    if (key.blocked and (endpoint != null or is_job_create))
         return respondError(acc, request, .payment_required, "budget_exceeded", "this key has exhausted its budget");
 
     if (method == .GET and std.mem.eql(u8, path, "/v1/models")) {
         return respondModels(acc, arena, request, snapshot, key);
     }
-
-    const endpoint: ?Endpoint = if (method == .POST) Endpoint.forPath(path) else null;
-    const is_job_create = method == .POST and std.mem.eql(u8, path, "/v1/jobs");
 
     // --- async media jobs: owned by the control plane ---------------------
     // (which also applies the key's model limits to them)
@@ -213,6 +226,58 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     const route = snapshot.findRoute(route_model) orelse
         return respondError(acc, request, .not_found, "model_not_found", "no route for this model");
 
+    const started = Io.Timestamp.now(app.io, .awake);
+
+    // One id per client request: returned in `x-omnigate-request-id` and used
+    // as the usage event id the ledger dedups on.
+    var raw_id: [16]u8 = undefined;
+    app.io.random(&raw_id);
+    const req_id = std.fmt.bytesToHex(raw_id, .lower);
+    acc.request_id.set(&req_id);
+
+    // --- response cache -----------------------------------------------------
+    // Only for routes that ask for it, and never for streams. The lookup comes
+    // after authentication, model limits, the budget and the rate limit, so a
+    // cached answer is subject to all of them.
+    var extras: ForwardExtras = .{};
+    var capture: Capture = .{ .limit = app.cache.maxEntryBytes() };
+    var cache_key: ?cache.Key = null;
+    const cache_ttl_ms: i64 = if (ep.metered and !is_stream and app.cache.max_bytes > 0) @as(i64, route.cache_ttl_s) * 1000 else 0;
+    if (cache_ttl_ms > 0) {
+        // The request as the client sent it: nothing below has changed it yet.
+        const ck = try cache.keyFor(arena, route_model, path, &key_hash, parsed.value);
+        if (app.cache.get(app.io, arena, &ck, started.toMilliseconds())) |hit| {
+            acc.status = hit.status;
+            acc.cache_hit = true;
+            // Counted, not billed: no tokens, and marked as served from cache.
+            report(app, arena, .{
+                .id = &req_id,
+                .key_sha256 = &key_hash,
+                .route_model = route_model,
+                .upstream = null,
+                .target_model = null,
+                .status = hit.status,
+                .stream = false,
+                .input_tokens = 0,
+                .output_tokens = 0,
+                .latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds(),
+                .attempts = &.{},
+                .cached = true,
+            });
+            return request.respond(hit.body, .{
+                .status = @fromBackingInt(@intCast(hit.status)),
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = hit.content_type },
+                    .{ .name = "x-omnigate-cache", .value = "hit" },
+                    .{ .name = "x-omnigate-request-id", .value = &req_id },
+                },
+            });
+        }
+        cache_key = ck;
+        extras.cache_note = "miss";
+        extras.capture = &capture;
+    }
+
     // OpenAI only reports usage on streams when asked to. If the client did
     // not ask, we do (to meter the call) and hide the extra chunk from it.
     const client_wants_usage = blk: {
@@ -230,16 +295,11 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     }
 
     // --- failover loop ----------------------------------------------------
-    const started = Io.Timestamp.now(app.io, .awake);
     var attempts: std.ArrayList(Attempt) = .empty;
     var usage: Usage = .{};
-
-    // One id per client request: returned in `x-omnigate-request-id` and used
-    // as the usage event id the ledger dedups on.
-    var raw_id: [16]u8 = undefined;
-    app.io.random(&raw_id);
-    const req_id = std.fmt.bytesToHex(raw_id, .lower);
-    acc.request_id.set(&req_id);
+    // `retry-after` of the most recent upstream answer that made us fail
+    // over, to pass on if that turns out to have been the last attempt.
+    var last_retry_after: ?[]const u8 = null;
 
     // The order to try the targets in: the route's strategy picks who goes
     // first (see balance.zig); upstreams that are cooling down after repeated
@@ -323,7 +383,8 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         var maybe_result: ?ForwardResult = null;
         var tries: u8 = 0;
         while (tries < 2) : (tries += 1) {
-            if (forward(app, arena, request, guard, up, upstream_path, out_body, hdrs, &usage, &req_id, &committed, mode, tried)) |r| {
+            extras.retry_after = null;
+            if (forward(app, arena, request, guard, up, upstream_path, out_body, hdrs, &usage, &req_id, &committed, mode, tried, &extras)) |r| {
                 if (r == .drop_sampling) {
                     // The model refused temperature/top_p/top_k, which a client
                     // of the other protocol could not have known. Remember it
@@ -357,11 +418,13 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     // The client already has part of the response; all we can
                     // do is bill what was metered and drop the connection.
                     try attempts.append(arena, .{ .upstream = up.name, .outcome = "stream_aborted" });
+                    const used = usage.normalized(up.kind);
                     acc.status = 499;
                     acc.upstream.set(up.name);
                     acc.attempts = tried;
-                    acc.input_tokens = usage.input_tokens;
-                    acc.output_tokens = usage.output_tokens;
+                    acc.input_tokens = used.input_tokens;
+                    acc.cached_input_tokens = used.cached_input_tokens + used.cache_write_input_tokens;
+                    acc.output_tokens = used.output_tokens;
                     if (ep.metered) report(app, arena, .{
                         .id = &req_id,
                         .key_sha256 = &key_hash,
@@ -370,8 +433,10 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                         .target_model = t.model,
                         .status = 499,
                         .stream = is_stream,
-                        .input_tokens = usage.input_tokens,
-                        .output_tokens = usage.output_tokens,
+                        .input_tokens = used.input_tokens,
+                        .cached_input_tokens = used.cached_input_tokens,
+                        .cache_write_input_tokens = used.cache_write_input_tokens,
+                        .output_tokens = used.output_tokens,
                         .latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds(),
                         .attempts = attempts.items,
                     });
@@ -386,6 +451,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 try attempts.append(arena, .{ .upstream = up.name, .outcome = @errorName(err) });
                 log.warn("upstream {s} failed: {t}", .{ up.name, err });
                 noteFailure(app, up.name);
+                last_retry_after = null;
                 break;
             }
         }
@@ -396,17 +462,28 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 try attempts.append(arena, .{ .upstream = up.name, .outcome = outcome });
                 log.warn("upstream {s} returned {d}, failing over", .{ up.name, @backingInt(status) });
                 noteFailure(app, up.name);
+                last_retry_after = extras.retry_after;
             },
             // Handled inside the loop above; they never escape it.
             .drop_sampling, .add_thought_signature => unreachable,
             .done => |status| {
                 app.health.recordSuccess(app.io, up.name);
+                const used = usage.normalized(up.kind);
                 acc.status = @backingInt(status);
                 acc.upstream.set(up.name);
                 acc.attempts = tried;
-                acc.input_tokens = usage.input_tokens;
-                acc.output_tokens = usage.output_tokens;
+                acc.input_tokens = used.input_tokens;
+                acc.cached_input_tokens = used.cached_input_tokens + used.cache_write_input_tokens;
+                acc.output_tokens = used.output_tokens;
                 try attempts.append(arena, .{ .upstream = up.name, .outcome = "ok" });
+                // A whole successful answer for a route that caches: keep it.
+                if (cache_key) |*ck| {
+                    const code = @backingInt(status);
+                    if (capture.complete and code >= 200 and code < 300) {
+                        const now = Io.Timestamp.now(app.io, .awake).toMilliseconds();
+                        app.cache.put(app.io, ck, code, capture.content_type, capture.body.items, cache_ttl_ms, now);
+                    }
+                }
                 if (ep.metered) report(app, arena, .{
                     .id = &req_id,
                     .key_sha256 = &key_hash,
@@ -415,8 +492,10 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     .target_model = t.model,
                     .status = @backingInt(status),
                     .stream = is_stream,
-                    .input_tokens = usage.input_tokens,
-                    .output_tokens = usage.output_tokens,
+                    .input_tokens = used.input_tokens,
+                    .cached_input_tokens = used.cached_input_tokens,
+                    .cache_write_input_tokens = used.cache_write_input_tokens,
+                    .output_tokens = used.output_tokens,
                     .latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds(),
                     .attempts = attempts.items,
                 });
@@ -447,13 +526,12 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             .attempts = attempts.items,
         },
     }, .{});
-    try request.respond(detail, .{
-        .status = .bad_gateway,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "x-omnigate-request-id", .value = &req_id },
-        },
-    });
+    // If the last upstream that answered said when to come back, say so too.
+    var failed_headers: std.ArrayList(http.Header) = .empty;
+    try failed_headers.append(arena, .{ .name = "content-type", .value = "application/json" });
+    try failed_headers.append(arena, .{ .name = "x-omnigate-request-id", .value = &req_id });
+    if (last_retry_after) |v| try failed_headers.append(arena, .{ .name = "retry-after", .value = v });
+    try request.respond(detail, .{ .status = .bad_gateway, .extra_headers = failed_headers.items });
 }
 
 /// Seconds to wait if this key is over its requests-per-minute limit, else
@@ -530,8 +608,15 @@ const UsageReport = struct {
     target_model: ?[]const u8,
     status: u16,
     stream: bool,
+    /// Input NOT served from the provider's prompt cache (see usage.zig).
     input_tokens: u64,
+    /// Input read from the provider's prompt cache.
+    cached_input_tokens: u64 = 0,
+    /// Input written to the provider's prompt cache (Anthropic bills these).
+    cache_write_input_tokens: u64 = 0,
     output_tokens: u64,
+    /// Answered from the gateway's response cache: counted, not billed.
+    cached: bool = false,
     latency_ms: i64,
     attempts: []const Attempt,
     /// Unique per client request; the ledger dedups on it.
@@ -551,6 +636,46 @@ fn report(app: *App, arena: std.mem.Allocator, r: UsageReport) void {
     const json = std.json.Stringify.valueAlloc(arena, event, .{}) catch return;
     app.reporter.enqueue(json);
 }
+
+/// A copy of a whole non-streaming answer, for the response cache.
+const Capture = struct {
+    /// Larger answers are not worth keeping; stop copying past this.
+    limit: usize,
+    body: std.ArrayList(u8) = .empty,
+    content_type: []const u8 = "",
+    overflow: bool = false,
+    /// Set once the complete answer is in `body`.
+    complete: bool = false,
+
+    fn reset(c: *Capture) void {
+        c.body.clearRetainingCapacity();
+        c.overflow = false;
+        c.complete = false;
+    }
+
+    fn add(c: *Capture, arena: std.mem.Allocator, bytes: []const u8) void {
+        if (c.overflow) return;
+        if (c.body.items.len + bytes.len > c.limit) {
+            c.overflow = true;
+            c.body.clearRetainingCapacity();
+            return;
+        }
+        c.body.appendSlice(arena, bytes) catch {
+            c.overflow = true;
+        };
+    }
+};
+
+/// Optional inputs and outputs of `forward` that most calls do not use.
+const ForwardExtras = struct {
+    /// Where to copy a non-streaming answer for the response cache.
+    capture: ?*Capture = null,
+    /// Value for `x-omnigate-cache` on the response ("miss"), if any.
+    cache_note: ?[]const u8 = null,
+    /// Out: the upstream's `retry-after` when it answered with a status we
+    /// fail over on.
+    retry_after: ?[]const u8 = null,
+};
 
 const ForwardResult = union(enum) {
     /// Upstream answered with a retryable status before we committed.
@@ -698,7 +823,9 @@ fn forward(
     mode: ForwardMode,
     /// How many upstreams this request has been sent to, this one included.
     attempt_no: u32,
+    extras: *ForwardExtras,
 ) !ForwardResult {
+    if (extras.capture) |c| c.reset();
     const base = std.mem.trimEnd(u8, up.base_url, "/");
     const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, try config.upstreamPath(arena, up.v1_path, path) });
     const uri = try std.Uri.parse(url);
@@ -751,9 +878,14 @@ fn forward(
     defer guard.disarm();
 
     const status = response.head.status;
-    if (isRetryable(status)) return .{ .retry = status };
+    // Copy what we need from the head before the body reader invalidates it:
+    // first the provider headers that are meant for the caller (headers.zig).
+    const relayed = try headers_mod.collect(arena, response.head.bytes);
+    if (isRetryable(status)) {
+        extras.retry_after = headers_mod.find(relayed, "retry-after");
+        return .{ .retry = status };
+    }
 
-    // Copy what we need from the head before the body reader invalidates it.
     const content_type = try arena.dupe(u8, response.head.content_type orelse "application/json");
     const content_length = response.head.content_length;
     const is_sse = std.ascii.startsWithIgnoreCase(content_type, "text/event-stream");
@@ -762,13 +894,19 @@ fn forward(
     const upstream_body = response.reader(&transfer_buf);
     var chunk: [16 * 1024]u8 = undefined;
 
+    // Response headers: ours, then the provider's that passed the allowlist.
+    // Slot 0 is the content type, which depends on the branch taken below.
     var attempt_buf: [12]u8 = undefined;
-    const common_headers = [_]http.Header{
+    var out_headers: std.ArrayList(http.Header) = .empty;
+    try out_headers.appendSlice(arena, &.{
+        .{ .name = "content-type", .value = content_type },
         .{ .name = "cache-control", .value = "no-cache" },
         .{ .name = "x-omnigate-upstream", .value = up.name },
         .{ .name = "x-omnigate-attempts", .value = std.fmt.bufPrint(&attempt_buf, "{d}", .{attempt_no}) catch unreachable },
         .{ .name = "x-omnigate-request-id", .value = req_id },
-    };
+    });
+    if (extras.cache_note) |note| try out_headers.append(arena, .{ .name = "x-omnigate-cache", .value = note });
+    try out_headers.appendSlice(arena, relayed);
 
     // --- translated, not a stream: buffer, convert, answer in one piece -----
     if (mode == .translate and !is_sse) {
@@ -788,11 +926,14 @@ fn forward(
             // Not the shape its protocol promises: treat like a failed upstream.
             else => return error.UpstreamUnparseable,
         };
+        if (extras.capture) |c| {
+            c.add(arena, converted);
+            c.content_type = "application/json";
+            c.complete = !c.overflow;
+        }
         committed.* = true;
-        try request.respond(converted, .{
-            .status = status,
-            .extra_headers = &(.{http.Header{ .name = "content-type", .value = "application/json" }} ++ common_headers),
-        });
+        out_headers.items[0].value = "application/json";
+        try request.respond(converted, .{ .status = status, .extra_headers = out_headers.items });
         return .{ .done = status };
     }
 
@@ -803,9 +944,11 @@ fn forward(
         .content_length = if (mode == .passthrough) content_length else null,
         .respond_options = .{
             .status = status,
-            .extra_headers = &(.{http.Header{ .name = "content-type", .value = content_type }} ++ common_headers),
+            .extra_headers = out_headers.items,
         },
     });
+    // Only a whole, unmodified, non-streaming body is worth remembering.
+    const capturing: ?*Capture = if (!is_sse) extras.capture else null;
 
     var translator: ?translate.StreamTranslator = if (mode == .translate) blk: {
         const x = mode.translate;
@@ -830,6 +973,7 @@ fn forward(
         } else if (mode == .hide_usage_chunk and is_sse) {
             try usage_filter.feed(arena, chunk[0..n], &body_writer.writer);
         } else {
+            if (capturing) |c| c.add(arena, chunk[0..n]);
             try body_writer.writer.writeAll(chunk[0..n]);
         }
         // Flush per chunk so SSE tokens reach the client immediately: first
@@ -842,6 +986,10 @@ fn forward(
     if (translator) |*tr| try tr.finish(&body_writer.writer);
     if (mode == .hide_usage_chunk and is_sse) try usage_filter.finish(&body_writer.writer);
     try body_writer.end();
+    if (capturing) |c| {
+        c.content_type = content_type;
+        c.complete = !c.overflow;
+    }
     return .{ .done = status };
 }
 
@@ -927,6 +1075,7 @@ fn forwardToControl(
 
 fn respondRateLimited(acc: *logging.Access, request: *http.Server.Request, retry_after_s: u32) !void {
     acc.status = 429;
+    acc.rejected = "rate_limit_exceeded";
     var num: [16]u8 = undefined;
     const secs = std.fmt.bufPrint(&num, "{d}", .{retry_after_s}) catch unreachable;
     try request.respond(
@@ -940,8 +1089,11 @@ fn respondRateLimited(acc: *logging.Access, request: *http.Server.Request, retry
     });
 }
 
+/// Answer with the gateway's own error object. `code` must be a string
+/// literal: it is kept as the reason this request is counted under.
 fn respondError(acc: *logging.Access, request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) !void {
     acc.status = @backingInt(status);
+    acc.rejected = code;
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     std.json.Stringify.value(.{ .@"error" = .{ .type = code, .message = message } }, .{}, &w) catch {};
@@ -958,6 +1110,12 @@ fn respondModels(acc: *logging.Access, arena: std.mem.Allocator, request: *http.
     var models: std.ArrayList(Model) = .empty;
     for (snapshot.routes) |r| {
         if (key.allows(r.model)) try models.append(arena, .{ .id = r.model });
+    }
+    // Media job models are served by the control plane (POST /v1/jobs); they
+    // are listed so that clients can discover them.
+    for (snapshot.media_models orelse &.{}) |name| {
+        if (!key.allows(name) or snapshot.findRoute(name) != null) continue;
+        try models.append(arena, .{ .id = name });
     }
     const json = try std.json.Stringify.valueAlloc(arena, .{ .object = "list", .data = models.items }, .{});
     try request.respond(json, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });

@@ -150,6 +150,13 @@ pub const BatchOutcome = enum {
     rejected,
 };
 
+/// POST the rejection counters (see counters.zig). An error means the control
+/// plane did not take them, for whatever reason, and they should be kept.
+pub fn postCounters(app: *App, body: []const u8) !void {
+    const status = try call(app, .POST, "/internal/counters", body, null);
+    if (status != .ok) return error.BadStatus;
+}
+
 /// POST a `{"events":[...]}` usage batch. An error means "try again later".
 pub fn postUsageBatch(app: *App, body: []const u8) !BatchOutcome {
     const status = try call(app, .POST, "/internal/usage/batch", body, null);

@@ -3,7 +3,8 @@
 //! Environment:
 //!   OMNIGATE_LISTEN          host:port to listen on        (default 127.0.0.1:8080)
 //!   OMNIGATE_CONTROL_URL     control plane base URL        (default http://127.0.0.1:4000)
-//!   OMNIGATE_INTERNAL_TOKEN  shared secret for /internal/* (required)
+//!   OMNIGATE_INTERNAL_TOKEN  shared secret for /internal/* (required; an
+//!                            empty value counts as not set)
 //!   OMNIGATE_POLL_MS         config poll interval in ms    (default 2000)
 //!   OMNIGATE_FLUSH_MS        usage flush interval in ms    (default 500)
 //!   OMNIGATE_UPSTREAM_TIMEOUT_MS  max wait for upstream response headers
@@ -29,6 +30,8 @@
 //!   OMNIGATE_SHUTDOWN_GRACE_MS  on SIGINT/SIGTERM (Ctrl-C/Ctrl-Break on
 //!                            Windows): how long requests in flight may take
 //!                            to finish before the process exits (default 10000)
+//!   OMNIGATE_CACHE_MAX_MB    memory for the response cache used by routes
+//!                            that set `cache_ttl_s` (default 64; 0 = off)
 //!   OMNIGATE_LOG_LEVEL       debug | info | warn | error   (default info)
 //!   OMNIGATE_LOG_FORMAT      text | json                   (default text)
 //!   <api_key_env>            provider keys named by each upstream in the config
@@ -37,8 +40,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const balance = @import("balance.zig");
+const cache = @import("cache.zig");
 const config = @import("config.zig");
 const control = @import("control.zig");
+const counters = @import("counters.zig");
 const health = @import("health.zig");
 const logging = @import("logging.zig");
 const proxy = @import("proxy.zig");
@@ -71,6 +76,10 @@ pub const App = struct {
     balancer: *balance.Counters,
     quirks: *quirks.Quirks,
     watchdog: *watchdog.Watchdog,
+    /// Requests refused before routing, by key and reason.
+    counters: *counters.Counters,
+    /// Answers remembered for routes that opt in with `cache_ttl_s`.
+    cache: *cache.Cache,
     /// Client connections being served right now.
     active_connections: std.atomic.Value(u32) = .init(0),
     /// Set once a stop was requested: finish what is in flight, start nothing new.
@@ -184,10 +193,13 @@ pub fn main(init: std.process.Init) !void {
 
     const listen = env.get("OMNIGATE_LISTEN") orelse "127.0.0.1:8080";
     const control_url = env.get("OMNIGATE_CONTROL_URL") orelse "http://127.0.0.1:4000";
-    const internal_token = env.get("OMNIGATE_INTERNAL_TOKEN") orelse {
+    // `.env.example` ships the variable empty; an empty secret would let the
+    // process start and then fail every call to the control plane.
+    const internal_token = std.mem.trim(u8, env.get("OMNIGATE_INTERNAL_TOKEN") orelse "", " \t\r\n");
+    if (internal_token.len == 0) {
         log.err("OMNIGATE_INTERNAL_TOKEN is not set", .{});
         return error.MissingInternalToken;
-    };
+    }
     const poll_ms: i64 = if (env.get("OMNIGATE_POLL_MS")) |s| try std.fmt.parseInt(i64, s, 10) else 2000;
     const flush_ms: i64 = if (env.get("OMNIGATE_FLUSH_MS")) |s| try std.fmt.parseInt(i64, s, 10) else 500;
     const upstream_timeout_ms: u32 = if (env.get("OMNIGATE_UPSTREAM_TIMEOUT_MS")) |s| try std.fmt.parseInt(u32, s, 10) else 600_000;
@@ -195,6 +207,7 @@ pub fn main(init: std.process.Init) !void {
     const stream_idle_timeout_ms = try envInt(env, u32, "OMNIGATE_STREAM_IDLE_TIMEOUT_MS", 300_000);
     const max_connections = try envInt(env, u32, "OMNIGATE_MAX_CONNECTIONS", 4096);
     const shutdown_grace_ms = try envInt(env, u32, "OMNIGATE_SHUTDOWN_GRACE_MS", 10_000);
+    const cache_max_mb = try envInt(env, u32, "OMNIGATE_CACHE_MAX_MB", 64);
     const spool_env = env.get("OMNIGATE_SPOOL") orelse "omnigate-usage.spool";
     const spool_path: ?[]const u8 = if (std.mem.eql(u8, spool_env, "off")) null else spool_env;
 
@@ -239,6 +252,12 @@ pub fn main(init: std.process.Init) !void {
     var sockets: watchdog.Watchdog = .{ .gpa = gpa };
     defer sockets.deinit();
 
+    var rejections: counters.Counters = .{};
+    defer rejections.deinit(gpa);
+
+    var response_cache: cache.Cache = .init(gpa, @as(usize, cache_max_mb) * 1024 * 1024);
+    defer response_cache.deinit();
+
     var app: App = .{
         .gpa = gpa,
         .io = io,
@@ -250,6 +269,8 @@ pub fn main(init: std.process.Init) !void {
         .balancer = &balancer,
         .quirks = &model_quirks,
         .watchdog = &sockets,
+        .counters = &rejections,
+        .cache = &response_cache,
         .env = env,
         .control_url = control_url,
         .internal_token = internal_token,
@@ -286,6 +307,7 @@ pub fn main(init: std.process.Init) !void {
 
     try background.concurrent(io, control.pollLoop, .{&app});
     try background.concurrent(io, reporter.flushLoop, .{&app});
+    try background.concurrent(io, counters.flushLoop, .{&app});
     try background.concurrent(io, watchdogTask, .{&app});
     try background.concurrent(io, stopWatcher, .{ &app, wake_address });
 
@@ -301,11 +323,13 @@ pub fn main(init: std.process.Init) !void {
         }
         if (app.active_connections.fetchAdd(1, .acq_rel) >= app.max_connections) {
             _ = app.active_connections.fetchSub(1, .acq_rel);
+            rejections.count(gpa, io, counters.unknown_key, "overloaded");
             refuse(io, stream);
             continue;
         }
         const conn = sockets.create(io, stream) orelse {
             _ = app.active_connections.fetchSub(1, .acq_rel);
+            rejections.count(gpa, io, counters.unknown_key, "overloaded");
             refuse(io, stream);
             continue;
         };
@@ -313,6 +337,7 @@ pub fn main(init: std.process.Init) !void {
             _ = app.active_connections.fetchSub(1, .acq_rel);
             log.warn("cannot spawn connection task: {t}", .{err});
             sockets.recycle(io, conn);
+            rejections.count(gpa, io, counters.unknown_key, "overloaded");
             refuse(io, stream);
             continue;
         };
@@ -338,6 +363,8 @@ pub fn main(init: std.process.Init) !void {
     // The flush task is gone; make one last attempt to hand over usage.
     // Whatever stays behind is in the spool file for the next start.
     const undelivered = reporter.drain(&app, 20);
+    // And the rejection counters, which have no spool: once, best effort.
+    _ = counters.flushOnce(&app);
     if (undelivered > 0) {
         log.warn("stopped with {d} usage event(s) undelivered{s}", .{
             undelivered, if (spool_path != null) " (kept in the spool)" else " (no spool: they are lost)",
@@ -353,6 +380,9 @@ test {
     _ = ratelimit;
     _ = health;
     _ = balance;
+    _ = cache;
+    _ = counters;
+    _ = @import("headers.zig");
     _ = quirks;
     _ = logging;
     _ = watchdog;

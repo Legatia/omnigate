@@ -5,10 +5,26 @@
 //! split across network chunks, so a small tail of the previous chunk is kept.
 //! Values are max-merged: Anthropic reports cumulative `output_tokens` in
 //! `message_delta`, OpenAI reports one final `usage` object.
+//!
+//! The scanner records what the provider said, in the provider's own terms.
+//! The two protocols disagree about prompt caching, so `normalized` turns
+//! that into one meaning for billing:
+//!
+//!   * OpenAI style (chat completions and the Responses API): the input
+//!     count (`prompt_tokens` / `input_tokens`) INCLUDES tokens read from the
+//!     cache, which are also given separately as `cached_tokens` inside
+//!     `prompt_tokens_details` / `input_tokens_details`.
+//!   * Anthropic style: `input_tokens` EXCLUDES the cache; reads are
+//!     `cache_read_input_tokens` and writes `cache_creation_input_tokens`.
+//!
+//! The quoted needles cannot match inside each other: `"input_tokens":` does
+//! not occur in `"cache_read_input_tokens":` (the character before `input`
+//! is `_`, not `"`), nor in `"input_tokens_details":`.
 
 const std = @import("std");
+const Kind = @import("config.zig").Kind;
 
-const Field = enum { input, output };
+const Field = enum { input, output, cached, cache_read, cache_write };
 
 const Pattern = struct { needle: []const u8, field: Field };
 
@@ -17,15 +33,55 @@ const patterns = [_]Pattern{
     .{ .needle = "\"input_tokens\":", .field = .input },
     .{ .needle = "\"completion_tokens\":", .field = .output },
     .{ .needle = "\"output_tokens\":", .field = .output },
+    .{ .needle = "\"cached_tokens\":", .field = .cached },
+    .{ .needle = "\"cache_read_input_tokens\":", .field = .cache_read },
+    .{ .needle = "\"cache_creation_input_tokens\":", .field = .cache_write },
 };
 
-const tail_cap = 48;
+/// Longest needle (30 bytes) plus a generous number, so a key and its value
+/// split across two reads are always seen whole in the joined region.
+const tail_cap = 64;
+
+/// Token counts with one meaning whatever the provider: `input_tokens` is the
+/// input NOT served from a prompt cache; cache reads and writes are separate.
+pub const Normalized = struct {
+    input_tokens: u64 = 0,
+    cached_input_tokens: u64 = 0,
+    cache_write_input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+};
 
 pub const Usage = struct {
+    /// As reported: OpenAI includes cached tokens here, Anthropic does not.
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
+    /// OpenAI style `cached_tokens`.
+    cached_tokens: u64 = 0,
+    /// Anthropic style.
+    cache_read_input_tokens: u64 = 0,
+    cache_creation_input_tokens: u64 = 0,
     tail: [tail_cap]u8 = undefined,
     tail_len: usize = 0,
+
+    /// The counts in gateway terms. `kind` is the protocol of the UPSTREAM
+    /// that produced the bytes, which for a translated request is not the
+    /// protocol the client speaks.
+    pub fn normalized(u: *const Usage, kind: Kind) Normalized {
+        return switch (kind) {
+            .openai => .{
+                // Never negative, whatever a provider reports.
+                .input_tokens = u.input_tokens -| u.cached_tokens,
+                .cached_input_tokens = @min(u.cached_tokens, u.input_tokens),
+                .output_tokens = u.output_tokens,
+            },
+            .anthropic => .{
+                .input_tokens = u.input_tokens,
+                .cached_input_tokens = u.cache_read_input_tokens,
+                .cache_write_input_tokens = u.cache_creation_input_tokens,
+                .output_tokens = u.output_tokens,
+            },
+        };
+    }
 
     pub fn feed(u: *Usage, chunk: []const u8) void {
         if (chunk.len == 0) return;
@@ -68,6 +124,9 @@ pub const Usage = struct {
                 switch (p.field) {
                     .input => u.input_tokens = @max(u.input_tokens, n),
                     .output => u.output_tokens = @max(u.output_tokens, n),
+                    .cached => u.cached_tokens = @max(u.cached_tokens, n),
+                    .cache_read => u.cache_read_input_tokens = @max(u.cache_read_input_tokens, n),
+                    .cache_write => u.cache_creation_input_tokens = @max(u.cache_creation_input_tokens, n),
                 }
             }
         }
@@ -147,6 +206,86 @@ test "anthropic sse usage with cache fields" {
     u.feed("event: message_delta\ndata: {\"usage\":{\"output_tokens\":15}}\n\n");
     try std.testing.expectEqual(@as(u64, 25), u.input_tokens);
     try std.testing.expectEqual(@as(u64, 15), u.output_tokens);
+}
+
+/// Feed `text` in pieces of `step` bytes, as a network would deliver it.
+fn feedSplit(u: *Usage, text: []const u8, step: usize) void {
+    var i: usize = 0;
+    while (i < text.len) : (i += step) u.feed(text[i..@min(text.len, i + step)]);
+}
+
+fn expectNormalized(expected: Normalized, text: []const u8, kind: Kind) !void {
+    // Whole, and split at every awkward size: the result must not depend on it.
+    for ([_]usize{ text.len, 1, 2, 3, 5, 7, 13, 31, 64 }) |step| {
+        var u: Usage = .{};
+        feedSplit(&u, text, step);
+        try std.testing.expectEqual(expected, u.normalized(kind));
+    }
+}
+
+test "openai chat usage: cached tokens are part of prompt_tokens" {
+    const body =
+        \\{"id":"c","choices":[],"usage":{"prompt_tokens":2006,"completion_tokens":300,"total_tokens":2306,
+        \\"prompt_tokens_details":{"cached_tokens":1920,"audio_tokens":0},
+        \\"completion_tokens_details":{"reasoning_tokens":64,"audio_tokens":0,"accepted_prediction_tokens":0}}}
+    ;
+    try expectNormalized(.{ .input_tokens = 86, .cached_input_tokens = 1920, .output_tokens = 300 }, body, .openai);
+}
+
+test "openai chat stream: the usage arrives in the last chunk" {
+    const stream =
+        "data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"content\":\"cached_tokens\"}}],\"usage\":null}\n\n" ++
+        "data: {\"id\":\"c\",\"choices\":[],\"usage\":{\"prompt_tokens\":191,\"completion_tokens\":1,\"total_tokens\":192," ++
+        "\"prompt_tokens_details\":{\"text_tokens\":191,\"audio_tokens\":0,\"image_tokens\":0,\"cached_tokens\":128}}}\n\n" ++
+        "data: [DONE]\n\n";
+    try expectNormalized(.{ .input_tokens = 63, .cached_input_tokens = 128, .output_tokens = 1 }, stream, .openai);
+}
+
+test "openai responses api usage: cached tokens are part of input_tokens" {
+    const body =
+        \\{"object":"response","usage":{"input_tokens":328,"input_tokens_details":{"cached_tokens":200},
+        \\"output_tokens":52,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":380}}
+    ;
+    try expectNormalized(.{ .input_tokens = 128, .cached_input_tokens = 200, .output_tokens = 52 }, body, .openai);
+}
+
+test "openai usage without cache details is unchanged" {
+    try expectNormalized(.{ .input_tokens = 11, .output_tokens = 6 }, "{\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":6,\"total_tokens\":17}}", .openai);
+}
+
+test "anthropic usage: cache reads and writes come on top of input_tokens" {
+    const body =
+        \\{"type":"message","usage":{"input_tokens":21,"cache_creation_input_tokens":188086,"cache_read_input_tokens":4500,
+        \\"cache_creation":{"ephemeral_5m_input_tokens":188086,"ephemeral_1h_input_tokens":0},"output_tokens":393}}
+    ;
+    try expectNormalized(.{ .input_tokens = 21, .cached_input_tokens = 4500, .cache_write_input_tokens = 188086, .output_tokens = 393 }, body, .anthropic);
+}
+
+test "anthropic stream: message_start has the input side, message_delta the final output" {
+    const stream =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25," ++
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":999,\"output_tokens\":1}}}\n\n" ++
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":15}}\n\n";
+    try expectNormalized(.{ .input_tokens = 25, .cached_input_tokens = 999, .output_tokens = 15 }, stream, .anthropic);
+}
+
+test "a translated request is normalised by the upstream that answered" {
+    // An OpenAI client served by an Anthropic upstream: the bytes metered are
+    // Anthropic's, so its cache fields count and nothing is subtracted.
+    var u: Usage = .{};
+    u.feed("{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":90,\"output_tokens\":5}}");
+    try std.testing.expectEqual(Normalized{ .input_tokens = 10, .cached_input_tokens = 90, .output_tokens = 5 }, u.normalized(.anthropic));
+
+    // An Anthropic client served by an OpenAI upstream.
+    var v: Usage = .{};
+    v.feed("{\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":90}}}");
+    try std.testing.expectEqual(Normalized{ .input_tokens = 10, .cached_input_tokens = 90, .output_tokens = 5 }, v.normalized(.openai));
+}
+
+test "a provider that reports more cached than prompt tokens cannot make input negative" {
+    var u: Usage = .{};
+    u.feed("{\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":9}}}");
+    try std.testing.expectEqual(Normalized{ .input_tokens = 0, .cached_input_tokens = 5, .output_tokens = 1 }, u.normalized(.openai));
 }
 
 test "key and number split across chunks" {

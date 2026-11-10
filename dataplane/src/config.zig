@@ -57,6 +57,9 @@ pub const Route = struct {
     /// Kept as text so that a name this build does not know degrades to
     /// failover instead of making the whole snapshot unparseable.
     strategy: ?[]const u8 = null,
+    /// Seconds a successful non-streaming answer may be reused for an
+    /// identical request from the same key; 0 = no caching. See cache.zig.
+    cache_ttl_s: u32 = 0,
 };
 
 pub const Key = struct {
@@ -102,6 +105,8 @@ test "snapshots parse with and without the newer optional fields" {
     try std.testing.expectEqual(@as(?[]const []const u8, null), old.value.keys[0].models);
     try std.testing.expectEqual(@as(?[]const u8, null), old.value.routes[0].strategy);
     try std.testing.expectEqual(@as(u32, 1), old.value.routes[0].targets[0].weight);
+    try std.testing.expectEqual(@as(u32, 0), old.value.routes[0].cache_ttl_s);
+    try std.testing.expectEqual(@as(?[]const []const u8, null), old.value.media_models);
 
     var new = try parse(gpa,
         \\{"version":"v2","keys":[{"key_sha256":"aa","name":"k","models":["m"]},{"key_sha256":"bb","name":"all","models":null}],
@@ -116,6 +121,15 @@ test "snapshots parse with and without the newer optional fields" {
     try std.testing.expectEqual(@as(u32, 3), new.value.routes[0].targets[0].weight);
     try std.testing.expectEqual(@as(u32, 0), new.value.routes[0].targets[1].weight);
     try std.testing.expectEqualStrings("something_new", new.value.routes[1].strategy.?);
+
+    var newer = try parse(gpa,
+        \\{"version":"v3","keys":[],"upstreams":[],"media_models":["image","video"],
+        \\ "routes":[{"model":"m","cache_ttl_s":600,"targets":[]}]}
+    );
+    defer newer.deinit();
+    try std.testing.expectEqual(@as(u32, 600), newer.value.routes[0].cache_ttl_s);
+    try std.testing.expectEqual(@as(usize, 2), newer.value.media_models.?.len);
+    try std.testing.expectEqualStrings("video", newer.value.media_models.?[1]);
 }
 
 pub const Snapshot = struct {
@@ -123,6 +137,9 @@ pub const Snapshot = struct {
     keys: []const Key,
     upstreams: []const Upstream,
     routes: []const Route,
+    /// Names of the media job models the control plane serves. The data plane
+    /// does not route them; it only lists them in `GET /v1/models`.
+    media_models: ?[]const []const u8 = null,
 
     pub fn findRoute(s: *const Snapshot, model: []const u8) ?*const Route {
         for (s.routes) |*r| if (std.mem.eql(u8, r.model, model)) return r;

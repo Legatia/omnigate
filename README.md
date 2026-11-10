@@ -6,8 +6,8 @@ async job API.
 
 **Status: the text gateway and the OpenAI image, ElevenLabs speech,
 Replicate, Gemini (image, speech, video) and xAI video adapters have been
-checked against the real APIs (November 2026).
-The fal adapter and bucket storage have only met mocks, and nothing has run
+checked against the real APIs, and bucket storage against Cloudflare R2
+(November 2026). The fal adapter has only met a mock, and nothing has run
 under production load.** See [Known gaps](#known-gaps).
 
 ```
@@ -303,6 +303,7 @@ Through the gateway, over TLS, with real keys:
 - One media job on OpenAI's image API (`gpt-image-1-mini`): generated, re-hosted, downloaded, webhook retried and delivered.
 - Replicate (`black-forest-labs/flux-1.1-pro`): prediction created and polled to completion, the image copied off Replicate and downloaded from the gateway, webhook delivered; an unknown model and an out-of-credit model failed with Replicate's own reasons.
 - xAI Grok (`grok-4.20-0309-non-reasoning`, `grok-imagine-image`) with no provider-specific code: chat, streaming, tool calls and round trips, the Responses API, provider errors, failover, metering; the same from an Anthropic-style client, translated; xAI's own Anthropic-compatible endpoint as an `anthropic` upstream; and an image job through the `openai_images` adapter.
+- Bucket storage on Cloudflare R2 (S3 API, region `auto`): a job's output uploaded under a key prefix, downloaded through the presigned link, refused without a signature or with a tampered one, and confirmed by an independently signed listing and read.
 - xAI video (`grok-imagine-video-1.5-lite`): a one-second clip submitted, polled to completion, copied off xAI and downloaded from the gateway as an MP4, billed per second, webhook delivered; an unknown model failed with xAI's reason.
 - Gemini video (`gemini-omni-1.2-flash`, through the Interactions API): a short clip generated in one call, stored and downloaded from the gateway as an MP4, webhook delivered.
 - Gemini media (`gemini-3.1-flash-lite-image`, `gemini-3.8-flash-lite-tts`): an image and a spoken sentence generated, stored and downloaded from the gateway; the repeat speech request served from cache; an unknown model failed with Google's reason.
@@ -310,7 +311,8 @@ Through the gateway, over TLS, with real keys:
 
 **Not verified**
 
-- The fal adapter and S3 storage have only run against mocks written from public documentation; expect details to differ.
+- The fal adapter has only run against a mock written from public documentation; expect details to differ.
+- S3-compatible storage other than Cloudflare R2 (Amazon S3 itself, Backblaze B2, MinIO and so on).
 - Replicate's `owner/name:version` form and job cancellation at a real provider.
 - Gemini's Veo models, which have their own job API and no adapter yet (the test key had no access to them); background interactions on Gemini's Interactions API; xAI video with an input image, and its failed and expired states.
 - Images in translated requests, long conversations, large payloads, and the official OpenAI and Anthropic SDKs as clients (the checks used plain HTTP).
@@ -349,7 +351,7 @@ Through the gateway, over TLS, with real keys:
 
 ## Next
 
-1. Run the fal adapter and S3 storage against the real services; test with the official SDKs as clients
+1. Run the fal adapter against the real service; test bucket storage on Amazon S3; test with the official SDKs as clients
 2. Test ARM images and a real-domain certificate
 3. Cluster-wide budgets and rate limits across control-plane nodes
 4. Retention: expire jobs, files and ledger ids

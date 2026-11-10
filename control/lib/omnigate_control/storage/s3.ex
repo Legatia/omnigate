@@ -7,6 +7,11 @@ defmodule OmnigateControl.Storage.S3 do
   `presign_ttl_s` (default one hour). Setting `public_base_url` without
   `presign_ttl_s` returns plain `public_base_url/<key>` URLs instead, for a
   public bucket or a CDN in front of it.
+
+  Checked against Cloudflare R2 (endpoint
+  `https://<account id>.r2.cloudflarestorage.com`, region `auto`) in November
+  2026: upload, presigned download, and refusal of unsigned requests. Other
+  S3-compatible services have only met the mock.
   """
   @behaviour OmnigateControl.Storage
 

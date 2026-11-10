@@ -300,7 +300,8 @@ Through the gateway, over TLS, with real keys:
 
 **Not verified**
 
-- The Replicate and fal adapters and S3 storage have only run against mocks written from public documentation; expect details to differ.
+- Replicate: the real API accepted the key and the request and its errors were reported correctly, but the account had no credit, so no prediction ran. Polling and output download have only met the mock.
+- The fal adapter and S3 storage have only run against mocks written from public documentation; expect details to differ.
 - Images in translated requests, long conversations, large payloads, and the official OpenAI and Anthropic SDKs as clients (the checks used plain HTTP).
 - Sustained or concurrent load against real providers.
 - Platforms other than Windows 11 and x86-64 Linux containers.

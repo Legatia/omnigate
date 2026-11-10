@@ -8,7 +8,10 @@ defmodule OmnigateControl.Jobs.Adapters.Replicate do
     * `GET /v1/predictions/{id}` until `status` is `succeeded`, `failed` or `canceled`
     * `output` is a URL or a list of URLs
 
-  Not yet exercised against the real service.
+  Against the real service (November 2026): authentication, the create
+  request and error reporting were checked. A prediction that runs to
+  completion was not, because the test account had no credit, so polling and
+  output handling have only met the mock.
   """
   @behaviour OmnigateControl.Jobs.Adapter
 

@@ -302,6 +302,7 @@ Through the gateway, over TLS, with real keys:
 - Failover from a dead OpenAI-style upstream to Claude; ledger token totals equal to what the providers reported.
 - One media job on OpenAI's image API (`gpt-image-1-mini`): generated, re-hosted, downloaded, webhook retried and delivered.
 - Replicate (`black-forest-labs/flux-1.1-pro`): prediction created and polled to completion, the image copied off Replicate and downloaded from the gateway, webhook delivered; an unknown model and an out-of-credit model failed with Replicate's own reasons.
+- xAI Grok (`grok-4.20-0309-non-reasoning`, `grok-imagine-image`) with no provider-specific code: chat, streaming, tool calls and round trips, the Responses API, provider errors, failover, metering; the same from an Anthropic-style client, translated; xAI's own Anthropic-compatible endpoint as an `anthropic` upstream; and an image job through the `openai_images` adapter.
 - Gemini media (`gemini-3.1-flash-lite-image`, `gemini-3.8-flash-lite-tts`): an image and a spoken sentence generated, stored and downloaded from the gateway; the repeat speech request served from cache; an unknown model failed with Google's reason.
 - ElevenLabs text-to-speech (`eleven_flash_v2_5`): real MP3 generated, re-hosted and downloaded; an identical request served from cache; an unknown voice failed with the provider's reason.
 
@@ -309,6 +310,7 @@ Through the gateway, over TLS, with real keys:
 
 - The fal adapter and S3 storage have only run against mocks written from public documentation; expect details to differ.
 - Replicate's `owner/name:version` form and job cancellation at a real provider.
+- Video generation at any real provider (xAI and Gemini video models have their own job APIs and no adapter yet).
 - Images in translated requests, long conversations, large payloads, and the official OpenAI and Anthropic SDKs as clients (the checks used plain HTTP).
 - Sustained or concurrent load against real providers.
 - Platforms other than Windows 11 and x86-64 Linux containers.

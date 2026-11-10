@@ -116,7 +116,8 @@ One-time things to settle. None of them is done by the workflow.
    and stops if that section is missing or empty.
 
 4. **Bring the README up to date** if the release changes what it says
-   (status, known gaps, check counts).
+   (the status paragraph, what has been verified, known limits). The README
+   carries no counts of test checks, on purpose: they change too often.
 
 5. **Commit, push to `main`, and wait for CI to pass** on that commit. The
    release workflow does not run the end-to-end, SDK or container suites,

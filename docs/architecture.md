@@ -26,7 +26,7 @@ omnigate is two processes with a narrow interface between them.
 | Audience | Applications. The public port. | Operators and data planes. A private port. |
 | Owns | Authenticating gateway keys, rate limits, routing, load balancing, failover, cooldowns, protocol translation, streaming, counting tokens, the response cache, client and stream timeouts, the connection cap, the access log | The config file, managed keys, prices, the usage ledger, budgets and their periods, media jobs, output storage, webhooks, dashboard, admin API, audit log, metrics, retention |
 | Credentials it holds | Text provider keys (from its environment) | Media provider keys, bucket credentials, webhook secrets, the admin token |
-| State | In memory, plus two files: the usage spool and a cache of the last config | Files: the ledger, the job log, the keys file, the audit log, stored outputs |
+| State | In memory, plus two files: the usage spool and a cache of the last config | Files: the ledger (segments and snapshots), the job log, the keys file, the audit log, stored outputs |
 | Dependencies | The Zig standard library | Two direct Hex packages (Bandit, Plug); outbound HTTP uses OTP's `httpc` |
 | If it stops | Applications get no answers | Text traffic continues; jobs answer 503; usage waits in the spool |
 
@@ -117,13 +117,23 @@ next snapshot.
    with `cache_ttl_s` is also put in the response cache.
 10. **Log.** One access-log line is written for the request.
 
-If every target fails, the client gets 502 `all_upstreams_failed` with the
-list of attempts, and a usage event with status 502 and no tokens is
-recorded.
+If every target fails, the client gets the list of attempts in a 429
+`upstream_rate_limited` when the last target tried answered 429 (with that
+upstream's `retry-after`), and in a 502 `all_upstreams_failed` otherwise. A
+usage event with that status and no tokens is recorded.
 
-A request that is refused in steps 1 to 4 (and a route that does not exist)
-produces no usage event. It is counted per key name and reason instead, and
-the counts are sent to the control plane on the same interval as usage.
+**Errors and ids.** Every answer the data plane produces, except
+`GET /healthz` and the immediate `503 overloaded`, carries the request id
+as `x-omnigate-request-id`, and as `x-request-id` and `request-id` (the
+provider's own values when it sent them). The gateway's own errors are written in the shape of the client's
+protocol, with the provider's category in `error.type` and the gateway's
+reason in `error.code`; the table is in [API](api.md#errors).
+
+A request that is refused in steps 1 to 4, one whose route does not exist,
+and one that no target of the route can be sent at all
+(`endpoint_not_supported`, `untranslatable_request`) produce no usage event.
+They are counted per key name and reason instead, and the counts are sent
+to the control plane on the same interval as usage.
 
 **Stopping.** On SIGTERM or SIGINT the accept loop ends, idle connections
 are cancelled, requests in flight get `OMNIGATE_SHUTDOWN_GRACE_MS` to
@@ -145,9 +155,9 @@ when the queue drains completely, and reloaded at startup, so events survive
 both a control-plane outage and a data-plane restart. After a crash the
 spool can hold events that were already delivered; they are sent again.
 
-**On the control plane**, a batch is appended to the ledger file
-(`ledger.jsonl`) and synced to disk before it is acknowledged, then folded
-into per-key totals in memory. Every event carries the request id as its
+**On the control plane**, a batch is appended to the ledger's active
+segment (`ledger.jsonl`) and synced to disk before it is acknowledged, then
+folded into per-key totals in memory. Every event carries the request id as its
 `id`, and an event whose id was already recorded is skipped. That is what
 makes at-least-once delivery bill exactly once.
 
@@ -159,7 +169,7 @@ A text usage event as the data plane sends it:
 | `key_sha256` | Which gateway key. |
 | `route_model` | The model name the client used. |
 | `upstream`, `target_model` | Which target answered; null when all failed. |
-| `status` | HTTP status sent to the client; 499 for a stream that broke mid-way; 502 when all targets failed. |
+| `status` | HTTP status sent to the client; 499 for a stream that broke mid-way; 502 when all targets failed, or 429 when the last of them was rate limited. |
 | `stream` | Whether the request was streamed. |
 | `input_tokens` | Input tokens that were not served from the provider's prompt cache. |
 | `cached_input_tokens` | Input tokens read from the provider's prompt cache. |
@@ -186,19 +196,74 @@ the job's own `cost_usd`.
 Besides the per-key totals, the ledger keeps each key's spend per UTC month
 and per UTC day, keyed by the event's own time. That is what a monthly or
 daily budget is compared with. Rows of periods long past are dropped from
-memory (the file keeps the events), and totals for the current UTC day feed
-the dashboard's "today" figures.
+memory (the segments keep the events for as long as they are kept), and
+totals for the current UTC day feed the dashboard's "today" figures.
 
 Totals are kept per key **hash**. A managed key that has been rotated has
 several hashes; the control plane adds them up wherever it shows a key.
 
-At startup the ledger file is replayed to rebuild all of this and the set
-of seen ids. The file is never rewritten; `retention.ledger_ids_days` only
-trims the in-memory id set.
-
 Known limits, from the README: spool appends are not fsynced, so a power
 loss can drop the last few events; the spool holds at most 100,000
 undelivered events; the ledger lives on a single control-plane node.
+
+### Ledger files: segments and snapshots
+
+The ledger is not one file that is replayed from the beginning at every
+start. It is a set of files next to each other, named after
+`OMNIGATE_LEDGER` (`ledger.jsonl` by default):
+
+| File | What it is |
+|---|---|
+| `ledger.jsonl` | The **active segment**: one JSON event per line, appended and synced before a batch is acknowledged. |
+| `ledger.000001.jsonl`, `ledger.000002.jsonl`, ... | **Sealed segments**: older events, in order. The active segment's number is one more than the highest sealed number. |
+| `ledger.snapshot` | Everything a replay of the covered events would have produced: the totals per key, per UTC day and per budget period, the duplicate-detection ids, and the short list of recent requests. It records the position it covers, a segment number and a byte offset. |
+| `ledger.snapshot.prev` | The snapshot before that one, kept as a spare. |
+| `ledger.snapshot.tmp` | A snapshot being written. Never read. |
+
+- **Sealing.** The active segment is renamed to its numbered name, and a
+  new empty one started, when it reaches 64 MiB, and at the first
+  five-minute check after the UTC day it was written in has ended.
+- **Snapshots** are written every 50,000 events, every five minutes when
+  anything was recorded since the last one, after a segment is sealed, after
+  a start that had to replay events, and at a clean stop. A snapshot is a
+  magic line, a SHA-256 of the payload, and the payload (Erlang's external
+  term format). It is written to the `.tmp` name and synced; then the
+  current snapshot is renamed to `.prev` and the new one into place.
+- **Start.** The control plane loads the newest snapshot that passes every
+  check (the magic line and the checksum match, the contents decode, and the
+  ledger bytes it covers are still there and are the same bytes) and replays
+  only the events written after it. If the newest one fails a check the
+  spare is used; if both fail, every segment is replayed. The commit that
+  introduced this records 1,000,000 events loading in 0.75 s instead of
+  10.7 s.
+- **Nothing to migrate.** An installation that only ever had `ledger.jsonl`
+  is simply at segment 1, still active. Its first start with this code
+  replays the file once and writes the first snapshot.
+- **Deleting old segments.** `retention.ledger_days` deletes sealed
+  segments whose last write is older than the cutoff. A segment is deleted
+  only when both snapshot generations cover it, the newest sealed segment is
+  never deleted (the numbering is read from the file names), and nothing is
+  deleted until the running control plane has itself written a snapshot on
+  top of the one it started from. Lifetime and period totals are
+  unaffected, because the snapshots carry what the deleted segments
+  contributed.
+- **The consequence.** Once segments have been deleted, the two snapshots
+  hold the only copy of those totals. If both were lost or damaged, the next
+  start would rebuild the totals from the segments that remain and log an
+  error saying that spend recorded before them is lost. Without
+  `ledger_days` the segments are complete, and losing the snapshots costs
+  start-up time only.
+- **`retention.ledger_ids_days`** trims the set of duplicate-detection ids
+  (which is also part of every snapshot). It touches neither totals nor
+  segments.
+
+Each step is safe to crash in. A torn last line of the active segment is
+cut off at the next start (its batch was never acknowledged, so the data
+plane sends it again). A crash while a snapshot is being installed leaves
+either the old one or the spare usable. A crash between the two halves of
+sealing leaves no active file, which a start treats as an empty one. The
+unit tests in `control/test/ledger_snapshot_test.exs` exercise these states;
+none of this has run in production.
 
 ## A media job
 
@@ -257,10 +322,12 @@ and `cancel`. There are seven: `replicate`, `fal`, `openai_images`,
 | File | Process | Written | Purpose |
 |---|---|---|---|
 | The config file | control (read only) | by you | File keys, upstreams, routes, media, retention. |
-| `ledger.jsonl` | control | Appended and synced per batch. Never rewritten. | Usage events; source of all spend totals, period spend included. |
-| `jobs.jsonl` | control | Each change appends the job's full snapshot, synced before the change is visible. Rewritten compacted (one line per job) at start and after a retention sweep. | Job state. |
+| `ledger.jsonl` | control | Appended and synced per batch. Renamed to the next numbered name when it is sealed (at 64 MiB, or after the UTC day turns); never rewritten. | The ledger's active segment: the newest usage events. |
+| `ledger.000001.jsonl`, ... | control | Never written again once sealed. Deleted by `retention.ledger_days`, if set. | Sealed ledger segments: the older usage events. |
+| `ledger.snapshot`, `ledger.snapshot.prev` | control | Replaced (temp file, sync, two renames) every 50,000 events, every five minutes while there is something new, after sealing and at a clean stop. | The ledger's totals, period spend and duplicate-detection ids up to a recorded position, so a start replays only what came after. Once segments have been deleted, the only copy of their totals. |
+| `jobs.jsonl` | control | Each change appends the job's full snapshot, synced before the change is visible. Rewritten compacted (one line per job) at start, after a retention sweep, and while running (checked once a minute) once the lines appended since the last compaction exceed both 5,000 and twice the number of jobs. | Job state. |
 | `keys.json` | control | Replaced whole on every key change (temp file, sync, rename). | Managed keys: name, SHA-256 of the current secret and of earlier ones, budget and period, rate limit, models, disabled flag, and the webhook secret (in clear text) if set. Never a key itself. |
-| `audit.jsonl` | control | One line appended and synced per admin action. Never rewritten. | Who changed which key, and sign-ins. |
+| `audit.jsonl`, `audit.jsonl.1` to `.3` | control | One line appended and synced per admin action. When the file would pass `OMNIGATE_AUDIT_MAX_MB` (50) it is renamed to `.1`, the older files move up, and the fourth falls off. | Who changed which key, and sign-ins. |
 | The media directory | control | One directory per job. | Locally stored outputs. |
 | `omnigate-usage.spool` | data | Appended per request (not synced); truncated when drained. | Undelivered usage events. |
 | `omnigate-config.cache.json` | data | Rewritten (temp file, then rename) when a new snapshot is installed. | Start without the control plane. Holds key hashes and routes, never secrets. |
@@ -273,10 +340,11 @@ fresh after a restart:
 
 - data plane: rate-limit buckets, cooldowns, round-robin counters, learned
   model quirks, the response cache, and refusal counts not yet reported;
-- control plane: the refusal counts it has received, the failed-login
-  counters, and the short lists of recent requests and audit entries the
-  dashboard shows (the audit list is reloaded from its file; the request
-  list is not).
+- control plane: the refusal counts it has received and the failed-login
+  counters. The short lists of recent requests and audit entries that the
+  dashboard shows are also held in memory, but both come back after a
+  restart: the request list from the ledger's snapshot and segments, the
+  audit list from the live audit file.
 
 Dashboard sessions are not state at all: the cookie is signed with a key
 derived from the admin token and carries its own expiry.
@@ -312,8 +380,19 @@ The reasons below are the ones stated in the code and the README.
   has a deadline, enforced by one watchdog task that cancels the
   connection's task (which also works on Windows, where shutting a socket
   down from another thread does not wake a blocked read).
-- **No extra services to run.** State is files on disk, replayed at start.
+- **No extra services to run.** State is files on disk, loaded at start.
   The README's comparison table lists this as a deliberate difference.
+- **Start-up time must not grow with history.** A ledger that is replayed
+  from its first event gets slower to start every day. Snapshots bound the
+  replay to what was written since the last one, and segments let old
+  history be deleted without touching the totals.
+- **An SDK should not be able to tell the gateway from the provider.** So
+  the gateway's own errors, its model list and its request-id headers follow
+  the protocol of the endpoint the client called.
+- **The control plane refuses what it does not recognise.** Its guards and
+  its router must see the same path, so a path with an encoded character is
+  refused outright, an unknown first segment is a 404 at the guard, and
+  credentials are checked before a body is parsed.
 - **Small dependency surface.** The data plane uses only the Zig standard
   library, the control plane has two direct Hex packages, the tools use only
   the Python standard library. The one exception is deliberate and
@@ -325,7 +404,7 @@ The reasons below are the ones stated in the code and the README.
   job id is persisted before polling, and a resumed job polls instead of
   resubmitting.
 
-What this design does not give you yet, also from the README: cluster-wide
-budgets and rate limits (both are per process or per node), latency- or
-cost-aware routing, and ledger rotation. The response cache and the refusal
-counts are likewise per data-plane process, not shared.
+What this design does not give you yet: cluster-wide budgets and rate
+limits (both are per process or per node), and latency- or cost-aware
+routing. The response cache and the refusal counts are likewise per
+data-plane process, not shared.

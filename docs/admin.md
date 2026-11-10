@@ -54,7 +54,7 @@ the figure for today (the current UTC day).
 | Column | Shows |
 |---|---|
 | Key | The name, tagged `file` or `managed` (see [below](#gateway-keys-two-sources)). |
-| State | `active`, `blocked` (budget spent for the current period) or `disabled` (switched off by an operator). |
+| State | `active`, `blocked` (budget spent for the current period) or `disabled` (switched off by an operator). A shadowed managed key (see [below](#gateway-keys-two-sources)) is not in this table at all; it is listed by `GET /admin/keys` only. |
 | Spend | Without a budget: total spend. With one: spend against the budget with a progress bar; for a monthly or daily budget that is this period's spend, with the all-time total beneath. |
 | Requests, Errors, Tokens in / out, Jobs | Totals from the ledger. Prompt-cache reads and writes are noted next to the tokens when there are any. |
 | Per min | The key's `rpm`, or a dash for no limit. |
@@ -74,9 +74,9 @@ SHA-256 is stored.
 
 **Recent requests.** Up to 25 of the newest text requests: time, key,
 model, the upstream and model that served it, status, tokens, latency, cost,
-and each failover attempt with its outcome. The list is kept in memory, so
-it starts empty when the control plane restarts (the totals do not: they are
-rebuilt from the ledger file).
+and each failover attempt with its outcome. The list is taken from the 50
+newest ledger events and comes back after a restart, like the totals: both
+are part of the ledger's snapshots.
 
 **Recent media jobs.** The 25 newest jobs: created, id, key, model, status,
 upstream, cost, links to the outputs, and the webhook's delivery state.
@@ -111,10 +111,30 @@ budgets, rate limits and model lists apply.
 
 Names are how keys are told apart in listings, metrics and the admin API's
 paths. The API refuses to create a managed key under a name that is
-already in use, by a managed key or a file key (`409 key_exists`). The
-config file is not checked the other way round: nothing in the code stops
-you from adding a file key with the name of an existing managed key, or two
-file keys with one name, so do not.
+already in use, by a managed key or a file key (`409 key_exists`).
+
+**Shadowed keys.** The other way round is possible: you can add a file key
+to the config under the name of an existing managed key. The file wins.
+
+- The file key is in use. The managed key is **shadowed**: it is left out
+  of the snapshot sent to data planes, so its secret is answered
+  `401 invalid_api_key` like a key that does not exist.
+- The control plane logs a warning once, when the key becomes shadowed
+  (`key "<name>" is defined in the config file and also exists as a managed
+  key: ...`).
+- `GET /admin/keys` and `GET /admin/usage` list the shadowed key after all
+  the others, with `"state": "shadowed"` and `"shadowed": true`. The
+  dashboard's key table and `GET /admin/overview` show only the keys in
+  use, so the shadowed one does not appear there.
+- The two keys have different secrets, and usage is recorded per secret, so
+  the file key starts with its own spend; the managed key's spend stays
+  with the managed key.
+- To end it, remove or rename the file key (the managed key works again,
+  with its spend and jobs), or delete the managed key with
+  `DELETE /admin/keys/{name}`. `PATCH`, rotate and delete on that name act
+  on the managed key, not on the file key.
+
+Two file keys with one name are still not checked for; do not do that.
 
 Things to know about the keys file:
 
@@ -246,25 +266,33 @@ curl -X DELETE http://127.0.0.1:4000/admin/keys/my-app -H "Authorization: Bearer
 ```
 
 `200` with `{"deleted": "my-app"}`. The gateway then answers the key with
-`401`. Its usage events stay in the ledger file, but they no longer appear
+`401`. Its usage events stay in the ledger, but they no longer appear
 under a name in listings and metrics, and its media jobs can no longer be
 fetched through the gateway. Creating a new key with the same name later
 does not bring them back: the new key has a new secret and a new hash.
 
 ### Errors
 
-Admin API errors have the gateway's usual shape,
-`{"error": {"type": "...", "message": "..."}}`.
+Admin API errors have the control plane's shape,
+`{"error": {"type": "...", "message": "..."}}`, with the reason in
+`error.type`. (The data plane's errors moved their reason to `error.code`;
+the control plane's did not.)
 
 | Status | `error.type` | When |
 |---|---|---|
-| 400 | `invalid_request` | A missing or malformed `name`, or a field with a bad value. |
+| 400 | `invalid_request` | A missing or malformed `name`, or a field with a bad value. Also any request whose path contains a percent-encoded character: `/admin/keys/my%2Dapp` is refused, `/admin/keys/my-app` is the only spelling. Key names never need encoding. |
+| 400 | `invalid_json` | The body is not valid JSON. |
 | 401 | `unauthorized` | No valid admin token or session. |
 | 403 | `csrf_failed` | A session-authenticated change without the CSRF token; see [below](#csrf-scripts-and-browsers). |
 | 404 | `key_not_found` | No key has this name. |
 | 409 | `key_exists` | Create: the name is taken, by a managed or a file key. |
 | 409 | `read_only_key` | Change, rotate or delete of a key that is defined in the config file. |
 | 500 | `storage_error` | The keys file could not be written; nothing was changed. |
+| 500 | `internal_error` | An unexpected failure. The error has a `request_id` that is also in the control plane's log. |
+
+An unknown path under `/admin` answers `401` without the admin token and
+`404 not_found` with it. The errors every control-plane request can get are
+listed in [API](api.md#errors-and-request-paths).
 
 ## Budgets and periods
 
@@ -311,7 +339,7 @@ sent.
 | `ts` | UTC time, to the second. |
 | `action` | `key.create`, `key.update`, `key.rotate`, `key.delete`, `login`, `logout`. |
 | `target` | The key name, or `null`. |
-| `auth` | How the caller was authenticated: `token` (bearer), `session` (dashboard), `password` (a login attempt) or `none`. |
+| `auth` | How the caller was authenticated: `token` (bearer), `session` (dashboard), `password` (a login attempt) or `none`. A key action can no longer be recorded with `none`: the admin API is not reachable without a credential. An older entry that says so was made through the bypass described in [SECURITY.md](../SECURITY.md#past-advisories). |
 | `address` | The peer address of the connection. Behind a reverse proxy that is the proxy. |
 | `forwarded_for` | Present when the request had an `X-Forwarded-For` header: its value, cut to 200 characters. A direct caller can fake it, so it is recorded, not trusted. |
 | `outcome` | `ok`, or the error type (`invalid_request`, `key_exists`, `read_only_key`, `key_not_found`, ...). For logins: `ok`, `denied` or `throttled`. |
@@ -336,12 +364,19 @@ curl "http://127.0.0.1:4000/admin/audit?limit=20" -H "Authorization: Bearer dev-
 ```
 
 `{"entries": [...]}`. `limit` is between 1 and 500 and defaults to 50. The
-control plane keeps the newest 500 entries in memory for this (reloaded
-from the file at start); older ones are only in the file.
+control plane keeps the newest 500 entries in memory for this; older ones
+are only in the files. At start the list is reloaded from the live file
+alone, so right after a rotation and a restart it can be shorter.
 
-The file only grows. Rotate or archive it with your own log tooling, and
-restart the control plane after moving it: the file is opened once, at
-start.
+**Rotation.** When the next line would take the file past
+`OMNIGATE_AUDIT_MAX_MB` (50 by default), `audit.jsonl` is renamed to
+`audit.jsonl.1`, an existing `.1` becomes `.2`, `.2` becomes `.3`, and an
+existing `.3` is deleted. Three older files are kept, so the log holds
+about four times the limit at most, and entries older than that are gone:
+copy the files elsewhere if you need them for longer. `0` turns rotation
+off and the file grows without bound. The file is opened for each entry,
+so you can also move or rotate it from outside at any time without
+restarting the control plane.
 
 ## CSRF: scripts and browsers
 
@@ -387,12 +422,12 @@ All on the control plane's port, all behind the admin token or a session.
 |---|---|
 | `generated_at` | UTC time the document was built. |
 | `totals`, `today` | `requests`, `errors`, `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `cached_responses`, `jobs`, `cost_usd`; over the whole ledger, and for the current UTC day. |
-| `keys` | As `GET /admin/keys`. |
-| `requests` | Up to 25 of the newest text requests recorded since the control plane started. |
+| `keys` | As `GET /admin/keys`, without shadowed keys. |
+| `requests` | Up to 25 text requests, taken from the 50 newest ledger events. |
 | `jobs` | The 25 newest media jobs, with output URLs and webhook state. |
 | `rejected` | Up to 50 `{key, reason, count}` series of refused requests, largest first. |
 | `audit` | The 10 newest audit entries. |
-| `config` | The read-only configuration view: upstreams by host, routes, media, storage, retention. |
+| `config` | The read-only configuration view: upstreams by host, routes, media, storage, retention (`jobs_days`, `ledger_ids_days`, `ledger_days`, `delete_bucket_objects`). |
 
 It is the dashboard's own feed rather than a versioned interface: expect its
 shape to follow the dashboard.

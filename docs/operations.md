@@ -1,6 +1,7 @@
 # Operations
 
 - [Dashboard and admin API](#dashboard-and-admin-api)
+- [Health and readiness](#health-and-readiness)
 - [Metrics](#metrics)
 - [Refused requests](#refused-requests)
 - [Budgets](#budgets)
@@ -36,6 +37,20 @@ The tour of the dashboard, the key API with `curl` examples, and the audit
 log are in [Admin](admin.md). The endpoint list is in
 [API](api.md#admin-api).
 
+## Health and readiness
+
+- `GET /healthz` on the data plane (no key) and on the control plane (no
+  credentials) says the process is up.
+- `GET /readyz` on the control plane says it can do its job: the config is
+  loaded, the job store is running, and the ledger is loaded and writable.
+  It answers `503` with a `reason` otherwise, for example
+  `ledger file is not writable`.
+
+Which probe to use where, and what the container health check does, is in
+[Deployment](deployment.md#health-and-readiness-probes). The data plane has
+no readiness endpoint: whether it has a config shows in its answers
+(`503 gateway_not_ready`) and in its log.
+
 ## Metrics
 
 `GET /metrics` on the control plane serves Prometheus text format behind the
@@ -69,16 +84,17 @@ Things to know:
   separately, in `omnigate_rejected_requests_total`; see
   [Refused requests](#refused-requests).
 - **Per-key ledger counters are totals over the whole ledger.** They are
-  rebuilt from the ledger file at start, so they do not reset when the
-  control plane restarts. `omnigate_config_reloads_total`,
+  restored from the ledger's snapshot and segments at start, so they do not
+  reset when the control plane restarts, and deleting old segments with
+  `retention.ledger_days` does not lower them. `omnigate_config_reloads_total`,
   `omnigate_uptime_seconds` and `omnigate_rejected_requests_total` do.
 - **A rotated key keeps its series**: usage under earlier secrets is added
   in. A deleted key's series disappear, although its events stay in the
-  ledger file.
+  ledger.
 - **`omnigate_key_errors_total`** counts ledger events with a status of 400
-  or above. That includes provider errors passed to the client, 502s after
-  every target failed, streams that broke or stalled mid-way (499), and
-  failed (502) or canceled (499) media jobs.
+  or above. That includes provider errors passed to the client, 502s and
+  429s after every target failed, streams that broke or stalled mid-way
+  (499), and failed (502) or canceled (499) media jobs.
 - **Input tokens come in three series.** `omnigate_key_input_tokens_total`
   is the input that was not served from a provider's prompt cache;
   `..._cached_input_tokens_total` and `..._cache_write_input_tokens_total`
@@ -110,15 +126,18 @@ key name and reason and reports the counts to the control plane every
 `OMNIGATE_FLUSH_MS`. They appear in the dashboard's "Refused requests"
 table and as `omnigate_rejected_requests_total{key, reason}`.
 
-`reason` is the `error.type` the client received: `invalid_api_key`,
+`reason` is the `error.code` the client received: `invalid_api_key`,
 `missing_api_key`, `budget_exceeded`, `model_not_allowed`,
 `rate_limit_exceeded`, `model_not_found`, `not_found`, `invalid_json`,
 `missing_model`, `payload_too_large`, `method_not_allowed`,
-`invalid_request`, `gateway_not_ready`, `control_plane_unavailable`. Two
-more have no error
-body of their own: `client_timeout` (a client that was disconnected for
-sending too slowly) and `overloaded` (a connection refused at the
-connection cap).
+`invalid_request`, `endpoint_not_supported`, `untranslatable_request`,
+`gateway_not_ready`, `control_plane_unavailable`, and `overloaded` (a
+connection refused at the connection cap). One more has no error body:
+`client_timeout`, a client that was disconnected for sending too slowly.
+
+`upstream_rate_limited` and `all_upstreams_failed` are not in this list.
+Those requests reached the failover loop, so they are in the ledger (and in
+`omnigate_key_requests_total` and `omnigate_key_errors_total`) instead.
 
 `key` is the key's name, or `-` when the request could not be tied to a
 known key (no key, an unknown key, or a connection refused before anything
@@ -266,7 +285,9 @@ Each can be turned off with `0`. Notes:
 
 Failover and cooldowns:
 - **Failover** to the next target happens on connection errors, timeouts,
-  429 and 5xx, and only before any byte has reached the client. A connection
+  429 and 5xx, and only before any byte has reached the client. When no
+  target is left, the client gets 429 if the last one tried answered 429
+  (with its `retry-after`), and 502 otherwise. A connection
   error is first retried once on a fresh connection, in case a pooled
   connection had gone stale (timeouts and refused connections are not
   retried this way).
@@ -324,12 +345,12 @@ Off by default: nothing is deleted unless the config has a `retention`
 section.
 
 ```json
-"retention": { "jobs_days": 30, "ledger_ids_days": 7, "delete_bucket_objects": true }
+"retention": { "jobs_days": 30, "ledger_ids_days": 7, "ledger_days": 90, "delete_bucket_objects": true }
 ```
 
 One sweep runs a few seconds after the control plane starts and then every
 hour. When it removes something it logs
-`retention sweep removed N finished jobs, N stored files, N bucket objects, N ledger dedup ids`.
+`retention sweep removed N finished jobs, N stored files, N bucket objects, N ledger dedup ids, N ledger segments`.
 
 **`jobs_days`.** Jobs that finished (succeeded, failed or canceled) more
 than this many days ago are removed from the job store and its file, and
@@ -359,14 +380,36 @@ their outputs are deleted: files on local disk, and objects in the bucket.
 **`ledger_ids_days`.** The ledger forgets the event ids it uses to reject
 duplicates once they are older than this.
 
-- Spend totals and the ledger file are untouched.
+- Spend totals and the ledger's segments are untouched.
 - A usage event that a data plane resends after its id was forgotten would
   be counted twice. Keep this well above the longest outage a data plane
   might spool through.
 
-What retention does not do: it does not trim `ledger.jsonl`. The ledger
-file grows for as long as the gateway runs and is replayed in full at every
-start; ledger rotation is on the README's "Next" list.
+**`ledger_days`.** Sealed ledger segments (the files
+`ledger.NNNNNN.jsonl`) whose last write is older than this are deleted.
+
+- Totals are unaffected: per-key spend, period spend and the metrics keep
+  counting what the deleted segments held, because the ledger's snapshots
+  carry it. What is gone is the event history itself (one line per request,
+  with tokens, upstream and attempts).
+- **After the first deletion, the two snapshot files are the only copy of
+  those totals.** Back up the whole data directory, snapshots included; see
+  [Deployment](deployment.md#backups).
+- A segment is deleted only when both snapshots cover it, and the newest
+  sealed segment always stays. A control plane also deletes nothing until
+  it has written a snapshot of its own since it started, so a sweep right
+  after a restart may remove no segments.
+- The active segment is sealed at 64 MiB or after the UTC day turns, so
+  with steady traffic there is about one segment per day and `ledger_days`
+  is accurate to about a day. An installation with no traffic seals nothing
+  and deletes nothing.
+- The age that counts is the file's modification time. A restored or
+  copied segment whose time stamp was not preserved looks new and is kept
+  longer.
+
+Without `ledger_days` the segments are kept for ever. They no longer slow
+down a start, which loads the newest snapshot and replays only what came
+after it; they only take disk space.
 
 ## When the control plane is down
 
@@ -468,13 +511,22 @@ Control plane:
 | `loaded N managed keys from <path>` | Startup, when the keys file has keys. |
 | `cannot write <path>: ...` | A key change could not be saved and was not applied. |
 | `audit log <path> could not be written: ...` | An admin action went ahead without its audit line. |
-| `retention sweep removed N finished jobs, N stored files, N bucket objects, N ledger dedup ids` | A sweep removed something. |
+| `retention sweep removed N finished jobs, N stored files, N bucket objects, N ledger dedup ids, N ledger segments` | A sweep removed something. |
 | `retention: could not delete bucket object <key>: ...` | The object stays in the bucket. |
 | `reloaded config <path>` | An edit was applied. |
 | `config reload failed, keeping previous: ...` | The edited file is invalid; the old config is still in force. |
 | `OMNIGATE_ADMIN_TOKEN is not set. Generated one for this run ...` | The token follows on the same line. |
 | `control plane listening on <address>: reachable from the network over plain HTTP ...` | `OMNIGATE_CONTROL_BIND` is not loopback. |
-| `ledger replayed N events from <path>` | Startup. |
+| `ledger ready in N ms from a snapshot plus N later events (<path>)` | Startup. Without a usable snapshot the line says `from N events`. |
+| `ledger: sealed segment N (N bytes)` | The active segment was closed under its number and a new one started. |
+| `ledger: ignoring ledger.snapshot (<reason>)` | A snapshot failed a check (checksum, contents, or the segment bytes it covers) and was not used. The spare, or a full replay, takes its place. |
+| `ledger: using the previous snapshot; the newest one was unusable` | Startup went on from the spare. |
+| `ledger: no usable snapshot, and segments before N were deleted by retention. ...` | Error. Totals were rebuilt from the remaining segments only; spend recorded before them is lost. Restore the data directory from a backup. |
+| `ledger: snapshot failed: ...` | A snapshot could not be written. Usage is still recorded; the next start replays more. |
+| `ledger: cutting N bytes of a torn last line from ledger.jsonl` | Startup after a crash in the middle of a write. The batch was never acknowledged and is sent again. |
+| `job store compacted its log (N lines since the last time)` | Routine. |
+| `key "<name>" is defined in the config file and also exists as a managed key: ...` | The managed key is shadowed and its secret no longer works. See [Admin](admin.md#gateway-keys-two-sources). |
+| `request <id> <METHOD> <path> failed: ...` | The control plane answered `500 internal_error`; `<id>` is the `request_id` the client got. |
 | `job <id>: <upstream> failed (<outcome>), trying next target` | Media failover. |
 | `job <id>: resuming provider job <provider id> on <upstream>` | A job continued after a restart. |
 | `job <id>: storing outputs failed: ...` | Storage problem; the job fails with `storage_error`. |
@@ -537,11 +589,15 @@ that is already in use.
 
 ## Troubleshooting
 
-By the `error.type` in the gateway's answer. An answer that has an
-`x-omnigate-upstream` header came from a provider, not from the gateway; see
-the last rows.
+By the reason in the gateway's answer: `error.code` when the data plane
+raised the error, `error.type` when the control plane did (the jobs API's
+own errors and everything on the control plane's port; see
+[API](api.md#errors)). An answer that has an `x-omnigate-upstream` header
+came from a provider, not from the gateway; see the last rows. A gateway
+error carries `x-omnigate-request-id`, which is the `id=` of the request's
+line in the data plane's access log.
 
-| `error.type` | Likely cause | What to do |
+| Reason | Likely cause | What to do |
 |---|---|---|
 | `gateway_not_ready` (503) | The data plane has never received a config. | Check `OMNIGATE_CONTROL_URL`, that the control plane is up (it does not start without `OMNIGATE_INTERNAL_TOKEN`, or with an invalid config file), and that both processes have the same `OMNIGATE_INTERNAL_TOKEN` (data plane log: `config fetch returned 401`). |
 | `missing_api_key` (401) | No `Authorization: Bearer` or `x-api-key` header. | Send the gateway key. For a file URL: the `sig` parameter was stripped. With an SDK: it may have picked up no key, or the wrong one, from the environment. |
@@ -554,7 +610,10 @@ the last rows.
 | `invalid_json`, `missing_model` (400) | The body is not a JSON object, or has no `"model"` string. | Fix the request. |
 | `payload_too_large` (413) | Body over 8 MiB. | Send less; the limit is not configurable. |
 | `rate_limit_exceeded` (429) | Over the key's `rpm`. | Wait `Retry-After` seconds, or raise `rpm`. |
-| `all_upstreams_failed` (502) | Every target failed. | Read `error.attempts`: `http_429` / `http_5xx` are provider answers; `UpstreamTimeout` means no headers within the timeout; `ConnectionRefused` and similar are network errors; `unknown_upstream` means a target names an upstream that is not in `upstreams[]`; `protocol_mismatch` means an untranslated endpoint (embeddings, responses, completions, count_tokens) was routed to an upstream of the other protocol; `untranslatable_request` means the request has audio or file parts and the target speaks the other protocol. |
+| `all_upstreams_failed` (502) | Every target failed, and the last one tried did not answer 429. | Read `error.attempts`: `http_429` / `http_5xx` are provider answers; `UpstreamTimeout` means no headers within the timeout; `ConnectionRefused` and similar are network errors; `unknown_upstream` means a target names an upstream that is not in `upstreams[]`; `protocol_mismatch` means that target speaks the other protocol and the endpoint is not translated; `untranslatable_request` means the request has audio or file parts and that target speaks the other protocol. |
+| `upstream_rate_limited` (429) | Every target failed, and the last one tried answered 429. | Wait for the `retry-after` the response carries (the provider's), or add a target at another provider to the route. This is your provider key's limit, not the gateway key's `rpm`. |
+| `endpoint_not_supported` (400) | An untranslated endpoint (embeddings, responses, completions, count_tokens) was called on a route whose upstreams all speak the other protocol. | Call a route that has an upstream of the endpoint's own protocol, or add one to this route. |
+| `untranslatable_request` (400) | The request has audio or file parts, and every target of the route would need it translated. | Use a route with an upstream of the client's own protocol. |
 | `control_plane_unavailable` (503) | A jobs or files request could not reach the control plane within 30 seconds. | Check the control plane; text endpoints are unaffected. |
 | `webhook_not_configured` (400) | A job asked for a webhook but no signing secret exists for the key. | Set one; see [Configuration](configuration.md#mediawebhooks). |
 | `invalid_webhook_url` (400) | Not http(s), no host, embedded credentials, does not resolve, or resolves to a private address. | Use a public URL. For local development set `media.webhooks.allow_private` to `true`. |
@@ -564,6 +623,8 @@ the last rows.
 | `csrf_failed` (403, control plane) | A change sent with a session cookie but without the session's CSRF token. | From a script, use the bearer token instead. In the dashboard, reload the page. See [Admin](admin.md#csrf-scripts-and-browsers). |
 | `read_only_key` (409, control plane) | The key is defined in the config file. | Edit the file. |
 | `key_exists` (409), `key_not_found` (404), `invalid_request` (400, control plane) | See [Admin](admin.md#errors). | |
+| `invalid_request` (400): `the request path must not contain encoded characters` | The path sent to the control plane (directly, or through the gateway for `/v1/jobs*` and `/v1/files/*`) contains a `%`. | Send the path plain. Key names, job ids and file names never need encoding. |
+| `internal_error` (500, control plane) | The control plane failed while handling the request. | Find the `request_id` from the error in the control plane's log (`request <id> ... failed:`). |
 | `invalid_signature`, `url_expired` (403) | A file URL was altered or is older than its lifetime. Changing `OMNIGATE_SIGNING_SECRET` (or the internal token it is derived from) also invalidates outstanding URLs. | Fetch the job again for a fresh URL. |
 
 A media job that ends `failed`:
@@ -602,6 +663,9 @@ Other symptoms:
 | Streamed tokens arrive in one burst through your proxy | The proxy is buffering. In Caddy: `flush_interval -1`. |
 | Spend shows $0 | The route's targets have no prices. Or the answers came from the response cache, which costs nothing. |
 | The control plane exits at once, or its container keeps restarting | `OMNIGATE_INTERNAL_TOKEN` is unset or empty (the log says so), the config file is invalid, or the keys file exists but cannot be read. |
+| The control container is `unhealthy` | `GET /readyz` is failing. Call it (`docker compose exec control wget -q -O - http://127.0.0.1:4000/readyz`) and read `reason`; a refused connection means the control plane is still loading its ledger or is not running. |
+| A managed key stopped working after a config edit | The config file now defines a key with the same name, which shadows the managed one. `GET /admin/keys` shows it with `"state": "shadowed"`. |
+| An application reports a rate limit although its key has no `rpm` | `429 upstream_rate_limited`: the provider's limit on your provider key, passed on. |
 | A connection the client kept open was closed by the gateway | It was idle for `OMNIGATE_CLIENT_TIMEOUT_MS` (30 seconds by default). Most HTTP clients retry on a fresh connection by themselves. |
 | A long streamed answer was cut off | The upstream sent nothing, or the client read nothing, for `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`. The ledger has the request with status 499. |
 | A changed answer keeps coming back unchanged | The route has `cache_ttl_s` and the response carries `x-omnigate-cache: hit`. |

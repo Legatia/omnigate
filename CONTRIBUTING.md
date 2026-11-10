@@ -14,8 +14,8 @@ Security problems: do not open a public issue. See [SECURITY.md](SECURITY.md).
 - Zig 0.17 (the container build pins 0.17.0; see `dataplane/Dockerfile`)
 - Erlang/OTP 29 with Elixir 1.20 (the container build uses Elixir 1.20.5)
 - Python 3.9 or newer; the tools use the standard library only, with one
-  exception: the SDK compatibility test needs the official SDKs
-  (`pip install openai anthropic`)
+  exception: the SDK compatibility test needs the official SDKs, at the
+  versions CI pins (`pip install openai==3.49.0 anthropic==2.8.0`)
 - Docker with the Compose plugin, only for the container test
 
 On Windows, Erlang and Elixir are installed but not on `PATH`. In
@@ -98,7 +98,7 @@ plane. It needs the two official SDKs, which the repository itself does not
 depend on:
 
 ```bash
-pip install openai anthropic
+pip install openai==3.49.0 anthropic==2.8.0
 ```
 
 ```bash
@@ -108,12 +108,17 @@ python tools/sdk_compat.py
 It starts the same stack as `tools/e2e.py --only text` (so it cannot run at
 the same time as the end-to-end test) and drives the gateway through the
 OpenAI and Anthropic Python SDKs: sync and async, streaming and not, both
-translation directions, and the exception classes each SDK raises. Places
-where the gateway is known to differ from the real APIs print `GAP` and do
-not fail the run unless `--strict` is given; `--keep` leaves the logs. CI
-installs the latest SDK releases, so a failure in the `sdk` job that your
-change did not cause may come from a new SDK version; the job log prints
-the versions it ran.
+translation directions, the exception classes each SDK raises, and the
+details an SDK user would notice (request ids, error codes and envelopes,
+the model endpoints, a provider's 429, structured output). Every case must
+pass; there is no mode that tolerates known gaps. `--keep` leaves the logs.
+
+The two versions above are the ones the suite was written against, and CI
+installs exactly those (`OPENAI_SDK_VERSION` and `ANTHROPIC_SDK_VERSION` at
+the top of `.github/workflows/ci.yml`), so a new SDK release cannot turn CI
+red by itself. To move to newer SDKs, run the suite locally with them, fix
+what they notice, and change the two numbers in the workflow and on this
+page in the same pull request. The job log prints the versions it ran.
 
 Container test (needs a Linux Docker daemon):
 
@@ -149,6 +154,8 @@ dataplane/            Zig data plane: the public port
   src/main.zig        startup, environment variables, the accept loop, stop signals and shutdown
   src/proxy.zig       request handling: auth, limits, routing, failover, streaming, job passthrough
   src/translate.zig   OpenAI chat completions <-> Anthropic messages (pure functions)
+  src/errors.zig      the gateway's own errors in each protocol's shape; reason -> category table
+  src/models.zig      GET /v1/models and /v1/models/{id} in each protocol's shape
   src/config.zig      the config snapshot and its lookups
   src/control.zig     talks to the control plane: config pull, usage and counter push, config cache
   src/reporter.zig    the usage spool and its delivery loop
@@ -176,7 +183,8 @@ control/              Elixir control plane
     dashboard.ex      the dashboard page (HTML, CSS and script in one module)
     audit.ex          the admin audit log
     rejections.ex     refused-request counts reported by data planes
-    ledger.ex         the usage ledger, including spend per budget period
+    ledger.ex         the usage ledger: totals, spend per budget period, snapshots, sealing
+    ledger/files.ex   the ledger on disk: segments, snapshot files, crash safety
     metrics.ex        Prometheus output
     retention.ex      periodic cleanup
     jobs.ex           the job API's logic: create, cancel, cost, cache, resume
@@ -224,8 +232,12 @@ not to, and say the reason in the commit.
   modules repeat it in their documentation. When you add or change provider
   behaviour, update those statements in the same change, and do not claim
   more than you ran.
-- **Keep the README's "Known gaps" honest.** A new limitation goes there
-  when it is introduced.
+- **Keep the README honest and short.** A new limitation goes into its
+  "Known limits" when it is introduced, and a limitation the code no longer
+  has comes out in the same change. Something checked against a real
+  provider goes into "What has been verified"; do not move a line there on
+  the strength of a mock. The README carries no counts of test checks and
+  no reference tables: those live in `docs/`.
 - **No secrets in the repository**, and no placeholders that look like
   them: a dev placeholder with a real secret's prefix has triggered secret
   scanning before. Provider keys are only ever named by environment
@@ -235,12 +247,19 @@ not to, and say the reason in the commit.
   and the tools use only the Python standard library (`tools/sdk_compat.py`
   imports the two SDKs it tests, inside a function, so that nothing else
   gains the dependency). Adding one needs a reason.
-- **Error answers have one shape:**
-  `{"error": {"type": "<snake_case>", "message": "<plain sentence>"}}`. A new
-  error type is part of the API: add it to `docs/api.md` (or `docs/admin.md`
-  for the admin API) and the troubleshooting table in `docs/operations.md`.
-  In the data plane the `type` of a refusal is also the `reason` it is
-  counted under, so it shows up as a metric label.
+- **Error answers follow two rules, one per process.**
+  - Data plane: every error goes through `errors.zig`, which writes it in
+    the shape of the client's protocol. The gateway's reason
+    (`<snake_case>`) is `error.code`, and it is also the `reason` a refusal
+    is counted under, so it shows up as a metric label. `error.type` is the
+    provider's category for it. A new reason needs a row in `typesFor` (or
+    a deliberate decision to let the status decide) and a line in the test
+    that lists every reason.
+  - Control plane: `{"error": {"type": "<snake_case>", "message": "<plain
+    sentence>"}}` through `send_error`, with the reason in `error.type`.
+  - Either way a new reason is part of the API: add it to `docs/api.md` (or
+    `docs/admin.md` for the admin API) and to the troubleshooting table in
+    `docs/operations.md`.
 - Files use LF line endings (`.gitattributes`).
 
 ### Zig (data plane)
@@ -274,7 +293,7 @@ not to, and say the reason in the commit.
   failure and restart behaviour.
 - State that must survive a restart is written to disk and synced before
   the change is visible or acknowledged (`Ledger`, `Jobs.Store`), and
-  replayed at start.
+  loaded or replayed at start.
 - Jobs and ledger events are JSON-shaped maps with string keys, as stored.
   The normalized config uses atom keys.
 - Config values are validated in `ConfigStore.normalize/1`. A missing
@@ -285,6 +304,10 @@ not to, and say the reason in the commit.
 - JSON uses the standard library's `JSON` module; outbound HTTP goes
   through `OmnigateControl.Http`.
 - Secrets are compared with `Plug.Crypto.secure_compare/2`.
+- The router's guards deny by default. A route under a new first path
+  segment answers 404 until that segment is added to the guard in
+  `router.ex`, with a decision about which credential it needs; say which
+  in the commit. No route may need a percent-encoded character in its path.
 - The code is formatted with `mix format`; `control/.formatter.exs` sets
   `line_length: 160`. CI runs `mix format --check-formatted` and fails on a
   file that is not formatted, so run `mix format` before committing.

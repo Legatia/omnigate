@@ -2,15 +2,9 @@
 
 [![CI](https://github.com/Legatia/omnigate/actions/workflows/ci.yml/badge.svg)](https://github.com/Legatia/omnigate/actions/workflows/ci.yml)
 
-A self-hostable AI gateway in two small processes. It fronts OpenAI- and
-Anthropic-style text APIs and wraps image, video and speech providers in one
-async job API.
+A self-hostable AI gateway in two small processes. The data plane (Zig) is the port applications call: it fronts OpenAI- and Anthropic-style text APIs with gateway keys, limits, failover and protocol translation. The control plane (Elixir) owns configuration, keys, budgets and the usage ledger, and wraps image, video and speech providers in one async job API.
 
-**Status: the text gateway and the OpenAI image, ElevenLabs speech,
-Replicate, Gemini (image, speech, video) and xAI video adapters have been
-checked against the real APIs, and bucket storage against Cloudflare R2
-(November 2026). The fal adapter has only met a mock, and nothing has run
-under production load.** See [Known gaps](#known-gaps).
+**Status (November 2026): pre-release. Nothing has run under production load, and no version has been tagged.** The text gateway and six of the seven media adapters have been checked by hand against the real provider APIs, and bucket storage against Cloudflare R2; the fal adapter has only met a mock. Everything added after those checks has only met the mock providers in the test suites: managed keys and the admin API, budget periods, the response cache, provider header passthrough, prompt-cache token accounting, provider-shaped errors, structured-output translation, ledger snapshots and retention. See [What has been verified](#what-has-been-verified) and [Known limits](#known-limits).
 
 ```
  apps ──▶ dataplane (Zig) ──────────▶ LLM providers (OpenAI-style, Anthropic-style)
@@ -24,77 +18,52 @@ under production load.** See [Known gaps](#known-gaps).
 | Part | Language | Job |
 |---|---|---|
 | `dataplane/` | Zig 0.17 | The public port. Authenticates keys, rate-limits, routes, fails over, translates protocols, streams, meters tokens |
-| `control/` | Elixir 1.20 / OTP 29 | Config, prices, budgets, the usage ledger, media jobs, output storage, webhooks, dashboard |
-| `config/` | JSON | Keys, upstreams, routes, media section |
-| `tools/` | Python (stdlib) | Mock providers, end-to-end test, container test, benchmark, LiteLLM config importer |
+| `control/` | Elixir 1.20 / OTP 29 | Config, managed keys, prices, budgets, the usage ledger, media jobs, output storage, webhooks, dashboard, admin API, metrics |
+| `config/` | JSON | Keys, upstreams, routes, media section, retention |
+| `tools/` | Python (stdlib) | Mock providers, end-to-end test, SDK compatibility test, container test, load test, benchmark, LiteLLM config importer |
 | `compose.yaml`, `deploy/` | Docker | Both images plus a Caddy proxy for TLS |
 
-## What it does
+## Features
 
 ### Text gateway
 
-- `POST /v1/chat/completions` and `POST /v1/messages`, streaming and non-streaming. Also `/v1/embeddings`, `/v1/responses`, `/v1/completions` and `/v1/messages/count_tokens` as same-protocol passthrough. `GET /v1/models`, `GET /healthz`.
-- **Protocol translation.** An OpenAI client can use a route served by an Anthropic upstream and the reverse, including streaming, tools and images. A route can mix both kinds as failover targets.
-- **OpenAI-compatible providers at any path.** Gemini, Groq, Mistral, OpenRouter and others speak the OpenAI protocol; an upstream's `v1_path` covers the ones that do not serve it under `/v1` (Gemini uses `/v1beta/openai`).
-- **Provider quirks handled for translated requests.** Current Claude models refuse `temperature` and `top_p`; Gemini 3 and later demand a "thought signature" on earlier tool calls. A client speaking the other protocol cannot know either rule, so when a translated request is refused for one of them the gateway retries with the fix and remembers it for that model.
-- **Failover** to the next target on connection errors, timeouts, 429 and 5xx, before any byte reaches the client. One retry on a fresh connection first, in case a pooled connection went stale.
-- **Timeouts.** Max wait for response headers, global or per upstream.
-- **Cooldowns.** An upstream that fails five times in a row is tried last for 30 seconds, so a dead provider costs one timeout, not one per request.
-- **Load balancing.** A route tries its targets in order by default; set `strategy` to `round_robin` to rotate the starting target, or `weighted` to pick it in proportion to each target's `weight`. The other targets remain as failover either way.
-- **Per-key model limits.** A key can be restricted to a list of models (`models`); anything else is a 403, and its model list shows only what it may use. The same list applies to media jobs.
-- **Rate limits** per key (requests per minute), answered with 429 and `Retry-After`.
-- **Budgets** per key: the control plane marks an overspent key blocked and the data plane answers 402.
-- **Usage metering** from the response stream without buffering it. If the client did not ask for the OpenAI usage chunk, the gateway asks for it anyway and hides it from the client.
-- **Usage that survives outages.** Events are spooled to disk on the data plane, sent in batches with retries, and deduplicated by request id in the ledger, so a call is billed once even if the control plane was down when it happened.
-- **Keeps serving without the control plane**, including after a data-plane restart (last config is cached on disk).
-- **Holds up under hostile clients.** Idle connections, half-sent requests and stalled streams are cut off by timeouts; connections are capped; on a stop signal the gateway finishes in-flight requests, delivers queued usage and exits cleanly.
-- **Access log.** One line per request with key name, route, upstream, attempts, tokens and latency; `OMNIGATE_LOG_FORMAT=json` for log shippers.
-- Response headers: `x-omnigate-upstream`, `x-omnigate-attempts`, `x-omnigate-request-id`.
-
-### Control plane access
-
-- **Dashboard login.** The dashboard asks for the admin token once and then uses a signed session cookie (12 hours, `HttpOnly`, `SameSite=Strict`).
-- **Admin API.** `/admin/*` takes the same token as `Authorization: Bearer`.
-- **Never open by default.** If `OMNIGATE_ADMIN_TOKEN` is not set, a random one is generated at startup and written to the log.
-- **Guessing is slowed.** Five failed logins from one address lock that address out for a minute.
-- **Key management.** Create, rotate, disable and delete gateway keys from the dashboard or the admin API (`/admin/keys`), with budget, rate limit and model limits per key. A new key is shown once and stored only as a hash. Data planes pick changes up within seconds. Keys in the config file keep working and are read-only there.
-- **Dashboard.** Spend against budget per key, today and total figures, recent requests and media jobs, and a read-only view of the configuration without secrets. It updates live, works without external assets, and protects changes with CSRF tokens.
-- **Metrics.** `GET /metrics` serves Prometheus text format behind the admin token: per-key requests, errors, tokens, jobs, cost, budget and blocked state; media jobs by status; webhook deliveries by state; ledger size; config reloads; uptime.
-- **Retention.** With a `retention` section in the config, finished jobs and their locally stored files are removed after `jobs_days`, and the ledger's duplicate-detection ids after `ledger_ids_days`. Off by default: nothing is deleted unless you set it.
-- **Separate credentials.** Gateway keys, the data planes' internal token and the admin token do not work in each other's place.
+- **Endpoints.** `POST /v1/chat/completions` and `POST /v1/messages`, streaming and not; `/v1/embeddings`, `/v1/responses`, `/v1/completions` and `/v1/messages/count_tokens` as same-protocol passthrough; `GET /v1/models` and `GET /v1/models/{id}`.
+- **Protocol translation.** An OpenAI client can use a route served by an Anthropic-style upstream and the reverse, including streaming, tools, images and JSON-schema structured output. A route can mix both kinds as failover targets.
+- **Provider differences absorbed.** An upstream's `v1_path` covers OpenAI-compatible providers that do not serve the API under `/v1` (Gemini uses `/v1beta/openai`). For translated requests, a model that refuses sampling parameters or demands a thought signature on earlier tool calls is retried with the fix, which is then remembered.
+- **Failover** to the next target on connection errors, timeouts, 429 and 5xx, before any byte reaches the client, with one retry on a fresh connection first. Upstreams that keep failing are tried last for a while.
+- **Load balancing.** `failover` (config order), `round_robin` or `weighted` per route; the other targets remain as failover.
+- **Per-key limits.** A model list (403 for anything else), requests per minute (429 with `Retry-After`), and a budget that is total, monthly or daily (402 once spent; the key keeps read access to its models, jobs and files).
+- **Usage metering** from the response stream without buffering it, with prompt-cache reads and writes counted and priced separately.
+- **Usage that survives outages.** Events are spooled to disk, sent in batches with retries and deduplicated by request id in the ledger, so a call is billed once even if the control plane was down.
+- **Response cache**, opt-in per route (`cache_ttl_s`): an identical non-streaming request from the same key is answered from memory, counted but not billed.
+- **Looks like the provider to an SDK.** Gateway errors use each protocol's own envelope and type names, with the gateway's reason in `error.code`; responses carry `x-request-id` / `request-id`; a provider's rate-limit and retry headers are passed on by allowlist; a 429 from the last upstream reaches the client as 429.
+- **Keeps serving text without the control plane**, including after a data-plane restart (the last config is cached on disk).
+- **Holds up under hostile clients.** Timeouts for slow requests and stalled streams, a connection cap, and a graceful stop that finishes requests in flight and delivers queued usage.
+- **Access log.** One line per request with key name, route, upstream, attempts, tokens, latency and request id; JSON lines on request.
 
 ### Media jobs
 
-One API for providers that each have a different one:
+One async API in front of providers that each have a different one: `POST /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/jobs`, `POST /v1/jobs/{id}/cancel`, `GET /v1/files/{job}/{name}`.
 
-```
-POST /v1/jobs            {model, input, webhook_url?, metadata?, cache?}   -> 202 + job
-GET  /v1/jobs/{id}       status: queued | running | succeeded | failed | canceled
-GET  /v1/jobs?limit=N    this key's jobs, newest first
-POST /v1/jobs/{id}/cancel
-GET  /v1/files/{job}/{name}?exp=&sig=    re-hosted output (signed URL, or the owning key)
-```
-
-- **Adapters** for seven provider shapes: Replicate-style predictions, fal-style queues, OpenAI-style synchronous images, ElevenLabs-style text-to-speech, Gemini's native API for its image and speech models (raw PCM speech is stored as a playable WAV), Gemini's Interactions API for its video-capable "omni" models, and xAI's video API.
-- **Failover across providers.** Targets are tried in order; a failed submit, a provider-side failure or a timeout moves on.
-- **Output custody.** Each output is downloaded and stored in a local directory or in your own S3-compatible bucket (SigV4). Job results carry your URLs, signed, not the provider's expiring ones.
-- **Webhooks that are signed and retried.** [Standard Webhooks](https://www.standardwebhooks.com/) headers, HMAC-SHA256, a backoff schedule, delivery state on the job. Deliveries survive a restart.
-- **Idempotency.** `Idempotency-Key` returns the existing job; reuse with a different body is a 409.
-- **Restart-safe.** Job state is on disk. A job already accepted by a provider resumes polling after a control-plane restart; it is not submitted again.
-- **Caching.** With `cache: true` or a route `cache_ttl_s`, an identical request reuses the stored output: no provider call, no charge.
+- **Adapters** for seven provider shapes: Replicate-style predictions, fal-style queues, OpenAI-style images, ElevenLabs-style text to speech, Gemini's native API for image and speech models, Gemini's Interactions API for its video-capable models, and xAI's video API.
+- **Failover across providers** inside one job: a failed submit, a provider-side failure or a timeout moves on to the next target.
+- **Output custody.** Each output is copied to a local directory or to your own S3-compatible bucket; job results carry your signed URLs, not the provider's expiring ones.
+- **Webhooks that are signed and retried** ([Standard Webhooks](https://www.standardwebhooks.com/) headers, HMAC-SHA256, a backoff schedule), with delivery state on the job. A delivery connects to the address that passed the private-address check.
+- **Idempotency keys**, **output caching** for identical requests, and **restart safety**: a job a provider already accepted resumes polling after a control-plane restart and is not submitted again.
 - **One ledger.** Per-job, per-output, per-second and per-character prices land in the same ledger and budgets as tokens.
 
-## Documentation
+### Operations and admin
 
-Guides live in [`docs/`](docs/README.md): [quickstart](docs/quickstart.md),
-[configuration](docs/configuration.md), [API](docs/api.md),
-[providers](docs/providers.md), [deployment](docs/deployment.md),
-[operations](docs/operations.md), [architecture](docs/architecture.md) and
-[migrating from LiteLLM](docs/migrating-from-litellm.md).
+- **Dashboard and admin API** behind one admin token (a bearer token for scripts, a signed session cookie with CSRF protection for the browser). Never open by default: without `OMNIGATE_ADMIN_TOKEN` a random one is generated and logged.
+- **Managed keys.** Create, change, disable, rotate and delete gateway keys from the dashboard or `/admin/keys`; a new key is shown once and stored as a hash. Keys in the config file keep working and are read-only there.
+- **Audit log** of key changes and sign-ins, rotated by size.
+- **Prometheus metrics** at `/metrics`: per-key requests, errors, tokens, cost, budget and blocked state; refused requests by reason; jobs and webhooks by state.
+- **A ledger that stays bounded.** Usage events are written in segments with checksummed snapshots, so a start replays only what came after the last snapshot. Retention (off by default) can delete old segments while totals stay exact, along with finished jobs, their files (local and bucket) and old duplicate-detection ids.
+- **Probes and credentials.** `GET /healthz` on both processes and `GET /readyz` on the control plane. Gateway keys, the data planes' internal token and the admin token do not work in each other's place.
 
-## Try it
+## Quickstart
 
-Prerequisites: Zig 0.17, Erlang/OTP 29 with Elixir 1.20, Python 3.9+.
+Prerequisites: Zig 0.17, Erlang/OTP 29 with Elixir 1.20, Python 3.9+. The full walk-through, with POSIX commands, the Windows `PATH` setup and a real provider, is in [docs/quickstart.md](docs/quickstart.md).
 
 ```bash
 cd dataplane && zig build
@@ -104,22 +73,9 @@ cd dataplane && zig build
 python tools/e2e.py
 ```
 
-The end-to-end test starts the mock providers, the control plane and the
-gateway on their own ports with state in a temp directory, runs its checks
-(failover, timeouts, streaming, translation, rate limits, budgets, an outage
-with a gateway restart, media jobs with failover, webhooks, cache, a
-control-plane restart mid-job, bucket storage) and exits non-zero if any fail.
-It currently runs 110 checks.
+The end-to-end test starts the mock providers, the control plane and the gateway on their own ports, with state in a temp directory, and exits non-zero if any check fails. It covers login and key management, failover and timeouts, load balancing, model limits, the response cache, streaming, translation, rate limits, the ledger and budgets, a control-plane outage with a gateway restart, and media jobs with failover, webhooks, caching, cancellation, a control-plane restart mid-job and bucket storage.
 
-### Run the pieces by hand
-
-On Windows, Erlang and Elixir are installed but not on `PATH`. In PowerShell, per session:
-
-```powershell
-$env:Path = 'C:\Program Files\Erlang OTP\bin;C:\Program Files\Elixir\bin;' + $env:Path
-```
-
-Four terminals, from the repo root:
+To run the pieces by hand, use four terminals from the repo root (PowerShell shown; run `mix deps.get` in `control/` before the first start):
 
 ```powershell
 python tools/mock_upstream.py
@@ -137,7 +93,7 @@ cd control; $env:OMNIGATE_INTERNAL_TOKEN='dev-internal-token'; $env:OMNIGATE_ADM
 cd dataplane; $env:OMNIGATE_INTERNAL_TOKEN='dev-internal-token'; $env:MOCK_API_KEY='mock-secret'; .\zig-out\bin\omnigate-dp.exe
 ```
 
-Then, for example:
+Both processes need the same `OMNIGATE_INTERNAL_TOKEN` and refuse to start without it. `OMNIGATE_ADMIN_TOKEN` is the dashboard password and the `/admin` API token. A text request and a media job:
 
 ```bash
 curl -N http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-unlimited-key" -d '{"model":"demo-chat","stream":true,"messages":[{"role":"user","content":"hi"}]}'
@@ -147,135 +103,15 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-u
 curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer og-unlimited-key" -d '{"model":"demo-image","input":{"prompt":"a lighthouse"}}'
 ```
 
-Dashboard: <http://127.0.0.1:4000/>, signing in with the admin token set above. Demo routes in `config/omnigate.dev.json`:
+The dashboard is at <http://127.0.0.1:4000/>; sign in with the admin token set above. The demo routes and keys of `config/omnigate.dev.json` are listed in the [quickstart](docs/quickstart.md#demo-routes-and-keys).
 
-| Route | Shows |
-|---|---|
-| `demo-chat` | First upstream always answers 503, so every call fails over |
-| `demo-claude` | Anthropic-style upstream; call it with either protocol |
-| `demo-slow` | First upstream takes 3 s and is abandoned after 1 s |
-| `demo-direct` | One healthy upstream, for benchmarks |
-| `demo-image`, `demo-video`, `demo-image-sync`, `demo-tts` | Media jobs on four of the adapters (Replicate, fal, OpenAI images, ElevenLabs shapes); `demo-image` fails over, `demo-tts` is cached |
+Other suites: `zig build test --summary all` in `dataplane/`, `mix test` in `control/`, `python tools/test_import_litellm.py`, `python tools/sdk_compat.py` (the official OpenAI and Anthropic Python SDKs as clients, against the mocks) and `python3 tools/container_test.py --compose` (the Compose file through TLS); see [CONTRIBUTING.md](CONTRIBUTING.md#tests). Coming from LiteLLM, `python tools/import_litellm.py litellm.yaml -o config/omnigate.json --generate-key myapp` converts a proxy config; see [docs/migrating-from-litellm.md](docs/migrating-from-litellm.md).
 
-Keys: `og-unlimited-key`, `og-dev-key` ($0.01 budget, blocked after four calls), `og-ratelimited-key` (5 requests per minute).
+## Running on a server
 
-### Tests
+Container images and a Compose file with a Caddy proxy for TLS are included: copy `.env.example` to `.env` and `config/omnigate.example.json` to `config/omnigate.json`, fill in both, then `docker compose up -d --build`. Only the proxy publishes ports; the control plane and the internal API between the two processes stay on the private Docker network.
 
-```powershell
-cd dataplane; zig build test --summary all
-```
-
-```powershell
-cd control; mix test
-```
-
-```powershell
-python tools/test_import_litellm.py
-```
-
-## Coming from LiteLLM
-
-```bash
-python tools/import_litellm.py litellm.yaml -o config/omnigate.json --generate-key myapp
-```
-
-Converts `model_list` to routes (entries sharing a `model_name` become ordered
-failover targets), `fallbacks`, per-token prices and timeouts. OpenAI,
-Anthropic, Gemini, Groq, Mistral, DeepSeek, OpenRouter, Together, Fireworks,
-xAI and Perplexity entries are mapped. Literal API keys
-in the YAML are never copied: the tool prints the environment variable to set
-instead. Providers with their own API shape (Azure, Bedrock, Vertex and so
-on) are listed as skipped. Virtual keys and
-budgets live in LiteLLM's database and are not imported.
-
-## Configuration
-
-One JSON file, hot-reloaded by the control plane every 2 s. See
-`config/omnigate.example.json` for a real-provider template.
-
-- `keys[]`: `name`, `key` (raw; hashed on load) or `key_sha256`, `budget_usd`, `rpm`, `models` (list of route names the key may use; absent = all), `webhook_secret` or `webhook_secret_env`.
-- `upstreams[]`: `name`, `kind` (`openai` or `anthropic`), `base_url`, `api_key_env`, `timeout_ms`, `v1_path` (only for providers whose API is not under `/v1`).
-- `routes[]`: `model`, `strategy` (`failover` by default, `round_robin` or `weighted`), ordered `targets[]` of `upstream`, `model`, `weight` (for `weighted`; default 1), `price_in_per_mtok`, `price_out_per_mtok`.
-- `retention`: `jobs_days`, `ledger_ids_days` (days, fractions allowed; absent or 0 = keep forever).
-- `media`: `public_base_url`, `upstreams[]` (`kind`: `replicate`, `fal`, `openai_images`, `elevenlabs`, `gemini`, `gemini_interactions`, `xai_video`), `routes[]` (`targets[].price` with `per_job_usd`, `per_output_usd`, `per_second_usd`, `per_input_char_usd`; `cache_ttl_s`; `timeout_s`), `storage` (`local` or `s3`), `webhooks` (`secret`, `retry_schedule_ms`, `max_attempts`, `allow_private`).
-
-Provider secrets are never in the file: each upstream names an environment
-variable. Text upstream keys are read by the data plane, media upstream keys
-and bucket credentials by the control plane.
-
-| Variable | Used by | Default |
-|---|---|---|
-| `OMNIGATE_INTERNAL_TOKEN` | both | required; shared secret for `/internal/*` |
-| `OMNIGATE_LISTEN` | data plane | `127.0.0.1:8080` |
-| `OMNIGATE_CONTROL_URL` | data plane | `http://127.0.0.1:4000` |
-| `OMNIGATE_POLL_MS` | data plane | `2000`; config poll interval |
-| `OMNIGATE_FLUSH_MS` | data plane | `500`; how often queued usage is sent |
-| `OMNIGATE_UPSTREAM_TIMEOUT_MS` | data plane | `600000`; max wait for upstream headers, `0` = none |
-| `OMNIGATE_COOLDOWN_FAILURES` | data plane | `5`; consecutive failures before an upstream is tried last, `0` = off |
-| `OMNIGATE_COOLDOWN_MS` | data plane | `30000` |
-| `OMNIGATE_SPOOL` | data plane | `omnigate-usage.spool`; `off` keeps usage in memory only |
-| `OMNIGATE_CLIENT_TIMEOUT_MS` | data plane | `30000`; time allowed for a request head and body, and for an idle keep-alive connection; `0` = off |
-| `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` | data plane | `300000`; a response stream silent this long is cut and billed for what was metered; `0` = off |
-| `OMNIGATE_MAX_CONNECTIONS` | data plane | `4096`; beyond it, an immediate 503 |
-| `OMNIGATE_SHUTDOWN_GRACE_MS` | data plane | `10000`; time for in-flight requests after a stop signal |
-| `OMNIGATE_LOG_LEVEL` | data plane | `info` (`debug`, `info`, `warn`, `error`) |
-| `OMNIGATE_LOG_FORMAT` | data plane | `text`; `json` gives one object per line |
-| `OMNIGATE_KEYS` | control plane | `data/keys.json`; keys created through the admin API (hashes only) |
-| `OMNIGATE_CONFIG_CACHE` | data plane | `omnigate-config.cache.json`; `off` disables |
-| `OMNIGATE_ADMIN_TOKEN` | control plane | generated and logged at startup if unset; dashboard password and `/admin` API token |
-| `OMNIGATE_CONTROL_BIND` | control plane | `127.0.0.1`; set an address such as `0.0.0.0` to accept connections from other machines |
-| `OMNIGATE_COOKIE_SECURE` | control plane | unset; `1` always marks the session cookie `Secure` (automatic behind a proxy that sends `X-Forwarded-Proto: https`) |
-| `OMNIGATE_CONTROL_PORT` | control plane | `4000` |
-| `OMNIGATE_CONFIG` | control plane | `../config/omnigate.dev.json` |
-| `OMNIGATE_LEDGER` | control plane | `data/ledger.jsonl` |
-| `OMNIGATE_MEDIA_DIR` | control plane | `data/media`; where local output storage keeps files unless the config names a `dir` |
-| `OMNIGATE_JOBS` | control plane | `data/jobs.jsonl` |
-| `OMNIGATE_SIGNING_SECRET` | control plane | derived from the internal token; signs file URLs |
-| `OMNIGATE_WEBHOOK_SECRET` | control plane | last-resort webhook signing secret |
-
-## Running it on a server
-
-Container images and a Compose file with TLS in front are included.
-
-```bash
-cp .env.example .env
-```
-
-```bash
-cp config/omnigate.example.json config/omnigate.json
-```
-
-Fill in both files (two long random tokens, your host names, provider keys, routes), then:
-
-```bash
-docker compose up -d --build
-```
-
-What you get:
-
-- **`proxy`** (Caddy) is the only container with published ports. It serves the gateway at `https://$OMNIGATE_API_HOST` and the dashboard at `https://$OMNIGATE_ADMIN_HOST`. Real DNS names get Let's Encrypt certificates automatically; the `localhost` defaults get certificates from Caddy's own CA.
-- **`dataplane`** is a 13 MB image: one static binary and a CA bundle on an empty base, running as a non-root user.
-- **`control`** is a 57 MB Alpine image with the Elixir release, running as a non-root user, with a health check.
-- **State** (ledger, jobs, stored outputs, usage spool, config cache) lives in named volumes and survives restarts.
-- **The internal API** between the two is reachable only on the private Docker network; the proxy answers 404 for `/internal/*`.
-
-`python3 tools/container_test.py --compose` brings up this Compose file (with
-mock providers added and a throwaway config) and runs 22 checks through TLS: certificate
-verification, failover, incremental streaming through the proxy, translation,
-a media job with a signed `https` download and a retried webhook, dashboard
-login with a `Secure` cookie, and restarts with the control plane down.
-
-Without `--compose` the same test runs with plain `docker` commands, for
-machines that have no Compose plugin.
-
-Tested with Docker 29 and Compose 2.40 on Ubuntu 24.04 (x86-64, under WSL 2),
-both ways. The test publishes one local port instead of 80 and 443 and uses
-its own env file and config. Not tested: ARM, Let's Encrypt issuance with a
-real domain, and Kubernetes.
-
-Without containers, the same rules apply: set both tokens, keep the control
-plane on a private address (`OMNIGATE_CONTROL_BIND`), and put TLS in front of
-both ports.
+Without containers the same rules apply: set both tokens, keep the control plane on a private address, and put TLS in front of both ports. Tested with Docker 29 and Compose 2.40 on Ubuntu 24.04 (x86-64); not tested on ARM, with Let's Encrypt on a real domain, or on Kubernetes. What to back up, the readiness probe and upgrades are in [docs/deployment.md](docs/deployment.md).
 
 ## How it compares
 
@@ -301,109 +137,69 @@ Where the others are ahead today, plainly:
 
 - **Provider coverage.** They speak to dozens or hundreds of providers natively. omnigate speaks two text protocols (which reaches every OpenAI-compatible provider, Gemini included) and seven media shapes. Azure, Bedrock and Vertex are not reachable.
 - **Production mileage.** They run real traffic. omnigate has passed scripted checks against a handful of real providers and has never served production traffic.
-- **Features not here yet:** latency- or cost-aware routing, response caching for text, guardrails, team and SSO management, tracing and log-export integrations (there is a Prometheus endpoint), realtime voice, an admin UI beyond a read-only dashboard.
+- **Features not here yet:** latency- or cost-aware routing, guardrails, team and SSO management, tracing and log-export integrations (there is a Prometheus endpoint and a JSON access log), realtime voice, an admin UI for anything but keys (upstreams, routes and prices are edited in the config file).
 
-### Load test
+## Measurements
 
-`python tools/load_test.py` drives a running gateway with many concurrent
-clients, including ones that stall, disconnect mid-stream, send oversized or
-malformed bodies, or never send anything. On this machine (Windows 11,
-optimized build, Python mock upstream, 94 clients for 5 minutes):
+**Load test.** `python tools/load_test.py` drives a running gateway with many concurrent clients, including ones that stall, disconnect mid-stream, send oversized or malformed bodies, or never send anything. On one machine (Windows 11, optimized build, Python mock upstream, 94 clients for 5 minutes):
 
 - 669,000 requests at about 2,100 per second, with no malformed response, crash or hang.
 - 635,318 usage events for 635,318 metered requests: none lost, none duplicated.
 - Health checks stayed responsive throughout (p99 57 ms).
 - Memory was flat at about 45 MB under load and returned to 42 MB afterwards.
 
-The Python mock caps throughput at a few thousand requests per second, so this
-shows stability, not a ceiling. It was not run over TLS, against real
-providers, or with more than 550 concurrent connections.
+The Python mock caps throughput at a few thousand requests per second, so this shows stability, not a ceiling. It was not run over TLS, against real providers, or with more than 550 concurrent connections.
 
-### Measured on this machine
-
-Windows 11, localhost, optimized build (`zig build -Doptimize=ReleaseSafe`),
-`python tools/bench.py`, 4,000 non-streaming requests over 16 connections
-against the Python mock:
+**Added latency.** Same machine, localhost, optimized build (`zig build -Doptimize=ReleaseSafe`), `python tools/bench.py`, 4,000 non-streaming requests over 16 connections against the Python mock:
 
 - Added latency at the median: about 0.5 ms (three runs: +0.48, +0.49, +0.56). At p95 and p99 the difference is inside the mock's own noise.
 - Data plane memory under that load: about 13 MB. Binary: 1.9 MB.
 
-This says the gateway is not a bottleneck in front of a mock. It is not a
-comparison with any other gateway; none was measured here.
+This says the gateway is not a bottleneck in front of a mock. It is not a comparison with any other gateway; none was measured here. Both sets of figures were recorded before the response cache, prompt-cache accounting and provider-shaped errors were added, and have not been taken again since.
 
-## Known gaps
+## What has been verified
 
-**Verified against real providers (November 2026)**
+Through the gateway, over TLS, with real keys (November 2026):
 
-Through the gateway, over TLS, with real keys:
+- **OpenAI**: chat completions (`gpt-4o-mini`, `gpt-5.4-mini`), streaming, embeddings, the Responses API, provider errors.
+- **Anthropic**: messages (`claude-haiku-5-5`, `claude-opus-5-5` with thinking on), streaming, token counting, provider errors.
+- **Translation both ways**: text, system prompts, streaming, tool calls and tool-result round trips, streamed tool calls, provider error shapes, refused sampling parameters.
+- **Gemini** (`gemini-3.5-flash-lite`, `gemini-embedding-001`) through Google's OpenAI-compatible endpoint: chat, streaming, tool calls, embeddings, provider errors, failover to it, metering; and the same from an Anthropic-style client, translated.
+- **xAI Grok** (`grok-4.20-0309-non-reasoning`) with no provider-specific code: chat, streaming, tool calls, the Responses API, failover, metering; translated from an Anthropic-style client; xAI's Anthropic-compatible endpoint as an `anthropic` upstream; and an image job (`grok-imagine-image`) through the `openai_images` adapter.
+- **Failover** from a dead OpenAI-style upstream to Claude, with ledger token totals equal to what the providers reported.
+- **Media jobs**, each generated, stored by the gateway and downloaded from it: OpenAI images (`gpt-image-1-mini`), Replicate (`black-forest-labs/flux-1.1-pro`), ElevenLabs speech (`eleven_flash_v2_5`), Gemini image and speech (`gemini-3.1-flash-lite-image`, `gemini-3.8-flash-lite-tts`), Gemini video through the Interactions API (`gemini-omni-1.2-flash`), xAI video (`grok-imagine-video-1.5-lite`). Webhooks were delivered for the OpenAI image (after a retry), Replicate and both video jobs; repeat speech requests were served from cache; an unknown model or voice failed with the provider's own reason at Replicate, xAI, Gemini and ElevenLabs.
+- **Bucket storage on Cloudflare R2** (S3 API, region `auto`): upload under a key prefix, download through the presigned link, refusal without a valid signature, confirmed by an independently signed listing and read.
 
-- OpenAI: chat completions (`gpt-4o-mini`, `gpt-5.4-mini`), streaming, embeddings, the Responses API, provider errors.
-- Anthropic: messages (`claude-haiku-5-5`, `claude-opus-5-5` with thinking on), streaming, token counting, provider errors.
-- Translation both ways: text, system prompts, streaming, tool calls, tool-result round trips, streamed tool calls, error shapes, refused sampling parameters.
-- Gemini (`gemini-3.5-flash-lite`, `gemini-embedding-001`) through Google's OpenAI-compatible endpoint: chat, streaming, tool calls and round trips, embeddings, provider errors, failover to it, metering; and the same from an Anthropic-style client, translated.
-- Failover from a dead OpenAI-style upstream to Claude; ledger token totals equal to what the providers reported.
-- One media job on OpenAI's image API (`gpt-image-1-mini`): generated, re-hosted, downloaded, webhook retried and delivered.
-- Replicate (`black-forest-labs/flux-1.1-pro`): prediction created and polled to completion, the image copied off Replicate and downloaded from the gateway, webhook delivered; an unknown model and an out-of-credit model failed with Replicate's own reasons.
-- xAI Grok (`grok-4.20-0309-non-reasoning`, `grok-imagine-image`) with no provider-specific code: chat, streaming, tool calls and round trips, the Responses API, provider errors, failover, metering; the same from an Anthropic-style client, translated; xAI's own Anthropic-compatible endpoint as an `anthropic` upstream; and an image job through the `openai_images` adapter.
-- Bucket storage on Cloudflare R2 (S3 API, region `auto`): a job's output uploaded under a key prefix, downloaded through the presigned link, refused without a signature or with a tampered one, and confirmed by an independently signed listing and read.
-- xAI video (`grok-imagine-video-1.5-lite`): a one-second clip submitted, polled to completion, copied off xAI and downloaded from the gateway as an MP4, billed per second, webhook delivered; an unknown model failed with xAI's reason.
-- Gemini video (`gemini-omni-1.2-flash`, through the Interactions API): a short clip generated in one call, stored and downloaded from the gateway as an MP4, webhook delivered.
-- Gemini media (`gemini-3.1-flash-lite-image`, `gemini-3.8-flash-lite-tts`): an image and a spoken sentence generated, stored and downloaded from the gateway; the repeat speech request served from cache; an unknown model failed with Google's reason.
-- ElevenLabs text-to-speech (`eleven_flash_v2_5`): real MP3 generated, re-hosted and downloaded; an identical request served from cache; an unknown voice failed with the provider's reason.
+Not verified against anything real:
 
-**Not verified**
+- The fal adapter (a mock written from public documentation; expect details to differ), and S3-compatible storage other than Cloudflare R2, including deleting bucket objects under retention.
+- Everything the status paragraph lists as added later. In particular, the structured-output mapping onto Anthropic's `output_config.format` has not been sent to the live Anthropic API, and prompt-cache token accounting has not been compared with a real provider bill.
+- The official SDKs against real providers: `tools/sdk_compat.py` runs the Python SDKs against the mocks only, and no other language's SDK has been tried.
+- Replicate's `owner/name:version` form, job cancellation at a real provider, Gemini's Veo models (no adapter), xAI video with an input image, images in translated requests, long conversations, large payloads, and sustained or concurrent load against real providers.
+- Platforms other than Windows 11 and x86-64 Linux (CI runs the unit, end-to-end, SDK and container suites on Ubuntu 24.04 for every push). macOS and ARM are untried.
 
-- The fal adapter has only run against a mock written from public documentation; expect details to differ.
-- S3-compatible storage other than Cloudflare R2 (Amazon S3 itself, Backblaze B2, MinIO and so on).
-- Replicate's `owner/name:version` form and job cancellation at a real provider.
-- Gemini's Veo models, which have their own job API and no adapter yet (the test key had no access to them); background interactions on Gemini's Interactions API; xAI video with an input image, and its failed and expired states.
-- Images in translated requests, long conversations, large payloads, and the official OpenAI and Anthropic SDKs as clients (the checks used plain HTTP).
-- Sustained or concurrent load against real providers.
-- Platforms other than Windows 11 and x86-64 Linux (CI runs the unit, end-to-end and container suites on Ubuntu 24.04 for every push). macOS and ARM are untried.
+## Known limits
 
-**Security**
+The security model is in [SECURITY.md](SECURITY.md); the detail behind each line below is in [docs/operations.md](docs/operations.md) and [docs/architecture.md](docs/architecture.md).
 
-- No TLS listener on either process; the included Caddy proxy (or another) provides it. Data-plane-to-control-plane traffic over HTTPS is untested; keep it on a private network.
-- A managed key's webhook secret is stored in plain text in the keys file, because signing needs it. Protect the data directory.
-- One shared admin token: no user accounts, roles or audit log. Sessions cannot be revoked individually; changing the token ends all of them.
-- The login lockout counts per client address and lives in memory. Behind a reverse proxy all clients share one address.
-- Webhook targets are resolved once per delivery, checked against private addresses, and connected to at the checked address, which closes DNS rebinding. Redirects are not followed.
-- Budgets are totals over the whole ledger and never reset; there is no monthly or daily period yet. A key over budget gets 402 on every request, including polling its own jobs.
-- Requests the gateway refuses before routing (bad key, rate limit, disallowed model) are not written to the ledger, so they do not appear in metrics or the dashboard.
-- Provider response headers other than content type and length are not passed to clients.
+- **No TLS listener** on either process; the included Caddy proxy (or another) provides it. Data-plane-to-control-plane traffic is plain HTTP and belongs on a private network.
+- **One shared admin token.** No user accounts or roles, so the audit log records how a caller was authenticated and from where, not who they were; sessions cannot be revoked individually. The login lockout counts per client address, in memory.
+- **A managed key's webhook secret is stored in clear text** in the keys file. Protect the data directory.
+- **Budgets are enforced after the fact**: the call that crosses the budget completes, the block arrives one usage flush plus one config poll later, on a single control-plane node, and a key cannot be newly blocked during a control-plane outage.
+- **Per-process state.** Rate limits, cooldowns, round-robin positions and the response cache live in each data-plane process and reset on restart; several data planes each allow the full rate limit. The response cache is exact-match only.
+- **Translation covers chat completions and messages only.** It drops what the other protocol cannot express (thinking blocks, cache control, penalties and similar) and refuses audio and file parts; any other endpoint on a route whose upstreams all speak the other protocol answers 400 `endpoint_not_supported`.
+- **Pricing gaps.** Reasoning tokens have no price of their own, and for media jobs the cost is the configured price of the target that delivered; provider charges for failed attempts are not recorded.
+- **Client timeouts and threads.** A client that times out gets a closed connection, not a 408. The data plane uses one thread per connection; it has been soaked at 94 connections for five minutes and tried at 550 for two, and beyond that is untested.
+- **Usage spool.** Appends are not fsynced, so a power loss can drop the last few events, and the spool holds at most 100,000 undelivered events. Counts of refused requests are kept in memory only.
+- **Media jobs need the control plane** (during an outage `/v1/jobs` answers 503). A crash between a provider accepting a job and its id reaching disk, or during a synchronous provider call, resubmits that job. There are no per-upstream concurrency limits and no transcoding.
+- **The media output cache is shared across gateway keys**, and two identical cacheable jobs submitted at the same moment both run.
+- **Two error shapes on the jobs API.** Errors raised by the control plane keep its own shape (the reason in `error.type`), those raised by the data plane use the OpenAI shape (the reason in `error.code`); see [docs/api.md](docs/api.md#errors).
+- **Ledger retention.** Once `retention.ledger_days` has deleted ledger segments, the two snapshot files hold the only copy of the totals those segments contributed, so back up the whole data directory. Deleting bucket objects under retention is best effort.
+- **Metrics.** Each scrape scans the whole job store, and the output has been checked by tests, not by a real Prometheus server.
+- **Zig 0.17 standard-library quirks worked around** in the data plane: `http.Client.fetch` panics on a reset keep-alive connection, `privileged_headers` are never sent, and `http.BodyWriter.flush` does not flush the body's own buffer.
 
-**Text gateway**
+## Documentation and license
 
-- Rate limits and cooldowns are per data-plane process and reset on restart. Budgets are enforced after the fact, with up to one poll interval of lag, on a single control-plane node, and cannot newly block a key during a control-plane outage.
-- The data plane uses one thread per connection, about two under load. It has been soaked at 94 connections for five minutes and tried at 550 for two; beyond that is untested.
-- A client that times out gets a closed connection, not a 408 response.
-- Load balancing is round-robin or weighted only, with state per data-plane process; nothing is latency-aware. No response caching, no idle timeout once a response has started streaming.
-- For text endpoints the request body is now read before the rate-limit check (so that a disallowed model is a 403, not a 429), which means a key over its limit still costs one body read.
-- Translation drops what the other protocol cannot express (thinking blocks, cache control, `response_format`, penalties and similar) and rejects audio and file parts. `/v1/embeddings`, `/v1/responses` and `/v1/completions` are not translated.
-- Cached-token and reasoning-token prices are not modelled; cost is input and output tokens only.
-- Spool appends are not fsynced, so a power loss can drop the last few usage events. The spool holds at most 100,000 undelivered events.
+[Quickstart](docs/quickstart.md) · [Configuration](docs/configuration.md) (every config field and environment variable) · [API reference](docs/api.md) (endpoints, errors, jobs, webhooks, the official SDKs) · [Admin](docs/admin.md) (dashboard, managed keys, budgets, audit log) · [Providers](docs/providers.md) · [Deployment](docs/deployment.md) · [Operations](docs/operations.md) (metrics, limits, retention, logs, troubleshooting) · [Architecture](docs/architecture.md) · [Migrating from LiteLLM](docs/migrating-from-litellm.md) · [Releasing](docs/releasing.md) · [docs index](docs/README.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) · [CHANGELOG.md](CHANGELOG.md)
 
-**Media jobs**
-
-- A crash between a provider accepting a job and its id reaching disk, or during a synchronous provider call, resubmits that job.
-- Cost is the configured price of the target that delivered. Provider charges for failed attempts are not recorded or reconciled.
-- Retention is off unless configured. When on, it removes finished jobs, their local files and old ledger ids; it does not delete objects in a bucket (use the bucket's lifecycle rules) and does not trim the ledger file itself. A data-plane resend older than `ledger_ids_days` would be counted twice.
-- Each metrics scrape scans the whole job store; the output has been checked by tests, not by a real Prometheus server.
-- The cache is shared across gateway keys. Two identical cacheable jobs submitted at the same moment both run.
-- No per-upstream concurrency limits. Output downloads send no provider credentials. No transcoding.
-- Job requests need the control plane: during an outage `/v1/jobs` answers 503.
-
-**Zig 0.17 standard-library quirks worked around**
-
-- `http.Client.fetch` panics on a reset keep-alive connection.
-- `privileged_headers` are never sent.
-- `http.BodyWriter.flush` does not flush the body's own buffer.
-
-## Next
-
-1. Run the fal adapter against the real service; test bucket storage on Amazon S3; test with the official SDKs as clients
-2. Test ARM images and a real-domain certificate
-3. Cluster-wide budgets and rate limits across control-plane nodes
-4. Ledger rotation, and deleting expired objects from buckets
-5. More provider shapes (Veo, Kling, Runway, BFL), then transcoding
-6. Realtime voice through a partner stack (LiveKit, Pipecat)
+There is no license file yet. Until there is one, no terms for use or redistribution have been granted; ask the maintainer before assuming any.

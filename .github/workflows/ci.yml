@@ -15,10 +15,11 @@
 #               jobs are not guaranteed to get the same CPU model.
 #   sdk         tools/sdk_compat.py: the same local stack as the text half of
 #               e2e, driven through the official OpenAI and Anthropic Python
-#               SDKs. The two SDKs are installed from PyPI at their latest
-#               versions (the job log prints which); they are the only
-#               third-party Python packages any job installs. Runs only if
-#               the two unit-test jobs pass.
+#               SDKs. The two SDKs are installed from PyPI at the versions
+#               pinned in OPENAI_SDK_VERSION and ANTHROPIC_SDK_VERSION below
+#               (the job log prints which); they are the only third-party
+#               Python packages any job installs. Runs only if the two
+#               unit-test jobs pass.
 #   containers  tools/container_test.py --compose: builds both images, starts
 #               compose.yaml (plus mock providers) and checks it through the
 #               TLS proxy.
@@ -46,6 +47,17 @@ env:
   OTP_VERSION: "29"
   ELIXIR_VERSION: "1.20.5"
   PYTHON_VERSION: "3.12"
+  # The SDK releases tools/sdk_compat.py was written against. Pinned so that a
+  # new SDK release cannot turn CI red without a change in this repository.
+  # To bump them: change the two numbers here in a pull request of its own,
+  # let the sdk job run, and fix whatever the newer SDK notices (in the
+  # gateway if it is a real incompatibility, in tools/sdk_compat.py if the
+  # SDK only renamed something). Check the newer versions locally first with
+  #   pip install openai==<new> anthropic==<new> && python tools/sdk_compat.py
+  # and update the versions named in CONTRIBUTING.md, docs/quickstart.md and
+  # docs/api.md in the same pull request.
+  OPENAI_SDK_VERSION: "3.49.0"
+  ANTHROPIC_SDK_VERSION: "2.8.0"
 
 jobs:
   dataplane:
@@ -215,15 +227,17 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Not pinned: the point of this job is to notice when a new SDK release
-      # stops working against the gateway. The test prints the versions it ran.
+      # Pinned (see the env block at the top for how to bump them): the suite
+      # asserts on SDK behaviour, so an SDK release must be a deliberate
+      # change here, not something that arrives by itself. The test prints
+      # the versions it ran.
       - name: Install the OpenAI and Anthropic SDKs
-        run: python -m pip install openai anthropic
+        run: python -m pip install "openai==${OPENAI_SDK_VERSION}" "anthropic==${ANTHROPIC_SDK_VERSION}"
 
       # Listens on 127.0.0.1 only: 9001-9005 (text mocks), 14000 (control
       # plane), 18080 (gateway). State and logs go to a directory named
-      # omnigate-sdk-* under TMPDIR. Known gaps are reported as GAP and do not
-      # fail the job (that would need --strict).
+      # omnigate-sdk-* under TMPDIR. Every case must pass: the test has no
+      # known-gap mode.
       - name: SDK compatibility test
         env:
           TMPDIR: ${{ runner.temp }}

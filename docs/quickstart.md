@@ -8,7 +8,8 @@ Two parts: run everything locally against the mock providers that ship in
 - Zig 0.17
 - Erlang/OTP 29 with Elixir 1.20
 - Python 3.9 or newer. The tools use the standard library only, except the
-  optional SDK test, which needs `pip install openai anthropic`.
+  optional SDK test, which needs the two official SDKs
+  (`pip install openai==3.49.0 anthropic==2.8.0`, the versions CI pins).
 
 The README records what has been tried: Windows 11 and x86-64 Linux, where
 CI builds and runs both processes on Ubuntu 24.04 for every push. macOS and
@@ -115,7 +116,9 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-u
 ```
 
 The same route without streaming, showing the gateway's response headers
-(`x-omnigate-upstream`, `x-omnigate-attempts`, `x-omnigate-request-id`):
+(`x-omnigate-upstream`, `x-omnigate-attempts`, `x-omnigate-request-id`, and
+the request id again as `x-request-id` and `request-id`, where the SDKs
+look for it):
 
 ```bash
 curl -i http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-unlimited-key" -d '{"model":"demo-chat","messages":[{"role":"user","content":"hi"}]}'

@@ -2,8 +2,9 @@
 
 How to configure each provider that works today, and how far each has been
 tested. The "Status" lines repeat the README's
-[Known gaps](../README.md#known-gaps) section (November 2026); "verified"
-there means through the gateway, over TLS, with real keys. Nothing has run
+[What has been verified](../README.md#what-has-been-verified) section
+(November 2026); "verified" there means through the gateway, over TLS, with
+real keys. Nothing has run
 under sustained or concurrent load against real providers.
 
 - [Text providers](#text-providers): OpenAI, Anthropic, Gemini, xAI, other
@@ -512,9 +513,7 @@ for failed attempts are not recorded or reconciled.
 
 ## Not reachable
 
-From the README:
-
 - Azure, Bedrock and Vertex (providers with their own API shape).
 - Gemini's Veo models, which have their own job API and no adapter yet.
-- More media shapes (Kling, Runway, BFL) are listed under "Next".
+- Other media shapes (Kling, Runway, BFL): there is no adapter for them.
 - Realtime voice.

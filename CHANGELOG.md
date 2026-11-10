@@ -12,9 +12,36 @@ see [docs/releasing.md](docs/releasing.md).
 
 Which features have been checked against real providers, and which have
 only met a mock, is tracked in the README's
-[Known gaps](README.md#known-gaps) section and in `docs/`, rather than here.
+[What has been verified](README.md#what-has-been-verified) section and in
+`docs/`, rather than here.
 
 ## [Unreleased]
+
+### Security
+
+- **Authentication bypass on the control plane, fixed in commit 97cf396.**
+  A request whose first path segment was percent-encoded (`/%61dmin/keys`,
+  `/%69nternal/config`, `/%6Detrics`) skipped the admin-token, internal-token
+  and CSRF checks and still reached its handler, because the checks looked
+  at the path as sent while the router matched the decoded one.
+  - **Who was affected:** anyone running an earlier commit with the control
+    plane's port, or the dashboard's host name behind the Compose proxy,
+    reachable by someone they do not trust. Such a caller needed no
+    credential to use the whole admin API (including creating, rotating and
+    deleting gateway keys), to read `/metrics`, and to use `/internal/*`
+    (the config snapshot with key hashes, usage intake, the jobs API as any
+    key). The admin token, the internal token and provider keys were not
+    revealed. A control plane reachable only from a trusted network was not
+    exposed.
+  - **What to do:** update the control plane; delete managed keys you did
+    not create and rotate the ones created or rotated while it was exposed;
+    look in the audit log for key actions with `"auth": "none"`, which only
+    this bypass could produce. The full advisory is in
+    [SECURITY.md](SECURITY.md#past-advisories).
+  - **The fix:** a request path with any encoded character is refused with
+    400 before routing; an unknown first path segment is a 404 at the check
+    instead of being passed on; credentials are checked before the body is
+    parsed. Found by an independent review of the code.
 
 ### Added
 
@@ -79,6 +106,17 @@ only met a mock, is tracked in the README's
   timeouts, the connection cap and so on) are counted per key name and
   reason and reported to the control plane.
 - `GET /v1/models` also lists the media job models the key may use.
+- `GET /v1/models/{id}`. Model objects carry `created`, and a client that
+  sends an `anthropic-version` header gets the model list and model objects
+  in Anthropic's shape.
+- `x-request-id` and `request-id` on every response except `GET /healthz`
+  and the immediate 503 at the connection cap: the provider's own value
+  when it sent one, the gateway's request id otherwise.
+- Structured output through translation: OpenAI's `response_format` with a
+  JSON schema becomes Anthropic's `output_config.format` and the reverse;
+  `{"type": "json_object"}` becomes an instruction in the system prompt.
+  Covered against the mock providers; the Anthropic side has not been
+  verified against the live API.
 
 **Control plane**
 
@@ -136,6 +174,21 @@ only met a mock, is tracked in the README's
 - Retention also deletes a removed job's objects from an S3-compatible
   bucket (`retention.delete_bucket_objects`, on by default; only acts when
   `jobs_days` is set).
+- Ledger snapshots: the control plane writes a checksummed snapshot of its
+  totals and loads it at start, replaying only the events written after it
+  (1,000,000 events: 10.7 s before, 0.75 s after). A damaged snapshot is
+  ignored in favour of the previous one, or of a full replay.
+- Ledger segments: the event log is split into numbered files by size and
+  at the turn of the UTC day, and `retention.ledger_days` deletes old ones
+  while lifetime and period totals stay exact. An existing `ledger.jsonl`
+  needs no migration.
+- The job log is compacted while the control plane runs, not only at start
+  and after a retention sweep.
+- `GET /readyz` on the control plane: 200 when the config is loaded, the
+  job store is running and the ledger is loaded and writable, 503 with a
+  reason otherwise. No credentials.
+- The audit log is rotated by size (`OMNIGATE_AUDIT_MAX_MB`, 50; three older
+  files are kept; `0` turns rotation off).
 
 **Packaging and tools**
 
@@ -170,6 +223,13 @@ only met a mock, is tracked in the README's
   changelog's section as notes. Described in `docs/releasing.md`.
 - `docs/admin.md` (dashboard, key lifecycle, budgets, audit log, CSRF) and
   a section on using the official SDKs in `docs/api.md`.
+- `tools/sdk_compat.py` also checks what an SDK user would notice: request
+  ids, error codes and envelopes, the model endpoints, a provider's 429,
+  structured output through translation. It no longer has a list of
+  tolerated gaps; every case must pass.
+- `tools/mock_upstream.py`: models that always answer 429 with
+  `retry-after`, that send a provider request id, and answers that follow a
+  requested JSON schema.
 
 ### Changed
 
@@ -207,7 +267,45 @@ only met a mock, is tracked in the README's
   queued usage events from 427 MiB to 77 MiB.
 - The control plane's code is formatted with `mix format` at a line length
   of 160, and CI enforces it.
-- The retention log line also reports the bucket objects removed.
+- The retention log line also reports the bucket objects removed, and the
+  ledger segments.
+- **Gateway errors are provider-shaped, and the gateway's reason moved from
+  `error.type` to `error.code`.** On OpenAI-style endpoints the error is
+  `{"error": {"message", "type", "param", "code"}}`; on Anthropic-style
+  endpoints it is `{"type": "error", "error": {"type", "message", "code"},
+  "request_id"}`. `type` is now the provider's category
+  (`invalid_request_error`, `rate_limit_error`, `not_found_error`, ...). A
+  client that matched on `error.type` must match on `error.code` instead.
+  Errors the control plane raises for the jobs API, and on its own port,
+  keep the reason in `error.type`. The mapping is in `docs/api.md`.
+- When every target of a route failed and the last one tried answered 429,
+  the client gets 429 `upstream_rate_limited` with that upstream's
+  `retry-after`. It used to get 502 `all_upstreams_failed`.
+- An endpoint that none of a route's upstreams can serve (embeddings on a
+  route with only Anthropic-style upstreams, for example) answers 400
+  `endpoint_not_supported`, and a request that no target can be sent
+  because it cannot be translated answers 400 `untranslatable_request`.
+  Both used to be 502s, and neither is written to the ledger any more;
+  they are counted as refused requests.
+- On the control plane, a body that is not JSON (400 `invalid_json`), a
+  body that is too large (413 `payload_too_large`) and an unexpected
+  exception (500 `internal_error`, with a `request_id` that is also in the
+  log) all answer with the JSON error object.
+- A config-file key with the name of a managed key now shadows it: the
+  file key is used, the managed key is left out, a warning is logged, and
+  `GET /admin/keys` lists the managed key with `"state": "shadowed"`.
+  Previously both were in the key list under one name.
+- The control plane refuses a request path that contains a percent-encoded
+  character with 400, answers an unknown first path segment with 404 before
+  authentication, and checks credentials before parsing the body (see
+  Security above). `/admin/keys/{name}` therefore has exactly one spelling.
+- The control image's health check calls `/readyz` instead of `/healthz`.
+- CI installs pinned versions of the two SDKs (`openai` 3.49.0,
+  `anthropic` 2.8.0) for the `sdk` job instead of the latest ones, so that
+  a new SDK release cannot fail CI without a change in the repository.
+- The README was rewritten as a shorter landing page: the environment
+  table and the config field lists now live only in
+  `docs/configuration.md`, and it no longer states counts of test checks.
 
 ### Fixed
 

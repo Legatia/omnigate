@@ -72,7 +72,7 @@ listed before the managed keys created through it
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | required | Label shown in the dashboard, the admin API, the access log and metrics. Give every key its own name; the admin API refuses a managed key whose name a file key already has. |
+| `name` | string | required | Label shown in the dashboard, the admin API, the access log and metrics. Give every key its own name. The admin API refuses a managed key whose name a file key already has. The other way round, a file key added under the name of an existing managed key takes over: the file key is used and the managed key is shadowed ([Admin](admin.md#gateway-keys-two-sources)). |
 | `key` | string | one of `key` / `key_sha256` is required | The key in clear text. Hashed on load. Meant for local development. |
 | `key_sha256` | string | | Lowercase hex SHA-256 of the key. If both fields are present, this one is used. |
 | `budget_usd` | number | none (no budget) | The key is blocked once its recorded spend in the current budget period reaches this amount. See [Operations](operations.md#budgets). |
@@ -181,7 +181,8 @@ live in memory in each data-plane process.
 A route may mix `openai` and `anthropic` upstreams. For
 `/v1/chat/completions` and `/v1/messages` the gateway translates when the
 target speaks the other protocol; for the other endpoints a target of the
-other protocol is skipped (`protocol_mismatch`).
+other protocol is skipped (`protocol_mismatch`), and if that leaves no
+target at all the request is refused with `400 endpoint_not_supported`.
 
 Example with two providers behind one name:
 
@@ -240,17 +241,21 @@ control plane and is shared across keys.
 ### Retention
 
 ```json
-"retention": { "jobs_days": 30, "ledger_ids_days": 7, "delete_bucket_objects": true }
+"retention": { "jobs_days": 30, "ledger_ids_days": 7, "ledger_days": 90, "delete_bucket_objects": true }
 ```
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `jobs_days` | number, fractions allowed | `0` (keep forever) | Finished jobs older than this are removed, with their output files: on local disk, and in the bucket unless `delete_bucket_objects` is `false`. |
 | `ledger_ids_days` | number, fractions allowed | `0` (keep forever) | The ledger forgets duplicate-detection ids recorded longer ago than this. |
+| `ledger_days` | number, fractions allowed | `0` (keep forever) | Sealed ledger segments (the history of usage events) last written longer ago than this are deleted. Spend totals are not affected: they are carried in the ledger's snapshots. |
 | `delete_bucket_objects` | boolean | `true` | Whether a removed job's objects are also deleted from an S3-compatible bucket. Only has an effect when `jobs_days` is set. Anything but `true` or `false` is rejected when the file is loaded. |
 
-Nothing is deleted unless you set these. Details and caveats are in
-[Operations](operations.md#retention).
+Nothing is deleted unless you set these. A negative number, or a value that
+is not a number, for one of the three `_days` fields is rejected when the
+file is loaded. Details and caveats are in
+[Operations](operations.md#retention); read the one about `ledger_days` and
+backups before you set it.
 
 ### Media
 
@@ -391,10 +396,11 @@ the data plane at startup.
 | `OMNIGATE_CONTROL_PORT` | `4000` | Port to listen on. |
 | `OMNIGATE_COOKIE_SECURE` | unset | `1` always marks the session cookie `Secure`. This is automatic when the request arrives with `X-Forwarded-Proto: https`. |
 | `OMNIGATE_CONFIG` | `../config/omnigate.dev.json` | Path of the config file. |
-| `OMNIGATE_LEDGER` | `data/ledger.jsonl` | The usage ledger. |
+| `OMNIGATE_LEDGER` | `data/ledger.jsonl` | The usage ledger's active segment. Sealed segments (`ledger.000001.jsonl`, ...) and the snapshots (`ledger.snapshot`, `ledger.snapshot.prev`) are written next to it and named after it. See [Architecture](architecture.md#ledger-files-segments-and-snapshots). |
 | `OMNIGATE_JOBS` | `data/jobs.jsonl` | Job state. |
 | `OMNIGATE_KEYS` | `data/keys.json` | Gateway keys created through the admin API or the dashboard: hashes, limits, and a key's webhook secret if it has one. See [Admin](admin.md#gateway-keys-two-sources). |
-| `OMNIGATE_AUDIT_LOG` | `data/audit.jsonl` | The admin audit log. See [Admin](admin.md#the-audit-log). |
+| `OMNIGATE_AUDIT_LOG` | `data/audit.jsonl` | The admin audit log. Rotated files (`.1` to `.3`) are kept next to it. See [Admin](admin.md#the-audit-log). |
+| `OMNIGATE_AUDIT_MAX_MB` | `50` | Size, in megabytes (fractions allowed), at which the audit log is rotated. `0` turns rotation off. A negative value, or one that is not a number, is replaced by the default without a message. |
 | `OMNIGATE_MEDIA_DIR` | `data/media` | Where local output storage keeps files, unless the config names a `dir`. |
 | `OMNIGATE_SIGNING_SECRET` | derived from `OMNIGATE_INTERNAL_TOKEN` | Signs the download URLs of locally stored files. |
 | `OMNIGATE_WEBHOOK_SECRET` | none | Last-resort webhook signing secret. |
@@ -406,6 +412,10 @@ Relative defaults are resolved against the control plane's working
 directory. When it is started from `control/` as in the quickstart, the
 config default is the repository's `config/omnigate.dev.json` and state goes
 to `control/data/`.
+
+Not configurable through the environment: when the ledger seals a segment
+(at 64 MiB, or after the UTC day turns) and how often it writes a snapshot
+(every 50,000 events, and every five minutes while there is something new).
 
 The container images set some of these differently; see
 [Deployment](deployment.md#what-the-images-set).

@@ -1,14 +1,19 @@
 # Deployment
 
 - [Compose with TLS](#compose-with-tls)
+- [Health and readiness probes](#health-and-readiness-probes)
 - [Running without containers](#running-without-containers)
 - [What to keep private](#what-to-keep-private)
 - [Backups](#backups)
 - [Upgrades](#upgrades)
 
-Read the README's [Known gaps](../README.md#known-gaps) first. In short:
-nothing has run under production load; neither process has a TLS listener of
-its own; there is one shared admin token and no user accounts.
+Read the README's [Known limits](../README.md#known-limits) first. In
+short: nothing has run under production load; neither process has a TLS
+listener of its own; there is one shared admin token and no user accounts.
+
+If you ran a commit older than 97cf396 with the control plane, or the
+dashboard's host name, reachable by anyone you do not trust, read
+[SECURITY.md](../SECURITY.md#past-advisories) before anything else.
 
 ## Compose with TLS
 
@@ -75,7 +80,7 @@ Field reference: [Configuration](configuration.md). Provider examples:
 docker compose up -d --build
 ```
 
-What you get, from the README:
+What you get:
 
 - **`proxy`** (Caddy) is the only container with published ports (80 and
   443). It serves the gateway at `https://$OMNIGATE_API_HOST` and the
@@ -85,7 +90,7 @@ What you get, from the README:
 - **`dataplane`** is one static binary and a CA bundle on an empty base
   image, running as a non-root user.
 - **`control`** is an Alpine image with the Elixir release, running as a
-  non-root user, with a health check on `/healthz`.
+  non-root user, with a health check on `/readyz`.
 - **State** lives in named volumes and survives restarts.
 - **The internal API** between the two is reachable only on the private
   Docker network; the proxy answers 404 for `/internal/*`.
@@ -113,7 +118,7 @@ verifies against it.
 
 | Volume | Mounted in | Holds |
 |---|---|---|
-| `control-data` | `control:/data` | `ledger.jsonl`, `jobs.jsonl`, `keys.json` (managed keys), `audit.jsonl` (admin audit log), `media/` (locally stored outputs) |
+| `control-data` | `control:/data` | The ledger (`ledger.jsonl`, sealed segments `ledger.NNNNNN.jsonl`, `ledger.snapshot` and `ledger.snapshot.prev`), `jobs.jsonl`, `keys.json` (managed keys), `audit.jsonl` and its rotated files (admin audit log), `media/` (locally stored outputs) |
 | `dataplane-data` | `dataplane:/data` | `omnigate-usage.spool`, `omnigate-config.cache.json` |
 | `caddy-data`, `caddy-config` | `proxy` | Certificates and Caddy's own state |
 
@@ -174,6 +179,36 @@ From the README: tested with Docker 29 and Compose 2.40 on Ubuntu 24.04
 (x86-64, under WSL 2). **Not tested: ARM, Let's Encrypt issuance with a real
 domain, and Kubernetes.**
 
+## Health and readiness probes
+
+| Process | Probe | Says |
+|---|---|---|
+| Data plane | `GET /healthz` on its port, no key | The process is up and answering. It does not say that a config has been loaded: a data plane that has never reached the control plane and has no cached config answers `ok` here and `503 gateway_not_ready` to everything else. |
+| Control plane | `GET /healthz`, no credentials | The process is up and answering. |
+| Control plane | `GET /readyz`, no credentials | It can do its job: the config is loaded, the job store is running, the ledger is loaded and its file is writable. `200 {"status":"ready"}`, or `503 {"status":"not_ready","reason":"..."}` naming the first thing that is not. |
+
+- **The control image's health check calls `/readyz`** every 10 seconds
+  (3 second timeout, 20 second start period, 3 retries);
+  `docker compose ps` shows the result. While the control plane is still
+  loading its ledger the port is not open at all, so the probe fails with a
+  refused connection rather than a 503. With snapshots that phase is short,
+  but a first start on a large ledger written by an older commit replays it
+  in full once; if that takes longer than the start period the container is
+  reported unhealthy until it is done. Nothing restarts it for that:
+  `compose.yaml` has no rule that acts on health.
+- **The data-plane image has no health check.** It is one static binary on
+  an empty base image, with nothing in it to run a probe. Probe
+  `GET /healthz` from outside (the proxy, a load balancer, your monitoring).
+- `compose.yaml` starts the data plane after the control plane without
+  waiting for it to be healthy. That is fine: the data plane retries until
+  the control plane answers, and serves from its cached config meanwhile.
+- Behind the Compose proxy, the control plane's `/healthz` and `/readyz`
+  are reachable on the dashboard's host name without credentials. They
+  disclose nothing but the state named above.
+- For an orchestrator with separate liveness and readiness probes, use
+  `/healthz` for liveness and `/readyz` for readiness on the control plane.
+  Kubernetes itself is untested.
+
 ## Running without containers
 
 The same rules apply as with Compose: set both tokens, keep the control
@@ -230,9 +265,14 @@ distribution.
 - send `X-Forwarded-Proto: https` to the control plane, so the session
   cookie is marked `Secure` (or set `OMNIGATE_COOKIE_SECURE=1`).
 
-From the README: data-plane-to-control-plane traffic over HTTPS is untested;
-keep it on a private network. Platforms other than Windows 11 and x86-64
-Linux containers are not verified.
+Data-plane-to-control-plane traffic over HTTPS is untested; keep it on a
+private network. Platforms other than Windows 11 and x86-64 Linux
+containers are not verified.
+
+The control plane refuses any request path that contains a percent-encoded
+character with `400`. Nothing it serves needs one, so the proxy needs no
+rule of its own for that; do not add one that rewrites paths on the way to
+the control plane.
 
 ## What to keep private
 
@@ -244,8 +284,8 @@ Linux containers are not verified.
 | `.env` | Holds both tokens and every provider key. |
 | The config file | Holds gateway keys if you used `"key"` instead of `"key_sha256"`, and webhook secrets if you wrote them inline. |
 | `keys.json` | Managed keys: hashes only, but a key's webhook secret in clear text if it has one. The control plane writes it with mode `0600`. |
-| `audit.jsonl` | Who changed which key and who signed in, with client addresses. No secrets. |
-| `ledger.jsonl`, `jobs.jsonl` | Usage per key, and every job's input (prompts), metadata and webhook URL. |
+| `audit.jsonl` and its rotated files | Who changed which key and who signed in, with client addresses. No secrets. |
+| The ledger files (`ledger*.jsonl`, `ledger.snapshot*`), `jobs.jsonl` | Usage per key, and every job's input (prompts), metadata and webhook URL. |
 | The data plane's log | Key names, route names and request paths in the access log. Never keys, hashes or request bodies. |
 | The media directory or bucket | The generated files. Buckets are assumed private; clients get presigned URLs. |
 | The data plane's port (8080) | Not secret, but plain HTTP. Publish it only through TLS. |
@@ -262,14 +302,38 @@ What holds state that cannot be recomputed:
 
 | What | Where (Compose) | If lost |
 |---|---|---|
-| The usage ledger | `control-data`: `/data/ledger.jsonl` | Spend totals are rebuilt from this file at every start. Without it all spend is zero and budget-blocked keys are unblocked. |
+| The usage ledger | `control-data`: `/data/ledger.jsonl`, the sealed segments `/data/ledger.NNNNNN.jsonl`, `/data/ledger.snapshot` and `/data/ledger.snapshot.prev` | Spend totals are loaded from these at every start. Without any of them all spend is zero and budget-blocked keys are unblocked. What losing only some of them means is described below the table. |
 | Job state | `control-data`: `/data/jobs.jsonl` | Jobs, their idempotency keys, cache entries and pending webhooks are gone. |
 | Managed keys | `control-data`: `/data/keys.json` | Every key created through the dashboard or the admin API stops working: the gateway answers them with 401. The keys cannot be recovered (only hashes were ever stored); you create new ones and hand them out again. Their past usage is still in the ledger but no longer belongs to a named key. |
-| The admin audit log | `control-data`: `/data/audit.jsonl` | The record of key changes and sign-ins is gone. Nothing else depends on it. |
+| The admin audit log | `control-data`: `/data/audit.jsonl`, `/data/audit.jsonl.1` to `.3` | The record of key changes and sign-ins is gone. Nothing else depends on it. |
 | Locally stored outputs | `control-data`: `/data/media/` | Output URLs of existing jobs answer 404. Not applicable with bucket storage. |
 | Your config and `.env` | the repository directory | You re-create them by hand. File keys come back with the config. |
 
-Restore `keys.json` together with `ledger.jsonl` from the same backup: the
+**Back up and restore the ledger as one set of files, from one moment.**
+The simplest rule is to treat the whole data directory as the unit.
+
+- The segments (`ledger.jsonl` and the numbered files) are the events. The
+  two snapshots are the totals up to a recorded position in them.
+- **Without `retention.ledger_days`** the segments are complete, and the
+  snapshots only save start-up time: lose or damage both and the next start
+  replays every segment and arrives at the same totals.
+- **With `retention.ledger_days`** old segments are deleted, and the two
+  snapshots are then the only record of the spend those segments held. Lose
+  both, and that spend is gone even though the remaining segments survive;
+  the control plane says so in an error at start (`ledger: no usable
+  snapshot, and segments before N were deleted by retention ...`). A backup
+  taken before you turned the setting on does not help for what was
+  recorded afterwards, so keep backing up.
+- A snapshot is used only if the segment bytes it covers are present and
+  unchanged. One restored next to segments from a different moment is
+  ignored (`ledger: ignoring ledger.snapshot (...)` in the log) and the
+  control plane falls back to the spare, then to replaying what it has.
+  Mixing files from two backups therefore does no silent damage, but with
+  deleted segments it can leave you without a usable snapshot.
+- For the same reason, do not copy the files one by one from a running
+  control plane. Stop it first, as shown below.
+
+Restore `keys.json` together with the ledger from the same backup: the
 ledger records usage by key hash, and `keys.json` is what ties those hashes
 (including the ones from before a rotation) to a key and its budget.
 
@@ -298,11 +362,13 @@ The volume name is prefixed with the Compose project name (the directory
 name by default); check it with `docker volume ls`. This procedure is
 ordinary Docker practice, not something the repository's tests exercise.
 
-The ledger, the job file and the audit log are appended to and synced to
-disk on every write (the job file is also rewritten compacted at start and
-after a retention sweep). On start, a torn last line of the ledger or the
-job file is skipped rather than treated as fatal, and unreadable lines of
-the audit log are skipped too. `keys.json` is different: it is replaced
+The ledger's active segment, the job file and the audit log are appended
+to and synced to disk on every write (the job file is also rewritten
+compacted at start, after a retention sweep, and from time to time while
+running). On start, a torn last line of the active segment is cut off, a
+torn last line of the job file is skipped, and unreadable lines of the
+audit log are skipped too; none of them is treated as fatal. `keys.json`
+is different: it is replaced
 whole on every change (temporary file, sync, rename), so a copy taken at
 any moment is complete; and if it exists but cannot be parsed, the control
 plane refuses to start rather than run without the managed keys.
@@ -362,6 +428,19 @@ restart:
   created the first time they are needed. Ledger events gained fields
   (`cached_input_tokens`, `cache_write_input_tokens`, `cached`); events
   written before they existed are read as before.
+- **The ledger's new files need no migration.** A `ledger.jsonl` written
+  by an older commit is read as segment 1. The first start with the newer
+  code replays it once in full and writes the first snapshot; later starts
+  load the snapshot. Going back to an older commit is another matter: older
+  code reads only `ledger.jsonl`, so once a segment has been sealed it would
+  start with the totals of the active segment alone. Keep the backup from
+  before the upgrade if you might need to go back.
+- **Changes a client can see.** The reason of a gateway error moved from
+  `error.type` to `error.code`, and errors now have the shape of the
+  client's protocol; a provider's 429 on the last target reaches the client
+  as 429 instead of 502. An application that matched on `error.type`, or
+  treated every 502 alike, needs to be changed with the upgrade. See
+  [API](api.md#errors) and the changelog's "Changed" section.
 - **Nothing is deleted by an upgrade itself.** Retention is off unless the
   config turns it on.
 

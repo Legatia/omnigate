@@ -16,7 +16,7 @@
     {
       "model": "claude",
       "targets": [
-        { "upstream": "anthropic", "model": "claude-sonnet-5-5", "price_in_per_mtok": 0.0, "price_out_per_mtok": 0.0 }
+        { "upstream": "anthropic", "model": "claude-sonnet-5-5", "price_in_per_mtok": 2.0, "price_out_per_mtok": 10.0 }
       ]
     },
     {

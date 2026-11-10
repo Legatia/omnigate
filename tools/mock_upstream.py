@@ -88,6 +88,10 @@ class AnthropicOk(Base):
         if not self.headers.get("x-api-key") or not self.headers.get("anthropic-version"):
             return self.send_json(401, {"type": "error", "error": {"type": "authentication_error",
                                                                   "message": "missing x-api-key or anthropic-version"}})
+        if "temperature" in req or "top_p" in req:
+            # Current Claude models refuse sampling parameters.
+            return self.send_json(400, {"type": "error", "error": {"type": "invalid_request_error",
+                                                                  "message": "`temperature` is deprecated for this model."}})
         if not req.get("stream"):
             return self.send_json(200, {
                 "id": "msg_mock", "type": "message", "role": "assistant", "model": req.get("model"),

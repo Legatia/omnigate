@@ -424,6 +424,15 @@ def text_checks(stack):
     main_calls += 1
     check("... and streams from it in the OpenAI format",
           status == 200 and openai_stream_text(events) == MOCK_TEXT and events[-1][1] == "[DONE]", events[-2:])
+    status, headers, body = chat("claude", temperature=0.2)
+    main_calls += 1
+    check("a parameter the other provider refuses (temperature) is dropped and the call retried",
+          status == 200 and body["choices"][0]["message"]["content"] == MOCK_TEXT
+          and headers.get("x-omnigate-attempts") == "1", (status, headers, body))
+    status, _, body = jcall("POST", GATEWAY + "/v1/messages", key=KEY_MAIN, body=dict(msg, temperature=0.2))
+    main_calls += 1
+    check("... but a same-protocol client gets the provider's own error, untouched",
+          status == 400 and body.get("type") == "error", (status, body))
     amsg = dict(msg, model="direct")
     status, headers, body = jcall("POST", GATEWAY + "/v1/messages", key=KEY_MAIN, body=amsg)
     main_calls += 1
@@ -450,7 +459,10 @@ def text_checks(stack):
     row = wait_until(lambda: main_row_with(main_calls), 10)
     check(f"ledger has exactly the {main_calls} metered calls of the main key", bool(row), usage_row("main"))
     row = row or usage_row("main")
-    check("tokens and cost are recorded", row.get("input_tokens", 0) >= 11 * main_calls and row.get("cost_usd", 0) > 0, row)
+    # Every call but one used at least 11 input tokens; the call the provider
+    # refused with a 400 is in the ledger with none.
+    check("tokens and cost are recorded",
+          row.get("input_tokens", 0) >= 11 * (main_calls - 1) and row.get("cost_usd", 0) > 0 and row.get("errors", 0) >= 1, row)
 
     codes = [chat("direct", key=KEY_BUDGET)[0] for _ in range(4)]
     blocked = wait_until(lambda: chat("direct", key=KEY_BUDGET)[0] == 402, 10, 0.3)

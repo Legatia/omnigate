@@ -4,8 +4,10 @@ A self-hostable AI gateway in two small processes. It fronts OpenAI- and
 Anthropic-style text APIs and wraps image, video and speech providers in one
 async job API.
 
-**Status: works end to end against mock providers. It has not yet been run
-against a real provider.** See [Known gaps](#known-gaps).
+**Status: the text gateway and the OpenAI image adapter have been checked
+against the real OpenAI and Anthropic APIs (37 checks, November 2026). The
+other three media adapters and bucket storage have only met mocks, and nothing
+has run under production load.** See [Known gaps](#known-gaps).
 
 ```
  apps ──▶ dataplane (Zig) ──────────▶ LLM providers (OpenAI-style, Anthropic-style)
@@ -29,6 +31,7 @@ against a real provider.** See [Known gaps](#known-gaps).
 
 - `POST /v1/chat/completions` and `POST /v1/messages`, streaming and non-streaming. Also `/v1/embeddings`, `/v1/responses`, `/v1/completions` and `/v1/messages/count_tokens` as same-protocol passthrough. `GET /v1/models`, `GET /healthz`.
 - **Protocol translation.** An OpenAI client can use a route served by an Anthropic upstream and the reverse, including streaming, tools and images. A route can mix both kinds as failover targets.
+- **Parameter mismatches handled.** Current Claude models and some OpenAI models refuse `temperature` and `top_p`. When a translated request is refused for that reason, the gateway retries without them and remembers it for that model.
 - **Failover** to the next target on connection errors, timeouts, 429 and 5xx, before any byte reaches the client. One retry on a fresh connection first, in case a pooled connection went stale.
 - **Timeouts.** Max wait for response headers, global or per upstream.
 - **Cooldowns.** An upstream that fails five times in a row is tried last for 30 seconds, so a dead provider costs one timeout, not one per request.
@@ -73,10 +76,11 @@ python tools/e2e.py
 ```
 
 The end-to-end test starts the mock providers, the control plane and the
-gateway on their own ports with state in a temp directory, runs 66 checks
+gateway on their own ports with state in a temp directory, runs its checks
 (failover, timeouts, streaming, translation, rate limits, budgets, an outage
 with a gateway restart, media jobs with failover, webhooks, cache, a
 control-plane restart mid-job, bucket storage) and exits non-zero if any fail.
+It currently runs 68 checks.
 
 ### Run the pieces by hand
 
@@ -209,7 +213,7 @@ on a row.
 Where the others are ahead today, plainly:
 
 - **Provider coverage.** They speak to dozens or hundreds of providers. omnigate speaks two text protocols and four media shapes.
-- **Production mileage.** They run real traffic. omnigate has only met mocks.
+- **Production mileage.** They run real traffic. omnigate has passed a few dozen checks against two real providers and nothing more.
 - **Features not here yet:** load balancing across targets, response caching for text, guardrails, team and SSO management, observability integrations, realtime voice, an admin UI beyond a read-only dashboard.
 
 ### Measured on this machine
@@ -226,10 +230,22 @@ comparison with any other gateway; none was measured here.
 
 ## Known gaps
 
+**Verified against real providers (November 2026)**
+
+Through the gateway, over TLS, with real keys:
+
+- OpenAI: chat completions (`gpt-4o-mini`, `gpt-5.4-mini`), streaming, embeddings, the Responses API, provider errors.
+- Anthropic: messages (`claude-haiku-5-5`, `claude-opus-5-5` with thinking on), streaming, token counting, provider errors.
+- Translation both ways: text, system prompts, streaming, tool calls, tool-result round trips, streamed tool calls, error shapes, refused sampling parameters.
+- Failover from a dead OpenAI-style upstream to Claude; ledger token totals equal to what the providers reported.
+- One media job on OpenAI's image API (`gpt-image-1-mini`): generated, re-hosted, downloaded, webhook retried and delivered.
+
 **Not verified**
 
-- No adapter, bucket or TLS path has run against a real service. Provider request and response shapes follow public documentation and may be wrong in details.
-- Only tested on Windows 11.
+- The Replicate, fal and ElevenLabs adapters and S3 storage have only run against mocks written from public documentation; expect details to differ.
+- Images in translated requests, long conversations, large payloads, and the official OpenAI and Anthropic SDKs as clients (the checks used plain HTTP).
+- Sustained or concurrent load against real providers.
+- Any platform other than Windows 11.
 
 **Security**
 
@@ -262,7 +278,7 @@ comparison with any other gateway; none was measured here.
 
 ## Next
 
-1. Run every adapter and both text protocols against real providers; fix what differs
+1. Run the Replicate, fal and ElevenLabs adapters and S3 storage against the real services; test with the official SDKs as clients
 2. Authentication on the control plane; TLS
 3. Cluster-wide budgets and rate limits across control-plane nodes
 4. Retention: expire jobs, files and ledger ids

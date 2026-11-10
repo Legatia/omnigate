@@ -7,7 +7,7 @@ defmodule OmnigateControl.Jobs.Adapters.OpenAIImages do
   The job's `input` is sent as the request body with `model` set to the
   route target's model.
 
-  Not yet exercised against the real service.
+  Checked against the real service with `gpt-image-1-mini` (November 2026).
   """
   @behaviour OmnigateControl.Jobs.Adapter
 

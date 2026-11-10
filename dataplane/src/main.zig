@@ -25,6 +25,7 @@ const config = @import("config.zig");
 const control = @import("control.zig");
 const health = @import("health.zig");
 const proxy = @import("proxy.zig");
+const quirks = @import("quirks.zig");
 const ratelimit = @import("ratelimit.zig");
 const reporter = @import("reporter.zig");
 
@@ -38,6 +39,7 @@ pub const App = struct {
     reporter: *reporter.Reporter,
     limiter: *ratelimit.Limiter,
     health: *health.Health,
+    quirks: *quirks.Quirks,
     env: *const std.process.Environ.Map,
     control_url: []const u8,
     internal_token: []const u8,
@@ -92,6 +94,9 @@ pub fn main(init: std.process.Init) !void {
     };
     defer upstream_health.deinit(gpa);
 
+    var model_quirks: quirks.Quirks = .{};
+    defer model_quirks.deinit(gpa);
+
     var app: App = .{
         .gpa = gpa,
         .io = io,
@@ -100,6 +105,7 @@ pub fn main(init: std.process.Init) !void {
         .reporter = &usage_reporter,
         .limiter = &limiter,
         .health = &upstream_health,
+        .quirks = &model_quirks,
         .env = env,
         .control_url = control_url,
         .internal_token = internal_token,
@@ -144,6 +150,7 @@ test {
     _ = reporter;
     _ = ratelimit;
     _ = health;
+    _ = quirks;
     _ = @import("translate.zig");
     _ = @import("usage.zig");
 }

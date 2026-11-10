@@ -14,6 +14,7 @@ const Io = std.Io;
 const http = std.http;
 const config = @import("config.zig");
 const control = @import("control.zig");
+const quirks = @import("quirks.zig");
 const translate = @import("translate.zig");
 const usage_mod = @import("usage.zig");
 const Usage = usage_mod.Usage;
@@ -232,7 +233,7 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
             continue;
         };
 
-        const out_body: []u8 = if (xlate) |x|
+        var out_body: []u8 = if (xlate) |x|
             translate.translateRequest(arena, x.dir, body, t.model) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
@@ -248,12 +249,19 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
             .openai => "/v1/chat/completions",
             .anthropic => "/v1/messages",
         };
-        const mode: ForwardMode = if (xlate) |x|
+        var mode: ForwardMode = if (xlate) |x|
             .{ .translate = x }
         else if (injected_usage)
             .hide_usage_chunk
         else
             .passthrough;
+
+        // A model already known to reject sampling parameters (see quirks.zig)
+        // gets the translated request without them from the start.
+        if (mode == .translate and app.quirks.rejectsSampling(app.io, up.name, t.model)) {
+            if (try quirks.stripSampling(arena, out_body)) |stripped| out_body = stripped;
+            mode.translate.sampling_stripped = true;
+        }
 
         tried += 1;
         var committed = false;
@@ -261,6 +269,19 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
         var tries: u8 = 0;
         while (tries < 2) : (tries += 1) {
             if (forward(app, arena, request, up, upstream_path, out_body, hdrs, &usage, &req_id, &committed, mode, tried)) |r| {
+                if (r == .drop_sampling) {
+                    // The model refused temperature/top_p/top_k, which a client
+                    // of the other protocol could not have known. Remember it
+                    // and send the same request once more without them.
+                    app.quirks.noteRejectsSampling(app.gpa, app.io, up.name, t.model);
+                    mode.translate.sampling_stripped = true;
+                    if (try quirks.stripSampling(arena, out_body)) |stripped| {
+                        log.info("{s}/{s} rejects sampling parameters; retrying without them", .{ up.name, t.model });
+                        out_body = stripped;
+                    }
+                    tries = 0;
+                    continue;
+                }
                 maybe_result = r;
                 break;
             } else |err| {
@@ -303,6 +324,8 @@ fn handleRequest(app: *App, request: *http.Server.Request) !void {
                 log.warn("upstream {s} returned {d}, failing over", .{ up.name, @backingInt(status) });
                 noteFailure(app, up.name);
             },
+            // Handled inside the loop above; it never escapes it.
+            .drop_sampling => unreachable,
             .done => |status| {
                 app.health.recordSuccess(app.io, up.name);
                 try attempts.append(arena, .{ .upstream = up.name, .outcome = "ok" });
@@ -442,6 +465,9 @@ const ForwardResult = union(enum) {
     retry: http.Status,
     /// Response fully streamed to the client.
     done: http.Status,
+    /// A translated request was refused (400) because of a sampling
+    /// parameter. Nothing was sent to the client; retry without them.
+    drop_sampling,
 };
 
 fn isRetryable(status: http.Status) bool {
@@ -532,6 +558,8 @@ const Translation = struct {
     stream: bool,
     /// OpenAI clients: did they ask for the final usage chunk?
     include_usage: bool,
+    /// Sampling parameters have already been removed from the request.
+    sampling_stripped: bool = false,
 };
 
 /// What to do with the upstream's response body on its way to the client.
@@ -644,6 +672,7 @@ fn forward(
             error.StreamTooLong => return error.UpstreamUnparseable,
             else => |e| return e,
         };
+        if (@backingInt(status) == 400 and !x.sampling_stripped and quirks.mentionsSampling(raw)) return .drop_sampling;
         usage.feed(raw);
         const now_s = @divTrunc(Io.Timestamp.now(app.io, .real).toMilliseconds(), 1000);
         const converted = translate.translateResponseAt(arena, x.dir, @backingInt(status), raw, x.route_model, now_s) catch |err| switch (err) {

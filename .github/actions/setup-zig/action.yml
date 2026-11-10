@@ -1,0 +1,78 @@
+# Installs the Zig compiler the same way dataplane/Dockerfile does: the
+# tarball comes from ziglang.org and must match the SHA-256 pinned in that
+# file. The version and checksums are read from the Dockerfile's ARG lines, so
+# the Dockerfile stays the single place where the compiler is pinned.
+#
+# The tarball (not the unpacked compiler) is cached, and the checksum is
+# verified on every run, cache hit or not.
+#
+# Needs the repository checked out first (it reads dataplane/Dockerfile).
+
+name: Set up Zig
+description: Install the Zig version pinned in dataplane/Dockerfile, verified against the SHA-256 that file pins.
+
+outputs:
+  version:
+    description: The Zig version that was installed.
+    value: ${{ steps.pin.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read the pinned version and checksum from dataplane/Dockerfile
+      id: pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        dockerfile=dataplane/Dockerfile
+        version="$(sed -n 's/^ARG ZIG_VERSION=//p' "$dockerfile" | tr -d '[:space:]')"
+        case "$(uname -m)" in
+          x86_64)  arch=x86_64;  sum="$(sed -n 's/^ARG ZIG_SHA256_X86_64=//p' "$dockerfile" | tr -d '[:space:]')" ;;
+          aarch64) arch=aarch64; sum="$(sed -n 's/^ARG ZIG_SHA256_AARCH64=//p' "$dockerfile" | tr -d '[:space:]')" ;;
+          *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+        esac
+        if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "could not read ZIG_VERSION from $dockerfile (got '$version')" >&2; exit 1
+        fi
+        if ! printf '%s' "$sum" | grep -Eq '^[0-9a-f]{64}$'; then
+          echo "could not read the Zig SHA-256 for $arch from $dockerfile (got '$sum')" >&2; exit 1
+        fi
+        {
+          echo "version=$version"
+          echo "arch=$arch"
+          echo "sha256=$sum"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Cache the Zig tarball
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/omnigate-zig
+        key: zig-tarball-${{ steps.pin.outputs.arch }}-${{ steps.pin.outputs.version }}-${{ steps.pin.outputs.sha256 }}
+
+    - name: Download (if not cached), verify and unpack
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ steps.pin.outputs.version }}
+        ZIG_ARCH: ${{ steps.pin.outputs.arch }}
+        ZIG_SHA256: ${{ steps.pin.outputs.sha256 }}
+      run: |
+        set -euo pipefail
+        dir="$HOME/.cache/omnigate-zig"
+        tarball="$dir/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+        mkdir -p "$dir"
+        if [ ! -f "$tarball" ]; then
+          curl -fsSL --retry 3 --retry-delay 5 -o "$tarball" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+        fi
+        # Same check as the Dockerfile. A tarball that fails it is removed so
+        # that it is never saved to the cache.
+        if ! echo "${ZIG_SHA256}  ${tarball}" | sha256sum -c -; then
+          rm -f "$tarball"
+          exit 1
+        fi
+        dest="$RUNNER_TEMP/zig"
+        rm -rf "$dest"
+        mkdir -p "$dest"
+        tar -xJf "$tarball" -C "$dest" --strip-components=1
+        echo "$dest" >> "$GITHUB_PATH"
+        "$dest/zig" version

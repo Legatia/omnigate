@@ -1,0 +1,256 @@
+# Quickstart
+
+Two parts: run everything locally against the mock providers that ship in
+`tools/` (no API keys needed), then point the gateway at one real provider.
+
+## Prerequisites
+
+- Zig 0.17
+- Erlang/OTP 29 with Elixir 1.20
+- Python 3.9 or newer (the tools use the standard library only)
+
+The README records what has been tried: Windows 11, and x86-64 Linux
+containers. Running the two processes directly on Linux or macOS is not
+listed as verified there. The commands below are given for PowerShell (as in
+the README) and for a POSIX shell.
+
+On Windows, Erlang and Elixir are installed but not on `PATH`. In PowerShell,
+once per session:
+
+```powershell
+$env:Path = 'C:\Program Files\Erlang OTP\bin;C:\Program Files\Elixir\bin;' + $env:Path
+```
+
+## 1. Build the data plane
+
+```bash
+cd dataplane && zig build
+```
+
+The binary is `dataplane/zig-out/bin/omnigate-dp` (`omnigate-dp.exe` on
+Windows).
+
+## 2. Check the build with the end-to-end test (optional)
+
+From the repository root:
+
+```bash
+python tools/e2e.py
+```
+
+It starts the mock providers, the control plane and the gateway on their own
+ports (control plane 14000, gateway 18080, mocks 9001-9004 and 9101-9109),
+keeps its state in a temporary directory, and exits non-zero if any check
+fails. It needs those ports to be free, so run it before you start the pieces
+by hand, not at the same time.
+
+## 3. Run the pieces by hand
+
+Four terminals, all starting in the repository root.
+
+Terminal 1, mock text providers (ports 9001-9004):
+
+```bash
+python tools/mock_upstream.py
+```
+
+Terminal 2, mock media providers, object store and webhook receiver (ports
+9101-9109):
+
+```bash
+python tools/mock_media.py
+```
+
+Terminal 3, the control plane (port 4000). PowerShell:
+
+```powershell
+cd control; $env:OMNIGATE_INTERNAL_TOKEN='dev-internal-token'; $env:OMNIGATE_ADMIN_TOKEN='dev-admin-token-change-me'; $env:MOCK_API_KEY='mock-secret'; mix run --no-halt
+```
+
+POSIX shell:
+
+```bash
+cd control && OMNIGATE_INTERNAL_TOKEN=dev-internal-token OMNIGATE_ADMIN_TOKEN=dev-admin-token-change-me MOCK_API_KEY=mock-secret mix run --no-halt
+```
+
+The first run needs `mix deps.get` in `control/` beforehand.
+
+Terminal 4, the data plane (port 8080). PowerShell:
+
+```powershell
+cd dataplane; $env:OMNIGATE_INTERNAL_TOKEN='dev-internal-token'; $env:MOCK_API_KEY='mock-secret'; .\zig-out\bin\omnigate-dp.exe
+```
+
+POSIX shell:
+
+```bash
+cd dataplane && OMNIGATE_INTERNAL_TOKEN=dev-internal-token MOCK_API_KEY=mock-secret ./zig-out/bin/omnigate-dp
+```
+
+With no `OMNIGATE_CONFIG` set, the control plane loads
+`config/omnigate.dev.json`. Both processes must be given the same
+`OMNIGATE_INTERNAL_TOKEN`. `MOCK_API_KEY` is the variable the dev config's
+upstreams name in `api_key_env`; the mocks only insist that it is not empty.
+
+## 4. Try it
+
+The examples use `curl` from a POSIX shell (Git Bash on Windows).
+
+A streamed chat completion. The first upstream of `demo-chat` always answers
+503, so every call fails over to the second:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-unlimited-key" -d '{"model":"demo-chat","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The same route without streaming, showing the gateway's response headers
+(`x-omnigate-upstream`, `x-omnigate-attempts`, `x-omnigate-request-id`):
+
+```bash
+curl -i http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-unlimited-key" -d '{"model":"demo-chat","messages":[{"role":"user","content":"hi"}]}'
+```
+
+An Anthropic-style upstream called with the OpenAI protocol (the gateway
+translates):
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-unlimited-key" -d '{"model":"demo-claude","messages":[{"role":"user","content":"hi"}]}'
+```
+
+The same upstream called with the Anthropic protocol:
+
+```bash
+curl http://127.0.0.1:8080/v1/messages -H "x-api-key: og-unlimited-key" -d '{"model":"demo-claude","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+A media job. The answer is `202` with a job object:
+
+```bash
+curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer og-unlimited-key" -d '{"model":"demo-image","input":{"prompt":"a lighthouse"}}'
+```
+
+Poll it with the `id` from that answer until `status` is `succeeded`, then
+open the URL in `outputs[0].url`:
+
+```bash
+curl http://127.0.0.1:8080/v1/jobs/JOB_ID -H "Authorization: Bearer og-unlimited-key"
+```
+
+Dashboard: <http://127.0.0.1:4000/>. Sign in with the admin token set above
+(`dev-admin-token-change-me`).
+
+### Demo routes and keys
+
+Routes in `config/omnigate.dev.json`:
+
+| Route | Shows |
+|---|---|
+| `demo-chat` | First upstream always answers 503, so every call fails over |
+| `demo-claude` | Anthropic-style upstream; call it with either protocol |
+| `demo-slow` | First upstream takes 3 s and is abandoned after 1 s |
+| `demo-direct` | One healthy upstream, for benchmarks |
+| `demo-image` | Media job on the Replicate-style adapter; the first target fails, the second delivers |
+| `demo-video` | Media job on the fal-style adapter |
+| `demo-image-sync` | Media job on the OpenAI-images-style adapter |
+| `demo-tts` | Media job on the ElevenLabs-style adapter; cached (input: `text`, `voice_id`) |
+
+Keys:
+
+| Key | Behaviour |
+|---|---|
+| `og-unlimited-key` | No budget, no rate limit |
+| `og-dev-key` | $0.01 budget; blocked (HTTP 402) after four calls |
+| `og-ratelimited-key` | 5 requests per minute; then HTTP 429 with `Retry-After` |
+
+## 5. One real provider
+
+This replaces the mocks with OpenAI. Any provider from
+[Providers](providers.md) works the same way.
+
+Create `config/omnigate.json` (this path is ignored by git):
+
+```json
+{
+  "keys": [
+    { "name": "my-app", "key": "og-local-test-key" }
+  ],
+  "upstreams": [
+    {
+      "name": "openai",
+      "kind": "openai",
+      "base_url": "https://api.openai.com",
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  ],
+  "routes": [
+    {
+      "model": "gpt",
+      "targets": [
+        {
+          "upstream": "openai",
+          "model": "gpt-4o-mini",
+          "price_in_per_mtok": 0.0,
+          "price_out_per_mtok": 0.0
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notes on this file:
+
+- `"key"` holds the gateway key in clear text, which is fine for a local
+  trial. For anything else use `"key_sha256"`; see
+  [Configuration](configuration.md#gateway-keys).
+- `gpt-4o-mini` is one of the models the README lists as checked. Use any
+  model id your account has.
+- The prices are zero, so the ledger records tokens but no cost. Fill in
+  your provider's prices in US dollars per million tokens to get spend and
+  budgets.
+
+Stop the control plane and the data plane (the mocks are no longer needed).
+Start the control plane with the new config. PowerShell:
+
+```powershell
+cd control; $env:OMNIGATE_INTERNAL_TOKEN='dev-internal-token'; $env:OMNIGATE_ADMIN_TOKEN='dev-admin-token-change-me'; $env:OMNIGATE_CONFIG='../config/omnigate.json'; mix run --no-halt
+```
+
+POSIX shell:
+
+```bash
+cd control && OMNIGATE_INTERNAL_TOKEN=dev-internal-token OMNIGATE_ADMIN_TOKEN=dev-admin-token-change-me OMNIGATE_CONFIG=../config/omnigate.json mix run --no-halt
+```
+
+Start the data plane with your provider key in its environment. Text
+provider keys are read by the data plane, not by the control plane. Put your
+own key where the placeholder is. PowerShell:
+
+```powershell
+cd dataplane; $env:OMNIGATE_INTERNAL_TOKEN='dev-internal-token'; $env:OPENAI_API_KEY='<your OpenAI key>'; .\zig-out\bin\omnigate-dp.exe
+```
+
+POSIX shell:
+
+```bash
+cd dataplane && OMNIGATE_INTERNAL_TOKEN=dev-internal-token OPENAI_API_KEY='<your OpenAI key>' ./zig-out/bin/omnigate-dp
+```
+
+Call it:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-local-test-key" -d '{"model":"gpt","messages":[{"role":"user","content":"Say hello."}]}'
+```
+
+`"model"` in the request is the route name (`gpt`), not the provider's model
+id. The gateway replaces it with the target's `model` before forwarding.
+
+Edits to the config file are picked up by the control plane within about two
+seconds, and by the data plane on its next poll (two seconds by default). No
+restart is needed.
+
+## Next
+
+- [Configuration](configuration.md) for every field and variable.
+- [Providers](providers.md) to add Anthropic, Gemini, xAI and media providers.
+- [Deployment](deployment.md) before exposing it to anything but localhost.

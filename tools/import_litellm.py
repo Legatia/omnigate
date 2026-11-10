@@ -5,7 +5,8 @@
 
 What is carried over
   * model_list entries -> routes. Entries that share a model_name become
-    ordered failover targets (omnigate fails over; it does not load-balance).
+    ordered failover targets (set "strategy": "round_robin" or "weighted" on
+    the route afterwards if you want omnigate to spread load across them).
   * router_settings.fallbacks / litellm_settings.fallbacks -> extra targets
     appended to the route.
   * api_key: os.environ/NAME -> api_key_env NAME. A literal key is never
@@ -16,7 +17,7 @@ What is carried over
 
 What is not
   * Providers that are neither OpenAI- nor Anthropic-shaped at a /v1 path
-    (Azure, Bedrock, Vertex, Gemini native, ...). They are listed as skipped.
+    (Azure, Bedrock, Vertex, ...). They are listed as skipped.
   * Virtual keys, teams and budgets (they live in LiteLLM's database, not in
     the YAML), per-deployment rpm/tpm, caching, guardrails and callbacks.
 

@@ -1,0 +1,183 @@
+# CI for omnigate. Five jobs, all on Linux:
+#
+#   dataplane   Zig unit tests and a build of the data plane. Zig is installed
+#               the way dataplane/Dockerfile installs it: downloaded from
+#               ziglang.org and checked against the SHA-256 that file pins
+#               (see .github/actions/setup-zig).
+#   control     Elixir unit tests of the control plane (`mix test`).
+#   tools       Unit tests of the LiteLLM importer (Python, stdlib only).
+#   e2e         tools/e2e.py: mock providers, the control plane and the data
+#               plane as local processes, checked end to end. Runs only if the
+#               two unit-test jobs pass. The data plane is built again in this
+#               job rather than passed along as an artifact: a default
+#               `zig build` targets the CPU of the machine it runs on, and two
+#               jobs are not guaranteed to get the same CPU model.
+#   containers  tools/container_test.py --compose: builds both images, starts
+#               compose.yaml (plus mock providers) and checks it through the
+#               TLS proxy.
+#
+# None of the jobs needs a secret or an API key: every provider is a mock.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request replaces the run in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OTP_VERSION: "29"
+  ELIXIR_VERSION: "1.20.5"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  dataplane:
+    name: Data plane (Zig)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-zig
+
+      - name: Unit tests
+        working-directory: dataplane
+        run: zig build test --summary all
+
+      - name: Build
+        working-directory: dataplane
+        run: zig build
+
+  control:
+    name: Control plane (Elixir)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache dependencies and their build
+        uses: actions/cache@v6
+        with:
+          path: |
+            control/deps
+            control/_build
+          key: mix-test-${{ runner.os }}-otp-${{ steps.beam.outputs.otp-version }}-elixir-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('control/mix.lock') }}
+
+      - name: Fetch dependencies
+        working-directory: control
+        run: mix deps.get
+
+      - name: Unit tests
+        working-directory: control
+        run: mix test
+
+  tools:
+    name: Tools (Python)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: LiteLLM importer tests
+        run: python tools/test_import_litellm.py
+
+  e2e:
+    name: End to end (mock providers)
+    needs: [dataplane, control]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-zig
+
+      # tools/e2e.py runs dataplane/zig-out/bin/omnigate-dp.
+      - name: Build the data plane
+        working-directory: dataplane
+        run: zig build
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache dependencies and their build
+        uses: actions/cache@v6
+        with:
+          path: |
+            control/deps
+            control/_build
+          key: mix-dev-${{ runner.os }}-otp-${{ steps.beam.outputs.otp-version }}-elixir-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('control/mix.lock') }}
+
+      # tools/e2e.py starts the control plane with `mix run --no-halt` and
+      # waits for its port; compiling first keeps that wait short.
+      - name: Fetch and compile the control plane
+        working-directory: control
+        run: |
+          mix deps.get
+          mix compile
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Listens on 127.0.0.1 only: 9001-9004 and 9101-9109 (mocks), 14000
+      # (control plane), 18080 (gateway). State and logs go to a directory
+      # named omnigate-e2e-* under TMPDIR.
+      - name: End-to-end test
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python tools/e2e.py
+
+      - name: Upload logs and state
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-logs
+          path: ${{ runner.temp }}/omnigate-e2e-*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  containers:
+    name: Containers (Compose, TLS proxy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Docker and Compose versions
+        run: |
+          docker version
+          docker compose version
+
+      # Builds both images (the data-plane build also runs the Zig unit
+      # tests), publishes one port on 127.0.0.1:18443, and removes everything
+      # it created when it is done. It prints container logs itself when a
+      # check fails.
+      - name: Container test
+        run: python3 tools/container_test.py --compose
+
+      - name: What was left running
+        if: failure()
+        run: docker ps -a

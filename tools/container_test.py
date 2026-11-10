@@ -363,6 +363,13 @@ def checks():
     health = wait_until(lambda: docker("inspect", cname("control"), "--format", "{{.State.Health.Status}}") == "healthy", 40, 1.0)
     check("the control-plane container reports healthy", bool(health), docker("inspect", cname("control"), "--format", "{{.State.Health.Status}}"))
 
+    # `docker stop` sends SIGTERM to PID 1: the gateway must drain and exit by itself.
+    t0 = time.time()
+    docker("stop", "-t", "25", cname("dataplane"))
+    took = time.time() - t0
+    code = docker("inspect", cname("dataplane"), "--format", "{{.State.ExitCode}}")
+    check("the gateway container shuts down cleanly on SIGTERM (exit 0, no kill)", code == "0" and took < 20, (code, f"{took:.1f}s"))
+
 
 def main():
     ap = argparse.ArgumentParser()

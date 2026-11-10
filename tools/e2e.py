@@ -304,14 +304,14 @@ class Stack:
     # -- individual services --------------------------------------------
 
     def start_mocks(self):
-        ports = [9001, 9002, 9003, 9004] + (MEDIA_PORTS if self.media else [])
+        ports = [9001, 9002, 9003, 9004, 9005] + (MEDIA_PORTS if self.media else [])
         busy = [p for p in ports + [CONTROL_PORT, GATEWAY_PORT] if not port_free(p)]
         if busy:
             self.fail(f"ports already in use: {busy}. Stop whatever is listening there and rerun.")
         self.start("mock_upstream", [sys.executable, os.path.join(ROOT, "tools", "mock_upstream.py")])
         if self.media:
             self.start_media_mock()
-        for port in [9001, 9002, 9003, 9004]:
+        for port in [9001, 9002, 9003, 9004, 9005]:
             if not wait_port(port, 15):
                 self.fail(f"mock on port {port} did not start", "mock_upstream")
 
@@ -368,11 +368,11 @@ def main_row_with(requests):
     return row if row.get("requests", 0) - row.get("jobs", 0) == requests else None
 
 
-def control_raw(method, path, headers=None, form=None):
+def control_raw(method, path, headers=None, form=None, raw=None):
     """One request to the control plane without following redirects."""
     conn = http.client.HTTPConnection("127.0.0.1", CONTROL_PORT, timeout=15)
     h = dict(headers or {})
-    body = None
+    body = raw
     if form is not None:
         body = "&".join(f"{k}={v}" for k, v in form.items())
         h["content-type"] = "application/x-www-form-urlencoded"
@@ -422,6 +422,63 @@ def login_checks():
     check("the public gateway port does not serve the admin API", status == 404, status)
     status, _, _ = call("GET", GATEWAY + "/admin/usage", key=ADMIN_TOKEN)
     check("... and the admin token is not a gateway key", status == 401, status)
+
+
+def admin(method, path, body=None):
+    return jcall(method, CONTROL + path, key=ADMIN_TOKEN, body=body)
+
+
+def key_checks():
+    """Gateway keys created, changed and revoked through the admin API, with no config edit."""
+    section("key management")
+    name = "e2e-managed"
+    status, _, created = admin("POST", "/admin/keys", {"name": name, "models": ["direct"]})
+    secret = created.get("key", "")
+    check("a key can be created through the admin API and is shown once",
+          status == 201 and secret.startswith("og-") and len(secret) >= 35 and created.get("source") == "managed", (status, {k: v for k, v in created.items() if k != "key"}))
+    usable = wait_until(lambda: chat("direct", key=secret)[0] == 200, 6, 0.2)
+    check("the gateway accepts the new key within seconds, without a restart", bool(usable))
+    status, _, body = chat("chat", key=secret)
+    check("... and enforces the model limit it was created with", status == 403, (status, body))
+    status, _, listing = admin("GET", "/admin/keys")
+    row = next((k for k in listing.get("keys", []) if k.get("name") == name), {})
+    check("the key list shows it with its usage and never its secret",
+          status == 200 and row.get("source") == "managed" and row.get("state") == "active"
+          and secret not in json.dumps(listing) and "key" not in row and "key_sha256" not in row, row)
+    status, _, _ = admin("POST", "/admin/keys", {"name": name})
+    check("a duplicate name is refused (409)", status == 409, status)
+    status, _, body = admin("PATCH", "/admin/keys/main", {"rpm": 1})
+    check("keys from the config file cannot be changed through the API (409)", status == 409, (status, body))
+
+    status, _, rotated = admin("POST", f"/admin/keys/{name}/rotate")
+    fresh = rotated.get("key", "")
+    check("rotating returns a new secret", status == 200 and fresh.startswith("og-") and fresh != secret, status)
+    swapped = wait_until(lambda: chat("direct", key=secret)[0] == 401 and chat("direct", key=fresh)[0] == 200, 6, 0.2)
+    check("... after which the old secret stops working and the new one works", bool(swapped))
+
+    status, _, _ = admin("PATCH", f"/admin/keys/{name}", {"disabled": True})
+    off = wait_until(lambda: chat("direct", key=fresh)[0] == 401, 6, 0.2)
+    check("a disabled key is refused", status == 200 and bool(off), status)
+    status, _, _ = admin("PATCH", f"/admin/keys/{name}", {"disabled": False})
+    on = wait_until(lambda: chat("direct", key=fresh)[0] == 200, 6, 0.2)
+    check("... and works again when re-enabled", status == 200 and bool(on), status)
+
+    status, _, _ = admin("DELETE", f"/admin/keys/{name}")
+    gone = wait_until(lambda: chat("direct", key=fresh)[0] == 401, 6, 0.2)
+    _, _, listing = admin("GET", "/admin/keys")
+    check("a deleted key is gone from the list and refused by the gateway",
+          status == 200 and bool(gone) and not any(k.get("name") == name for k in listing.get("keys", [])), status)
+
+    # A browser session must present a CSRF token for changes; the bearer token above did not need one.
+    _, headers, _ = control_raw("POST", "/login", form={"password": ADMIN_TOKEN})
+    session = headers.get("set-cookie", "").split(";")[0]
+    status, _, body = control_raw("POST", "/admin/keys", {"cookie": session, "content-type": "application/json"}, raw=json.dumps({"name": "csrf-probe"}))
+    check("a browser session without a CSRF token cannot change keys (403)", status == 403 and "csrf" in body.lower(), (status, body[:120]))
+    status, _, page = control_raw("GET", "/", {"cookie": session})
+    check("the dashboard page renders for a session and lists the keys", status == 200 and "Sign out" in page and "main" in page, status)
+    status, _, overview = admin("GET", "/admin/overview")
+    check("the overview feed the dashboard polls has totals, keys, requests, jobs and config",
+          status == 200 and all(k in overview for k in ("totals", "today", "keys", "requests", "jobs", "config")), list(overview)[:8])
 
 
 def text_checks(stack):
@@ -905,6 +962,7 @@ def main():
         if not wait_until(lambda: call("GET", GATEWAY + "/v1/models", key=KEY_MAIN)[0] == 200, 15):
             stack.fail("gateway never received its config from the control plane", "gateway")
         login_checks()
+        key_checks()
         if run_media:
             media_checks(stack)
         if run_text:

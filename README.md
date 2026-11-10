@@ -45,6 +45,8 @@ under production load.** See [Known gaps](#known-gaps).
 - **Usage metering** from the response stream without buffering it. If the client did not ask for the OpenAI usage chunk, the gateway asks for it anyway and hides it from the client.
 - **Usage that survives outages.** Events are spooled to disk on the data plane, sent in batches with retries, and deduplicated by request id in the ledger, so a call is billed once even if the control plane was down when it happened.
 - **Keeps serving without the control plane**, including after a data-plane restart (last config is cached on disk).
+- **Holds up under hostile clients.** Idle connections, half-sent requests and stalled streams are cut off by timeouts; connections are capped; on a stop signal the gateway finishes in-flight requests, delivers queued usage and exits cleanly.
+- **Access log.** One line per request with key name, route, upstream, attempts, tokens and latency; `OMNIGATE_LOG_FORMAT=json` for log shippers.
 - Response headers: `x-omnigate-upstream`, `x-omnigate-attempts`, `x-omnigate-request-id`.
 
 ### Control plane access
@@ -53,6 +55,8 @@ under production load.** See [Known gaps](#known-gaps).
 - **Admin API.** `/admin/*` takes the same token as `Authorization: Bearer`.
 - **Never open by default.** If `OMNIGATE_ADMIN_TOKEN` is not set, a random one is generated at startup and written to the log.
 - **Guessing is slowed.** Five failed logins from one address lock that address out for a minute.
+- **Key management.** Create, rotate, disable and delete gateway keys from the dashboard or the admin API (`/admin/keys`), with budget, rate limit and model limits per key. A new key is shown once and stored only as a hash. Data planes pick changes up within seconds. Keys in the config file keep working and are read-only there.
+- **Dashboard.** Spend against budget per key, today and total figures, recent requests and media jobs, and a read-only view of the configuration without secrets. It updates live, works without external assets, and protects changes with CSRF tokens.
 - **Metrics.** `GET /metrics` serves Prometheus text format behind the admin token: per-key requests, errors, tokens, jobs, cost, budget and blocked state; media jobs by status; webhook deliveries by state; ledger size; config reloads; uptime.
 - **Retention.** With a `retention` section in the config, finished jobs and their locally stored files are removed after `jobs_days`, and the ledger's duplicate-detection ids after `ledger_ids_days`. Off by default: nothing is deleted unless you set it.
 - **Separate credentials.** Gateway keys, the data planes' internal token and the admin token do not work in each other's place.
@@ -78,6 +82,14 @@ GET  /v1/files/{job}/{name}?exp=&sig=    re-hosted output (signed URL, or the ow
 - **Caching.** With `cache: true` or a route `cache_ttl_s`, an identical request reuses the stored output: no provider call, no charge.
 - **One ledger.** Per-job, per-output, per-second and per-character prices land in the same ledger and budgets as tokens.
 
+## Documentation
+
+Guides live in [`docs/`](docs/README.md): [quickstart](docs/quickstart.md),
+[configuration](docs/configuration.md), [API](docs/api.md),
+[providers](docs/providers.md), [deployment](docs/deployment.md),
+[operations](docs/operations.md), [architecture](docs/architecture.md) and
+[migrating from LiteLLM](docs/migrating-from-litellm.md).
+
 ## Try it
 
 Prerequisites: Zig 0.17, Erlang/OTP 29 with Elixir 1.20, Python 3.9+.
@@ -95,7 +107,7 @@ gateway on their own ports with state in a temp directory, runs its checks
 (failover, timeouts, streaming, translation, rate limits, budgets, an outage
 with a gateway restart, media jobs with failover, webhooks, cache, a
 control-plane restart mid-job, bucket storage) and exits non-zero if any fail.
-It currently runs 96 checks.
+It currently runs 110 checks.
 
 ### Run the pieces by hand
 
@@ -141,7 +153,7 @@ Dashboard: <http://127.0.0.1:4000/>, signing in with the admin token set above. 
 | `demo-claude` | Anthropic-style upstream; call it with either protocol |
 | `demo-slow` | First upstream takes 3 s and is abandoned after 1 s |
 | `demo-direct` | One healthy upstream, for benchmarks |
-| `demo-image`, `demo-video`, `demo-image-sync`, `demo-tts` | Media jobs on each adapter; `demo-image` fails over, `demo-tts` is cached |
+| `demo-image`, `demo-video`, `demo-image-sync`, `demo-tts` | Media jobs on four of the adapters (Replicate, fal, OpenAI images, ElevenLabs shapes); `demo-image` fails over, `demo-tts` is cached |
 
 Keys: `og-unlimited-key`, `og-dev-key` ($0.01 budget, blocked after four calls), `og-ratelimited-key` (5 requests per minute).
 
@@ -200,6 +212,13 @@ and bucket credentials by the control plane.
 | `OMNIGATE_COOLDOWN_FAILURES` | data plane | `5`; consecutive failures before an upstream is tried last, `0` = off |
 | `OMNIGATE_COOLDOWN_MS` | data plane | `30000` |
 | `OMNIGATE_SPOOL` | data plane | `omnigate-usage.spool`; `off` keeps usage in memory only |
+| `OMNIGATE_CLIENT_TIMEOUT_MS` | data plane | `30000`; time allowed for a request head and body, and for an idle keep-alive connection; `0` = off |
+| `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` | data plane | `300000`; a response stream silent this long is cut and billed for what was metered; `0` = off |
+| `OMNIGATE_MAX_CONNECTIONS` | data plane | `4096`; beyond it, an immediate 503 |
+| `OMNIGATE_SHUTDOWN_GRACE_MS` | data plane | `10000`; time for in-flight requests after a stop signal |
+| `OMNIGATE_LOG_LEVEL` | data plane | `info` (`debug`, `info`, `warn`, `error`) |
+| `OMNIGATE_LOG_FORMAT` | data plane | `text`; `json` gives one object per line |
+| `OMNIGATE_KEYS` | control plane | `data/keys.json`; keys created through the admin API (hashes only) |
 | `OMNIGATE_CONFIG_CACHE` | data plane | `omnigate-config.cache.json`; `off` disables |
 | `OMNIGATE_ADMIN_TOKEN` | control plane | generated and logged at startup if unset; dashboard password and `/admin` API token |
 | `OMNIGATE_CONTROL_BIND` | control plane | `127.0.0.1`; set an address such as `0.0.0.0` to accept connections from other machines |
@@ -279,8 +298,24 @@ on a row.
 Where the others are ahead today, plainly:
 
 - **Provider coverage.** They speak to dozens or hundreds of providers natively. omnigate speaks two text protocols (which reaches every OpenAI-compatible provider, Gemini included) and seven media shapes. Azure, Bedrock and Vertex are not reachable.
-- **Production mileage.** They run real traffic. omnigate has passed a few dozen checks against two real providers and nothing more.
+- **Production mileage.** They run real traffic. omnigate has passed scripted checks against a handful of real providers and has never served production traffic.
 - **Features not here yet:** latency- or cost-aware routing, response caching for text, guardrails, team and SSO management, tracing and log-export integrations (there is a Prometheus endpoint), realtime voice, an admin UI beyond a read-only dashboard.
+
+### Load test
+
+`python tools/load_test.py` drives a running gateway with many concurrent
+clients, including ones that stall, disconnect mid-stream, send oversized or
+malformed bodies, or never send anything. On this machine (Windows 11,
+optimized build, Python mock upstream, 94 clients for 5 minutes):
+
+- 669,000 requests at about 2,100 per second, with no malformed response, crash or hang.
+- 635,318 usage events for 635,318 metered requests: none lost, none duplicated.
+- Health checks stayed responsive throughout (p99 57 ms).
+- Memory was flat at about 45 MB under load and returned to 42 MB afterwards.
+
+The Python mock caps throughput at a few thousand requests per second, so this
+shows stability, not a ceiling. It was not run over TLS, against real
+providers, or with more than 550 concurrent connections.
 
 ### Measured on this machine
 
@@ -327,13 +362,19 @@ Through the gateway, over TLS, with real keys:
 **Security**
 
 - No TLS listener on either process; the included Caddy proxy (or another) provides it. Data-plane-to-control-plane traffic over HTTPS is untested; keep it on a private network.
+- A managed key's webhook secret is stored in plain text in the keys file, because signing needs it. Protect the data directory.
 - One shared admin token: no user accounts, roles or audit log. Sessions cannot be revoked individually; changing the token ends all of them.
 - The login lockout counts per client address and lives in memory. Behind a reverse proxy all clients share one address.
-- Webhook targets are checked against private addresses when the job is submitted only, so DNS rebinding is not closed.
+- Webhook targets are resolved once per delivery, checked against private addresses, and connected to at the checked address, which closes DNS rebinding. Redirects are not followed.
+- Budgets are totals over the whole ledger and never reset; there is no monthly or daily period yet. A key over budget gets 402 on every request, including polling its own jobs.
+- Requests the gateway refuses before routing (bad key, rate limit, disallowed model) are not written to the ledger, so they do not appear in metrics or the dashboard.
+- Provider response headers other than content type and length are not passed to clients.
 
 **Text gateway**
 
 - Rate limits and cooldowns are per data-plane process and reset on restart. Budgets are enforced after the fact, with up to one poll interval of lag, on a single control-plane node, and cannot newly block a key during a control-plane outage.
+- The data plane uses one thread per connection, about two under load. It has been soaked at 94 connections for five minutes and tried at 550 for two; beyond that is untested.
+- A client that times out gets a closed connection, not a 408 response.
 - Load balancing is round-robin or weighted only, with state per data-plane process; nothing is latency-aware. No response caching, no idle timeout once a response has started streaming.
 - For text endpoints the request body is now read before the rate-limit check (so that a disallowed model is a 403, not a 429), which means a key over its limit still costs one body read.
 - Translation drops what the other protocol cannot express (thinking blocks, cache control, `response_format`, penalties and similar) and rejects audio and file parts. `/v1/embeddings`, `/v1/responses` and `/v1/completions` are not translated.

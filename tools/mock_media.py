@@ -14,6 +14,8 @@ Servers (all on 127.0.0.1):
     9105  ElevenLabs-style text to speech (synchronous, returns audio bytes)
     9106  S3-compatible object store that verifies AWS SigV4
     9107  Webhook receiver that verifies Standard Webhooks signatures
+    9108  Gemini-style generateContent (image, speech) and Interactions API (video)
+    9109  xAI-style video generation (submit, then poll by request id)
 
 Every server answers GET /_stats with its counters. Provider mocks insist on
 a non-empty API key in the header the real service uses.

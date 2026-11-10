@@ -564,11 +564,11 @@ def text_checks(stack):
 # media jobs
 # --------------------------------------------------------------------------
 
-MEDIA_PORTS = [9101, 9102, 9103, 9104, 9105, 9106, 9107]
+MEDIA_PORTS = [9101, 9102, 9103, 9104, 9105, 9106, 9107, 9108]
 MEDIA_MOCK_ARGS = []
 MOCK = {name: f"http://127.0.0.1:{port}" for name, port in [
     ("replicate", 9101), ("replicate_broken", 9102), ("fal", 9103), ("openai_images", 9104),
-    ("elevenlabs", 9105), ("s3", 9106), ("webhooks", 9107)]}
+    ("elevenlabs", 9105), ("s3", 9106), ("webhooks", 9107), ("gemini", 9108)]}
 TERMINAL = ("succeeded", "failed", "canceled")
 
 
@@ -596,6 +596,7 @@ def media_config(work, storage="local"):
             up("fal", "fal", MOCK["fal"]),
             up("openai-images", "openai_images", MOCK["openai_images"]),
             up("elevenlabs", "elevenlabs", MOCK["elevenlabs"]),
+            up("gemini", "gemini", MOCK["gemini"]),
         ],
         "routes": [
             {"model": "image", "targets": [
@@ -605,6 +606,10 @@ def media_config(work, storage="local"):
                 {"upstream": "fal", "model": "mock/video/text-to-video", "price": {"per_second_usd": 0.1}}]},
             {"model": "image-sync", "targets": [
                 {"upstream": "openai-images", "model": "mock-image-1", "price": {"per_output_usd": 0.05}}]},
+            {"model": "gemini-image", "targets": [
+                {"upstream": "gemini", "model": "mock-flash-image", "price": {"per_output_usd": 0.02}}]},
+            {"model": "gemini-speech", "targets": [
+                {"upstream": "gemini", "model": "mock-flash-tts", "price": {"per_input_char_usd": 0.00001}}]},
             {"model": "tts", "cache_ttl_s": 3600, "targets": [
                 {"upstream": "elevenlabs", "model": "mock_multilingual_v2", "price": {"per_input_char_usd": 0.00003}}]},
         ],
@@ -706,6 +711,24 @@ def media_checks(stack):
     check("synchronous provider (OpenAI images shape) is wrapped in the same job API",
           sync.get("status") == "succeeded" and close(sync.get("cost_usd"), 0.05) and sync.get("outputs"), sync)
 
+    _, _, gimg = create_job({"model": "gemini-image", "input": {"prompt": "a green cube"}})
+    gimg = wait_job(gimg.get("id", "missing"))
+    data = call("GET", gimg["outputs"][0]["url"])[2] if gimg.get("outputs") else b""
+    check("inline-file provider (Gemini shape) returns an image through the same job API",
+          gimg.get("status") == "succeeded" and close(gimg.get("cost_usd"), 0.02) and data[:8] == b"\x89PNG\r\n\x1a\n", gimg)
+    phrase = "Good morning."
+    _, _, gtts = create_job({"model": "gemini-speech", "input": {"text": phrase, "voice": "Kore"}})
+    gtts = wait_job(gtts.get("id", "missing"))
+    data = call("GET", gtts["outputs"][0]["url"])[2] if gtts.get("outputs") else b""
+    check("... and its raw PCM speech is stored as a playable WAV, billed per character",
+          gtts.get("status") == "succeeded" and close(gtts.get("cost_usd"), len(phrase) * 0.00001)
+          and data[:4] == b"RIFF" and data[8:12] == b"WAVE" and gtts["outputs"][0]["content_type"] == "audio/wav", (gtts, data[:12]))
+    _, _, gblk = create_job({"model": "gemini-image", "input": {"prompt": "something blocked"}})
+    gblk = wait_job(gblk.get("id", "missing"))
+    check("a refused prompt fails the job with the reason and no charge",
+          gblk.get("status") == "failed" and "SAFETY" in json.dumps(gblk.get("attempts")) and close(gblk.get("cost_usd") or 0.0, 0.0), gblk)
+    gemini_cost = 0.02 + len(phrase) * 0.00001
+
     text = "Your order has shipped and will arrive on Thursday."
     calls_before = stats("elevenlabs")["calls"]
     tts_body = {"model": "tts", "input": {"text": text, "voice_id": "mock-voice"}}
@@ -728,7 +751,7 @@ def media_checks(stack):
     _, _, other_list = jcall("GET", GATEWAY + "/v1/jobs", key=KEY_OTHER)
     check("another key's job list is empty", other_list.get("data") == [], other_list)
 
-    expected = 0.003 + 0.5 + 0.05 + len(text) * 0.00003
+    expected = 0.003 + 0.5 + 0.05 + len(text) * 0.00003 + gemini_cost
     row = wait_until(lambda: (lambda r: r if close(r.get("cost_usd"), expected) else None)(usage_row("main")), 10) or usage_row("main")
     check("the ledger total equals the sum of the job costs", close(row.get("cost_usd"), expected), (row, expected))
 

@@ -63,6 +63,7 @@ PORTS = {
     "elevenlabs": 9105,
     "s3": 9106,
     "webhooks": 9107,
+    "gemini": 9108,
 }
 
 # Placeholder shared with config/omnigate.dev.json. Not a real secret.
@@ -624,6 +625,48 @@ class Webhooks(Base):
         self.send(status, {"ok": status == 200})
 
 
+# --------------------------------------------------------------------------
+# Gemini-style generateContent (image and speech models)
+# --------------------------------------------------------------------------
+
+class Gemini(Base):
+    stats = {"calls": 0}
+
+    def do_GET(self):
+        if self.maybe_stats():
+            return
+        self.send(404, {"error": {"code": 404, "message": "not found", "status": "NOT_FOUND"}})
+
+    def do_POST(self):
+        req = self.json_body()
+        if not self.headers.get("x-goog-api-key"):
+            return self.send(401, {"error": {"code": 401, "message": "API key not valid", "status": "UNAUTHENTICATED"}})
+        path = self.path.split("?")[0]
+        if not (path.startswith("/v1beta/models/") and path.endswith(":generateContent")):
+            return self.send(404, {"error": {"code": 404, "message": "not found", "status": "NOT_FOUND"}})
+        model = path[len("/v1beta/models/"):-len(":generateContent")]
+        try:
+            text = req["contents"][0]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError):
+            return self.send(400, {"error": {"code": 400, "message": "contents is required", "status": "INVALID_ARGUMENT"}})
+        self.bump("calls")
+        if "blocked" in text:
+            # Gemini answers 200 with no file when a prompt is refused.
+            return self.send(200, {"promptFeedback": {"blockReason": "SAFETY"}})
+        config = req.get("generationConfig") or {}
+        if "AUDIO" in (config.get("responseModalities") or []):
+            # Headerless PCM, as the older speech models return it.
+            data, mime = b"\x00\x01" * 2400, "audio/L16;codec=pcm;rate=24000"
+        else:
+            data, mime = png(len(text)), "image/png"
+        self.send(200, {
+            "candidates": [{"content": {"role": "model", "parts": [
+                {"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode()}}]}, "finishReason": "STOP", "index": 0}],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 50, "totalTokenCount": 55},
+            "modelVersion": model,
+        })
+
+
 def main():
     servers = [
         ("replicate_ok", replicate_handler(False)),
@@ -633,6 +676,7 @@ def main():
         ("elevenlabs", ElevenLabs),
         ("s3", S3),
         ("webhooks", Webhooks),
+        ("gemini", Gemini),
     ]
     for name, handler in servers:
         httpd = ThreadingHTTPServer((BIND, PORTS[name]), handler)

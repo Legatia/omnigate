@@ -153,6 +153,37 @@ defmodule OmnigateControl.MediaUnitTest do
       assert config.media.webhooks.allow_private == false
     end
 
+    test "gemini adapter: request forms, inline outputs, PCM wrapped as WAV" do
+      alias OmnigateControl.Jobs.Adapters.Gemini
+
+      assert {:ok, %{"contents" => [%{"parts" => [%{"text" => "a cube"}]}]} = body} = Gemini.request_body(%{"prompt" => "a cube"})
+      refute Map.has_key?(body, "generationConfig")
+
+      assert {:ok, %{"generationConfig" => config}} = Gemini.request_body(%{"text" => "hi", "voice" => "Kore"})
+      assert config["responseModalities"] == ["AUDIO"]
+      assert get_in(config, ["speechConfig", "voiceConfig", "prebuiltVoiceConfig", "voiceName"]) == "Kore"
+
+      # A native request is passed through, minus fields that are not Gemini's.
+      raw = %{"contents" => [%{"parts" => []}], "generationConfig" => %{"x" => 1}, "voice" => "ignored"}
+      assert {:ok, %{"contents" => [_], "generationConfig" => %{"x" => 1}} = sent} = Gemini.request_body(raw)
+      refute Map.has_key?(sent, "voice")
+      assert {:error, "invalid_input" <> _} = Gemini.request_body(%{})
+
+      part = fn mime, bytes -> %{"inlineData" => %{"mimeType" => mime, "data" => Base.encode64(bytes)}} end
+      response = fn parts -> %{"candidates" => [%{"content" => %{"parts" => parts}, "finishReason" => "STOP"}]} end
+
+      assert {:done, [{:binary, "JPEGDATA", "image/jpeg"}]} = Gemini.outputs(response.([%{"text" => "here"}, part.("image/jpeg", "JPEGDATA")]))
+
+      pcm = <<1, 0, 2, 0, 3, 0, 4, 0>>
+      assert {:done, [{:binary, wav, "audio/wav"}]} = Gemini.outputs(response.([part.("audio/L16;codec=pcm;rate=24000", pcm)]))
+      assert <<"RIFF", 44::little-32, "WAVE", "fmt ", 16::little-32, 1::little-16, 1::little-16, 24_000::little-32,
+               48_000::little-32, 2::little-16, 16::little-16, "data", 8::little-32, ^pcm::binary>> = wav
+
+      assert {:error, "no_output: prompt blocked (SAFETY)"} = Gemini.outputs(%{"promptFeedback" => %{"blockReason" => "SAFETY"}})
+      assert {:error, "no_output: generation stopped (IMAGE_SAFETY)"} =
+               Gemini.outputs(%{"candidates" => [%{"content" => %{"parts" => []}, "finishReason" => "IMAGE_SAFETY"}]})
+    end
+
     test "s3 storage: private by default, key prefix always ends in a slash" do
       storage = fn extra ->
         base = %{"kind" => "s3", "endpoint" => "http://s3", "bucket" => "b", "access_key_env" => "A", "secret_key_env" => "S"}

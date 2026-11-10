@@ -92,6 +92,12 @@
         "kind": "elevenlabs",
         "base_url": "https://api.elevenlabs.io",
         "api_key_env": "ELEVENLABS_API_KEY"
+      },
+      {
+        "name": "gemini-media",
+        "kind": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com",
+        "api_key_env": "GEMINI_API_KEY"
       }
     ],
     "routes": [
@@ -147,6 +153,31 @@
           {
             "upstream": "elevenlabs",
             "model": "<elevenlabs model_id>",
+            "price": {
+              "per_input_char_usd": 0.0
+            }
+          }
+        ]
+      },
+      {
+        "model": "gemini-image",
+        "targets": [
+          {
+            "upstream": "gemini-media",
+            "model": "<gemini image model id>",
+            "price": {
+              "per_output_usd": 0.0
+            }
+          }
+        ]
+      },
+      {
+        "model": "gemini-speech",
+        "cache_ttl_s": 86400,
+        "targets": [
+          {
+            "upstream": "gemini-media",
+            "model": "<gemini tts model id>",
             "price": {
               "per_input_char_usd": 0.0
             }

@@ -5,8 +5,8 @@ Anthropic-style text APIs and wraps image, video and speech providers in one
 async job API.
 
 **Status: the text gateway and the OpenAI image, ElevenLabs speech,
-Replicate, Gemini media and xAI video adapters have been checked against the
-real APIs (November 2026).
+Replicate, Gemini (image, speech, video) and xAI video adapters have been
+checked against the real APIs (November 2026).
 The fal adapter and bucket storage have only met mocks, and nothing has run
 under production load.** See [Known gaps](#known-gaps).
 
@@ -65,7 +65,7 @@ POST /v1/jobs/{id}/cancel
 GET  /v1/files/{job}/{name}?exp=&sig=    re-hosted output (signed URL, or the owning key)
 ```
 
-- **Adapters** for six provider shapes: Replicate-style predictions, fal-style queues, OpenAI-style synchronous images, ElevenLabs-style text-to-speech, Gemini's native API for its image and speech models (raw PCM speech is stored as a playable WAV), and xAI's video API.
+- **Adapters** for seven provider shapes: Replicate-style predictions, fal-style queues, OpenAI-style synchronous images, ElevenLabs-style text-to-speech, Gemini's native API for its image and speech models (raw PCM speech is stored as a playable WAV), Gemini's Interactions API for its video-capable "omni" models, and xAI's video API.
 - **Failover across providers.** Targets are tried in order; a failed submit, a provider-side failure or a timeout moves on.
 - **Output custody.** Each output is downloaded and stored in a local directory or in your own S3-compatible bucket (SigV4). Job results carry your URLs, signed, not the provider's expiring ones.
 - **Webhooks that are signed and retried.** [Standard Webhooks](https://www.standardwebhooks.com/) headers, HMAC-SHA256, a backoff schedule, delivery state on the job. Deliveries survive a restart.
@@ -91,7 +91,7 @@ gateway on their own ports with state in a temp directory, runs its checks
 (failover, timeouts, streaming, translation, rate limits, budgets, an outage
 with a gateway restart, media jobs with failover, webhooks, cache, a
 control-plane restart mid-job, bucket storage) and exits non-zero if any fail.
-It currently runs 86 checks.
+It currently runs 88 checks.
 
 ### Run the pieces by hand
 
@@ -178,7 +178,7 @@ One JSON file, hot-reloaded by the control plane every 2 s. See
 - `keys[]`: `name`, `key` (raw; hashed on load) or `key_sha256`, `budget_usd`, `rpm`, `webhook_secret` or `webhook_secret_env`.
 - `upstreams[]`: `name`, `kind` (`openai` or `anthropic`), `base_url`, `api_key_env`, `timeout_ms`, `v1_path` (only for providers whose API is not under `/v1`).
 - `routes[]`: `model`, ordered `targets[]` of `upstream`, `model`, `price_in_per_mtok`, `price_out_per_mtok`.
-- `media`: `public_base_url`, `upstreams[]` (`kind`: `replicate`, `fal`, `openai_images`, `elevenlabs`, `gemini`, `xai_video`), `routes[]` (`targets[].price` with `per_job_usd`, `per_output_usd`, `per_second_usd`, `per_input_char_usd`; `cache_ttl_s`; `timeout_s`), `storage` (`local` or `s3`), `webhooks` (`secret`, `retry_schedule_ms`, `max_attempts`, `allow_private`).
+- `media`: `public_base_url`, `upstreams[]` (`kind`: `replicate`, `fal`, `openai_images`, `elevenlabs`, `gemini`, `gemini_interactions`, `xai_video`), `routes[]` (`targets[].price` with `per_job_usd`, `per_output_usd`, `per_second_usd`, `per_input_char_usd`; `cache_ttl_s`; `timeout_s`), `storage` (`local` or `s3`), `webhooks` (`secret`, `retry_schedule_ms`, `max_attempts`, `allow_private`).
 
 Provider secrets are never in the file: each upstream names an environment
 variable. Text upstream keys are read by the data plane, media upstream keys
@@ -273,7 +273,7 @@ on a row.
 
 Where the others are ahead today, plainly:
 
-- **Provider coverage.** They speak to dozens or hundreds of providers natively. omnigate speaks two text protocols (which reaches every OpenAI-compatible provider, Gemini included) and six media shapes. Azure, Bedrock and Vertex are not reachable.
+- **Provider coverage.** They speak to dozens or hundreds of providers natively. omnigate speaks two text protocols (which reaches every OpenAI-compatible provider, Gemini included) and seven media shapes. Azure, Bedrock and Vertex are not reachable.
 - **Production mileage.** They run real traffic. omnigate has passed a few dozen checks against two real providers and nothing more.
 - **Features not here yet:** load balancing across targets, response caching for text, guardrails, team and SSO management, observability integrations, realtime voice, an admin UI beyond a read-only dashboard.
 
@@ -304,6 +304,7 @@ Through the gateway, over TLS, with real keys:
 - Replicate (`black-forest-labs/flux-1.1-pro`): prediction created and polled to completion, the image copied off Replicate and downloaded from the gateway, webhook delivered; an unknown model and an out-of-credit model failed with Replicate's own reasons.
 - xAI Grok (`grok-4.20-0309-non-reasoning`, `grok-imagine-image`) with no provider-specific code: chat, streaming, tool calls and round trips, the Responses API, provider errors, failover, metering; the same from an Anthropic-style client, translated; xAI's own Anthropic-compatible endpoint as an `anthropic` upstream; and an image job through the `openai_images` adapter.
 - xAI video (`grok-imagine-video-1.5-lite`): a one-second clip submitted, polled to completion, copied off xAI and downloaded from the gateway as an MP4, billed per second, webhook delivered; an unknown model failed with xAI's reason.
+- Gemini video (`gemini-omni-1.2-flash`, through the Interactions API): a short clip generated in one call, stored and downloaded from the gateway as an MP4, webhook delivered.
 - Gemini media (`gemini-3.1-flash-lite-image`, `gemini-3.8-flash-lite-tts`): an image and a spoken sentence generated, stored and downloaded from the gateway; the repeat speech request served from cache; an unknown model failed with Google's reason.
 - ElevenLabs text-to-speech (`eleven_flash_v2_5`): real MP3 generated, re-hosted and downloaded; an identical request served from cache; an unknown voice failed with the provider's reason.
 
@@ -311,7 +312,7 @@ Through the gateway, over TLS, with real keys:
 
 - The fal adapter and S3 storage have only run against mocks written from public documentation; expect details to differ.
 - Replicate's `owner/name:version` form and job cancellation at a real provider.
-- Gemini's video models (Veo), which have their own job API and no adapter yet; xAI video with an input image, and its failed and expired states.
+- Gemini's Veo models, which have their own job API and no adapter yet (the test key had no access to them); background interactions on Gemini's Interactions API; xAI video with an input image, and its failed and expired states.
 - Images in translated requests, long conversations, large payloads, and the official OpenAI and Anthropic SDKs as clients (the checks used plain HTTP).
 - Sustained or concurrent load against real providers.
 - Platforms other than Windows 11 and x86-64 Linux containers.

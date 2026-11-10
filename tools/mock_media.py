@@ -631,21 +631,51 @@ class Webhooks(Base):
 # --------------------------------------------------------------------------
 
 class Gemini(Base):
-    stats = {"calls": 0}
+    stats = {"calls": 0, "interactions": 0, "polls": 0}
+    interactions: dict = {}
+
+    def interaction_body(self, iid: str, r: dict) -> dict:
+        if time.time() < r["ready_at"]:
+            return {"id": iid, "object": "interaction", "status": "in_progress", "model": r["model"]}
+        return {"id": iid, "object": "interaction", "status": "completed", "model": r["model"], "steps": [
+            {"type": "thought", "signature": "mock"},
+            {"type": "model_output", "content": [
+                {"type": "video", "mime_type": "video/mp4", "data": base64.b64encode(fake_mp4(iid)).decode()}]}]}
+
+    def interaction(self, req: dict):
+        """The Interactions API: foreground answers finished, background answers early."""
+        if not isinstance(req.get("input"), str) or not req.get("model"):
+            return self.send(400, {"error": {"code": 400, "message": "model and input are required", "status": "INVALID_ARGUMENT"}})
+        self.bump("interactions")
+        iid = "v1_" + hashlib.sha256(("%s%f" % (req["input"], time.time())).encode()).hexdigest()[:24]
+        r = {"model": req["model"], "ready_at": time.time() + (1.0 if req.get("background") else 0.0)}
+        with LOCK:
+            self.interactions[iid] = r
+        self.send(200, self.interaction_body(iid, r))
 
     def do_GET(self):
         if self.maybe_stats():
             return
-        self.send(404, {"error": {"code": 404, "message": "not found", "status": "NOT_FOUND"}})
+        path = self.path.split("?")[0]
+        with LOCK:
+            r = self.interactions.get(path[len("/v1beta/interactions/"):]) if path.startswith("/v1beta/interactions/") else None
+        if r is None or not self.headers.get("x-goog-api-key"):
+            return self.send(404, {"error": {"code": 404, "message": "not found", "status": "NOT_FOUND"}})
+        self.bump("polls")
+        self.send(200, self.interaction_body(path[len("/v1beta/interactions/"):], r))
 
     def do_POST(self):
         req = self.json_body()
         if not self.headers.get("x-goog-api-key"):
             return self.send(401, {"error": {"code": 401, "message": "API key not valid", "status": "UNAUTHENTICATED"}})
         path = self.path.split("?")[0]
+        if path == "/v1beta/interactions":
+            return self.interaction(req)
         if not (path.startswith("/v1beta/models/") and path.endswith(":generateContent")):
             return self.send(404, {"error": {"code": 404, "message": "not found", "status": "NOT_FOUND"}})
         model = path[len("/v1beta/models/"):-len(":generateContent")]
+        if "omni" in model:
+            return self.send(400, {"error": {"code": 400, "message": "This model only supports Interactions API.", "status": "INVALID_ARGUMENT"}})
         try:
             text = req["contents"][0]["parts"][0]["text"]
         except (KeyError, IndexError, TypeError):

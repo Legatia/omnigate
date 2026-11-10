@@ -74,7 +74,7 @@ defmodule OmnigateControl.Jobs.Adapters.Gemini do
       for %{"inlineData" => %{"data" => b64} = data} <- parts,
           {:ok, bytes} <- [Base.decode64(b64, ignore: :whitespace)],
           byte_size(bytes) > 0 do
-        playable(bytes, data["mimeType"] || "application/octet-stream")
+        file(bytes, data["mimeType"] || "application/octet-stream")
       end
 
     case files do
@@ -95,10 +95,13 @@ defmodule OmnigateControl.Jobs.Adapters.Gemini do
     end
   end
 
-  # "audio/L16;codec=pcm;rate=24000" is headerless 16-bit mono PCM.
-  defp playable(bytes, "audio/L16" <> params), do: {:binary, wav(bytes, sample_rate(params)), "audio/wav"}
-  defp playable(bytes, "audio/l16" <> params), do: {:binary, wav(bytes, sample_rate(params)), "audio/wav"}
-  defp playable(bytes, mime), do: {:binary, bytes, mime |> String.split(";") |> hd() |> String.trim()}
+  @doc """
+  One generated file as a job output. "audio/L16;codec=pcm;rate=24000" is
+  headerless 16-bit mono PCM and is wrapped as WAV; everything else is kept.
+  """
+  def file(bytes, "audio/L16" <> params), do: {:binary, wav(bytes, sample_rate(params)), "audio/wav"}
+  def file(bytes, "audio/l16" <> params), do: {:binary, wav(bytes, sample_rate(params)), "audio/wav"}
+  def file(bytes, mime), do: {:binary, bytes, mime |> String.split(";") |> hd() |> String.trim()}
 
   defp sample_rate(params) do
     case Regex.run(~r/rate=(\d+)/, params) do

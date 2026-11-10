@@ -184,6 +184,27 @@ defmodule OmnigateControl.MediaUnitTest do
                Gemini.outputs(%{"candidates" => [%{"content" => %{"parts" => []}, "finishReason" => "IMAGE_SAFETY"}]})
     end
 
+    test "gemini interactions adapter: request forms and answers" do
+      alias OmnigateControl.Jobs.Adapters.GeminiInteractions, as: GI
+
+      assert {:ok, %{"model" => "m", "input" => "a clip"}} = GI.request_body(%{"prompt" => "a clip"}, "m")
+      # A native body is kept, with the route's model.
+      assert {:ok, %{"model" => "m", "input" => [%{"type" => "text"}], "background" => true}} =
+               GI.request_body(%{"input" => [%{"type" => "text"}], "background" => true, "model" => "ignored"}, "m")
+      assert {:error, "invalid_input" <> _} = GI.request_body(%{}, "m")
+
+      video = %{"type" => "video", "mime_type" => "video/mp4", "data" => Base.encode64("MP4DATA")}
+      done = %{"status" => "completed", "steps" => [%{"type" => "thought", "signature" => "s"}, %{"type" => "model_output", "content" => [video]}]}
+      assert {:done, [{:binary, "MP4DATA", "video/mp4"}]} = GI.interpret(done)
+
+      assert :pending = GI.interpret(%{"id" => "x", "status" => "in_progress"})
+      assert {:error, "provider_failed: boom"} = GI.interpret(%{"status" => "failed", "error" => %{"message" => "boom"}})
+      assert {:error, "provider_cancelled"} = GI.interpret(%{"status" => "cancelled"})
+      # Finished, but only text came back.
+      assert {:error, "no_output" <> _} =
+               GI.interpret(%{"status" => "completed", "steps" => [%{"type" => "model_output", "content" => [%{"type" => "text", "text" => "no"}]}]})
+    end
+
     test "xai video adapter: poll responses" do
       alias OmnigateControl.Jobs.Adapters.XaiVideo
 

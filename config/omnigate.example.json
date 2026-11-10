@@ -104,6 +104,12 @@
         "kind": "xai_video",
         "base_url": "https://api.x.ai",
         "api_key_env": "XAI_API_KEY"
+      },
+      {
+        "name": "gemini-interactions",
+        "kind": "gemini_interactions",
+        "base_url": "https://generativelanguage.googleapis.com",
+        "api_key_env": "GEMINI_API_KEY"
       }
     ],
     "routes": [
@@ -199,6 +205,19 @@
             "model": "<xai video model id>",
             "price": {
               "per_second_usd": 0.0
+            }
+          }
+        ]
+      },
+      {
+        "model": "gemini-video",
+        "timeout_s": 600,
+        "targets": [
+          {
+            "upstream": "gemini-interactions",
+            "model": "<gemini omni model id>",
+            "price": {
+              "per_job_usd": 0.0
             }
           }
         ]

@@ -598,6 +598,7 @@ def media_config(work, storage="local"):
             up("elevenlabs", "elevenlabs", MOCK["elevenlabs"]),
             up("gemini", "gemini", MOCK["gemini"]),
             up("xai-video", "xai_video", MOCK["xai_video"]),
+            up("gemini-interactions", "gemini_interactions", MOCK["gemini"]),
         ],
         "routes": [
             {"model": "image", "targets": [
@@ -609,6 +610,8 @@ def media_config(work, storage="local"):
                 {"upstream": "openai-images", "model": "mock-image-1", "price": {"per_output_usd": 0.05}}]},
             {"model": "grok-video", "timeout_s": 60, "targets": [
                 {"upstream": "xai-video", "model": "mock-imagine-video", "price": {"per_second_usd": 0.05}}]},
+            {"model": "gemini-video", "timeout_s": 60, "targets": [
+                {"upstream": "gemini-interactions", "model": "mock-omni-flash", "price": {"per_job_usd": 0.3}}]},
             {"model": "gemini-image", "targets": [
                 {"upstream": "gemini", "model": "mock-flash-image", "price": {"per_output_usd": 0.02}}]},
             {"model": "gemini-speech", "targets": [
@@ -740,7 +743,18 @@ def media_checks(stack):
     gvf = wait_job(gvf.get("id", "missing"))
     check("... and a generation the provider reports as failed fails the job unbilled",
           gvf.get("status") == "failed" and "mock generation failed" in json.dumps(gvf.get("attempts")) and close(gvf.get("cost_usd") or 0.0, 0.0), gvf)
-    gemini_cost = 0.02 + len(phrase) * 0.00001 + 0.2
+    _, _, gomni = create_job({"model": "gemini-video", "input": {"prompt": "a short clip"}})
+    gomni = wait_job(gomni.get("id", "missing"))
+    data = call("GET", gomni["outputs"][0]["url"])[2] if gomni.get("outputs") else b""
+    check("interactions-style provider (Gemini omni shape) returns a video in one call",
+          gomni.get("status") == "succeeded" and close(gomni.get("cost_usd"), 0.3) and data[4:8] == b"ftyp"
+          and gomni["outputs"][0]["content_type"] == "video/mp4", gomni)
+    polls_before = stats("gemini")["polls"]
+    _, _, gbg = create_job({"model": "gemini-video", "input": {"input": "a longer clip", "background": True}})
+    gbg = wait_job(gbg.get("id", "missing"))
+    check("... and a background interaction is polled until it completes",
+          gbg.get("status") == "succeeded" and gbg.get("outputs") and stats("gemini")["polls"] > polls_before, (gbg, stats("gemini")))
+    gemini_cost = 0.02 + len(phrase) * 0.00001 + 0.2 + 0.3 + 0.3
 
     text = "Your order has shipped and will arrive on Thursday."
     calls_before = stats("elevenlabs")["calls"]

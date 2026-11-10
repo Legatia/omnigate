@@ -14,6 +14,8 @@ pub const Upstream = struct {
     kind: Kind,
     base_url: []const u8,
     api_key_env: []const u8,
+    /// Max time to wait for response headers; 0 uses the gateway default.
+    timeout_ms: u32 = 0,
 };
 
 pub const Target = struct {
@@ -30,6 +32,8 @@ pub const Key = struct {
     key_sha256: []const u8,
     name: []const u8,
     blocked: bool = false,
+    /// Requests per minute; 0 means unlimited.
+    rpm: u32 = 0,
 };
 
 pub const Snapshot = struct {

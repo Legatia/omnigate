@@ -1,6 +1,6 @@
 # Zig
 dataplane/.zig-cache/
-dataplane/zig-out/
+dataplane/zig-out*/
 
 # Elixir
 control/_build/
@@ -13,3 +13,7 @@ erl_crash.dump
 
 # Data plane usage spool
 *.spool
+
+# Data plane config cache
+*.cache.json
+*.cache.json.tmp

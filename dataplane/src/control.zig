@@ -67,9 +67,7 @@ fn call(app: *App, method: http.Method, path: []const u8, payload: ?[]const u8, 
 
 /// Fetch `/internal/config` and install it if its version changed.
 pub fn syncOnce(app: *App) !void {
-    const gpa = app.gpa;
-
-    var body: Io.Writer.Allocating = .init(gpa);
+    var body: Io.Writer.Allocating = .init(app.gpa);
     defer body.deinit();
 
     const status = try call(app, .GET, "/internal/config", null, &body.writer);
@@ -77,22 +75,55 @@ pub fn syncOnce(app: *App) !void {
         log.warn("config fetch returned {d}", .{@backingInt(status)});
         return error.BadStatus;
     }
+    if (try install(app, body.written())) saveCache(app, body.written());
+}
 
+/// Parse a snapshot and make it current. Returns false when it is the
+/// version already being served.
+fn install(app: *App, bytes: []const u8) !bool {
+    const gpa = app.gpa;
     const parsed = try gpa.create(config.Parsed);
     errdefer gpa.destroy(parsed);
-    parsed.* = try config.parse(gpa, body.written());
+    parsed.* = try config.parse(gpa, bytes);
 
     if (app.store.currentVersion(app.io)) |v| {
         if (std.mem.eql(u8, v, parsed.value.version)) {
             parsed.deinit();
             gpa.destroy(parsed);
-            return;
+            return false;
         }
     }
     log.info("installed config version {s} ({d} routes, {d} keys)", .{
         parsed.value.version, parsed.value.routes.len, parsed.value.keys.len,
     });
     try app.store.install(app.io, gpa, parsed);
+    return true;
+}
+
+/// Start from the last snapshot the control plane gave us, so a data plane
+/// that restarts during a control-plane outage still serves traffic. The
+/// snapshot holds key hashes and routes, never secrets.
+pub fn loadCache(app: *App) !void {
+    const path = app.config_cache_path orelse return error.CacheDisabled;
+    const bytes = try Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(64 * 1024 * 1024));
+    defer app.gpa.free(bytes);
+    _ = try install(app, bytes);
+}
+
+/// Best effort: a cache that cannot be written only costs the restart case.
+fn saveCache(app: *App, bytes: []const u8) void {
+    const path = app.config_cache_path orelse return;
+    const cwd = Io.Dir.cwd();
+    const tmp = std.fmt.allocPrint(app.gpa, "{s}.tmp", .{path}) catch return;
+    defer app.gpa.free(tmp);
+    // Write beside it, then rename, so a crash never leaves half a snapshot.
+    cwd.writeFile(app.io, .{ .sub_path = tmp, .data = bytes }) catch |err| {
+        log.warn("cannot write config cache {s}: {t}", .{ tmp, err });
+        return;
+    };
+    cwd.rename(tmp, cwd, path, app.io) catch |err| {
+        log.warn("cannot move config cache into place at {s}: {t}", .{ path, err });
+    };
 }
 
 /// Background task: poll for config changes (budgets flip keys to blocked).

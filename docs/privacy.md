@@ -1,6 +1,6 @@
 # Privacy mode
 
-Privacy mode is a setting on a gateway key. It has four parts, each of which
+Privacy mode is a setting on a gateway key. It has five parts, each of which
 can be switched on by itself:
 
 | Part | Setting | What it does |
@@ -9,6 +9,7 @@ can be switched on by itself:
 | Redaction | `redact` | E-mail addresses, phone numbers, payment card numbers, IP addresses and common secret formats in a text request are replaced by placeholders before the provider sees them, and put back in the answer. |
 | Encrypted outputs | `encrypt_to` | The outputs of the key's media jobs are encrypted to an [age](https://age-encryption.org) recipient before they are stored anywhere. |
 | Unlinking | `unlink` | The request fields that name an end user to the provider are removed. |
+| Attested providers only | `attested` | A text request only goes to a provider that has proven, and recently, what hardware and configuration it runs on. Otherwise it is refused, not sent elsewhere. It needs an [attested upstream](attestation.md) in the config. |
 
 Read [What it does not do](#what-it-does-not-do) before you rely on it. In
 one sentence: the provider still reads the prompt, with the listed kinds of
@@ -22,6 +23,7 @@ Contents:
 - [Redaction](#redaction)
 - [Encrypted outputs](#encrypted-outputs)
 - [Unlinking](#unlinking)
+- [Attested providers only](#attested-providers-only)
 - [The request header](#the-request-header)
 - [What it does not do](#what-it-does-not-do)
 - [What has been tested](#what-has-been-tested)
@@ -35,7 +37,9 @@ the dashboard:
 { "name": "support-bot", "key_sha256": "...", "privacy": true }
 ```
 
-`true` is `no_store`, `redact` (every class) and `unlink`. Part by part:
+`true` is `no_store`, `redact` (every class) and `unlink`. It is not
+`attested`: see [Attested providers only](#attested-providers-only). Part
+by part:
 
 ```json
 {
@@ -56,6 +60,7 @@ the dashboard:
 | `redact` | boolean, or a list of classes | `false` | [Redaction](#redaction). `true` is every class; a list picks from `email`, `phone`, `card`, `ip`, `secret`. |
 | `unlink` | boolean | `false` | [Unlinking](#unlinking). |
 | `encrypt_to` | string | none | An age X25519 recipient (`age1...`). [Encrypted outputs](#encrypted-outputs). |
+| `attested` | boolean | `false` | [Attested providers only](#attested-providers-only). |
 
 `false`, `null`, or leaving `privacy` out switches everything off. Anything
 else is refused: an unknown field, an unknown class, a recipient that is not
@@ -322,6 +327,42 @@ the client's address, no cookies.
 What still links requests: they all arrive from the gateway's address under
 your provider key, and the content itself.
 
+## Attested providers only
+
+`attested` restricts where a text request may go: only to a target on an
+[attested upstream](attestation.md) whose attestation is verified right
+now. A target on any other upstream is passed over, and so is an attested
+one whose evidence does not currently hold. If that leaves none, the answer
+is `503 attestation_unverified` and nothing was sent to anyone.
+
+```json
+{ "name": "legal-team", "key_sha256": "...", "privacy": { "no_store": true, "redact": true, "unlink": true, "attested": true } }
+```
+
+Things to know:
+
+- `"privacy": true` does **not** switch it on, and neither does
+  `x-omnigate-privacy: on`. Those are the three parts every gateway can do.
+  This one needs an attested upstream; had `true` included it, every key
+  that was `true` before the part existed would be refused on every model.
+  Ask for it by name.
+- A request that has it is never answered from the response cache, and its
+  answer is not stored there.
+- A media job that has it is refused (`503 attestation_unverified`): no
+  media provider is attested.
+- A response that came from an attested target says so:
+  `x-omnigate-attestation: verified; tcb=UpToDate; since=<unix seconds>`.
+- What an attestation proves, what it does not, and how old a verification
+  can be: [Attested upstreams](attestation.md#what-a-pass-means). In one
+  sentence: it is about who else can read the request on the provider's
+  side (the operator of the machine cannot), not about what the model
+  itself is shown; that is what redaction limits. The two are meant to be
+  used together.
+
+To see what a provider would be sent without sending it, add
+`x-omnigate-dry-run: privacy` to a request:
+[Seeing what a provider would be sent](attestation.md#seeing-what-a-provider-would-be-sent).
+
 ## The request header
 
 A request can switch protections on for itself, on any key:
@@ -330,6 +371,7 @@ A request can switch protections on for itself, on any key:
 x-omnigate-privacy: on                    all of no-store, redact, unlink
 x-omnigate-privacy: redact                one part
 x-omnigate-privacy: no-store, unlink      several
+x-omnigate-privacy: redact, attested      attested providers only is asked for by name
 ```
 
 It can only add to the key's setting. There is no value that switches a part
@@ -339,7 +381,8 @@ rather than ignored: a request that asked for privacy and mistyped it does
 not go out without. `redact` in the header means every class.
 
 On `POST /v1/jobs` the part that matters is `no-store` (it makes that job
-private); `redact` and `unlink` are accepted and have no effect there.
+private); `redact` and `unlink` are accepted and have no effect there, and
+`attested` gets the job refused (no media provider is attested).
 Encryption cannot be asked for per request: it needs a recipient, which is
 the key's.
 
@@ -368,11 +411,14 @@ client = anthropic.Anthropic(base_url="https://llm.example.com", api_key="<gatew
 
 ## What it does not do
 
-- **It does not hide the prompt from the provider.** The provider reads
+- **It does not hide the prompt from the model.** The model reads
   everything that was not replaced, and has to: that is what it answers.
-  There is no zero-knowledge proof, homomorphic encryption or trusted
-  enclave here, and none of them could make a hosted model answer a prompt
-  it cannot read.
+  There is no zero-knowledge proof or homomorphic encryption here, and
+  nothing could make a hosted model answer a prompt it cannot read. With
+  `attested`, the request goes only to a provider that runs the model in
+  confidential hardware and has proven it, which keeps the provider's own
+  operators out of the machine's memory; the limits of that proof are in
+  [Attested upstreams](attestation.md#what-is-not-checked).
 - **It does not control what the provider keeps.** `"store": false` covers
   OpenAI's stored completions and responses. Abuse-monitoring retention,
   logs and training policies are set by your agreement with each provider

@@ -46,13 +46,57 @@ test "upstreamPath replaces only a leading /v1" {
     try std.testing.expectEqualStrings("/healthz", try upstreamPath(arena, "/x", "/healthz"));
 }
 
+/// The control plane's verdict on a target whose upstream has to prove what
+/// it runs on (an attested upstream, see docs/attestation.md).
+pub const Attestation = struct {
+    /// The evidence was verified, and recently enough, when this snapshot
+    /// was made.
+    verified: bool = false,
+    /// How old a verification may be. The control plane re-checks well
+    /// within it; here it bounds how long a snapshot may go without being
+    /// confirmed by the control plane before `verified` stops counting.
+    max_age_s: u32 = 900,
+    /// The platform's patch status as verified ("UpToDate"), for the
+    /// response header.
+    tcb: ?[]const u8 = null,
+    /// Unix seconds since which it has been verified without a gap.
+    since: i64 = 0,
+
+    /// Does the verdict hold now? `synced_ago_ms` is how long ago the
+    /// control plane last answered a config poll (null: never, in this
+    /// process). A data plane that lost its control plane keeps serving its
+    /// last config, but not this part of it: nobody is checking any more.
+    pub fn holds(a: Attestation, synced_ago_ms: ?i64) bool {
+        if (!a.verified) return false;
+        const ago = synced_ago_ms orelse return false;
+        return ago >= 0 and ago <= @as(i64, a.max_age_s) * 1000;
+    }
+};
+
 pub const Target = struct {
     upstream: []const u8,
     model: []const u8,
     /// Share of first attempts under the `weighted` strategy. 0 means never
     /// first, but still used as a fallback. Other strategies ignore it.
     weight: u32 = 1,
+    /// Set for a target on an attested upstream; such a target is only used
+    /// while the verdict holds. Null: the upstream makes no such claim.
+    attestation: ?Attestation = null,
 };
+
+test "an attestation verdict holds only while verified and recently confirmed" {
+    const ok: Attestation = .{ .verified = true, .max_age_s = 900 };
+    try std.testing.expect(ok.holds(0));
+    try std.testing.expect(ok.holds(900_000));
+    try std.testing.expect(!ok.holds(900_001));
+    try std.testing.expect(!ok.holds(null));
+    try std.testing.expect(!ok.holds(-1));
+    const failed: Attestation = .{ .verified = false };
+    try std.testing.expect(!failed.holds(0));
+    // What an absent field means: not verified.
+    const empty: Attestation = .{};
+    try std.testing.expect(!empty.holds(0));
+}
 
 pub const Route = struct {
     model: []const u8,
@@ -75,6 +119,8 @@ pub const Privacy = struct {
     redact: []const []const u8 = &.{},
     /// Remove the fields that name an end user.
     unlink: bool = false,
+    /// Only send to targets whose attestation holds (see `Attestation`).
+    attested: bool = false,
 };
 
 pub const Key = struct {
@@ -163,6 +209,24 @@ test "snapshots parse with and without the newer optional fields" {
     try std.testing.expectEqual(@as(?Privacy, null), private.value.keys[1].privacy);
     try std.testing.expect(!private.value.keys[2].privacy.?.no_store and private.value.keys[2].privacy.?.redact.len == 0);
     try std.testing.expectEqual(@as(?Privacy, null), old.value.keys[0].privacy);
+    try std.testing.expect(!p.attested);
+    try std.testing.expectEqual(@as(?Attestation, null), old.value.routes[0].targets[0].attestation);
+
+    var attested = try parse(gpa,
+        \\{"version":"v5","upstreams":[],"keys":[{"key_sha256":"aa","name":"p","privacy":{"attested":true}}],
+        \\ "routes":[{"model":"m","targets":[{"upstream":"u","model":"a","attestation":{"verified":true,"max_age_s":600,"tcb":"UpToDate","since":1762850000,"later":1}},
+        \\   {"upstream":"u","model":"b","attestation":{"verified":false,"max_age_s":600,"tcb":null,"since":0}},
+        \\   {"upstream":"u","model":"c","attestation":{}},{"upstream":"v","model":"d","attestation":null}]}]}
+    );
+    defer attested.deinit();
+    try std.testing.expect(attested.value.keys[0].privacy.?.attested);
+    const targets = attested.value.routes[0].targets;
+    try std.testing.expect(targets[0].attestation.?.holds(1000));
+    try std.testing.expectEqualStrings("UpToDate", targets[0].attestation.?.tcb.?);
+    try std.testing.expectEqual(@as(i64, 1762850000), targets[0].attestation.?.since);
+    try std.testing.expect(!targets[1].attestation.?.holds(1000));
+    try std.testing.expect(!targets[2].attestation.?.holds(1000));
+    try std.testing.expectEqual(@as(?Attestation, null), targets[3].attestation);
 }
 
 pub const Snapshot = struct {

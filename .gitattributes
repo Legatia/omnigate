@@ -1,2 +1,5 @@
 * text=auto eol=lf
 *.png binary
+# DER-encoded test fixtures (certificates, revocation lists): never line-ending converted.
+*.der binary
+*.cer binary

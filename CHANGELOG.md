@@ -17,7 +17,63 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Attested upstreams** ([docs/attestation.md](docs/attestation.md)). A
+  text upstream can carry `"attestation": {"provider": "near", ...}`: the
+  control plane then verifies NEAR AI Cloud's TEE attestation for every
+  model routed there and keeps it verified, and the data plane only uses a
+  target while that holds. The verification is the gateway's own code on
+  OTP's `:crypto`: the Intel TDX quote, its certificate chain to Intel's
+  pinned root, revocation lists, Intel's signed patch-level lists, the
+  quoting enclave's identity, debug mode, the nonce and signing-key
+  binding, the measured configuration, the event log, NVIDIA's verdict on
+  GPU evidence, and optional allowlists of measurements. A check that fails
+  on the evidence withdraws the target at once; one that cannot fetch its
+  inputs leaves a recent pass standing until `max_age_s`. The data plane
+  also stops counting a verdict when its control plane has been silent for
+  longer than `max_age_s`. Unverified targets are passed over; with none
+  left the answer is `503 attestation_unverified`.
+- **Privacy mode, fifth part: `attested`.** On a key (`"privacy":
+  {"attested": true}`) or per request (`x-omnigate-privacy: attested`): the
+  request goes only to a target whose attestation is verified right now,
+  and is refused otherwise. Not part of `"privacy": true` or of the
+  header's `on`. Responses from an attested target carry
+  `x-omnigate-attestation: verified; tcb=...; since=...`.
+- **A privacy dry run.** `x-omnigate-dry-run: privacy` on a text request
+  answers with the request as privacy mode left it and sends nothing.
+- **The Private chat page** (`/private-chat` on the control plane): the
+  conversation, what the provider is sent for it, and the attestation
+  checklist with its raw values and a "verify again now" button. It sends
+  through the data plane with a managed key of its own (`private-chat`) and
+  keeps nothing. `OMNIGATE_GATEWAY_URL` tells the control plane where the
+  data plane is.
+- `GET /admin/attestations`, `POST /admin/attestations/verify`, and the
+  metrics `omnigate_attestation_verified`, `omnigate_attestation_age_seconds`
+  and `omnigate_attestation_checks_total`.
+- `config/omnigate.near.json`, `tools/near_live.py` (the integration
+  against the real service; `--serve` starts the gateway with that config)
+  and `OmnigateControl.Attestation.Live` (the check alone, from the command
+  line).
+
+### Changed
+
+- `GET /admin/keys` and the config snapshot: a key's `privacy` object has a
+  fifth field, `attested`. A target in the snapshot may carry
+  `attestation`.
+- The error text for a malformed `x-omnigate-privacy` header names
+  `attested` among the parts.
+
+### Verified
+
+- Against the real NEAR AI Cloud, without an API key, on 11 November 2026:
+  `tools/near_live.py`, 11 checks (see
+  [docs/attestation.md](docs/attestation.md#what-has-been-tested)). No
+  completion has been run through an attested target: no key was at hand.
+- Not implemented, and said so in the documentation: image provenance,
+  binding the data plane's TLS connections to the report, and checking
+  NEAR's per-response signatures (the verification function exists and is
+  tested with keys made in the test only).
 
 ## [0.1.0-rc.1] - 2026-11-11
 

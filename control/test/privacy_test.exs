@@ -286,12 +286,15 @@ defmodule OmnigateControl.PrivacyTest do
 
   describe "the setting" do
     test "true is no_store, redact and unlink; an object picks parts; nothing on is nil" do
-      assert Privacy.normalize(true) == {:ok, %{no_store: true, redact: Privacy.classes(), unlink: true, encrypt_to: nil}}
+      assert Privacy.normalize(true) == {:ok, %{no_store: true, redact: Privacy.classes(), unlink: true, encrypt_to: nil, attested: false}}
       assert Privacy.normalize(nil) == {:ok, nil}
       assert Privacy.normalize(false) == {:ok, nil}
       assert Privacy.normalize(%{}) == {:ok, nil}
       assert Privacy.normalize(%{"no_store" => false, "redact" => [], "unlink" => false, "encrypt_to" => nil}) == {:ok, nil}
-      assert Privacy.normalize(%{"redact" => ["secret", "email"]}) == {:ok, %{no_store: false, redact: ["email", "secret"], unlink: false, encrypt_to: nil}}
+
+      assert Privacy.normalize(%{"redact" => ["secret", "email"]}) ==
+               {:ok, %{no_store: false, redact: ["email", "secret"], unlink: false, encrypt_to: nil, attested: false}}
+
       assert {:ok, %{redact: all, no_store: true}} = Privacy.normalize(%{"redact" => true, "no_store" => true})
       assert all == ~w(email phone card ip secret)
     end
@@ -318,7 +321,7 @@ defmodule OmnigateControl.PrivacyTest do
 
     test "a recipient must be a real age recipient" do
       {recipient, _public, _secret} = AgeReader.keypair()
-      assert {:ok, %{encrypt_to: ^recipient, no_store: false}} = Privacy.normalize(%{"encrypt_to" => recipient})
+      assert {:ok, %{encrypt_to: ^recipient, no_store: false}} = Privacy.normalize(%{"encrypt_to" => recipient, "attested" => false})
       # Upper case is the same address.
       assert {:ok, %{encrypt_to: ^recipient}} = Privacy.normalize(%{"encrypt_to" => String.upcase(recipient)})
 
@@ -383,12 +386,12 @@ defmodule OmnigateControl.PrivacyTest do
 
       created = admin_json(:post, "/admin/keys", %{"name" => name, "privacy" => true})
       assert created.status == 201
-      assert json(created)["privacy"] == %{"no_store" => true, "redact" => Privacy.classes(), "unlink" => true, "encrypt_to" => nil}
+      assert json(created)["privacy"] == %{"no_store" => true, "redact" => Privacy.classes(), "unlink" => true, "encrypt_to" => nil, "attested" => false}
       assert json(created)["privacy_summary"] == "no-store, redact, unlink"
 
       changed = admin_json(:patch, "/admin/keys/#{name}", %{"privacy" => %{"redact" => ["secret"], "encrypt_to" => recipient}})
       assert changed.status == 200
-      assert json(changed)["privacy"] == %{"no_store" => false, "redact" => ["secret"], "unlink" => false, "encrypt_to" => recipient}
+      assert json(changed)["privacy"] == %{"no_store" => false, "redact" => ["secret"], "unlink" => false, "encrypt_to" => recipient, "attested" => false}
 
       # What is on disk reads back as the same setting.
       stored = Application.fetch_env!(:omnigate_control, :keys_path) |> File.read!() |> JSON.decode!() |> Map.fetch!("keys") |> Enum.find(&(&1["name"] == name))
@@ -396,7 +399,7 @@ defmodule OmnigateControl.PrivacyTest do
 
       # The snapshot: what a data plane applies, and nothing else.
       in_snapshot = Router.snapshot().keys |> Enum.find(&(&1.name == name))
-      assert in_snapshot.privacy == %{no_store: false, redact: ["secret"], unlink: false}
+      assert in_snapshot.privacy == %{no_store: false, redact: ["secret"], unlink: false, attested: false}
       refute JSON.encode!(Router.snapshot()) =~ recipient
       assert Enum.all?(Router.snapshot().keys, &Map.has_key?(&1, :privacy))
 

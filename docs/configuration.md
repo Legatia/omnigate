@@ -85,7 +85,7 @@ listed before the managed keys created through it
 | `disabled` | boolean | `false` | `true` switches the key off without removing it: the gateway answers it with 401, and its usage stays in the ledger. |
 | `webhook_secret` | string | none | Signing secret for this key's job webhooks. |
 | `webhook_secret_env` | string | none | Name of an environment variable (read by the control plane) holding that secret. Used when `webhook_secret` is absent. |
-| `privacy` | `true`, or an object | absent (off) | Privacy mode for every request of the key: `true`, or `{"no_store", "redact", "unlink", "encrypt_to"}` part by part. What each part does, and what none of them does, is in [Privacy mode](privacy.md). Anything it does not know (a field, a class of `redact`, a recipient that is not a valid `age1...` address) is rejected when the file is loaded. |
+| `privacy` | `true`, or an object | absent (off) | Privacy mode for every request of the key: `true`, or `{"no_store", "redact", "unlink", "encrypt_to", "attested"}` part by part. What each part does, and what none of them does, is in [Privacy mode](privacy.md). Anything it does not know (a field, a class of `redact`, a recipient that is not a valid `age1...` address) is rejected when the file is loaded. |
 
 `max_concurrent` is new with the close-out commit (the one after
 55a294d). Until then every key had the data plane's
@@ -138,6 +138,8 @@ Example:
 | `timeout_ms` | whole number, 0 to 3,600,000 | `0` | Maximum wait for the provider's response headers. `0` uses the data plane's `OMNIGATE_UPSTREAM_TIMEOUT_MS`. |
 | `v1_path` | string | absent (`/v1`) | For providers that do not serve the API under `/v1`: the leading `/v1` of the request path is replaced by this value. Gemini's OpenAI-compatible endpoint uses `/v1beta/openai`. An empty string puts the API at the root. |
 | `privacy_store_flag` | boolean | absent (only when the host is `api.openai.com`) | Whether a request of a key with [privacy mode](privacy.md#no-retention)'s `no_store` is sent `"store": false` on chat completions and the Responses API. Set `true` for a proxy in front of OpenAI or a compatible server known to take the field; `false` to switch it off for an OpenAI upstream. Only read for `openai` upstreams. Anything but `true` or `false` is rejected when the file is loaded. |
+
+| `attestation` | object | absent | The provider proves what hardware and configuration it runs on, and its targets are only used while that is verified: `{"provider": "near", "accepted_tcb": [...], "gpu": "if_present", "max_age_s": 900, "measurements": {...}}`. Every field, what is verified and what is not: [Attested upstreams](attestation.md#switching-it-on). A setting that is not understood is rejected when the file is loaded. |
 
 How the key is sent: `openai` upstreams get `Authorization: Bearer <key>`;
 `anthropic` upstreams get `x-api-key: <key>` and an `anthropic-version`
@@ -627,6 +629,7 @@ quietly becomes a default.
 | `OMNIGATE_AUDIT_LOG` | `data/audit.jsonl` | The admin audit log. Rotated files (`.1` to `.3`) are kept next to it. See [Admin](admin.md#the-audit-log). |
 | `OMNIGATE_AUDIT_MAX_MB` | `50` | Size, in megabytes (fractions allowed), at which the audit log is rotated. `0` turns rotation off. A negative value, or one that is not a number (`50MB`, say), stops the start with a message that names the variable; earlier commits replaced it by the default without a word. |
 | `OMNIGATE_MEDIA_DIR` | `data/media` | Where local output storage keeps files, unless the config names a `dir`. |
+| `OMNIGATE_GATEWAY_URL` | the config's `media.public_base_url` (`http://127.0.0.1:8080`) | Where the control plane itself reaches the data plane's public port. Only the dashboard's [Private chat page](attestation.md#the-private-chat-page) uses it, to send the messages typed there through the gateway like any client. `compose.yaml` sets it to `http://dataplane:8080`. |
 | `OMNIGATE_SIGNING_SECRET` | derived from `OMNIGATE_INTERNAL_TOKEN` | Signs the download URLs of locally stored files. |
 | `OMNIGATE_WEBHOOK_SECRET` | none | Last-resort webhook signing secret. |
 | the names in `media.upstreams[].api_key_env` | none | Provider keys for media upstreams. |
@@ -699,13 +702,16 @@ control plane (`GET /internal/config`) that contains:
   data plane treats it as unknown), and its `max_concurrent` (`0` when the
   key has none of its own);
 - for each of those keys, the parts of its [privacy mode](privacy.md) that a
-  data plane applies (`no_store`, the classes to `redact`, `unlink`), or
-  `null`; never the `encrypt_to` recipient, which only the control plane
-  uses;
+  data plane applies (`no_store`, the classes to `redact`, `unlink`,
+  `attested`), or `null`; never the `encrypt_to` recipient, which only the
+  control plane uses;
 - the text upstreams as configured (the `api_key_env` name, never a secret;
-  `privacy_store_flag` when set);
+  `privacy_store_flag` when set), without their `attestation` setting, which
+  only the control plane uses;
 - for each text route: `model`, `strategy`, `cache_ttl_s`, and each target's
-  `upstream`, `model` and `weight`;
+  `upstream`, `model` and `weight`; for a target on an
+  [attested upstream](attestation.md#what-the-data-plane-does-with-the-verdict),
+  also the verdict (`attestation`: `verified`, `max_age_s`, `tcb`, `since`);
 - the names of the media routes, which the data plane only uses to list
   them in `GET /v1/models`.
 

@@ -1417,9 +1417,14 @@ pub const Request = struct {
     no_store: bool = false,
     redact: bool = false,
     unlink: bool = false,
+    /// Only to a provider whose attestation holds (proxy.zig).
+    attested: bool = false,
 
-    /// `on` (or `true`, `1`): everything. Otherwise a comma-separated list
-    /// of `no-store`, `redact`, `unlink`. Null for anything else.
+    /// `on` (or `true`, `1`): the three parts that need nothing else.
+    /// Otherwise a comma-separated list of `no-store`, `redact`, `unlink`,
+    /// `attested`. Null for anything else. (`on` does not include
+    /// `attested`: it would refuse every request of a gateway that has no
+    /// attested upstream.)
     pub fn parse(value: []const u8) ?Request {
         const v = std.mem.trim(u8, value, " \t");
         if (v.len == 0 or v.len > 64) return null;
@@ -1435,6 +1440,8 @@ pub const Request = struct {
                 out.redact = true;
             } else if (eq(p, "unlink")) {
                 out.unlink = true;
+            } else if (eq(p, "attested")) {
+                out.attested = true;
             } else return null;
         }
         return out;
@@ -1754,8 +1761,14 @@ test "the header only ever asks for more" {
     try testing.expectEqual(Request{ .no_store = true, .redact = true, .unlink = true }, Request.parse(" TRUE ").?);
     try testing.expectEqual(Request{ .redact = true }, Request.parse("redact").?);
     try testing.expectEqual(Request{ .no_store = true, .unlink = true }, Request.parse("no-store, unlink").?);
+    // "attested" is asked for by name; "on" is the three parts that every
+    // gateway can do, and must not refuse the requests of one without an
+    // attested upstream.
+    try testing.expectEqual(Request{ .attested = true }, Request.parse("Attested").?);
+    try testing.expectEqual(Request{ .redact = true, .attested = true }, Request.parse("redact , attested").?);
+    try testing.expect(!Request.parse("on").?.attested);
     const long: [65]u8 = @splat('x');
-    for ([_][]const u8{ "", "off", "false", "0", "none", "redact,off", "redact;unlink", &long }) |bad| {
+    for ([_][]const u8{ "", "off", "false", "0", "none", "redact,off", "redact;unlink", "attest", "attested=false", "on,attested", &long }) |bad| {
         try testing.expectEqual(@as(?Request, null), Request.parse(bad));
     }
 }

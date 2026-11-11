@@ -42,6 +42,7 @@ defmodule OmnigateControl.Application do
     OmnigateControl.RateLimit.setup()
     OmnigateControl.Counters.setup()
     OmnigateControl.Audit.setup()
+    OmnigateControl.Attestation.Manager.setup()
     {:ok, ip} = bind_address()
 
     # Everything that holds state: the logs, the keys, the ledger, the jobs.
@@ -64,6 +65,9 @@ defmodule OmnigateControl.Application do
 
     children = [
       {OmnigateControl.ConfigStore, path: config},
+      # Checks of attested upstreams run as tasks; the manager decides when.
+      {Task.Supervisor, name: OmnigateControl.Attestation.TaskSup},
+      OmnigateControl.Attestation.Manager,
       {OmnigateControl.Guard, name: OmnigateControl.StateGuard, supervisor_name: OmnigateControl.Supervisor, children: state, strategy: :one_for_one},
       # HTTP/1.1 only: nothing here needs HTTP/2 or WebSockets, and every
       # protocol left on is one more parser in front of the authentication.

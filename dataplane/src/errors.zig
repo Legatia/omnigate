@@ -161,6 +161,8 @@ test "every reason the gateway uses has the right category in both protocols" {
         .{ "all_upstreams_failed", 502, "server_error", "api_error" },
         .{ "gateway_not_ready", 503, "server_error", "api_error" },
         .{ "control_plane_unavailable", 503, "server_error", "api_error" },
+        // No target with a verified attestation (proxy.zig): "not now".
+        .{ "attestation_unverified", 503, "server_error", "api_error" },
         .{ "overloaded", 503, "server_error", "overloaded_error" },
     };
     for (cases) |c| {

@@ -163,7 +163,33 @@ class Base(BaseHTTPRequestHandler):
         if path == "/__watch":
             with LAST_LOCK:
                 return self.send_json(200, {"requests": WATCH["requests"], "seen": dict(WATCH["seen"])})
+        if path == "/v1/attestation/report":
+            return self.attestation_report(urllib.parse.parse_qs(query))
         self.send_json(404, {"error": {"message": "unknown path"}})
+
+    def attestation_report(self, query):
+        """What an attested upstream is asked before any request goes to it
+        (docs/attestation.md). A mock cannot produce evidence that verifies:
+        that takes a quote signed by a real Intel processor. So every answer
+        here is one the gateway must refuse, each in its own way."""
+        model = query.get("model", [""])[0]
+        nonce = query.get("nonce", [""])[0]
+        report = {"signing_algo": "ed25519", "signing_address": "11" * 32, "request_nonce": nonce,
+                  "event_log": "[]", "info": {"tcb_info": {"app_compose": "{}"}}}
+        if model == "attest-garbage-1":
+            # Looks like a report, echoes the nonce; the quote is not a quote.
+            report["intel_quote"] = "00ff" * 40
+            return self.send_json(200, {"gateway_attestation": report, "model_attestations": [dict(report, model_name=model)]})
+        if model == "attest-stale-1":
+            # Somebody else's report: it answers another nonce.
+            report["intel_quote"] = "00ff" * 40
+            report["request_nonce"] = "ab" * 32
+            return self.send_json(200, {"gateway_attestation": report, "model_attestations": [dict(report, model_name=model)]})
+        if model == "attest-html-1":
+            return self.send_bytes(200, b"<html><body>welcome</body></html>", "text/html")
+        # Any other model: this provider cannot attest it (what NEAR answers
+        # for a model it only relays to someone else).
+        return self.send_json(503, {"error": {"message": "No provider found that supports attestation reports", "type": "service_unavailable"}})
 
     def send_json(self, status, body, headers=None):
         data = json.dumps(body).encode()

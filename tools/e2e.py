@@ -52,6 +52,13 @@ KEY_SEALED = "og-e2e-sealed"
 # No privacy mode: the comparison in the privacy checks. (Not the main key,
 # whose calls are reconciled against the ledger one by one.)
 KEY_PLAIN = "og-e2e-plain"
+# Privacy mode with `attested` only: its requests may go to attested providers alone.
+KEY_ATTESTED = "og-e2e-attested"
+# A second data plane, in front of a control plane played by this script
+# (see `attestation_checks`).
+FAKE_CONTROL_PORT = 14001
+GATEWAY2_PORT = 18081
+GATEWAY2 = f"http://127.0.0.1:{GATEWAY2_PORT}"
 WEBHOOK_SECRET = "e2e-webhook-secret"
 
 # A string that only ever goes into private requests. After the run, no file
@@ -277,6 +284,7 @@ def text_config():
             {"name": "redact-only", "key": KEY_REDACT, "privacy": {"redact": ["email", "secret"]}},
             {"name": "sealed", "key": KEY_SEALED, "privacy": {"encrypt_to": AGE_RECIPIENT}},
             {"name": "plain", "key": KEY_PLAIN, "webhook_secret": WEBHOOK_SECRET},
+            {"name": "attested", "key": KEY_ATTESTED, "privacy": {"attested": True}},
         ],
         "upstreams": [
             {"name": "mock-flaky", "kind": "openai", "base_url": "http://127.0.0.1:9001", "api_key_env": "MOCK_API_KEY"},
@@ -290,6 +298,11 @@ def text_config():
             # The working mock again, declared to take OpenAI's `"store": false`.
             {"name": "mock-store", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY",
              "privacy_store_flag": True},
+            # The working mock once more, as a provider that has to prove what
+            # it runs on. Its evidence never verifies (it cannot: see
+            # `attestation_report` in tools/mock_upstream.py).
+            {"name": "mock-attested", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY",
+             "attestation": {"provider": "near", "gpu": "skip", "max_age_s": 60}},
         ],
         "routes": [
             {"model": "chat", "targets": [dict(upstream="mock-flaky", model="flaky-1", **price),
@@ -315,6 +328,12 @@ def text_config():
             {"model": "echo-store", "targets": [dict(upstream="mock-store", model="echo-1", **price)]},
             {"model": "echo-cached", "cache_ttl_s": 60, "targets": [dict(upstream="mock-ok", model="echo-1", **price)]},
             {"model": "echo-err", "targets": [dict(upstream="mock-ok", model="echo-err-1", **price)]},
+            # Attested upstreams whose evidence does not hold, alone and in front of an ordinary target.
+            {"model": "tee-only", "targets": [dict(upstream="mock-attested", model="attest-garbage-1", **price),
+                                              dict(upstream="mock-attested", model="attest-html-1", **price),
+                                              dict(upstream="mock-attested", model="attest-none-1", **price)]},
+            {"model": "tee-then-plain", "targets": [dict(upstream="mock-attested", model="attest-stale-1", **price),
+                                                    dict(upstream="mock-ok", model="ok-1", **price)]},
         ],
     }
 
@@ -1007,6 +1026,224 @@ def privacy_media_checks():
         print("  note  pyrage is not installed: the decryption check was skipped (pip install pyrage)", flush=True)
 
 
+class FakeControl:
+    """A control plane played by this script, for one question the real one
+    cannot be asked in a test: what does the data plane do with a target
+    whose attestation IS verified? (The real control plane only says so after
+    verifying a quote signed by an Intel processor, and nothing here can make
+    one.) It serves a snapshot and takes usage reports; `answering = False`
+    makes it refuse everything, like a control plane that is down."""
+
+    def __init__(self, snapshot):
+        import http.server
+        import threading
+        fake = self
+        self.snapshot = snapshot
+        self.answering = True
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def answer(self):
+                length = int(self.headers.get("content-length") or 0)
+                if length:
+                    self.rfile.read(length)
+                if self.headers.get("x-omnigate-internal") != TOKEN or not fake.answering:
+                    status, body = 503, b'{"error":{"message":"not now"}}'
+                elif self.path == "/internal/config":
+                    status, body = 200, json.dumps(fake.snapshot).encode()
+                else:
+                    status, body = 200, b'{"accepted":0,"duplicates":0}'
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.send_header("connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+
+            do_GET = do_POST = answer
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", FAKE_CONTROL_PORT), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def attestation_checks(stack):
+    error_code = lambda body: (body.get("error") or {}).get("code") or (body.get("error") or {}).get("type")
+    ask = lambda model, key, headers=None, base=GATEWAY: jcall("POST", base + "/v1/chat/completions", key=key, headers=headers,
+                                                             body={"model": model, "messages": [{"role": "user", "content": "hi"}]})
+
+    section("attested upstreams: evidence that does not hold is refused")
+    def settled():
+        _, _, listed = admin("GET", "/admin/attestations")
+        rows = {(a["upstream"], a["model"]): a for a in listed.get("attestations", [])}
+        return rows if len(rows) == 4 and all(a["state"] == "failed" for a in rows.values()) else None
+    rows = wait_until(settled, 20) or {}
+    reason = lambda model: (rows.get(("mock-attested", model)) or {}).get("reason") or ""
+    code = lambda model: (rows.get(("mock-attested", model)) or {}).get("reason_code")
+    check("every routed model of the attested upstream was checked and none passed",
+          len(rows) == 4 and not any(a["verified"] for a in rows.values()), rows)
+    check("a report whose quote is not an Intel quote: refused as such", code("attest-garbage-1") in ("bad_quote", "unsupported_quote"), (code("attest-garbage-1"), reason("attest-garbage-1")))
+    check("a report that answers another nonce: refused as not fresh, before anything is fetched for it",
+          code("attest-stale-1") == "nonce_mismatch" and "nonce" in reason("attest-stale-1"), (code("attest-stale-1"), reason("attest-stale-1")))
+    check("a web page instead of a report: refused", code("attest-html-1") == "bad_report", (code("attest-html-1"), reason("attest-html-1")))
+    check("a model the provider cannot attest: refused, with the provider's words",
+          code("attest-none-1") == "report_unavailable" and "HTTP 503" in reason("attest-none-1"), (code("attest-none-1"), reason("attest-none-1")))
+
+    status, _, body = ask("tee-only", KEY_PLAIN)
+    check("a model whose targets are all unverified answers 503 attestation_unverified", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+    check("nothing of that request reached the provider",
+          all(jcall("GET", f"http://127.0.0.1:9002/__last?model={m}")[0] == 404 for m in ("attest-garbage-1", "attest-html-1", "attest-none-1")))
+    status, headers, body = ask("tee-then-plain", KEY_PLAIN)
+    check("an unverified target is passed over like one that is down: the next target answers",
+          status == 200 and headers.get("x-omnigate-upstream") == "mock-ok" and "x-omnigate-attestation" not in headers, (status, headers.get("x-omnigate-upstream"), body))
+
+    section("privacy mode: attested providers only")
+    status, _, body = ask("tee-then-plain", KEY_ATTESTED)
+    check("a key that asks for attested providers is not failed over to an ordinary one", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+    status, _, body = ask("direct", KEY_ATTESTED)
+    check("... and is refused on a model that has none", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+    before = jcall("GET", "http://127.0.0.1:9002/__watch")[2].get("requests")
+    status, _, body = ask("direct", KEY_PLAIN, headers={"x-omnigate-privacy": "attested"})
+    check("the request header asks for the same", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+    status, _, body = ask("direct", KEY_PLAIN, headers={"x-omnigate-privacy": "redact, attested, no-store"})
+    check("... also next to the other parts", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+    check("none of those requests was sent anywhere", jcall("GET", "http://127.0.0.1:9002/__watch")[2].get("requests") == before)
+    status, headers, _ = ask("direct", KEY_PLAIN, headers={"x-omnigate-privacy": "on"})
+    check("\"on\" does not include it: a gateway without attested upstreams keeps working", status == 200 and headers.get("x-omnigate-privacy") == "no-store, redact, unlink", (status, headers.get("x-omnigate-privacy")))
+    status, _, _ = ask("direct", KEY_PLAIN, headers={"x-omnigate-privacy": "attest"})
+    check("a misspelt part is still a 400", status == 400, status)
+    status, _, body = jcall("POST", GATEWAY + "/v1/jobs", key=KEY_ATTESTED, body={"model": "image", "input": {"prompt": "x"}})
+    check("a media job is refused: no media provider is attested", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+    status, _, body = jcall("POST", GATEWAY + "/v1/jobs", key=KEY_PLAIN, headers={"x-omnigate-privacy": "attested"}, body={"model": "image", "input": {"prompt": "x"}})
+    check("... also when only the header asks", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+
+    status, _, verdict = admin("POST", "/admin/attestations/verify", {"upstream": "mock-attested", "model": "attest-stale-1"})
+    check("\"verify now\" runs a fresh check and reports the verdict", status == 200 and verdict.get("state") == "failed" and verdict.get("checks", 0) >= 2, (status, verdict))
+    status, _, _ = admin("POST", "/admin/attestations/verify", {"upstream": "mock-ok", "model": "ok-1"})
+    check("... and knows no attestation for an ordinary upstream", status == 404, status)
+    _, _, metrics = call("GET", CONTROL + "/metrics", headers={"authorization": "Bearer " + ADMIN_TOKEN})
+    metrics = metrics.decode()
+    check("metrics: the gauge is 0 for each unverified model, and failed checks are counted",
+          'omnigate_attestation_verified{upstream="mock-attested",model="attest-stale-1"} 0' in metrics
+          and 'omnigate_attestation_checks_total{outcome="failed"}' in metrics, [l for l in metrics.splitlines() if "attestation" in l and not l.startswith("#")])
+    def refusals():
+        _, _, overview = admin("GET", "/admin/overview")
+        return next((r for r in overview.get("rejected", []) if r["key"] == "attested" and r["reason"] == "attestation_unverified"), None)
+    check("the refusals are counted per key", bool(wait_until(lambda: (refusals() or {}).get("count", 0) >= 3, 10)), refusals())
+
+    section("privacy dry run and the Private chat page")
+    user = [{"role": "user", "content": PRIVATE_TEXT}]
+    before = jcall("GET", "http://127.0.0.1:9002/__watch")[2].get("requests")
+    status, headers, dry = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PLAIN, headers={"x-omnigate-privacy": "redact, unlink", "x-omnigate-dry-run": "privacy"},
+                                 body={"model": "echo", "user": "customer-42", "messages": user})
+    would = dry.get("body") or ""
+    check("a dry run answers with the request as privacy mode left it",
+          status == 200 and dry.get("object") == "omnigate.privacy_dry_run" and dry.get("sent_upstream") is False and headers.get("x-omnigate-dry-run") == "privacy"
+          and all(p in would for p in PLACEHOLDERS) and not any(v in would for v in PII.values()) and "customer-42" not in would and CANARY in would, (status, dry))
+    check("... says how many values of each class it replaced",
+          dry.get("replaced") == {"email": 1, "phone": 1, "card": 1, "ip": 1, "secret": 1} and dry.get("protections") == "redact, unlink", dry.get("replaced"))
+    check("... and sends nothing to any provider", jcall("GET", "http://127.0.0.1:9002/__watch")[2].get("requests") == before)
+    status, _, plain = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PLAIN, headers={"x-omnigate-dry-run": "privacy"}, body={"model": "echo", "messages": user})
+    check("without privacy mode the dry run shows the request unchanged", status == 200 and PII["email"] in (plain.get("body") or "") and plain.get("protections") == "", (status, plain))
+    status, _, _ = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PLAIN, headers={"x-omnigate-dry-run": "yes"}, body={"model": "echo", "messages": user})
+    check("a dry-run value that is not understood is a 400, never a real request",
+          status == 400 and jcall("GET", "http://127.0.0.1:9002/__watch")[2].get("requests") == before, status)
+    status, _, _ = jcall("POST", GATEWAY + "/v1/chat/completions", key="og-not-a-key", headers={"x-omnigate-dry-run": "privacy"}, body={"model": "echo", "messages": user})
+    check("a dry run needs a gateway key like any request", status == 401, status)
+
+    status, headers, page = control_raw("GET", "/private-chat", {"authorization": "Bearer " + ADMIN_TOKEN})
+    check("the Private chat page is served to a signed-in operator, with nothing loaded from elsewhere",
+          status == 200 and "Private chat" in page and "What left this machine" in page and "default-src 'none'" in headers.get("content-security-policy", "")
+          and "http://" not in page.replace("http://www.w3.org", "") and "https://" not in page, (status, headers.get("content-security-policy")))
+    status, headers, _ = control_raw("GET", "/private-chat")
+    check("... and sends anyone else to the login form", status == 302 and headers.get("location") == "/login", (status, headers.get("location")))
+    status, _, state = admin("GET", "/admin/private-chat/state")
+    by_model = {m["model"]: m for m in state.get("models", [])}
+    check("its state lists the text models and which targets are attested",
+          status == 200 and state.get("gateway_url") == GATEWAY and by_model.get("echo", {}).get("targets", [{}])[0].get("attested") is False
+          and (by_model.get("tee-then-plain", {}).get("targets") or [{}])[0].get("attested") is True
+          and ((by_model.get("tee-then-plain", {}).get("targets") or [{}])[0].get("attestation") or {}).get("verified") is False, (status, list(by_model)))
+    status, _, turn = admin("POST", "/admin/private-chat/send", {"model": "echo", "messages": user, "redact": True, "attested": False})
+    shown = (turn.get("dry_run") or {}).get("body") or ""
+    answer = turn.get("response") or {}
+    check("a message sent from the page: the answer has the real values, the panel shows the placeholders the provider got",
+          status == 200 and answer.get("ok") is True and answer.get("text") == "You said: " + PRIVATE_TEXT and all(p in shown for p in PLACEHOLDERS)
+          and not any(v in shown for v in PII.values()) and hidden(seen_by(9002)), (status, turn))
+    check("... sent with the page's own managed key, as no-store",
+          answer.get("privacy") == "no-store, redact, unlink" and answer.get("upstream") == "mock-ok" and any(k.get("name") == "private-chat" and k.get("source") == "managed" for k in admin("GET", "/admin/keys")[2].get("keys", [])),
+          (answer.get("privacy"), answer.get("upstream")))
+    status, _, turn = admin("POST", "/admin/private-chat/send", {"model": "echo", "messages": user, "redact": True, "attested": True})
+    answer = turn.get("response") or {}
+    check("with \"attested providers only\" the same message is refused, unsent, and the page is told why",
+          status == 200 and answer.get("ok") is False and answer.get("status") == 503 and (answer.get("error") or {}).get("code") == "attestation_unverified"
+          and answer.get("upstream") is None and (turn.get("dry_run") or {}).get("ok") is True, (status, turn))
+    codes = [admin("POST", "/admin/private-chat/send", body)[0] for body in (
+        {"model": "no-such-model", "messages": user}, {"model": "echo", "messages": []}, {"model": "echo", "messages": [{"role": "system", "content": "x"}]},
+        {"model": "echo", "messages": [{"role": "user", "content": "x" * 40000}]})]
+    check("the page's endpoint refuses what it does not send: unknown models, empty or oversized conversations, other roles", codes == [400, 400, 400, 400], codes)
+    status, _, _ = control_raw("POST", "/admin/private-chat/send", {"content-type": "application/json", "cookie": "omnigate_session=forged"}, raw=json.dumps({"model": "echo", "messages": user}))
+    check("... and anyone without the admin token or a session", status in (401, 403), status)
+
+    section("attested upstreams: a verified target, and a control plane that goes quiet")
+    # The data plane on its own, in front of a control plane played by this
+    # script: the only way to show it a target that IS verified.
+    key = lambda name, secret, privacy=None: {"key_sha256": sha(secret), "name": name, "blocked": False, "rpm": 0, "max_concurrent": 0, "models": None, "privacy": privacy}
+    verified = {"verified": True, "max_age_s": 3, "tcb": "UpToDate", "since": 1762850000}
+    fake = FakeControl({
+        "version": "fake-1",
+        "keys": [key("plain", KEY_PLAIN), key("attested", KEY_ATTESTED, {"no_store": False, "redact": [], "unlink": False, "attested": True})],
+        "upstreams": [{"name": "tee", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY", "timeout_ms": 0},
+                      {"name": "open", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY", "timeout_ms": 0}],
+        "routes": [{"model": "tee", "strategy": "failover", "cache_ttl_s": 0, "targets": [{"upstream": "tee", "model": "ok-1", "weight": 1, "attestation": verified}]},
+                   {"model": "tee-withdrawn", "strategy": "failover", "cache_ttl_s": 0,
+                    "targets": [{"upstream": "tee", "model": "ok-1", "weight": 1, "attestation": dict(verified, verified=False, tcb=None, since=0)}]},
+                   {"model": "open", "strategy": "failover", "cache_ttl_s": 0, "targets": [{"upstream": "open", "model": "ok-1", "weight": 1}]}],
+        "media_models": [],
+    })
+    second = os.path.join(stack.work, "gateway2")
+    os.makedirs(second, exist_ok=True)
+    exe = os.path.join(ROOT, "dataplane", "zig-out", "bin", "omnigate-dp" + (".exe" if WINDOWS else ""))
+    proc = stack.start("gateway2", [exe], cwd=second, env={"OMNIGATE_LISTEN": f"127.0.0.1:{GATEWAY2_PORT}", "OMNIGATE_CONTROL_URL": f"http://127.0.0.1:{FAKE_CONTROL_PORT}",
+                                                           "OMNIGATE_POLL_MS": "300", "OMNIGATE_FLUSH_MS": "200"})
+    try:
+        if not wait_port(GATEWAY2_PORT, 15, proc):
+            stack.fail("the second gateway did not start", "gateway2")
+        wait_until(lambda: call("GET", GATEWAY2 + "/v1/models", key=KEY_PLAIN)[0] == 200, 15)
+        status, headers, body = ask("tee", KEY_ATTESTED, base=GATEWAY2)
+        check("a request for attested providers goes to a target whose attestation is verified", status == 200 and headers.get("x-omnigate-upstream") == "tee", (status, body))
+        check("the response says so: x-omnigate-attestation", headers.get("x-omnigate-attestation") == "verified; tcb=UpToDate; since=1762850000", headers.get("x-omnigate-attestation"))
+        status, headers, _ = ask("tee", KEY_PLAIN, base=GATEWAY2)
+        check("any request to that target carries the header", status == 200 and (headers.get("x-omnigate-attestation") or "").startswith("verified;"), headers.get("x-omnigate-attestation"))
+        status, headers, _ = ask("open", KEY_PLAIN, base=GATEWAY2)
+        check("a response from an ordinary target does not", status == 200 and "x-omnigate-attestation" not in headers, headers.get("x-omnigate-attestation"))
+        status, _, body = ask("tee-withdrawn", KEY_PLAIN, base=GATEWAY2)
+        check("a target the control plane calls unverified is not used", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+        status, _, body = ask("open", KEY_ATTESTED, base=GATEWAY2)
+        check("the attested key is refused on the ordinary model here too", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+
+        fake.answering = False
+        time.sleep(4.5)
+        status, _, body = ask("tee", KEY_ATTESTED, base=GATEWAY2)
+        check("once the control plane has been quiet for longer than max_age_s, \"verified\" no longer counts", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+        status, _, _ = ask("open", KEY_PLAIN, base=GATEWAY2)
+        check("... while everything else keeps being served from the last config", status == 200, status)
+        fake.answering = True
+        back = wait_until(lambda: ask("tee", KEY_ATTESTED, base=GATEWAY2)[0] == 200, 10)
+        check("and it counts again when the control plane answers", bool(back))
+    finally:
+        stack.stop("gateway2")
+        fake.stop()
+
+
 def leftovers(work):
     """Files the stack wrote that still contain the private canary."""
     found = []
@@ -1029,6 +1266,8 @@ def leftovers(work):
 def control_env(work):
     return {
         "OMNIGATE_JOBS": os.path.join(work, "jobs.jsonl"),
+        # Where the control plane reaches the data plane (the Private chat page).
+        "OMNIGATE_GATEWAY_URL": GATEWAY,
         "E2E_S3_ACCESS_KEY": "mock-access-key",
         "E2E_S3_SECRET_KEY": "mock-secret-key",
     }
@@ -1498,6 +1737,7 @@ def main():
         key_checks()
         if run_text:
             privacy_text_checks()
+            attestation_checks(stack)
         if run_media:
             media_checks(stack)
         if run_text:

@@ -420,6 +420,29 @@ def privacy_mode():
     case("x-omnigate-privacy sent twice is refused (400), whatever the two say",
          ask("hi", key=ARGS.key, extra=header(b"on") + header(b"on")), expect=400, read_timeout=3, keep_reading=5)
 
+    # "attested": only to a provider with a verified attestation. This stack
+    # has none, so the request must be refused (503) and never forwarded.
+    def refused_unverified(raw, status):
+        return None if b"attestation_unverified" in raw else "the refusal does not name attestation_unverified"
+    case("x-omnigate-privacy: attested on a gateway without attested upstreams is refused (503), not sent elsewhere",
+         ask("hi", key=ARGS.key, extra=header(b"attested")), expect=503, check=refused_unverified, read_timeout=3, keep_reading=5)
+    case("... next to other parts, in capitals, too", ask("hi", key=ARGS.key, extra=header(b"Redact, ATTESTED")),
+         expect=503, check=refused_unverified, read_timeout=3, keep_reading=5)
+    for value in (b"attest", b"attested=false", b"attested;", b"on,attested"):
+        case(f"x-omnigate-privacy: {value!r} is refused (400)", ask("hi", key=ARGS.key, extra=header(value)), expect=400, read_timeout=3, keep_reading=5)
+
+    def dry(value):
+        return b"X-Omnigate-Dry-Run: " + value + b"\r\n"
+
+    def is_dry_run(raw, status):
+        return None if b"omnigate.privacy_dry_run" in raw and b"\"sent_upstream\":false" in raw else "not a dry-run answer"
+    case("x-omnigate-dry-run: privacy answers with the rewritten request (200) and forwards nothing",
+         ask("mail bob@example.com", extra=dry(b"privacy")), expect=200, check=is_dry_run, read_timeout=5, keep_reading=8)
+    for value in (b"", b"1", b"true", b"privacy,", b"privacy privacy", b"\xff", b"p" * 300):
+        case(f"x-omnigate-dry-run: {value[:24]!r} is refused (400): a request meant to stay here is never sent on",
+             ask("hi", key=ARGS.key, extra=dry(value)), expect=400, read_timeout=3, keep_reading=5)
+    case("x-omnigate-dry-run sent twice is refused (400)", ask("hi", key=ARGS.key, extra=dry(b"privacy") + dry(b"privacy")), expect=400, read_timeout=3, keep_reading=5)
+
     def applied(wanted):
         def check(raw, status):
             head = raw.split(b"\r\n\r\n")[0].lower()

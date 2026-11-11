@@ -140,8 +140,23 @@ pub fn syncOnce(app: *App) !void {
         log.warn("config fetch returned {d}", .{@backingInt(status)});
         return error.BadStatus;
     }
+    // The control plane answered with a config: what it says about attested
+    // targets is confirmed as of now (see `syncedAgoMs`).
+    app.config_synced_ms.store(Io.Timestamp.now(app.io, .awake).toMilliseconds(), .release);
     if (try install(app, body.written())) saveCache(app, body.written());
 }
+
+/// Milliseconds since the control plane last answered a config poll, or null
+/// when it has not in this process (the config then comes from the cache
+/// file). An attestation verdict in the snapshot only counts while this is
+/// recent: see `config.Attestation.holds`.
+pub fn syncedAgoMs(app: *App) ?i64 {
+    const at = app.config_synced_ms.load(.acquire);
+    if (at == never_synced) return null;
+    return Io.Timestamp.now(app.io, .awake).toMilliseconds() - at;
+}
+
+pub const never_synced: i64 = std.math.minInt(i64);
 
 /// Parse a snapshot and make it current. Returns false when it is the
 /// version already being served.

@@ -3,9 +3,13 @@
 For maintainers. A release is made by pushing a version tag; the
 [release workflow](../.github/workflows/release.yml) does the rest.
 
-**The workflow has not run yet.** No tag has been pushed, so nothing on this
-page has been exercised on GitHub. Do a [dry run](#dry-run) before the first
-real release, and read [What may fail the first time](#what-may-fail-the-first-time).
+**The workflow has run once.** The tag `v0.1.0-rc.1` was pushed on 11 November
+2026 and all four jobs passed on the first attempt: five archives with
+checksums and two multi-platform images were published as a pre-release. Two
+archives were downloaded and matched their checksums; the published images
+have not been run. A full (non-pre-release) version has not been cut; read
+[What may fail the first time](#what-may-fail-the-first-time) for what was
+rehearsed beforehand.
 
 - [What a release contains](#what-a-release-contains)
 - [Before the first release](#before-the-first-release)
@@ -286,7 +290,8 @@ the right tool when nothing in the repository has to change.
 ## What may fail the first time
 
 The workflow file parses and its shell steps were tried locally where that
-was possible, but GitHub has never run it. Tried on 11 November 2026, on
+was possible before GitHub first ran it (it then passed, see the top of
+this page). Tried on 11 November 2026, on
 the tree that became 0.1.0-rc.1: every step of `prepare` (as if the tag
 `v0.1.0-rc.1` had been pushed), the five cross-compiles (on Windows), and
 on Linux (WSL) the binary smoke test, the packaging step, the image

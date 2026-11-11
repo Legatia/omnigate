@@ -31,6 +31,7 @@ Contents:
 - [The third-review commit](#the-third-review-commit)
 - [The privacy mode commit](#the-privacy-mode-commit)
 - [0.1.0-rc.1](#010-rc1)
+- [The attestation commit](#the-attestation-commit)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -591,6 +592,36 @@ installation can notice:
   `user-agent` and in the webhook `user-agent` is `0.1.0-rc.1`.
 
 **Going back** to 99dd04c needs nothing.
+
+## The attestation commit
+
+The commit after 0.1.0-rc.1 adds [attested upstreams](attestation.md), the
+`attested` part of privacy mode, the privacy dry run and the Private chat
+page. Nothing changes for an installation that uses none of them, with the
+exceptions in the last table. Nothing changes on disk.
+
+**Mixed versions.** The data plane enforces an attestation verdict; the
+control plane produces it.
+
+| Control plane | Data plane | What happens |
+|---|---|---|
+| new | old | The snapshot carries each target's verdict and each key's `attested`; an old data plane ignores both. **Attested targets are used whether or not they are verified, and a key's `attested` restricts nothing.** An `x-omnigate-privacy: attested` request header is refused by it with 400. No response says `x-omnigate-attestation`, and `x-omnigate-dry-run` is ignored: the request is **sent** to a provider. |
+| old | new | An `attestation` setting on an upstream is ignored by the old control plane, without an error, and nothing is verified; a key with `"privacy": {"attested": true}` makes the old control plane refuse the config (it does not know the field). The new data plane sees no verdict on any target and refuses every `attested` request. |
+
+Upgrade both, the data plane included, before you rely on any of it, and
+check a response's `x-omnigate-attestation` header and
+`GET /admin/attestations` afterwards.
+
+**What an installation can notice without using it**
+
+| Change | Before | Now |
+|---|---|---|
+| `x-omnigate-privacy: attested` | `400 invalid_request` | Accepted; on a gateway without attested upstreams the request is refused with `503 attestation_unverified` |
+| A request with an `x-omnigate-dry-run` header | Ignored (the request was sent) | `privacy` answers with a dry run; any other value is `400 invalid_request` |
+| A key's `privacy` in `GET /admin/keys` and in the snapshot | Four fields (three in the snapshot) | One more, `attested` |
+| `/metrics` | | `omnigate_attestation_checks_total` (three series, all 0 without attested upstreams) |
+| The dashboard's top bar | | A link to the Private chat page. Using the page creates a managed key named `private-chat`; a config-file key of that name stops the page from working |
+| The control plane's outbound calls | | With an attested upstream only: the upstream's host, Intel's and NVIDIA's attestation services ([list](attestation.md#what-the-control-plane-calls)) |
 
 ## Tested upgrades
 

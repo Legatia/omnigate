@@ -281,6 +281,18 @@ python tools/upgrade_test.py 6d5ed6e --variant both --mixed
   `--gateway-wsl <path>` runs a Linux build of the data plane inside WSL
   instead (with WSL's mirrored networking) and reads its memory, threads
   and number of memory mappings from `/proc`.
+- **`tools/near_live.py`** runs the NEAR AI Cloud integration against the
+  real service: the control plane's attestation code from the command
+  line, then both processes with `config/omnigate.near.json`, the
+  manager's verdicts, and what the data plane does with them. It needs the
+  network (NEAR, Intel's and NVIDIA's attestation services) and no API key;
+  with `NEAR_AI_API_KEY` set it also sends one real completion. `--serve`
+  starts the gateway with that config on ports 4000 and 8080 for the
+  Private chat page. Run it when you touch `control/lib/omnigate_control/attestation*`
+  or the attestation handling in `proxy.zig`. The offline counterpart,
+  which CI runs, is `control/test/attestation_test.exs` on a saved real
+  report (`control/test/fixtures/attestation`, valid only at the time
+  recorded in `verified_at.txt`, which the tests pass as "now").
 - **`tools/upgrade_test.py <commit>`** checks out an older commit into a
   temporary git worktree, builds it, lets it write realistic state (keys,
   usage, ledger segments and a snapshot, finished, failed, cancelled and
@@ -368,6 +380,7 @@ control/              Elixir control plane
 config/
   omnigate.dev.json       mock providers; the default config for local runs
   omnigate.example.json   template for real providers
+  omnigate.near.json      NEAR AI Cloud as an attested upstream (tools/near_live.py)
 
 tools/                Python, standard library only (sdk_compat.py excepted; e2e.py uses pyrage if it is there)
   mock_upstream.py, mock_media.py   mock providers, object store, webhook receiver
@@ -378,6 +391,7 @@ tools/                Python, standard library only (sdk_compat.py excepted; e2e
   load_test.py                      load and soak test against a running gateway
   privacy_soak.py                   soak test of privacy mode on a stack it starts (long; not in check.py)
   upgrade_test.py                   an older commit's files read by the current build, and mixed pairs (long; not in check.py)
+  near_live.py                      attestation and attested-only routing against the real NEAR AI Cloud (network; not in check.py)
   bench.py                          latency measurement
   import_litellm.py, test_import_litellm.py
 

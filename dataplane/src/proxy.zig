@@ -231,6 +231,9 @@ const ClientHeaders = struct {
     /// `x-omnigate-privacy`, as sent.
     privacy: ?[]const u8 = null,
     privacy_repeated: bool = false,
+    /// `x-omnigate-dry-run`, as sent.
+    dry_run: ?[]const u8 = null,
+    dry_run_repeated: bool = false,
 };
 
 /// What privacy mode does to one request: the key's setting, plus whatever
@@ -242,13 +245,16 @@ const Privacy = struct {
     redact: redact.ClassSet = .none,
     /// Fields that name an end user are removed.
     unlink: bool = false,
+    /// Only targets whose attestation holds are used.
+    attested: bool = false,
 
     fn of(key: *const config.Key, header: redact.Request) Privacy {
-        var p: Privacy = .{ .no_store = header.no_store, .unlink = header.unlink };
+        var p: Privacy = .{ .no_store = header.no_store, .unlink = header.unlink, .attested = header.attested };
         if (header.redact) p.redact = .every;
         if (key.privacy) |k| {
             p.no_store = p.no_store or k.no_store;
             p.unlink = p.unlink or k.unlink;
+            p.attested = p.attested or k.attested;
             for (k.redact) |name| {
                 if (redact.Class.parse(name)) |c| p.redact.add(c);
             }
@@ -355,6 +361,9 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             // Sent twice, there is no telling which one a reader would take.
             if (hdrs.privacy != null) hdrs.privacy_repeated = true;
             hdrs.privacy = try arena.dupe(u8, h.value);
+        } else if (std.ascii.eqlIgnoreCase(h.name, "x-omnigate-dry-run")) {
+            if (hdrs.dry_run != null) hdrs.dry_run_repeated = true;
+            hdrs.dry_run = try arena.dupe(u8, h.value);
         }
     }
 
@@ -387,9 +396,19 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         return respondError(acc, request, .bad_request, "invalid_request", "x-omnigate-privacy was sent more than once");
     const privacy_request: redact.Request = if (hdrs.privacy) |v|
         redact.Request.parse(v) orelse
-            return respondError(acc, request, .bad_request, "invalid_request", "invalid x-omnigate-privacy header: use \"on\", or a comma-separated list of no-store, redact, unlink (it can only switch protections on)")
+            return respondError(acc, request, .bad_request, "invalid_request", "invalid x-omnigate-privacy header: use \"on\", or a comma-separated list of no-store, redact, unlink, attested (it can only switch protections on)")
     else
         .{};
+    // A dry run sends nothing anywhere. One kind exists; a value that is not
+    // it is refused, because a request meant to stay here must not be sent
+    // on for a spelling mistake.
+    if (hdrs.dry_run_repeated)
+        return respondError(acc, request, .bad_request, "invalid_request", "x-omnigate-dry-run was sent more than once");
+    const dry_run_privacy = if (hdrs.dry_run) |v| blk: {
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, v, " \t"), "privacy"))
+            return respondError(acc, request, .bad_request, "invalid_request", "invalid x-omnigate-dry-run header: the one value is \"privacy\"");
+        break :blk true;
+    } else false;
     // `idempotency-key` is looked at where it is used: on job requests,
     // below. Elsewhere it is not forwarded, so what it contains is the
     // client's business (SDKs send one of their own on every call).
@@ -458,6 +477,12 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             null;
         if (job_body) |b| if (!guard_mod.jsonDepthOk(b, guard_mod.max_client_json_depth))
             return respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply");
+        if (dry_run_privacy)
+            return respondError(acc, request, .bad_request, "invalid_request", "x-omnigate-dry-run is for text endpoints; a media job has no body that is rewritten");
+        // No media provider proves what it runs on, so a job that may only
+        // go to an attested one cannot go anywhere.
+        if (is_job_create and (privacy_request.attested or (key.privacy != null and key.privacy.?.attested)))
+            return respondError(acc, request, .service_unavailable, "attestation_unverified", "this request may only go to an attested provider, and no media provider is attested");
         // (The key's own setting is the control plane's to apply; the
         // header's wish for this one job is passed on.)
         return forwardToControl(app, acc, arena, request, guard, method, path, query, job_body, hdrs.idempotency_key, &key_hash, is_job_create and privacy_request.no_store);
@@ -588,6 +613,38 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     }
     var restorer: redact.Restorer = .init(&redactions);
 
+    // --- dry run ------------------------------------------------------------
+    // `x-omnigate-dry-run: privacy`: answer with the request as privacy mode
+    // left it, which is what a provider would be sent (before the model name
+    // is replaced by the target's), and send nothing. It went through the
+    // same code as a request that is forwarded, up to this line.
+    if (dry_run_privacy) {
+        var out: Io.Writer.Allocating = .init(arena);
+        const w = &out.writer;
+        try w.writeAll("{\"object\":\"omnigate.privacy_dry_run\",\"sent_upstream\":false,\"protections\":");
+        try std.json.Stringify.value(privacy.note() orelse "", .{}, w);
+        try w.print(",\"attested_only\":{},\"replaced\":{{", .{privacy.attested});
+        for (redact.Class.all, 0..) |c, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.print("\"{s}\":{d}", .{ c.name(), redactions.hits[c.index()] });
+        }
+        try w.writeAll("},\"body\":");
+        try std.json.Stringify.value(body, .{}, w);
+        try w.writeByte('}');
+        acc.status = 200;
+        var dry_headers: std.ArrayList(http.Header) = .empty;
+        try dry_headers.appendSlice(arena, &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "cache-control", .value = "no-store" },
+            .{ .name = "x-omnigate-dry-run", .value = "privacy" },
+            .{ .name = "x-omnigate-request-id", .value = &req_id },
+            .{ .name = "x-request-id", .value = &req_id },
+            .{ .name = "request-id", .value = &req_id },
+        });
+        if (privacy.note()) |note| try dry_headers.append(arena, .{ .name = "x-omnigate-privacy", .value = note });
+        return request.respond(out.written(), .{ .status = .ok, .keep_alive = reusable(request), .extra_headers = dry_headers.items });
+    }
+
     const started = Io.Timestamp.now(app.io, .awake);
 
     // --- response cache -----------------------------------------------------
@@ -607,7 +664,9 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     // Never for a private request: a "no-store" request leaves nothing
     // behind, and an answer that was written around placeholders belongs to
     // the request that made them.
-    const cacheable = ep.metered and !is_stream and app.cache.max_bytes > 0 and !privacy.no_store and privacy.redact.isEmpty();
+    // Nor for one that may only be answered by an attested provider: the
+    // cache does not know who wrote what it holds.
+    const cacheable = ep.metered and !is_stream and app.cache.max_bytes > 0 and !privacy.no_store and privacy.redact.isEmpty() and !privacy.attested;
     const cache_ttl_ms: i64 = if (cacheable) @as(i64, route.cache_ttl_s) * 1000 else 0;
     // The key is the request in canonical form, which takes a tree of it. A
     // body too costly to parse (see `cacheKeyFor`) is simply not cached.
@@ -707,12 +766,37 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     balance.order(order, route.targets, cooling, strategy, counter, random);
 
     var tried: u32 = 0;
+    // Targets passed over because their attestation does not hold, or
+    // because the request wanted an attested one and they are not.
+    var unattested: u32 = 0;
     for (order) |target_index| {
         const t = &route.targets[target_index];
         const up = snapshot.findUpstream(t.upstream) orelse {
             try attempts.append(arena, .{ .upstream = t.upstream, .outcome = "unknown_upstream" });
             continue;
         };
+        // An upstream that has to prove what it runs on is only used while
+        // that proof holds; a request that asked for such an upstream is
+        // sent to no other. Either way the target is passed over like one
+        // that is down, and what is left decides.
+        if (t.attestation) |verdict| {
+            if (!verdict.holds(control.syncedAgoMs(app))) {
+                try attempts.append(arena, .{ .upstream = up.name, .outcome = "attestation_unverified" });
+                unattested += 1;
+                continue;
+            }
+            extras.attestation_note = try std.fmt.allocPrint(arena, "verified; tcb={s}; since={d}", .{
+                if (verdict.tcb) |tcb| (if (framing.plainHeaderValue(tcb, 64)) tcb else "unknown") else "unknown",
+                verdict.since,
+            });
+        } else {
+            if (privacy.attested) {
+                try attempts.append(arena, .{ .upstream = up.name, .outcome = "not_attested" });
+                unattested += 1;
+                continue;
+            }
+            extras.attestation_note = null;
+        }
         // The upstream may speak the other protocol: translate both ways.
         const xlate: ?Translation = if (up.kind == kind)
             null
@@ -944,6 +1028,17 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 return;
             },
         }
+    }
+
+    // Nothing was sent because every target that could have taken the
+    // request lacks a verified attestation. Nothing is wrong with the
+    // request, and it must not go anywhere else: "not now".
+    if (tried == 0 and unattested > 0) {
+        acc.attempts = 0;
+        return respondError(acc, request, .service_unavailable, "attestation_unverified", if (privacy.attested)
+            "this request may only go to an attested provider, and no target of this model has a verified attestation right now"
+        else
+            "the providers of this model must prove what they run on, and none has a verified attestation right now");
     }
 
     // Nothing was sent upstream because no target can serve this request at
@@ -1287,6 +1382,9 @@ const ForwardExtras = struct {
     cache_note: ?[]const u8 = null,
     /// Value for `x-omnigate-privacy` on the response: what was applied.
     privacy_note: ?[]const u8 = null,
+    /// Value for `x-omnigate-attestation` on the response, when the target
+    /// that answers is on an attested upstream whose verdict holds.
+    attestation_note: ?[]const u8 = null,
     /// Puts back what privacy mode replaced in the request; null when
     /// nothing was replaced.
     restorer: ?*redact.Restorer = null,
@@ -1665,6 +1763,7 @@ fn forward(
     });
     if (extras.cache_note) |note| try out_headers.append(arena, .{ .name = "x-omnigate-cache", .value = note });
     if (extras.privacy_note) |note| try out_headers.append(arena, .{ .name = "x-omnigate-privacy", .value = note });
+    if (extras.attestation_note) |note| try out_headers.append(arena, .{ .name = "x-omnigate-attestation", .value = note });
     for (relayed) |h| {
         // Already set above.
         if (std.ascii.eqlIgnoreCase(h.name, "x-request-id") or std.ascii.eqlIgnoreCase(h.name, "request-id")) continue;

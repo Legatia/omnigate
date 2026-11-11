@@ -219,7 +219,10 @@ defmodule OmnigateControl.ConfigStore do
             v1_path: u["v1_path"],
             # Whether a private request is sent `"store": false` here; nil =
             # only when the host is api.openai.com.
-            privacy_store_flag: store_flag!(u)
+            privacy_store_flag: store_flag!(u),
+            # The provider proves what it runs on (`OmnigateControl.Attestation`),
+            # and its targets are only used while that is verified; nil = no.
+            attestation: OmnigateControl.Attestation.normalize!(u["attestation"], "upstream #{inspect(u["name"])}")
           }
         end),
       routes:

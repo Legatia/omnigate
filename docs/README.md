@@ -23,6 +23,7 @@ exercised against a mock, or not at all, the page says so.
 | Upgrade an installation that runs an earlier commit: what changes on disk, which defaults changed, what clients will notice, the order to upgrade the two processes, and going back | [Upgrading](upgrading.md) |
 | Harden a deployment: what to expose, where each credential lives, the admin allow-list, backups, logs | [Security hardening](security.md) |
 | Keep less of a request, and show a provider less of it: redaction, no retention, encrypted job outputs, unlinking, and what none of them does | [Privacy mode](privacy.md) |
+| Send requests only to a provider that has proven what hardware it runs on (NEAR AI Cloud's TEE attestation, verified by the gateway), see what a provider would be sent, use the Private chat page | [Attested upstreams](attestation.md) |
 | Monitor it, understand limits and timeouts, read its logs, or debug an error | [Operations](operations.md) |
 | Understand how the two processes divide the work | [Architecture](architecture.md) |
 | Convert a LiteLLM proxy config | [Migrating from LiteLLM](migrating-from-litellm.md) |
@@ -33,6 +34,7 @@ exercised against a mock, or not at all, the page says so.
 - [`README.md`](../README.md): overview, what has been verified, comparison, measurements, known limits.
 - [`config/omnigate.dev.json`](../config/omnigate.dev.json): the config the quickstart uses, with mock providers.
 - [`config/omnigate.example.json`](../config/omnigate.example.json): a template for real providers.
+- [`config/omnigate.near.json`](../config/omnigate.near.json): NEAR AI Cloud as an attested upstream, with a relayed model and an unattested route to compare; used by `tools/near_live.py`.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md): building, tests, code layout.
 - [`SECURITY.md`](../SECURITY.md): reporting a vulnerability, security model, known limits, past advisories.
 - `.env.example`, `.env.control.example`, `.env.dataplane.example`: the three environment files of the Compose deployment.

@@ -20,8 +20,48 @@ A self-hostable AI gateway in two small processes. The data plane (Zig) is the p
 | `dataplane/` | Zig 0.17 | The public port. Authenticates keys, rate-limits, routes, fails over, translates protocols, streams, meters tokens |
 | `control/` | Elixir 1.20 / OTP 29 | Config, managed keys, prices, budgets, the usage ledger, media jobs, output storage, webhooks, dashboard, admin API, metrics |
 | `config/` | JSON | Keys, upstreams, routes, media section, retention |
-| `tools/` | Python (stdlib) | Mock providers, end-to-end test, SDK compatibility test, container test, hostile-input test, a one-command runner for all of them (`check.py`), load test, benchmark, LiteLLM config importer |
+| `tools/` | Python (stdlib) | Mock providers, end-to-end test, SDK compatibility test, container test, hostile-input test, a one-command runner for all of them (`check.py`), load test, benchmark, LiteLLM config importer, the live NEAR AI Cloud check (`near_live.py`) |
 | `compose.yaml`, `deploy/` | Docker | Both images plus a Caddy proxy for TLS, with one environment file per container |
+
+## NEAR hackathon
+
+This repository is an entry in the NEAR hackathon (1 to 14 November 2026), track **Privacy & Private AI**. This section is for the people and the coding agents that review it: what was built, what NEAR does in it, and steps to see it work.
+
+**What it is.** omnigate is a self-hostable gateway that applications call instead of calling AI providers directly. The whole repository was written inside the hackathon window (first commit 10 November 2026; see `git log`), with Claude Code.
+
+**The problem.** A team that wants to use hosted models on sensitive text has two worries: what the model is shown, and who else at the provider can read the request. Promises in a privacy policy answer neither in a way that can be checked.
+
+**What was built for it, and NEAR's part.**
+
+1. **Redaction at the gateway** (not NEAR-specific): e-mail addresses, phone numbers, card numbers, IP addresses and secrets in a request are replaced by placeholders before it leaves, and put back in the answer. This limits what the model is shown.
+2. **Attested-only routing, on NEAR AI Cloud's TEE attestation**: NEAR AI Cloud runs its gateway and its own models in Intel TDX machines and publishes attestation reports. omnigate verifies those reports itself, natively, with no verification library: the Intel quote and its certificate chain to Intel's pinned root, revocation lists, platform patch status, debug mode, the fresh nonce, the measured configuration, the event log, and NVIDIA's verdict on the GPU evidence. It keeps each model verified (re-checked with a new nonce every few minutes), and a request marked `attested` is sent **only** to a model whose attestation is verified right now. Otherwise it is refused, never sent elsewhere. This answers "who else can read it" with evidence instead of a promise.
+3. **A page that shows both**: `/private-chat` in the dashboard has the conversation, the request exactly as the gateway's redaction leaves it, and the verification checklist with the raw evidence.
+4. **Nothing kept**: requests from that page go out as `no-store`; the gateway keeps no content of them, and the end-to-end test searches every file both processes wrote for a marked prompt to check it.
+
+What the attestation check does **not** establish is written down as plainly: [docs/attestation.md](docs/attestation.md#what-is-not-checked) (no image-provenance check; the measurement allowlist is empty unless set; the data plane's TLS connections are not bound to the report; NEAR's per-response signatures are not checked).
+
+**See it work.** Prerequisites: Zig 0.17, Erlang/OTP 29 with Elixir 1.20, Python 3.9+ ([docs/quickstart.md](docs/quickstart.md) has the setup, including the Windows `PATH`). Build once:
+
+```bash
+cd dataplane && zig build && cd ../control && mix deps.get && mix compile && cd ..
+```
+
+Without any API key (an attestation report is public):
+
+1. Run `python tools/near_live.py`. See: a checklist of what was verified for NEAR's gateway and for `z-ai/glm-5.3-flash` (genuine TDX quotes, status `UpToDate`, nonce bound, configuration measured, GPU evidence accepted by NVIDIA), then 11 checks that end in `11/11 checks passed`: the running gateway verifies the model NEAR serves itself, refuses `openai/gpt-5` (which NEAR only relays and cannot attest), lets an `attested` request through to the verified model, and refuses it, unsent, on the two other routes.
+2. Run `python tools/near_live.py --serve`. It prints an address and an admin token. Open `http://127.0.0.1:4000/private-chat`, sign in with the token. See: the **Verified** panel with a green check per item; each opens to the raw values. Press **Verify again now**: a new nonce, a new verdict in about two seconds.
+3. On that page, press **Fill in an example**, then **Send**. See: the middle panel shows the message with `[EMAIL_1]`, `[PHONE_1]` and `[CARD_1]` where the values were. Without a NEAR key the provider answers 401, and the page says so.
+4. Choose the model **unattested** (the same NEAR endpoint, configured without attestation) and send again. See: `Not sent`, `attestation_unverified`. Choose **relayed** and see the same, with NEAR's own reason in the Verified panel.
+5. Run the offline tests: `cd control && mix test test/attestation_test.exs test/attestation_manager_test.exs`. See: `12 passed`. The first of them is 96 checks on a saved real report, in which each kind of tampering has to fail with its own error. `python tools/check.py` from the repository root runs every suite (about six minutes).
+
+With a NEAR AI Cloud key (`NEAR_AI_API_KEY`; from https://cloud.near.ai, or $10 of credits at https://nearbuilders.org/dashboard):
+
+6. Set `NEAR_AI_API_KEY` in the shell and run `python tools/near_live.py` again. See: four more checks, a real completion whose answer contains the real e-mail address and card number although the model was only sent placeholders, with `x-omnigate-attestation: verified; tcb=UpToDate; ...` on the response.
+7. Run `python tools/near_live.py --serve` with the key set and chat on the page with the model **private**. See: the answer with your values in it on the left, placeholders in the middle, and "Attestation: verified" under them.
+
+**Status of this part, honestly.** Steps 1 to 5 were run on 11 November 2026 and pass. Steps 6 and 7 had not been run when this was written: no NEAR key was at hand, so a completion coming back through an attested target is exercised only up to NEAR's own 401.
+
+**Built with.** Zig 0.17 (standard library only) for the data plane; Elixir 1.20 on Erlang/OTP 29 with [Bandit](https://github.com/mtrudel/bandit) and [Plug](https://github.com/elixir-plug/plug) for the control plane; Python's standard library for the tools (the SDK test uses the official `openai` and `anthropic` packages, the end-to-end test `pyrage` when installed); Docker and Caddy for the Compose deployment. The TDX verification was written for this project in Elixir on OTP's `:crypto`, following Intel's DCAP rules as implemented in Phala's [dcap-qvl](https://github.com/Phala-Network/dcap-qvl) and NEAR's verification documentation; the Intel SGX Root CA certificate is pinned in the source. License: [PolyForm Noncommercial 1.0.0](LICENSE).
 
 ## Features
 
@@ -62,8 +102,10 @@ A setting per gateway key, or per request with `x-omnigate-privacy`; each part c
 - **No retention at the gateway.** No response cache for the key; a media job's input and metadata never enter the job log and are erased when the job ends, and its outputs are deleted a day later; OpenAI is told `"store": false`.
 - **Encrypted job outputs.** Outputs are encrypted to the key owner's [age](https://age-encryption.org) recipient before they are stored on disk or in the bucket; the gateway cannot read them afterwards.
 - **Unlinking.** The request fields that name an end user to the provider (`user`, `safety_identifier`, `prompt_cache_key`, `metadata`) are removed.
+- **Attested providers only.** A request marked `attested` goes only to a provider that runs its models in confidential hardware and whose attestation the gateway has verified itself, and recently: Intel TDX quotes checked up to Intel's pinned root, with revocation, patch status, a fresh nonce, the measured configuration and NVIDIA's verdict on GPU evidence. Built for [NEAR AI Cloud](https://docs.near.ai/cloud/verification). Otherwise the request is refused, not sent elsewhere. What a pass proves and what it does not: [docs/attestation.md](docs/attestation.md).
+- **A dry run** (`x-omnigate-dry-run: privacy`) answers with the request as privacy mode left it and sends nothing, and the dashboard's **Private chat** page shows that next to the answer and the attestation checklist.
 
-This is not zero-knowledge inference and does not claim to be: a hosted model has to read the prompt it answers.
+This is not zero-knowledge inference and does not claim to be: a hosted model has to read the prompt it answers. Redaction limits what the model is shown; attestation is about who else at the provider can read it.
 
 ### Operations and admin
 
@@ -207,11 +249,12 @@ Through the gateway, over TLS, with real keys (November 2026):
 
 **After commits e4e30e4 and d79406b**, which replaced the control plane's HTTP client and the data plane's response reader: the control plane's new HTTP client and the data plane's new response reader were each run against the real hosts of OpenAI, Anthropic, Gemini, xAI, ElevenLabs, Replicate and fal with deliberately invalid keys; every provider's own auth error came back intact. The successful paths were then re-run with real keys on 11 November 2026, at commit 809b96f, and all passed: OpenAI and Anthropic text (direct, streamed, translated both ways, tool calls, failover, metering), Gemini text, xAI text, an OpenAI image job, Gemini image, speech and video jobs, an xAI image job and a one-second xAI video, a Replicate image job, ElevenLabs speech with a cache hit, and output storage in a Cloudflare R2 bucket. fal has still only returned an auth error, never a completed job.
 
+**NEAR AI Cloud attestation** (11 November 2026, no API key needed): the gateway and `z-ai/glm-5.3-flash` verify through the running control plane, GPU evidence included; a model NEAR only relays is refused; the data plane routes by the verdict (`tools/near_live.py`, 11 checks). A completion through an attested target has not been run: no NEAR key was at hand. See [docs/attestation.md](docs/attestation.md#what-has-been-tested).
+
 Not verified against anything real:
 
-- Privacy mode. Everything in it runs against the mock providers in the test suites (which assert on what the mock received and on what the client got back), and files the gateway encrypted are decrypted by an independent age implementation there. No real provider has been sent a redacted request or `"store": false` by this code, and how well real models repeat placeholders has not been measured.
-
-- The fal adapter (a mock written from public documentation; expect details to differ), the Sume adapter (the same: written from Sume's public documentation, never run with a Sume key, and its prices never compared with a Sume bill), and S3-compatible storage other than Cloudflare R2, including deleting bucket objects under retention.
+- Privacy mode beyond one run. On 11 November 2026 redaction, restoring (whole, streamed, in tool-call arguments and through translation), no-store, unlink and an encrypted image output were checked against the real OpenAI, Anthropic, Gemini and xAI APIs (35 checks, all passed). Only the email and card classes were exercised there; phone numbers, secrets and Anthropic's diagnostics opt-out have only met the mocks, and how reliably real models repeat placeholders over long conversations has not been measured.
+- The fal adapter (a mock written from public documentation; expect details to differ), the Sume adapter beyond one successful image job and one successful video job (cancel, refusals, idempotent replay and failed jobs are mock only, and its prices were never compared with a Sume bill), and S3-compatible storage other than Cloudflare R2, including deleting bucket objects under retention.
 - Everything the status paragraph lists as added later. In particular, the structured-output mapping onto Anthropic's `output_config.format` has not been sent to the live Anthropic API, and prompt-cache token accounting has not been compared with a real provider bill.
 - The security fixes against anything but the project's own tests: no external penetration test, no real hostile traffic, and neither the figures billed for an abandoned stream after reading the provider's answer to its end nor the estimate have been compared with what a provider charged for one.
 - The official SDKs against real providers: `tools/sdk_compat.py` runs the Python SDKs against the mocks only, and no other language's SDK has been tried.
@@ -222,6 +265,7 @@ Not verified against anything real:
 
 The security model is in [SECURITY.md](SECURITY.md); the detail behind each line below is in [docs/operations.md](docs/operations.md) and [docs/architecture.md](docs/architecture.md).
 
+- **Attestation is of a provider's deployment, not of each answer.** For an attested upstream the gateway verifies the provider's TEE evidence every few minutes and routes by it. It does not check where the measured software was built, does not bind its own TLS connections to the report, and does not check the provider's per-response signatures; the allowlist of accepted measurements is empty unless you fill it. A target can stay in use for up to twice `max_age_s` after its last successful check in the worst case. Only NEAR AI Cloud is supported, and no completion has been run through it yet ([docs/attestation.md](docs/attestation.md#what-is-not-checked)).
 - **No TLS listener** on either process; the included Caddy proxy (or another) provides it. Data-plane-to-control-plane traffic is plain HTTP and belongs on a private network.
 - **One shared admin token.** No user accounts or roles, so the audit log records how a caller was authenticated and from where, not who they were; sessions cannot be revoked individually. The lockouts for failed sign-ins and wrong tokens count per client address, in memory, and locking an address out also stops legitimate callers that share it.
 - **A managed key's webhook secret is stored in clear text** in the keys file. Protect the data directory.
@@ -242,6 +286,6 @@ The security model is in [SECURITY.md](SECURITY.md); the detail behind each line
 
 ## Documentation and license
 
-[Quickstart](docs/quickstart.md) · [Configuration](docs/configuration.md) (every config field and environment variable) · [API reference](docs/api.md) (endpoints, errors, jobs, webhooks, the official SDKs) · [Admin](docs/admin.md) (dashboard, managed keys, budgets, audit log) · [Providers](docs/providers.md) · [Deployment](docs/deployment.md) · [Upgrading](docs/upgrading.md) (what changes on disk, changed defaults, the order to upgrade) · [Security hardening](docs/security.md) (what to expose, where each credential lives, backups, logs) · [Privacy mode](docs/privacy.md) (redaction, no retention, encrypted outputs, and what none of it does) · [Operations](docs/operations.md) (metrics, limits, retention, logs, troubleshooting) · [Architecture](docs/architecture.md) · [Migrating from LiteLLM](docs/migrating-from-litellm.md) · [Releasing](docs/releasing.md) · [docs index](docs/README.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) · [CHANGELOG.md](CHANGELOG.md)
+[Quickstart](docs/quickstart.md) · [Configuration](docs/configuration.md) (every config field and environment variable) · [API reference](docs/api.md) (endpoints, errors, jobs, webhooks, the official SDKs) · [Admin](docs/admin.md) (dashboard, managed keys, budgets, audit log) · [Providers](docs/providers.md) · [Deployment](docs/deployment.md) · [Upgrading](docs/upgrading.md) (what changes on disk, changed defaults, the order to upgrade) · [Security hardening](docs/security.md) (what to expose, where each credential lives, backups, logs) · [Privacy mode](docs/privacy.md) (redaction, no retention, encrypted outputs, and what none of it does) · [Attested upstreams](docs/attestation.md) (TEE attestation of NEAR AI Cloud verified by the gateway, attested-only routing, the Private chat page) · [Operations](docs/operations.md) (metrics, limits, retention, logs, troubleshooting) · [Architecture](docs/architecture.md) · [Migrating from LiteLLM](docs/migrating-from-litellm.md) · [Releasing](docs/releasing.md) · [docs index](docs/README.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) · [CHANGELOG.md](CHANGELOG.md)
 
 omnigate is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE): free to self-host for personal and other noncommercial use. Business or commercial use needs a paid license; see [COMMERCIAL.md](COMMERCIAL.md) or write to hello@legatia.solutions.

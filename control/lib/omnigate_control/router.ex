@@ -13,7 +13,12 @@ defmodule OmnigateControl.Router do
     * `GET/POST /admin/keys`, `PATCH/DELETE /admin/keys/:name`,
       `POST /admin/keys/:name/rotate` — managed gateway keys, see `Keys`
     * `GET  /admin/audit`     — the latest admin actions, see `Audit`
+    * `GET  /admin/attestations`, `POST /admin/attestations/verify` — attested
+      upstreams and their verdicts, see `Attestation`
     * `GET  /`                — dashboard (session; redirects to `/login`)
+    * `GET  /private-chat`    — the Private chat page (session), with
+      `GET /admin/private-chat/state` and `POST /admin/private-chat/send`,
+      see `PrivateChat`
     * `GET/POST /login`, `POST /logout` — dashboard sessions, see `AdminAuth`
     * `GET  /metrics`         — Prometheus metrics (admin token or session)
     * `GET  /healthz`         — liveness, no authentication
@@ -28,6 +33,7 @@ defmodule OmnigateControl.Router do
   alias OmnigateControl.{
     Admin,
     AdminAuth,
+    Attestation,
     Audit,
     ConfigStore,
     Dashboard,
@@ -36,6 +42,8 @@ defmodule OmnigateControl.Router do
     Ledger,
     Metrics,
     Privacy,
+    PrivateChat,
+    PrivateChatPage,
     RateLimit,
     Redactions,
     Rejections,
@@ -362,6 +370,28 @@ defmodule OmnigateControl.Router do
     send_json(conn, 200, %{entries: Audit.recent(limit)})
   end
 
+  # -- attested upstreams -------------------------------------------------------
+
+  get "/admin/attestations" do
+    now = System.os_time(:second)
+    send_json(conn, 200, %{attestations: Enum.map(Attestation.Manager.all(), &Attestation.view(&1, now)), checks: Attestation.Manager.counts()})
+  end
+
+  # Check one (upstream, model) now, with a fresh nonce, and answer with the verdict.
+  post "/admin/attestations/verify" do
+    attrs = json_object(conn)
+
+    with upstream when is_binary(upstream) <- attrs["upstream"],
+         model when is_binary(model) <- attrs["model"],
+         %{} = entry <- Attestation.Manager.verify_now(upstream, model) do
+      Audit.record(conn, "attestation.verify", audit_name("#{upstream}/#{model}"), if(entry.state == :verified, do: "ok", else: "failed"))
+      send_json(conn, 200, Attestation.view(entry))
+    else
+      nil -> send_error(conn, 404, "not_found", "the config routes no target to this upstream and model on an attested upstream")
+      _ -> send_error(conn, 400, "invalid_request", "expected {\"upstream\": name, \"model\": name}")
+    end
+  end
+
   get "/" do
     nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
 
@@ -374,6 +404,34 @@ defmodule OmnigateControl.Router do
       end
 
     send_html(conn, 200, Dashboard.page(Admin.overview(), csrf, nonce), nonce)
+  end
+
+  # -- the Private chat page ----------------------------------------------------
+
+  get "/private-chat" do
+    nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+
+    csrf =
+      case conn.assigns[:auth] == :session && AdminAuth.session(conn) do
+        session when is_binary(session) -> AdminAuth.csrf_token(session)
+        _ -> ""
+      end
+
+    send_html(conn, 200, PrivateChatPage.page(csrf, nonce), nonce)
+  end
+
+  get "/admin/private-chat/state" do
+    send_json(conn, 200, PrivateChat.state())
+  end
+
+  # One turn of the page's conversation: a dry run and the real request,
+  # both through the data plane's public port with the page's own key.
+  # Nothing of the body is logged or audited.
+  post "/admin/private-chat/send" do
+    case PrivateChat.send_turn(json_object(conn)) do
+      {:ok, result} -> send_json(conn, 200, result)
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
   end
 
   get "/login" do
@@ -475,7 +533,9 @@ defmodule OmnigateControl.Router do
             privacy: Privacy.for_data_plane(Map.get(k, :privacy))
           }
         end,
-      upstreams: config.upstreams,
+      # (How an upstream is attested is this side's business; the verdict
+      # goes out per target, below.)
+      upstreams: Enum.map(config.upstreams, &Map.delete(&1, :attestation)),
       routes:
         Enum.map(config.routes, fn r ->
           %{
@@ -483,7 +543,17 @@ defmodule OmnigateControl.Router do
             strategy: r.strategy,
             # Seconds the data plane may answer identical requests from its own cache; 0 = never.
             cache_ttl_s: Map.get(r, :cache_ttl_s, 0),
-            targets: Enum.map(r.targets, &Map.take(&1, [:upstream, :model, :weight]))
+            targets:
+              Enum.map(r.targets, fn t ->
+                target = Map.take(t, [:upstream, :model, :weight])
+
+                # On an attested upstream: whether the evidence is verified
+                # right now. Absent for every other target.
+                case Attestation.Manager.for_snapshot(t.upstream, t.model) do
+                  nil -> target
+                  verdict -> Map.put(target, :attestation, verdict)
+                end
+              end)
           }
         end),
       # Names only: media jobs are routed here, but data planes list them in /v1/models.
@@ -740,7 +810,7 @@ defmodule OmnigateControl.Router do
     end
   end
 
-  defp admin_auth(%{path_info: []} = conn, _opts) do
+  defp admin_auth(%{path_info: path} = conn, _opts) when path in [[], ["private-chat"]] do
     conn = assign(conn, :auth, AdminAuth.authenticate(conn))
 
     case conn.assigns.auth do

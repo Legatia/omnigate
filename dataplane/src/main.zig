@@ -177,6 +177,9 @@ pub const App = struct {
     abort_drain_max_bytes: u64,
     max_connections: u32,
     config_cache_path: ?[]const u8,
+    /// When the control plane last answered a config poll (awake clock, ms);
+    /// `control.never_synced` until it has. See `control.syncedAgoMs`.
+    config_synced_ms: std.atomic.Value(i64) = .init(control.never_synced),
     /// When this process started (Unix seconds); reported as the creation
     /// time of every model in `/v1/models`.
     started_unix_s: i64,

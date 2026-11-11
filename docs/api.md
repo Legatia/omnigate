@@ -122,6 +122,7 @@ job error's reason from `error.type` must read `error.code` now.
 | 431 | none | | | The request head is larger than 16 KiB. The answer has no body. |
 | 502 | `all_upstreams_failed` | `server_error` | `api_error` | Every target failed and none of them answered 429. The error has `attempts`. |
 | 503 | `gateway_not_ready` | `server_error` | `api_error` | The data plane has no config yet (the control plane has never answered and there is no cached config). |
+| 503 | `attestation_unverified` | `server_error` | `api_error` | No target could be sent the request because of [attestation](attestation.md): every target of the model is on an attested upstream whose evidence is not verified right now, or the request may only go to attested providers ([privacy mode](privacy.md#attested-providers-only)'s `attested`) and no target qualifies. Also the answer to `POST /v1/jobs` with `attested`. Nothing was sent to a provider. |
 | 503 | `control_plane_unavailable` | `server_error` | `api_error` | A jobs or files request could not reach the control plane. |
 | 503 | `overloaded` | `server_error` | `overloaded_error` | Two cases, both with `retry-after: 1`. (1) The data plane is already serving `OMNIGATE_MAX_CONNECTIONS` connections: sent at once, without reading the request, with `connection: close`; because the request was not read, this answer is always in the OpenAI shape and has no request id. (2) The gateway as a whole is holding as many request bodies, or converting as many requests, as its memory budgets allow (`OMNIGATE_REQUEST_MEMORY_MB`, `OMNIGATE_PARSE_MEMORY_MB`): an ordinary answer for this one request, in the client's protocol, with a request id. |
 
@@ -424,7 +425,8 @@ Request headers the gateway acts on:
 | `anthropic-version` | Forwarded to `anthropic` upstreams. Defaults to `2023-06-01` when absent. |
 | `anthropic-beta` | Forwarded to `anthropic` upstreams. |
 | `Idempotency-Key` | Jobs API only. |
-| `x-omnigate-privacy` | Switches parts of [privacy mode](privacy.md#the-request-header) on for this one request: `on`, or a comma-separated list of `no-store`, `redact`, `unlink`. It can only add to the key's setting; any other value, or the header sent twice, answers `400 invalid_request`. Never forwarded. |
+| `x-omnigate-privacy` | Switches parts of [privacy mode](privacy.md#the-request-header) on for this one request: `on` (`no-store`, `redact` and `unlink`), or a comma-separated list of `no-store`, `redact`, `unlink`, `attested`. It can only add to the key's setting; any other value, or the header sent twice, answers `400 invalid_request`. Never forwarded. |
+| `x-omnigate-dry-run` | `privacy`: answer with the request as privacy mode left it (`{"object": "omnigate.privacy_dry_run", "sent_upstream": false, "body": "...", ...}`) and send nothing to any provider. Any other value, or the header twice, answers `400 invalid_request`. See [Seeing what a provider would be sent](attestation.md#seeing-what-a-provider-would-be-sent). Never forwarded. |
 
 Other request headers are not forwarded to the provider. The values of
 the first three are restricted to plain characters; see
@@ -442,7 +444,8 @@ The provider's response, with these headers added:
 | `x-omnigate-request-id` | Id of this request (32 hex characters); also the id of its usage event in the ledger. |
 | `x-request-id`, `request-id` | The request id where the OpenAI and the Anthropic SDK look for it. The provider's own id is preferred, so that a support ticket can quote it: when the provider sent both headers each keeps its value, when it sent only one of them that id goes into both, and when it sent neither both carry the gateway's id (the value of `x-omnigate-request-id`). |
 | `x-omnigate-cache` | Only on routes with `cache_ttl_s`, for non-streaming requests: `hit` or `miss`. See [Response cache](#response-cache). |
-| `x-omnigate-privacy` | Only when a part of [privacy mode](privacy.md) applied to the request (from the key or from the request header): the parts, in the order `no-store, redact, unlink`. |
+| `x-omnigate-privacy` | Only when a part of [privacy mode](privacy.md) applied to the request (from the key or from the request header): the parts, in the order `no-store, redact, unlink`. (`attested` is not listed here; the next header answers it.) |
+| `x-omnigate-attestation` | Only when the upstream that answered is an [attested upstream](attestation.md): `verified; tcb=<platform status>; since=<unix seconds>`. It says the provider's attestation was verified, and recently, when the request was sent; it is not a signature over this response. |
 
 **Request ids are on every answer the gateway produces, with three
 exceptions**: provider responses, the gateway's own errors, the model
@@ -1423,6 +1426,9 @@ check, then the endpoint.
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
 | `GET /admin/overview` | Everything the dashboard shows, as JSON. |
 | `GET /admin/audit?limit=N` | The newest entries of the admin audit log. |
+| `GET /admin/attestations` | Every (upstream, model) on an [attested upstream](attestation.md#looking-at-it-the-admin-api-metrics-logs): the verdict, when it was reached, the evidence. |
+| `POST /admin/attestations/verify` | Check one of them now, with a new nonce: `{"upstream": "...", "model": "..."}`. |
+| `GET /admin/private-chat/state`, `POST /admin/private-chat/send` | The feed and the send action of the dashboard's [Private chat page](attestation.md#the-private-chat-page) (`GET /private-chat`). The page's own interface rather than a versioned one. |
 
 Request bodies, answers, error types and `curl` examples for all of these
 are in [Admin](admin.md). In short:
@@ -1532,6 +1538,9 @@ curl http://127.0.0.1:4000/metrics -H "Authorization: Bearer dev-admin-token-cha
 | `omnigate_rejected_requests_total` | counter | `key`, `reason` | Requests data planes refused before routing, since this control plane started. `reason` is the `error.code` the client got; `key` is the key's name, or `-` when the request had no usable key. |
 | `omnigate_redactions_total` | counter | `key`, `class` | Values [privacy mode](privacy.md#redaction) replaced by placeholders before a provider saw them, since this control plane started. `class` is `email`, `phone`, `card`, `ip` or `secret`. Counts only. |
 | `omnigate_key_private` | gauge | `key` | 1 when the key has any part of privacy mode switched on, else 0. |
+| `omnigate_attestation_verified` | gauge | `upstream`, `model` | 1 while the [attestation](attestation.md) of an upstream's model is verified and recent enough, else 0 (its targets are then not used). No series without attested upstreams. |
+| `omnigate_attestation_age_seconds` | gauge | `upstream`, `model` | Seconds since that attestation last verified; absent until it has. |
+| `omnigate_attestation_checks_total` | counter | `outcome` | Attestation checks since this control plane started: `ok`, `failed` (the evidence did not hold), `unavailable` (it could not be fetched). |
 | `omnigate_jobs` | gauge | `status` | Media jobs currently in the job store, by status. |
 | `omnigate_webhooks` | gauge | `state` | Webhook deliveries of the jobs currently in the job store, by state. |
 | `omnigate_ledger_events_total` | counter | | Usage events in the ledger. |

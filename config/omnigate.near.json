@@ -1,0 +1,43 @@
+{
+  "keys": [],
+  "upstreams": [
+    {
+      "name": "near-ai",
+      "kind": "openai",
+      "base_url": "https://cloud-api.near.ai",
+      "api_key_env": "NEAR_AI_API_KEY",
+      "attestation": {
+        "provider": "near",
+        "accepted_tcb": ["UpToDate"],
+        "gpu": "if_present",
+        "max_age_s": 900
+      }
+    },
+    {
+      "name": "near-ai-unattested",
+      "kind": "openai",
+      "base_url": "https://cloud-api.near.ai",
+      "api_key_env": "NEAR_AI_API_KEY"
+    }
+  ],
+  "routes": [
+    {
+      "model": "private",
+      "targets": [
+        { "upstream": "near-ai", "model": "z-ai/glm-5.3-flash" }
+      ]
+    },
+    {
+      "model": "relayed",
+      "targets": [
+        { "upstream": "near-ai", "model": "openai/gpt-5" }
+      ]
+    },
+    {
+      "model": "unattested",
+      "targets": [
+        { "upstream": "near-ai-unattested", "model": "z-ai/glm-5.3-flash" }
+      ]
+    }
+  ]
+}

@@ -7,7 +7,7 @@ defmodule OmnigateControl.Metrics do
   to instrument and nothing extra to store. Per-key series are labelled with
   the key's configured name, never its hash.
   """
-  alias OmnigateControl.{ConfigStore, Counters, Keys, Ledger, Redactions, Rejections}
+  alias OmnigateControl.{Attestation, ConfigStore, Counters, Keys, Ledger, Redactions, Rejections}
   alias OmnigateControl.Jobs.Store
 
   @job_statuses ~w(queued running succeeded failed canceled)
@@ -19,6 +19,8 @@ defmodule OmnigateControl.Metrics do
     meta = ConfigStore.meta()
     ledger = Ledger.stats()
     {uptime_ms, _} = :erlang.statistics(:wall_clock)
+    attestations = Attestation.Manager.all()
+    now_s = System.os_time(:second)
 
     # Across rotations of a managed key, so its series never restart.
     keys = Enum.map(config.keys, fn k -> {k, Keys.totals(k)} end)
@@ -117,6 +119,24 @@ defmodule OmnigateControl.Metrics do
         :counter,
         "Usage events dropped because they were malformed, since this control plane started.",
         [{[], Counters.get(:ledger_invalid_events)}]
+      ),
+      metric(
+        "omnigate_attestation_verified",
+        :gauge,
+        "1 while the attestation of an upstream's model is verified and recent enough, 0 otherwise (its targets are then not used).",
+        Enum.map(attestations, fn e -> {[upstream: e.upstream, model: e.model], if(Attestation.Manager.verified?(e, now_s), do: 1, else: 0)} end)
+      ),
+      metric(
+        "omnigate_attestation_age_seconds",
+        :gauge,
+        "Seconds since the attestation of an upstream's model last verified; absent until it has.",
+        for(e <- attestations, e.checked_at, do: {[upstream: e.upstream, model: e.model], now_s - e.checked_at})
+      ),
+      metric(
+        "omnigate_attestation_checks_total",
+        :counter,
+        "Attestation checks since start, by outcome: ok, failed (the evidence did not hold), unavailable (it could not be fetched).",
+        Enum.map(Attestation.Manager.counts(), fn {outcome, n} -> {[outcome: outcome], n} end)
       ),
       metric(
         "omnigate_ledger_unpriced_events_total",

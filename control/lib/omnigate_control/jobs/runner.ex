@@ -411,8 +411,14 @@ defmodule OmnigateControl.Jobs.Runner do
         end)
 
       case fetched do
-        {:ok, files, _left} -> store(job, t, files)
-        {:error, reason} -> next(job, index, t.upstream.name, "output_fetch_failed: #{describe(reason)}")
+        {:ok, files, _left} ->
+          store(job, t, files)
+
+        {:error, reason} ->
+          # Before the job is told: `next` may make it terminal, and nobody
+          # who then looks should still find a half-fetched file of it.
+          Enum.each(tmps, &File.rm/1)
+          next(job, index, t.upstream.name, "output_fetch_failed: #{describe(reason)}")
       end
     after
       # Whatever happened (a download that failed half way, a raise, storage

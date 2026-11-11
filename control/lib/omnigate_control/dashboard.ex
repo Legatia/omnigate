@@ -28,7 +28,7 @@ defmodule OmnigateControl.Dashboard do
       ~s(<header class="top"><div class="brand">omnigate <span>control plane</span></div>),
       ~s(<nav aria-label="Sections"><a href="#overview">Overview</a><a href="#keys">Keys</a>),
       ~s(<a href="#requests">Requests</a><a href="#jobs">Jobs</a><a href="#refused">Refused</a><a href="#activity">Activity</a>),
-      ~s(<a href="#config">Configuration</a></nav>),
+      ~s(<a href="#config">Configuration</a><a href="/private-chat">Private chat</a></nav>),
       ~s(<div class="right"><span id="updated" class="muted" role="status">Updated ),
       h(clock(o.generated_at)),
       ~s( UTC</span>),
@@ -494,7 +494,8 @@ defmodule OmnigateControl.Dashboard do
 
   # -- assets ---------------------------------------------------------------------
 
-  defp css do
+  @doc "The dashboard's style sheet; the Private chat page builds on it."
+  def css do
     ~S"""
     :root{--bg:#f6f7f9;--panel:#fff;--text:#1c2024;--muted:#667085;--line:#e3e6ea;--accent:#2f5bea;--accent-text:#fff;
     --ok:#12703a;--ok-bg:#e3f6ea;--warn:#8a5a00;--warn-bg:#fdf1d3;--bad:#a8231c;--bad-bg:#fde7e5;--info:#1d4f91;--info-bg:#e4eefb;--off:#555d68;--off-bg:#eceef1}

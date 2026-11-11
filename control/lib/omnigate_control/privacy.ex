@@ -13,7 +13,8 @@ defmodule OmnigateControl.Privacy do
         "no_store":   true,
         "redact":     true,          (or a list: ["email", "phone", "card", "ip", "secret"])
         "unlink":     true,
-        "encrypt_to": "age1..."
+        "encrypt_to": "age1...",
+        "attested":   true
       }
 
     * `no_store`: nothing of a request's content is kept here. The data
@@ -29,17 +30,24 @@ defmodule OmnigateControl.Privacy do
       removed.
     * `encrypt_to`: an age recipient. The outputs of the key's media jobs
       are encrypted to it before they are stored anywhere.
+    * `attested`: a text request only goes to a target whose provider has
+      proven, and recently, what hardware and configuration it runs on
+      (`OmnigateControl.Attestation`). When no such target is there the
+      request is refused, not sent elsewhere. Media jobs are refused: no
+      media provider is attested.
 
-  `true` is `no_store`, `redact` (every class) and `unlink`. A request can
+  `true` is `no_store`, `redact` (every class) and `unlink`. It is not
+  `attested`: that part needs an attested upstream in the config, and a
+  key that had `true` before the part existed must keep working. A request can
   add parts for itself with the `x-omnigate-privacy` header; nothing a
   request sends can take one away.
 
-  Normalised, a setting is `nil` (nothing on) or a map with all four fields.
+  Normalised, a setting is `nil` (nothing on) or a map with all five fields.
   """
   alias OmnigateControl.Age
 
   @classes ~w(email phone card ip secret)
-  @fields ~w(no_store redact unlink encrypt_to)
+  @fields ~w(no_store redact unlink encrypt_to attested)
 
   @doc "The classes of values `redact` knows."
   def classes, do: @classes
@@ -50,7 +58,7 @@ defmodule OmnigateControl.Privacy do
   """
   def normalize(nil), do: {:ok, nil}
   def normalize(false), do: {:ok, nil}
-  def normalize(true), do: {:ok, %{no_store: true, redact: @classes, unlink: true, encrypt_to: nil}}
+  def normalize(true), do: {:ok, %{no_store: true, redact: @classes, unlink: true, encrypt_to: nil, attested: false}}
 
   def normalize(%{} = map) do
     map = Map.new(map, fn {k, v} -> {to_string(k), v} end)
@@ -58,10 +66,11 @@ defmodule OmnigateControl.Privacy do
     with [] <- Map.keys(map) -- @fields,
          {:ok, no_store} <- flag(map["no_store"], "no_store"),
          {:ok, unlink} <- flag(map["unlink"], "unlink"),
+         {:ok, attested} <- flag(map["attested"], "attested"),
          {:ok, redact} <- redact(map["redact"]),
          {:ok, encrypt_to} <- encrypt_to(map["encrypt_to"]) do
-      if no_store or unlink or redact != [] or encrypt_to != nil do
-        {:ok, %{no_store: no_store, redact: redact, unlink: unlink, encrypt_to: encrypt_to}}
+      if no_store or unlink or attested or redact != [] or encrypt_to != nil do
+        {:ok, %{no_store: no_store, redact: redact, unlink: unlink, encrypt_to: encrypt_to, attested: attested}}
       else
         {:ok, nil}
       end
@@ -126,11 +135,11 @@ defmodule OmnigateControl.Privacy do
 
   @doc "The setting as the admin API shows it; nil when nothing is on."
   def view(nil), do: nil
-  def view(%{} = p), do: %{no_store: p.no_store, redact: p.redact, unlink: p.unlink, encrypt_to: p.encrypt_to}
+  def view(%{} = p), do: %{no_store: p.no_store, redact: p.redact, unlink: p.unlink, encrypt_to: p.encrypt_to, attested: attested?(p)}
 
   @doc "What a data plane needs of it (it has no use for the recipient); nil when none of that is on."
   def for_data_plane(%{} = p) do
-    if p.no_store or p.unlink or p.redact != [], do: %{no_store: p.no_store, redact: p.redact, unlink: p.unlink}
+    if p.no_store or p.unlink or attested?(p) or p.redact != [], do: %{no_store: p.no_store, redact: p.redact, unlink: p.unlink, attested: attested?(p)}
   end
 
   def for_data_plane(_), do: nil
@@ -139,7 +148,7 @@ defmodule OmnigateControl.Privacy do
   def summary(nil), do: ""
 
   def summary(%{} = p) do
-    [p.no_store && "no-store", p.redact != [] && "redact", p.unlink && "unlink", p.encrypt_to && "encrypt"]
+    [p.no_store && "no-store", p.redact != [] && "redact", p.unlink && "unlink", p.encrypt_to && "encrypt", attested?(p) && "attested"]
     |> Enum.filter(& &1)
     |> Enum.join(", ")
   end
@@ -155,6 +164,11 @@ defmodule OmnigateControl.Privacy do
     end
   end
 
+  @doc "Does this key's setting (or the setting itself) ask for attested providers only?"
+  def attested?(%{attested: true}), do: true
+  def attested?(%{privacy: %{attested: true}}), do: true
+  def attested?(_), do: false
+
   @doc "A key's setting, or nil."
   def of(key) when is_map(key), do: Map.get(key, :privacy)
   def of(_), do: nil
@@ -162,7 +176,8 @@ defmodule OmnigateControl.Privacy do
   @doc """
   What an `x-omnigate-privacy` request header asks for, for a media job:
   `{:ok, no_store?}` or `:error`. (The data plane has checked it already;
-  this is the same grammar.)
+  this is the same grammar. It refuses a job that asks for `attested`, so
+  the word is accepted here and means nothing more.)
   """
   def header(nil), do: {:ok, false}
 
@@ -178,7 +193,10 @@ defmodule OmnigateControl.Privacy do
 
       true ->
         parts = v |> String.split(",") |> Enum.map(&String.trim/1)
-        if Enum.all?(parts, &(&1 in ["no-store", "no_store", "redact", "unlink"])), do: {:ok, Enum.any?(parts, &(&1 in ["no-store", "no_store"]))}, else: :error
+
+        if Enum.all?(parts, &(&1 in ["no-store", "no_store", "redact", "unlink", "attested"])),
+          do: {:ok, Enum.any?(parts, &(&1 in ["no-store", "no_store"]))},
+          else: :error
     end
   end
 end

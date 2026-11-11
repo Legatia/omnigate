@@ -84,6 +84,13 @@ data with JavaScript off. With JavaScript on it refreshes itself every four
 seconds from `GET /admin/overview` (the top bar shows the time of the last
 update, in UTC), and the buttons that change keys work.
 
+The top bar also links to the **Private chat** page (`/private-chat`, same
+sign-in): a chat that shows what privacy mode sends to the provider and
+what was verified about the machine that answers. It uses a managed key of
+its own, `private-chat`, which appears in the key list like any other and
+can be given a budget or be disabled there. See
+[Attested upstreams](attestation.md#the-private-chat-page).
+
 From top to bottom:
 
 **Overview.** Six figures: requests, errors, tokens in, tokens out, spend
@@ -558,6 +565,8 @@ All on the control plane's port, all behind the admin token or a session.
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
 | `GET /admin/overview` | Everything the dashboard shows, as one JSON document. |
 | `GET /admin/audit?limit=N` | The newest audit entries. |
+| `GET /admin/attestations` | The verdict and evidence for every model on an attested upstream; see [Attested upstreams](attestation.md#looking-at-it-the-admin-api-metrics-logs). |
+| `POST /admin/attestations/verify` | Check one now: `{"upstream": "...", "model": "..."}`. Audited as `attestation.verify`. |
 | `GET /metrics` | Prometheus metrics; see [API](api.md#get-metrics). |
 
 `GET /admin/overview` is the feed the dashboard polls. Its top-level fields:

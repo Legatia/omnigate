@@ -60,6 +60,9 @@ services:
       # instead of all against the proxy. Remove this if you publish the
       # control plane's port directly.
       OMNIGATE_TRUST_FORWARDED: "1"
+      # Where the control plane itself reaches the data plane: only the
+      # dashboard's Private chat page uses it (docs/attestation.md).
+      OMNIGATE_GATEWAY_URL: http://dataplane:8080
     # A clean stop writes a ledger snapshot; give it time.
     stop_grace_period: 30s
     mem_limit: ${OMNIGATE_CONTROL_MEMORY:-1g}

@@ -218,6 +218,44 @@ also records that xAI's own Anthropic-compatible endpoint worked as an
 `anthropic` upstream; the repository does not record the base URL used for
 that.
 
+### NEAR AI Cloud (attested)
+
+An `openai` upstream, with the one thing no other provider here has: an
+`attestation` setting. NEAR AI Cloud runs its gateway and the models it
+serves itself in Intel TDX machines, and the gateway verifies that before a
+request goes there. All of it: [Attested upstreams](attestation.md).
+
+```json
+{
+  "name": "near-ai",
+  "kind": "openai",
+  "base_url": "https://cloud-api.near.ai",
+  "api_key_env": "NEAR_AI_API_KEY",
+  "attestation": { "provider": "near", "accepted_tcb": ["UpToDate"], "gpu": "if_present", "max_age_s": 900 }
+}
+```
+
+```json
+{ "model": "private", "targets": [ { "upstream": "near-ai", "model": "z-ai/glm-5.3-flash", "price_in_per_mtok": 0.0, "price_out_per_mtok": 0.0 } ] }
+```
+
+- Use canonical model ids, as `GET https://cloud-api.near.ai/v1/models`
+  lists them (public). The models NEAR serves itself are `"owned_by":
+  "nearai"`; only those have an attestation. A relayed model on this
+  upstream (`openai/gpt-5`, say) is never used; put it on a second upstream
+  entry without `attestation` if you want it.
+- Prices are yours to fill in from NEAR's price list; with `0.0`, usage is
+  counted and costs nothing in the ledger.
+- `config/omnigate.near.json` is a complete config with this upstream, a
+  relayed model and an unattested route to compare.
+
+Status: **attestation verified against the real service** on 11 November
+2026 without a key (`tools/near_live.py`): gateway and model reports, GPU
+evidence, re-checks, refusal of a relayed model, routing by the verdict up
+to NEAR's own 401. **No completion has been run**: no key was at hand, so
+chat, streaming, tool calls and metering through this upstream are
+untested beyond what any OpenAI-compatible upstream shares.
+
 ### Other OpenAI-compatible providers
 
 Any service that speaks the OpenAI protocol can be an `openai` upstream. Set

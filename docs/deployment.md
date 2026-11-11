@@ -207,6 +207,7 @@ The images change these defaults; everything else is as in
 | control | `OMNIGATE_JOBS` | `/data/jobs.jsonl` |
 | control | `OMNIGATE_KEYS` | `/data/keys.json` |
 | control | `OMNIGATE_AUDIT_LOG` | `/data/audit.jsonl` |
+| control | `OMNIGATE_RECEIPTS` | `/data/receipts.json` |
 | control | `OMNIGATE_MEDIA_DIR` | `/data/media` |
 | dataplane | `OMNIGATE_LISTEN` | `0.0.0.0:8080` |
 | dataplane | `OMNIGATE_CONTROL_URL` | `http://control:4000` |
@@ -667,6 +668,7 @@ What holds state that cannot be recomputed:
 | Job state | `control-data`: `/data/jobs.jsonl` and the directory `/data/jobs.jsonl.inputs/` | Jobs, their idempotency keys, cache entries and pending webhooks are gone. Without the directory alone, every job whose input was over 8 KiB has lost that input. |
 | Managed keys | `control-data`: `/data/keys.json` | Every key created through the dashboard or the admin API stops working: the gateway answers them with 401. The keys cannot be recovered (only hashes were ever stored); you create new ones and hand them out again. Their past usage is still in the ledger but no longer belongs to a named key. |
 | The admin audit log | `control-data`: `/data/audit.jsonl`, `/data/audit.jsonl.1` to `.3` | The record of key changes and sign-ins is gone. Nothing else depends on it. |
+| Receipts of answers from attested upstreams | `control-data`: `/data/receipts.json` | Earlier receipts answer 404. Nothing else depends on it; only present with an [attested upstream](attestation.md). |
 | Locally stored outputs | `control-data`: `/data/media/` | Output URLs of existing jobs answer 404. Not applicable with bucket storage. |
 | Your config and the three environment files (`.env`, `.env.control`, `.env.dataplane`) | the repository directory | You re-create them by hand. File keys come back with the config. Losing the internal token also invalidates outstanding signed file URLs, unless `OMNIGATE_SIGNING_SECRET` is set. |
 

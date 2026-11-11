@@ -726,6 +726,10 @@ defmodule OmnigateControl.Ledger do
     # plane lets through, whoever sent the event.
     usage = tagged(usage)
 
+    # What a data plane adds for an answer's receipt is kept by
+    # `OmnigateControl.Receipts`, not in the usage history.
+    usage = Map.delete(usage, "receipt")
+
     tokens = %{
       input: usage["input_tokens"] || 0,
       cached_input: usage["cached_input_tokens"] || 0,

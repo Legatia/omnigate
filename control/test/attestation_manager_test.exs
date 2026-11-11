@@ -149,6 +149,13 @@ defmodule OmnigateControl.AttestationManagerTest do
     assert entry.evidence.gateway.status == "UpToDate"
     assert [%{model: model}] = entry.evidence.models
     assert model == ctx.model
+
+    # A signature on an answer is matched to what was verified before the
+    # request began, never to a later report.
+    at = entry.evidence.verified_at
+    assert Manager.evidence_before("near", ctx.model, at, name) == entry.evidence
+    assert Manager.evidence_before("near", ctx.model, at - 1, name) == nil
+    assert Manager.evidence_before("near", "another-model", at, name) == nil
     now = System.os_time(:second)
     assert entry.until == entry.checked_at + 900
     assert entry.next_check_at <= entry.checked_at + 450

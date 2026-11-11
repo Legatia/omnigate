@@ -139,6 +139,12 @@ defmodule OmnigateControl.Metrics do
         Enum.map(Attestation.Manager.counts(), fn {outcome, n} -> {[outcome: outcome], n} end)
       ),
       metric(
+        "omnigate_receipts",
+        :gauge,
+        "Receipts held for answers from attested upstreams, by verdict: verified, not_verified, pending.",
+        Enum.map(OmnigateControl.Receipts.counts(), fn {verdict, n} -> {[verdict: verdict], n} end)
+      ),
+      metric(
         "omnigate_ledger_unpriced_events_total",
         :counter,
         "Usage events recorded at $0 because the config has no such route or target, since this control plane started.",

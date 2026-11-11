@@ -132,7 +132,9 @@ view says `"private": true`:
   continue after a restart and a provider may be tried again.
 - When the job ends (succeeded, failed or canceled, and its account with the
   provider is closed), both files are deleted and the job says
-  `"input_erased": true`. This happens before the webhook is sent, so the
+  `"input_erased": true`. The job's record loses both in the same write
+  that ends it, so it is never readable as finished with its input still
+  there; the files go right after. This happens before the webhook is sent, so the
   webhook carries neither; nor does `GET /v1/jobs/{id}`, the job list, or the
   answer to a repeated `Idempotency-Key`. Until then `GET /v1/jobs/{id}`
   still returns them to the key that created the job. A job that ended just

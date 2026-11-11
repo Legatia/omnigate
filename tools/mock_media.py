@@ -433,28 +433,119 @@ class OpenAIImages(Base):
 # ElevenLabs-style TTS
 # --------------------------------------------------------------------------
 
+# ElevenLabs-style: text to speech, sound effects, music (each one call that
+# answers with audio) and the Flows API for images and videos (create, then
+# ask until it ends). Written from the public documentation (November 2026).
+# What a test wants is steered by words in the prompt or text:
+#
+#   "paid plan"   402 paid_plan_required, as a workspace below Pro gets from
+#                 the Flows endpoints
+#   "too short"   422 with a list of validation errors, as the real service
+#                 answers a length a model does not take
+#   "fail"        the generation fails (failure_reason moderated)
+#   "huge"        the finished file is 3 MiB
+# A request that carries `webhook`, or a provider-named duration next to
+# none of its own, is counted (`leaked_fields`): the gateway must send neither.
 class ElevenLabs(Base):
-    stats = {"calls": 0, "characters": 0}
+    stats = {"calls": 0, "characters": 0, "sound": 0, "music": 0, "image": 0, "video": 0, "polls": 0, "downloads": 0, "leaked_fields": 0}
+    generations: dict = {}
+    last: dict = {}
+
+    def error(self, status, code, message):
+        self.send(status, {"detail": {"type": "invalid_request" if status < 500 else "server_error", "code": code, "message": message, "status": code}})
 
     def do_GET(self):
         if self.maybe_stats():
             return
+        path = self.path.split("?")[0]
+        if path == "/_last":
+            with LOCK:
+                return self.send(200, dict(self.last))
+        if path.startswith("/files/"):
+            self.bump("downloads")
+            name = path[len("/files/"):]
+            with LOCK:
+                g = self.generations.get(name.split(".")[0])
+            if g is None:
+                return self.send(404, {"detail": {"status": "not_found", "message": "not found"}})
+            data = png(len(name)) if g["api"] == "image" else fake_mp4(name)
+            if "huge" in g["req"].get("prompt", ""):
+                data += b"\x00" * (3 * 1024 * 1024)
+            return self.send(200, data, "image/png" if g["api"] == "image" else "video/mp4")
+        if not self.headers.get("xi-api-key"):
+            return self.error(401, "invalid_api_key", "missing xi-api-key")
+        parts = [x for x in path.split("/") if x]
+        if len(parts) == 4 and parts[:2] == ["v1", "flows"] and parts[2] in ("image", "video"):
+            with LOCK:
+                g = self.generations.get(parts[3])
+            if g is None or g["api"] != parts[2]:
+                return self.error(404, "not_found", "no such generation")
+            self.bump("polls")
+            gid = parts[3]
+            if time.time() < g["ready_at"]:
+                return self.send(200, {"status": "pending" if time.time() < g["ready_at"] - 0.5 else "generating", "id": gid})
+            if "fail" in g["req"].get("prompt", ""):
+                return self.send(200, {"status": "failed", "id": gid, "failure_reason": "moderated", "error_message": "The prompt was flagged by moderation."})
+            ext, mime = ("png", "image/png") if g["api"] == "image" else ("mp4", "video/mp4")
+            return self.send(200, {"status": "completed", "id": gid, "content_url": "%s/files/%s.%s" % (self.base_url(), gid, ext), "content_mime_type": mime})
         self.send(404, {"detail": {"status": "not_found", "message": "not found"}})
 
     def do_POST(self):
         req = self.json_body()
         if not self.headers.get("xi-api-key"):
-            return self.send(401, {"detail": {"status": "invalid_api_key", "message": "missing xi-api-key"}})
-        parts = [s for s in self.path.split("?")[0].split("/") if s]
-        if len(parts) != 3 or parts[:2] != ["v1", "text-to-speech"]:
-            return self.send(404, {"detail": {"status": "not_found", "message": "not found"}})
-        text = req.get("text")
-        if not isinstance(text, str) or not text:
-            return self.send(422, {"detail": {"status": "invalid_request", "message": "text is required"}})
-        self.bump("calls")
+            return self.error(401, "invalid_api_key", "missing xi-api-key")
+        path, _, query = self.path.partition("?")
+        parts = [x for x in path.split("/") if x]
         with LOCK:
-            self.stats["characters"] += len(text)
-        self.send(200, fake_mp3(parts[2] + ":" + text), "audio/mpeg")
+            self.last.clear()
+            self.last.update({"path": path, "query": query, "body": req})
+        if len(parts) == 3 and parts[:2] == ["v1", "text-to-speech"]:
+            text = req.get("text")
+            if not isinstance(text, str) or not text:
+                return self.send(422, {"detail": {"status": "invalid_request", "message": "text is required"}})
+            self.bump("calls")
+            with LOCK:
+                self.stats["characters"] += len(text)
+            return self.send(200, fake_mp3(parts[2] + ":" + text), "audio/mpeg")
+        if parts == ["v1", "sound-generation"]:
+            text, seconds = req.get("text"), req.get("duration_seconds")
+            if not isinstance(text, str) or not text:
+                return self.error(422, "invalid_request", "text is required")
+            if seconds is not None and not (isinstance(seconds, (int, float)) and 0.5 <= seconds <= 30):
+                return self.error(422, "invalid_request", "duration_seconds must be between 0.5 and 30")
+            if not str(req.get("model_id", "")).startswith("eleven_text_to_sound"):
+                return self.error(422, "invalid_request", "unknown model_id")
+            self.bump("sound")
+            return self.send(200, fake_mp3("sound:" + text), "audio/mpeg")
+        if parts == ["v1", "music"]:
+            prompt, plan, ms = req.get("prompt"), req.get("composition_plan"), req.get("music_length_ms")
+            if (prompt is None) == (plan is None):
+                return self.error(422, "invalid_request", "send prompt or composition_plan")
+            if ms is not None and not (isinstance(ms, int) and 3000 <= ms <= 600000):
+                return self.error(422, "invalid_request", "music_length_ms must be between 3000 and 600000")
+            if "store_for_inpainting" in req:
+                self.bump("leaked_fields")
+            if "paid plan" in str(prompt):
+                return self.error(402, "paid_plan_required", "The Music API requires a paid plan.")
+            self.bump("music")
+            return self.send(200, fake_mp3("music:" + json.dumps(prompt or plan)), "audio/mpeg")
+        if len(parts) == 3 and parts[:2] == ["v1", "flows"] and parts[2] in ("image", "video"):
+            api, prompt = parts[2], req.get("prompt")
+            if not isinstance(prompt, str) or not prompt or not isinstance(req.get("model_id"), str):
+                return self.error(422, "invalid_request", "prompt and model_id are required")
+            if "webhook" in req or "duration" in req or "duration_seconds" in req or "music_length_ms" in req:
+                self.bump("leaked_fields")
+            if "too short" in prompt:
+                return self.send(422, {"detail": [{"type": "greater_than_equal", "loc": ["body", req["model_id"], "duration_secs"],
+                                                   "msg": "Input should be greater than or equal to 4", "input": req.get("duration_secs"), "ctx": {"ge": 4}}]})
+            if "paid plan" in prompt:
+                return self.error(402, "paid_plan_required", "This endpoint requires a Pro plan or above.")
+            gid = "gen_" + uuid.uuid4().hex[:20]
+            with LOCK:
+                self.generations[gid] = {"api": api, "req": req, "ready_at": time.time() + 1.0}
+            self.bump(api)
+            return self.send(200, {"status": "pending", "id": gid})
+        self.send(404, {"detail": {"status": "not_found", "message": "not found"}})
 
 
 # --------------------------------------------------------------------------

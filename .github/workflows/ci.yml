@@ -135,6 +135,9 @@ jobs:
       - name: LiteLLM importer tests
         run: python tools/test_import_litellm.py
 
+      - name: Receipt verifier against RFC 8032's Ed25519 vectors
+        run: python tools/verify_receipt.py --self-test
+
   e2e:
     name: End to end (mock providers)
     needs: [dataplane, control]

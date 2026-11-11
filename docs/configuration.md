@@ -289,6 +289,7 @@ control plane and is shared across keys.
 | `ledger_days` | number, fractions allowed | `0` (keep forever) | Sealed ledger segments (the history of usage events) last written longer ago than this are deleted. Spend totals are not affected: they are carried in the ledger's snapshots. |
 | `delete_bucket_objects` | boolean | `true` | Whether a removed job's objects are also deleted from an S3-compatible bucket. Only has an effect when `jobs_days` is set. Anything but `true` or `false` is rejected when the file is loaded. |
 | `private_outputs_hours` | number, 0 to 87,600, fractions allowed | `24` | The outputs of private jobs ([privacy mode](privacy.md#no-retention), `no_store`) are deleted this long after the job finished, on local disk and in the bucket, whatever `jobs_days` and `delete_bucket_objects` say. The job itself stays and says `"outputs_expired": true`. `0` keeps them like any other job's. A value outside the range is rejected when the file is loaded. |
+| `receipts_days` | number, fractions allowed | `30` | [Receipts](attestation.md#a-receipt-for-each-answer) of answers from attested upstreams older than this are dropped. `0` sets no age limit; the newest 10,000 are kept either way. Only matters with an attested upstream. |
 
 No job, file or ledger segment is deleted unless you set these, with two
 exceptions that have a default. One only concerns jobs created under privacy
@@ -353,7 +354,11 @@ the next target.
 Each target has `upstream`, `model` (the provider's model id), an optional
 `price` object, on a `sume` upstream a required `router` (`"image"` or
 `"video"`: which of Sume's two generate endpoints the model is on; refused
-on any other kind), and, for per-second prices, three optional settings:
+on any other kind), on an `elevenlabs` upstream an optional `api`
+(`"speech"`, `"sound"`, `"music"`, `"image"` or `"video"`: which
+[ElevenLabs product](providers.md#elevenlabs) the model belongs to; speech
+when it is left out; refused on any other kind), and, for per-second
+prices, three optional settings:
 
 | Target field | Type | Default | Meaning |
 |---|---|---|---|
@@ -365,9 +370,11 @@ on any other kind), and, for per-second prices, three optional settings:
 and a `default_seconds` of 0 are rejected when the file is loaded.
 
 **Per-second prices and providers that take no duration.** Only the video
-kinds (`replicate`, `fal`, `xai_video`, `sume`) are sent a duration from the
-request. An upstream of kind `openai_images`, `elevenlabs`, `gemini` or
-`gemini_interactions` never is, so there a `per_second_usd` price has
+kinds (`replicate`, `fal`, `xai_video`, `sume`) and an `elevenlabs` target
+whose `api` is `sound`, `music` or `video` are sent a duration from the
+request. An upstream of kind `openai_images`, `gemini` or
+`gemini_interactions`, and an `elevenlabs` target for speech or images,
+never is, so there a `per_second_usd` price has
 nothing from the request to multiply: the job is billed
 `default_seconds` (raised to `min_seconds`), whatever `input.duration`
 says, and `max_seconds` refuses nothing. A per-second price on such a
@@ -404,7 +411,7 @@ own price by moving its text or its duration into another field:
 | `replicate`, `fal`, `xai_video` | `input.prompt`, `input.text` and `input.input`, each when it is a string, added together (the whole `input` goes to the provider) | The larger of `input.duration` and `input.seconds` (a number, a string that is one, or a number followed by `s`: `5`, `"5"`, `"5s"`) |
 | `sume` | `input.prompt` | `input.duration`; replaced by the length Sume reports for the result, when it reports one |
 | `openai_images` | `input.prompt` | none |
-| `elevenlabs` | `input.text` | none |
+| `elevenlabs` | `input.text` for speech and sound, `input.prompt` for music, image and video | By the target's `api`: `input.duration` for sound, music and video (for music from a `composition_plan`, the sum of the plan's sections); none for speech and image |
 | `gemini` | Every `text` part of the request's `contents` and `systemInstruction`, whether it came from the short form (`prompt`, else `text`) or from a native body | none |
 | `gemini_interactions` | The request's `input` (a string, or every `text` inside it) and `system_instruction` | none |
 
@@ -627,6 +634,7 @@ quietly becomes a default.
 | `OMNIGATE_JOBS` | `data/jobs.jsonl` | Job state. Job inputs over 8 KiB are kept next to it in the directory `<this path>.inputs/` (`data/jobs.jsonl.inputs/`), one file per job; it belongs to the job log and must be backed up with it. |
 | `OMNIGATE_KEYS` | `data/keys.json` | Gateway keys created through the admin API or the dashboard: hashes, limits, and a key's webhook secret if it has one. See [Admin](admin.md#gateway-keys-two-sources). |
 | `OMNIGATE_AUDIT_LOG` | `data/audit.jsonl` | The admin audit log. Rotated files (`.1` to `.3`) are kept next to it. See [Admin](admin.md#the-audit-log). |
+| `OMNIGATE_RECEIPTS` | `data/receipts.json` | [Receipts](attestation.md#a-receipt-for-each-answer) of answers from attested upstreams: hashes, signatures and verdicts, no content. Written only when there is an attested upstream. |
 | `OMNIGATE_AUDIT_MAX_MB` | `50` | Size, in megabytes (fractions allowed), at which the audit log is rotated. `0` turns rotation off. A negative value, or one that is not a number (`50MB`, say), stops the start with a message that names the variable; earlier commits replaced it by the default without a word. |
 | `OMNIGATE_MEDIA_DIR` | `data/media` | Where local output storage keeps files, unless the config names a `dir`. |
 | `OMNIGATE_GATEWAY_URL` | the config's `media.public_base_url` (`http://127.0.0.1:8080`) | Where the control plane itself reaches the data plane's public port. Only the dashboard's [Private chat page](attestation.md#the-private-chat-page) uses it, to send the messages typed there through the gateway like any client. `compose.yaml` sets it to `http://dataplane:8080`. |

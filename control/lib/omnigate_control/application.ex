@@ -43,6 +43,7 @@ defmodule OmnigateControl.Application do
     OmnigateControl.Counters.setup()
     OmnigateControl.Audit.setup()
     OmnigateControl.Attestation.Manager.setup()
+    OmnigateControl.Receipts.setup()
     {:ok, ip} = bind_address()
 
     # Everything that holds state: the logs, the keys, the ledger, the jobs.
@@ -68,6 +69,8 @@ defmodule OmnigateControl.Application do
       # Checks of attested upstreams run as tasks; the manager decides when.
       {Task.Supervisor, name: OmnigateControl.Attestation.TaskSup},
       OmnigateControl.Attestation.Manager,
+      # A receipt per answer from an attested upstream; idle without one.
+      {OmnigateControl.Receipts, path: receipts_path()},
       {OmnigateControl.Guard, name: OmnigateControl.StateGuard, supervisor_name: OmnigateControl.Supervisor, children: state, strategy: :one_for_one},
       # HTTP/1.1 only: nothing here needs HTTP/2 or WebSockets, and every
       # protocol left on is one more parser in front of the authentication.
@@ -109,6 +112,12 @@ defmodule OmnigateControl.Application do
     System.get_env("OMNIGATE_AUDIT_LOG") ||
       Application.get_env(:omnigate_control, :audit_path) ||
       Path.expand("data/audit.jsonl", File.cwd!())
+  end
+
+  defp receipts_path do
+    System.get_env("OMNIGATE_RECEIPTS") ||
+      Application.get_env(:omnigate_control, :receipts_path) ||
+      Path.expand("data/receipts.json", File.cwd!())
   end
 
   defp jobs_path do

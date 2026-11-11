@@ -1141,6 +1141,30 @@ shape, with the reason in `error.code` (see [Shape](#shape)), and the same
 | 404 | `job_not_found` | No such job for this key. |
 | 409 | `idempotency_conflict` | The `Idempotency-Key` was already used with a different request. |
 
+## Receipts
+
+```
+GET /v1/attestations/{request id}
+```
+
+Only on a gateway with an [attested upstream](attestation.md). The receipt
+of one answer that came from such an upstream: the provider's signature
+over the exact request and response bytes, and whether it verified against
+the attestation checked before the request. `{request id}` is the
+`x-omnigate-request-id` of the response. The fields, an example and what a
+receipt does and does not prove are in
+[A receipt for each answer](attestation.md#a-receipt-for-each-answer).
+
+| Status | `error.code` | When |
+|---|---|---|
+| 200 | | The receipt. `verdict` is `verified`, `not_verified` (with `reason` and `reason_code`) or, for the second or so the check takes, `pending`. |
+| 404 | `receipt_not_found` | No receipt under this id: the answer did not come from an attested upstream, was an error, was cut off or came from the cache; the receipt is not made yet (ask again in a moment); it is older than `retention.receipts_days`; or it belongs to another key. |
+| 401 | `missing_api_key`, `invalid_api_key` | As everywhere. |
+| 405 | `method_not_allowed` | Anything but `GET`. |
+
+Only the key that made the request (across its rotations) can read it.
+`tools/verify_receipt.py` checks one offline.
+
 ## File URLs
 
 ```
@@ -1431,6 +1455,7 @@ check, then the endpoint.
 | `GET /admin/audit?limit=N` | The newest entries of the admin audit log. |
 | `GET /admin/attestations` | Every (upstream, model) on an [attested upstream](attestation.md#looking-at-it-the-admin-api-metrics-logs): the verdict, when it was reached, the evidence. |
 | `POST /admin/attestations/verify` | Check one of them now, with a new nonce: `{"upstream": "...", "model": "..."}`. |
+| `GET /admin/receipts?limit=N`, `GET /admin/receipts/{request id}` | [Receipts](attestation.md#a-receipt-for-each-answer) of answers from attested upstreams, newest first (50 unless `limit`, at most 500), each with the name of the key that made the request, and `counts` by verdict; or one of them. |
 | `GET /admin/private-chat/state`, `POST /admin/private-chat/send` | The feed and the send action of the dashboard's [Private chat page](attestation.md#the-private-chat-page) (`GET /private-chat`). The page's own interface rather than a versioned one. |
 
 Request bodies, answers, error types and `curl` examples for all of these
@@ -1544,6 +1569,7 @@ curl http://127.0.0.1:4000/metrics -H "Authorization: Bearer dev-admin-token-cha
 | `omnigate_attestation_verified` | gauge | `upstream`, `model` | 1 while the [attestation](attestation.md) of an upstream's model is verified and recent enough, else 0 (its targets are then not used). No series without attested upstreams. |
 | `omnigate_attestation_age_seconds` | gauge | `upstream`, `model` | Seconds since that attestation last verified; absent until it has. |
 | `omnigate_attestation_checks_total` | counter | `outcome` | Attestation checks since this control plane started: `ok`, `failed` (the evidence did not hold), `unavailable` (it could not be fetched). |
+| `omnigate_receipts` | gauge | `verdict` | [Receipts](attestation.md#a-receipt-for-each-answer) held for answers from attested upstreams: `verified`, `not_verified`, `pending`. All 0 without an attested upstream. |
 | `omnigate_jobs` | gauge | `status` | Media jobs currently in the job store, by status. |
 | `omnigate_webhooks` | gauge | `state` | Webhook deliveries of the jobs currently in the job store, by state. |
 | `omnigate_ledger_events_total` | counter | | Usage events in the ledger. |

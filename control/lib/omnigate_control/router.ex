@@ -15,6 +15,10 @@ defmodule OmnigateControl.Router do
     * `GET  /admin/audit`     — the latest admin actions, see `Audit`
     * `GET  /admin/attestations`, `POST /admin/attestations/verify` — attested
       upstreams and their verdicts, see `Attestation`
+    * `GET  /admin/receipts`, `GET /admin/receipts/:id` — the receipts of
+      answers from attested upstreams, see `Receipts`; the key that made a
+      request reads its own through the data plane, which forwards
+      `GET /v1/attestations/:id` to `/internal/v1/attestations/:id`
     * `GET  /`                — dashboard (session; redirects to `/login`)
     * `GET  /private-chat`    — the Private chat page (session), with
       `GET /admin/private-chat/state` and `POST /admin/private-chat/send`,
@@ -45,6 +49,7 @@ defmodule OmnigateControl.Router do
     PrivateChat,
     PrivateChatPage,
     RateLimit,
+    Receipts,
     Redactions,
     Rejections,
     Storage,
@@ -173,6 +178,8 @@ defmodule OmnigateControl.Router do
     case conn.body_params do
       %{"events" => events} when is_list(events) ->
         {:ok, counts} = Ledger.record_batch(events)
+        # Answers from attested upstreams carry what a receipt needs.
+        Receipts.offer(events)
         send_json(conn, 200, counts)
 
       _ ->
@@ -282,6 +289,19 @@ defmodule OmnigateControl.Router do
     else
       {:error, status, type, message} -> send_error(conn, status, type, message)
       nil -> send_error(conn, 404, "job_not_found", "no such job")
+    end
+  end
+
+  # The receipt of one answer from an attested upstream, for the key that
+  # made the request (across its rotations). Anyone else's, and an id that
+  # has none, are the same 404.
+  get "/internal/v1/attestations/:id" do
+    with {:ok, key} <- gateway_key(conn),
+         %{} = receipt <- Receipts.own(Keys.hashes(key), id) do
+      send_json(conn, 200, Receipts.view(receipt))
+    else
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+      nil -> send_error(conn, 404, "receipt_not_found", "no receipt for this request id")
     end
   end
 
@@ -432,6 +452,27 @@ defmodule OmnigateControl.Router do
   get "/admin/attestations" do
     now = System.os_time(:second)
     send_json(conn, 200, %{attestations: Enum.map(Attestation.Manager.all(), &Attestation.view(&1, now)), checks: Attestation.Manager.counts()})
+  end
+
+  # Receipts of answers from attested upstreams: the newest, or one by its
+  # request id, with the name of the key that made the request.
+  get "/admin/receipts" do
+    conn = fetch_query_params(conn)
+
+    limit =
+      case Integer.parse(conn.query_params["limit"] || "") do
+        {n, ""} -> n |> max(1) |> min(500)
+        _ -> 50
+      end
+
+    send_json(conn, 200, %{receipts: Enum.map(Receipts.recent(limit), &admin_receipt/1), counts: Receipts.counts()})
+  end
+
+  get "/admin/receipts/:id" do
+    case Receipts.get(id) do
+      nil -> send_error(conn, 404, "receipt_not_found", "no receipt for this request id")
+      receipt -> send_json(conn, 200, admin_receipt(receipt))
+    end
   end
 
   # Check one (upstream, model) now, with a fresh nonce, and answer with the verdict.
@@ -684,6 +725,11 @@ defmodule OmnigateControl.Router do
   defp changed_key(_), do: nil
 
   # A job belongs to a key under its current secret or one from before a rotation.
+  defp admin_receipt(receipt) do
+    owner = is_binary(receipt["key_sha256"]) && Keys.find_owner(receipt["key_sha256"])
+    receipt |> Receipts.view() |> Map.put("key", if(owner, do: owner.name))
+  end
+
   defp own_job(key, id), do: Enum.find_value(Keys.hashes(key), &Jobs.get(&1, id))
 
   defp outcome({:ok, _key}), do: "ok"

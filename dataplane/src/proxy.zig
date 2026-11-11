@@ -38,6 +38,7 @@ const limits = @import("limits.zig");
 const models = @import("models.zig");
 const logging = @import("logging.zig");
 const quirks = @import("quirks.zig");
+const receipt_mod = @import("receipt.zig");
 const redact = @import("redact.zig");
 const translate = @import("translate.zig");
 const usage_mod = @import("usage.zig");
@@ -479,6 +480,17 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         return respondModels(app, acc, arena, request, snapshot, key, path["/v1/models/".len..]);
     }
 
+    // --- the receipt of an answer from an attested upstream ---------------
+    // Kept by the control plane, which also checks that it is this key's.
+    if (std.mem.startsWith(u8, path, "/v1/attestations/")) {
+        if (method != .GET)
+            return respondError(acc, request, .method_not_allowed, "method_not_allowed", "use GET");
+        const id = path["/v1/attestations/".len..];
+        if (!receiptId(id))
+            return respondError(acc, request, .not_found, "receipt_not_found", "no receipt for this request id");
+        return forwardToControl(app, acc, arena, request, guard, method, path, "", null, null, &key_hash, false, null);
+    }
+
     // --- async media jobs: owned by the control plane ---------------------
     // (which also applies the key's model limits to them)
     if (is_jobs or is_files) {
@@ -798,6 +810,8 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     balance.order(order, route.targets, cooling, strategy, counter, random);
 
     var tried: u32 = 0;
+    // For an answer from an attested upstream (receipt.zig).
+    var evidence: receipt_mod.Evidence = .{};
     // Targets passed over because their attestation does not hold, or
     // because the request wanted an attested one and they are not.
     var unattested: u32 = 0;
@@ -821,6 +835,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 if (verdict.tcb) |tcb| (if (framing.plainHeaderValue(tcb, 64)) tcb else "unknown") else "unknown",
                 verdict.since,
             });
+            extras.receipt = &evidence;
         } else {
             if (privacy.attested) {
                 try attempts.append(arena, .{ .upstream = up.name, .outcome = "not_attested" });
@@ -828,6 +843,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 continue;
             }
             extras.attestation_note = null;
+            extras.receipt = null;
         }
         // The upstream may speak the other protocol: translate both ways.
         const xlate: ?Translation = if (up.kind == kind)
@@ -1058,6 +1074,13 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     .estimated = estimated,
                     .latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds(),
                     .attempts = attempts.items,
+                    // A whole answer from an attested upstream: what the
+                    // control plane needs to check the provider's signature
+                    // on it. (An answer that was cut off has no receipt.)
+                    .receipt = if (extras.receipt != null and @backingInt(status) >= 200 and @backingInt(status) < 300)
+                        try evidence.report(arena)
+                    else
+                        null,
                 });
                 return;
             },
@@ -1364,6 +1387,9 @@ const UsageReport = struct {
     id: []const u8,
     /// The caller's own label for the request (`x-omnigate-tag`), if any.
     tag: ?[]const u8 = null,
+    /// For an answer from an attested upstream: the hashes of what was sent
+    /// and received and the provider's id for it (receipt.zig).
+    receipt: ?receipt_mod.Report = null,
     /// Filled in by `report`.
     ts_ms: i64 = 0,
 };
@@ -1422,6 +1448,10 @@ const ForwardExtras = struct {
     /// Value for `x-omnigate-attestation` on the response, when the target
     /// that answers is on an attested upstream whose verdict holds.
     attestation_note: ?[]const u8 = null,
+    /// Set while the target is on an attested upstream whose verdict holds:
+    /// takes the hashes of this exchange for the answer's receipt, and makes
+    /// the request ask the provider not to substitute another model.
+    receipt: ?*receipt_mod.Evidence = null,
     /// Puts back what privacy mode replaced in the request; null when
     /// nothing was replaced.
     restorer: ?*redact.Restorer = null,
@@ -1701,6 +1731,7 @@ fn forward(
     extras.parked = null;
     // A fresh reader for this attempt's response.
     usage.* = .{};
+    if (extras.receipt) |e| e.begin(out_body);
     // While waiting for the upstream its own timeout applies, not the
     // deadline on our answer; that comes back when this returns (whatever
     // the caller does next ends in an answer to the client).
@@ -1732,6 +1763,10 @@ fn forward(
             if (hdrs.anthropic_beta) |b| try extra.append(arena, .{ .name = "anthropic-beta", .value = b });
         },
     }
+    // An attested upstream was verified for exactly this model name, and its
+    // signature on the answer names it: the provider must refuse rather than
+    // serve the request with another model under an alias.
+    if (extras.receipt != null) try extra.append(arena, .{ .name = "x-no-aliasing", .value = "true" });
 
     var call: UpstreamCall = .{
         .client = app.client,
@@ -1821,6 +1856,7 @@ fn forward(
         if (@backingInt(status) == 400 and !x.signatures_added and x.dir == .anthropic_to_openai and
             quirks.mentionsThoughtSignature(raw)) return .add_thought_signature;
         usage.feed(raw);
+        if (extras.receipt) |e| e.feed(raw);
         const now_s = @divTrunc(Io.Timestamp.now(app.io, .real).toMilliseconds(), 1000);
         // A tree of the upstream's answer, capped like one of a request: an
         // answer that needs more is not the shape its protocol promises.
@@ -1854,6 +1890,7 @@ fn forward(
         if (start.ended) {
             framing.release(&call.req, &upstream_body);
             usage.feed(small);
+            if (extras.receipt) |e| e.feed(small);
             if (extras.capture) |c| {
                 c.add(arena, small);
                 c.content_type = content_type;
@@ -1930,6 +1967,7 @@ fn forward(
             break :next chunk[0..n];
         };
         usage.feed(data);
+        if (extras.receipt) |e| e.feed(data);
         // A client that is connected but takes nothing gets the stall
         // timeout, not the (much longer) one for a silent upstream.
         guard.arm(app.io, app.client_stall_timeout_ms);
@@ -2188,7 +2226,20 @@ fn drainRead(job: *DrainJob) void {
     }
 }
 
-/// Hand a `/v1/jobs*` or `/v1/files/*` request to the control plane at
+/// A request id as this gateway hands them out, or anything of that shape:
+/// what `/v1/attestations/<id>` passes on to the control plane.
+fn receiptId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 128) return false;
+    for (id) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == ':')) return false;
+    return true;
+}
+
+test "receipt ids are plain tokens" {
+    try std.testing.expect(receiptId("req_0123abcd-ef.4:5"));
+    for ([_][]const u8{ "", "a/b", "..%2f", "a b", "a?b", &@as([129]u8, @splat('a')) }) |bad| try std.testing.expect(!receiptId(bad));
+}
+
+/// Hand a `/v1/jobs*`, `/v1/files/*` or `/v1/attestations/*` request to the control plane at
 /// `/internal<target>` and stream its answer back unchanged. `key_sha256` is
 /// null only for signed file URLs, which the control plane verifies itself.
 fn forwardToControl(

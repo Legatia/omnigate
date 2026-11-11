@@ -604,6 +604,7 @@ All on the control plane's port, all behind the admin token or a session.
 | `GET /admin/audit?limit=N` | The newest audit entries. |
 | `GET /admin/attestations` | The verdict and evidence for every model on an attested upstream; see [Attested upstreams](attestation.md#looking-at-it-the-admin-api-metrics-logs). |
 | `POST /admin/attestations/verify` | Check one now: `{"upstream": "...", "model": "..."}`. Audited as `attestation.verify`. |
+| `GET /admin/receipts?limit=N`, `GET /admin/receipts/{request id}` | The receipts of answers from attested upstreams (the provider's signature on each, and whether it verified), with the key's name; see [A receipt for each answer](attestation.md#a-receipt-for-each-answer). |
 | `GET /metrics` | Prometheus metrics; see [API](api.md#get-metrics). |
 
 `GET /admin/overview` is the feed the dashboard polls. Its top-level fields:

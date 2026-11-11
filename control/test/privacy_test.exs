@@ -659,6 +659,77 @@ defmodule OmnigateControl.PrivacyTest do
       assert await(json(answer)["id"], &settled?/1)["erased"] == true
     end
 
+    test "ends and is erased in one write: no reader finds it finished and not yet erased" do
+      # Many jobs, each watched by a reader that does nothing but look.
+      for round <- 1..12 do
+        Stub.set(:submit, {:slow, 5 + rem(round, 4) * 5})
+        {:ok, job} = Jobs.create(hash(), %{"model" => "pv", "input" => %{"prompt" => "watched #{round}"}, "metadata" => %{"n" => round}}, nil, private())
+        id = job["id"]
+
+        watcher =
+          Task.async(fn ->
+            Stream.repeatedly(fn -> Store.get(id) end)
+            |> Enum.reduce_while(0, fn seen, looks ->
+              cond do
+                seen["status"] in ~w(succeeded failed canceled) and seen["erased"] != true -> {:halt, {:finished_unerased, seen}}
+                seen["erased"] == true -> {:halt, {:ok, looks}}
+                true -> {:cont, looks + 1}
+              end
+            end)
+          end)
+
+        assert {:ok, _looks} = Task.await(watcher, 10_000)
+        view = Jobs.view(await(id, &settled?/1))
+        assert view["status"] == "succeeded" and view["input_erased"] == true and view["input"] == nil
+        # The files follow the record at once.
+        assert wait_until(fn -> not File.exists?(Store.input_path(id)) end)
+      end
+
+      # A canceled job whose provider call is still open is erased when its
+      # account is closed, in that same write.
+      Stub.set(:submit, {:slow, 200})
+      key = hash()
+      {:ok, job} = Jobs.create(key, %{"model" => "pv", "input" => %{"prompt" => "to be canceled"}}, nil, private())
+      assert wait_until(fn -> match?(%{"run" => %{"attempt_started_ms" => ms}} when is_integer(ms), Store.get(job["id"])) end)
+      canceled = Jobs.cancel(key, job["id"])
+      assert canceled["status"] == "canceled"
+      settled = await(job["id"], &settled?/1)
+      assert settled["erased"] == true and settled["provider_pending"] != true
+
+      # A stop after the record was written and before the files went:
+      # the next start deletes them.
+      id = "job_" <> (:crypto.strong_rand_bytes(12) |> Base.encode16(case: :lower))
+      now = System.os_time(:millisecond)
+      :ok = Store.put_input(id, JSON.encode!(%{"prompt" => @canary}))
+      :ok = Store.put_metadata(id, JSON.encode!(%{"note" => @meta_canary}))
+
+      {:ok, _} =
+        Store.create(%{
+          "id" => id,
+          "status" => "succeeded",
+          "model" => "pv",
+          "input" => nil,
+          "input_file" => false,
+          "metadata" => nil,
+          "metadata_file" => false,
+          "private" => true,
+          "erased" => true,
+          "outputs" => [],
+          "attempts" => [],
+          "key_sha256" => hash(),
+          "created_ms" => now,
+          "finished_ms" => now,
+          "ledgered" => true,
+          "webhook" => nil,
+          "cost_usd" => 0.0
+        })
+
+      assert File.exists?(Store.input_path(id))
+      Jobs.resume_all()
+      refute File.exists?(Store.input_path(id))
+      refute File.exists?(String.replace_suffix(Store.input_path(id), ".json", ".meta.json"))
+    end
+
     test "a stop between its end and its erasure is made up for at the next start" do
       id = "job_" <> (:crypto.strong_rand_bytes(12) |> Base.encode16(case: :lower))
       now = System.os_time(:millisecond)

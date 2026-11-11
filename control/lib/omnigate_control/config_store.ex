@@ -398,6 +398,10 @@ defmodule OmnigateControl.ConfigStore do
           n when is_number(n) and n >= 0 and n <= 87_600 -> n
           other -> raise ArgumentError, "retention.private_outputs_hours must be a number of hours (0 = keep like other jobs), got #{inspect(other)}"
         end,
+      # Receipts of answers from attested upstreams (`OmnigateControl.Receipts`)
+      # older than this are dropped. A month unless set; 0 = no age limit
+      # (the newest 10,000 are kept either way).
+      receipts_days: if(is_nil(r["receipts_days"]), do: 30, else: days(r["receipts_days"], "receipts_days")),
       # Also delete a removed job's objects from the bucket. On unless
       # switched off; it only ever does anything when jobs_days is set.
       delete_bucket_objects:
@@ -417,7 +421,7 @@ defmodule OmnigateControl.ConfigStore do
 
   # Media (async job) config. Never sent to data planes.
   defp normalize_media(m) do
-    m |> build_media() |> check_per_second_prices!() |> check_routers!()
+    m |> build_media() |> check_apis!() |> check_per_second_prices!() |> check_routers!()
   end
 
   # A per-second price needs seconds to multiply. Video providers take them
@@ -432,11 +436,38 @@ defmodule OmnigateControl.ConfigStore do
       kind = kinds[target.upstream]
 
       if OmnigateControl.Jobs.per_second?(target.price) and is_binary(kind) and
-           not OmnigateControl.Jobs.Adapter.takes_duration?(kind) and is_nil(target.default_seconds) do
+           not OmnigateControl.Jobs.Adapter.takes_duration?(kind, target) and is_nil(target.default_seconds) do
         raise ArgumentError,
               "media route #{inspect(route.model)}: the target on #{inspect(target.upstream)} has \"per_second_usd\", " <>
                 "but a #{kind} provider is never sent a duration. Set \"default_seconds\" on the target " <>
                 "(the seconds every job is billed for), or price it with \"per_job_usd\" or \"per_output_usd\""
+      end
+    end
+
+    media
+  end
+
+  # ElevenLabs has several products behind one key; which one a target uses
+  # is said (`"api"`), not guessed from a model name. Speech when it is left
+  # out, as before the others existed. No other kind has such a setting.
+  defp check_apis!(media) do
+    kinds = Map.new(media.upstreams, &{&1.name, &1.kind})
+    apis = OmnigateControl.Jobs.Adapters.ElevenLabs.apis()
+
+    for route <- media.routes, target <- route.targets, Map.has_key?(target, :api) do
+      case kinds[target.upstream] do
+        "elevenlabs" ->
+          if target.api not in apis do
+            raise ArgumentError,
+                  "media route #{inspect(route.model)}: \"api\" on an elevenlabs target must be one of #{Enum.join(apis, ", ")}, got #{inspect(target.api)}"
+          end
+
+        kind when is_binary(kind) ->
+          raise ArgumentError,
+                "media route #{inspect(route.model)}: \"api\" is a setting of elevenlabs targets; the target on #{inspect(target.upstream)} is #{kind}"
+
+        _ ->
+          :ok
       end
     end
 
@@ -577,6 +608,7 @@ defmodule OmnigateControl.ConfigStore do
                 }
                 |> Map.merge(seconds!(t, r["model"]))
                 |> then(&if(Map.has_key?(t, "router"), do: Map.put(&1, :router, t["router"]), else: &1))
+                |> then(&if(Map.has_key?(t, "api"), do: Map.put(&1, :api, t["api"]), else: &1))
               end)
           }
         end),

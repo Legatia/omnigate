@@ -246,7 +246,10 @@ defmodule OmnigateControl.Admin do
           end
       },
       retention:
-        Map.merge(%{jobs_days: 0, ledger_ids_days: 0, ledger_days: 0, delete_bucket_objects: true, private_outputs_hours: 24}, Map.get(config, :retention, %{}))
+        Map.merge(
+          %{jobs_days: 0, ledger_ids_days: 0, ledger_days: 0, delete_bucket_objects: true, private_outputs_hours: 24, receipts_days: 30},
+          Map.get(config, :retention, %{})
+        )
     }
   end
 

@@ -428,7 +428,19 @@ defmodule OmnigateControl.Attestation.Near do
   @spec verify_response_signature(map, binary, binary, String.t() | nil, verified) ::
           {:ok, :provider_tee | :gateway} | {:error, reason}
   def verify_response_signature(signature, request_bytes, response_bytes, model, verified) do
-    hashes = sha256_hex(request_bytes) <> ":" <> sha256_hex(response_bytes)
+    verify_signature_over_hashes(signature, sha256_hex(request_bytes), sha256_hex(response_bytes), model, verified)
+  end
+
+  @doc """
+  `verify_response_signature/5` for a caller that holds only the two
+  SHA-256 hashes (lower-case hexadecimal) of the bytes, as the control
+  plane does: the data plane hashes what it sent and received and passes on
+  nothing else.
+  """
+  @spec verify_signature_over_hashes(map, String.t(), String.t(), String.t() | nil, verified) ::
+          {:ok, :provider_tee | :gateway} | {:error, reason}
+  def verify_signature_over_hashes(signature, request_sha256, response_sha256, model, verified) do
+    hashes = request_sha256 <> ":" <> response_sha256
 
     with :ok <- available(signature),
          {:ok, kind, expected, candidates} <- expected_text(signature["signature_kind"], hashes, model, verified),

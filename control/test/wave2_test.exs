@@ -693,7 +693,8 @@ defmodule OmnigateControl.Wave2Test do
                ledger_ids_days: 3,
                ledger_days: 0,
                delete_bucket_objects: true,
-               private_outputs_hours: 24
+               private_outputs_hours: 24,
+               receipts_days: 30
              }
 
       assert ConfigStore.normalize(%{"retention" => %{"delete_bucket_objects" => false}}).retention.delete_bucket_objects == false

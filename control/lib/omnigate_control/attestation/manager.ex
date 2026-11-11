@@ -40,6 +40,9 @@ defmodule OmnigateControl.Attestation.Manager do
   @backoff_s [5, 15, 60, 120]
   @collateral_refresh_s 86_400
   @check_timeout_ms 120_000
+  # Passes kept per pair for matching signatures on answers that began
+  # before the newest one.
+  @history 4
   @collateral :omnigate_attestation_collateral
   @counters :omnigate_attestation_counters
   @entries :omnigate_attestation_entries
@@ -85,6 +88,20 @@ defmodule OmnigateControl.Attestation.Manager do
       e ->
         ok = verified?(e, now)
         %{verified: ok, max_age_s: e.max_age_s, tcb: if(ok, do: e.evidence.gateway.status), since: if(ok, do: e.verified_since, else: 0)}
+    end
+  end
+
+  @doc """
+  The evidence of the newest pass that was complete at `unix_s` (seconds),
+  or nil: what a request that started then could rely on. A signature on an
+  answer is matched against this, never against a report fetched afterwards.
+  The last few passes are kept, so a re-check that finished while a request
+  was under way does not take its evidence away.
+  """
+  def evidence_before(upstream, model, unix_s, server \\ __MODULE__) do
+    case status(upstream, model, server) do
+      %{history: history} -> Enum.find(history, &(&1.verified_at <= unix_s))
+      _ -> nil
     end
   end
 
@@ -251,6 +268,8 @@ defmodule OmnigateControl.Attestation.Manager do
       reason: nil,
       reason_code: nil,
       evidence: nil,
+      # The evidence of the last passes, newest first (`evidence_before/4`).
+      history: [],
       checked_at: nil,
       verified_since: nil,
       until: nil,
@@ -345,6 +364,7 @@ defmodule OmnigateControl.Attestation.Manager do
         reason: nil,
         reason_code: nil,
         evidence: evidence,
+        history: Enum.take([evidence | entry.history], @history),
         checked_at: now,
         verified_since: if(entry.state == :verified, do: entry.verified_since, else: now),
         until: now + entry.max_age_s,

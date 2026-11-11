@@ -23,6 +23,11 @@ What a run does:
   5. With a key: one chat completion with an e-mail address and a card number
      in it. The answer must have the real values, the response must carry
      x-omnigate-attestation, and NEAR must have been sent placeholders.
+  6. With a key: one more completion whole and one streamed, each with its
+     receipt: NEAR's signature over the exact request and response bytes,
+     verified by the control plane against the attestation it had checked
+     before, and again by tools/verify_receipt.py from the bytes this
+     script sent and received.
 
 --serve does step 2 on the usual ports (control plane 4000, gateway 8080),
 prints the address of the Private chat page and the admin token, and waits
@@ -30,6 +35,7 @@ for Ctrl-C. Build the data plane first: `zig build` in dataplane/
 (`mix deps.get` in control/ before the first start).
 """
 import argparse
+import hashlib
 import json
 import os
 import secrets
@@ -96,6 +102,7 @@ class Stack:
             "OMNIGATE_KEYS": os.path.join(work, "keys.json"),
             "OMNIGATE_JOBS": os.path.join(work, "jobs.jsonl"),
             "OMNIGATE_AUDIT_LOG": os.path.join(work, "audit.jsonl"),
+            "OMNIGATE_RECEIPTS": os.path.join(work, "receipts.json"),
             "OMNIGATE_MEDIA_DIR": os.path.join(work, "media"),
             "OMNIGATE_LISTEN": f"127.0.0.1:{gateway_port}",
             "OMNIGATE_CONTROL_URL": self.control,
@@ -202,6 +209,66 @@ def run_checks(stack, have_key):
     print(f"        answer: {said[:200]!r}")
     usage = answer.get("usage") or {}
     print(f"        usage: {usage.get('prompt_tokens')} tokens in, {usage.get('completion_tokens')} out; request id {headers.get('x-omnigate-request-id')}")
+    receipt_checks(stack, key)
+
+
+def receipt_checks(stack, key):
+    """A receipt for a real answer: NEAR's signature over the exact bytes,
+    checked by the control plane, then again here with tools/verify_receipt.py
+    from the bytes this client sent and received."""
+    section("a receipt for a real answer")
+    _, _, listed = stack.admin("GET", "/admin/attestations")
+    evidence = next((a.get("evidence") or {} for a in listed.get("attestations", []) if a["upstream"] == "near-ai" and a["model"] == MODEL), {})
+    signers = {"gateway": (evidence.get("gateway") or {}).get("signing_address"), "provider_tee": ((evidence.get("models") or [{}])[0]).get("signing_address")}
+    tool = os.path.join(ROOT, "tools", "verify_receipt.py")
+    sha = lambda data: hashlib.sha256(data).hexdigest()
+
+    def receipt_of(request_id):
+        fetch = lambda: jcall("GET", f"{stack.gateway}/v1/attestations/{request_id}", key=key)
+        wait_until(lambda: fetch()[0] == 200 and fetch()[2].get("verdict") != "pending", 45, 1)
+        return fetch()
+
+    def verify(receipt, request, response, name):
+        paths = [os.path.join(stack.work, f"{name}-{part}") for part in ("receipt.json", "request.bin", "response.bin")]
+        for path, data in zip(paths, (json.dumps(receipt).encode(), request, response)):
+            with open(path, "wb") as f:
+                f.write(data)
+        p = subprocess.run([sys.executable, tool, *paths, "--signer", signers.get((receipt.get("signature") or {}).get("kind")) or "00"], capture_output=True, text=True, timeout=120)
+        for line in p.stdout.rstrip().splitlines():
+            print("        | " + line)
+        return p.returncode, (p.stdout.strip().splitlines() or [""])[-1]
+
+    # Sent without redaction and without `no-store`, so that what the gateway
+    # sends to NEAR is this body with nothing but the model name replaced,
+    # and this client can say what the signed request bytes must be.
+    for name, extra in (("whole", {}), ("streamed", {"stream": True, "stream_options": {"include_usage": True}})):
+        sent = json.dumps(dict({"model": "private", "max_tokens": 400, "messages": [{"role": "user", "content": "Name one prime number between 10 and 20."}]}, **extra)).encode()
+        upstream_body = sent.replace(b'"private"', json.dumps(MODEL).encode(), 1)
+        status, headers, received = call("POST", stack.gateway + "/v1/chat/completions", key=key, body=sent, headers={"x-omnigate-privacy": "attested"}, timeout=180)
+        request_id = headers.get("x-omnigate-request-id")
+        check(f"{name}: NEAR answered through the gateway, from the attested target",
+              status == 200 and (headers.get("x-omnigate-attestation") or "").startswith("verified;"), (status, received[:300]))
+        if status != 200:
+            continue
+        status, _, receipt = receipt_of(request_id)
+        signature = receipt.get("signature") or {}
+        print(f"        receipt: {json.dumps(receipt)[:1500]}")
+        check(f"{name}: the gateway has a receipt for it, and its verdict is \"verified\"", status == 200 and receipt.get("verdict") == "verified", (status, receipt.get("verdict"), receipt.get("reason")))
+        check(f"{name}: signed by {'the model machine or the gateway' if extra else 'the model machine (provider_tee)'}, with the key of a report verified before the request",
+              signature.get("kind") in (("provider_tee", "gateway") if extra else ("provider_tee",)) and signature.get("signing_address") == signers.get(signature.get("kind")),
+              (signature.get("kind"), signature.get("signing_address"), signers))
+        check(f"{name}: its hashes are those of the body this client sent (model name replaced) and of the bytes it received",
+              receipt.get("request_sha256") == sha(upstream_body) and receipt.get("response_sha256") == sha(received),
+              (receipt.get("request_sha256"), sha(upstream_body), receipt.get("response_sha256"), sha(received)))
+        check(f"{name}: tools/verify_receipt.py, given the receipt and those two bodies, says VERIFIED", verify(receipt, upstream_body, received, name) == (0, "VERIFIED"))
+        altered = bytearray(received)
+        altered[len(altered) // 2] ^= 1
+        check(f"{name}: ... and NOT VERIFIED when one byte of the answer is changed", verify(receipt, upstream_body, bytes(altered), name + "-altered") == (1, "NOT VERIFIED"))
+
+    status, _, other = stack.admin("POST", "/admin/keys", {"name": "near-live-other"})
+    wait_until(lambda: call("GET", stack.gateway + "/v1/models", key=other.get("key"))[0] == 200, 20)
+    status, _, _ = jcall("GET", f"{stack.gateway}/v1/attestations/{request_id}", key=other.get("key"))
+    check("another key cannot read the receipt", status == 404, status)
 
 
 def serve():

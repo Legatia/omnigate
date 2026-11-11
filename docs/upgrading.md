@@ -32,6 +32,8 @@ Contents:
 - [The privacy mode commit](#the-privacy-mode-commit)
 - [0.1.0-rc.1](#010-rc1)
 - [The attestation commit](#the-attestation-commit)
+- [The build-around commit](#the-build-around-commit)
+- [The receipts commit](#the-receipts-commit)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -653,6 +655,37 @@ them, with the exceptions below.
 | A request with an `x-omnigate-tag` header | Ignored | Recorded if it is 1 to 64 letters, digits, `.`, `_`, `:`, `-`; otherwise, or sent twice, `400 invalid_request` |
 | `POST /admin/keys/{name}/topup`, `GET /admin/events` | `404` | The new endpoints |
 | The audit log | | `key.topup` entries |
+
+## The receipts commit
+
+Adds a [receipt for each answer](attestation.md#a-receipt-for-each-answer)
+from an attested upstream, and more ElevenLabs products for media jobs.
+Nothing changes for an installation without an attested upstream, with the
+exceptions in the table.
+
+**Between the two processes.** A usage event for an answer from an attested
+target now carries `"receipt": {"request_sha256", "response_sha256",
+"completion_id"}` (`null` on every other event), and the data plane sends
+such requests with `x-no-aliasing: true`.
+
+| Control plane | Data plane | What happens |
+|---|---|---|
+| new | old | No event carries hashes: no receipt is made. `GET /v1/attestations/<id>` is answered `404 not_found` by the old data plane. Attested routing works as before. |
+| old | new | The old control plane ignores the new field (and records the usage as before); `GET /v1/attestations/<id>` gets its `404`. |
+
+**On disk (control plane).** A new file, `data/receipts.json`
+(`OMNIGATE_RECEIPTS`), written only when there is an attested upstream. An
+older control plane does not read it; deleting it loses the receipts and
+nothing else. Include it in backups if receipts matter to you.
+
+| | Before | After |
+|---|---|---|
+| The control plane's environment | The provider's API key was needed by the data plane only | For receipts the control plane needs the attested upstream's `api_key_env` too (it asks the provider for each signature). Without it every receipt is `not_verified` (`api_key_missing`); nothing else is affected. |
+| Requests to an attested upstream | | Carry `x-no-aliasing: true`: a provider that would have served the request with another model under an alias now refuses it. |
+| `retention` | | One more setting, `receipts_days` (30). It appears in `GET /admin/overview`'s config and on the dashboard. |
+| `Retention.sweep` result, `/metrics` | | `receipts` in the sweep's counts; `omnigate_receipts{verdict}` (three series, all 0 without attested upstreams). |
+| A private media job (`no-store`) | Could be seen as `succeeded` for a moment before `input_erased` appeared | Its input is erased in the same write that makes it terminal. |
+| ElevenLabs media targets | Text to speech only | A target may name `"api": "sound"`, `"music"`, `"image"` or `"video"`; without it nothing changes. |
 
 ## Tested upgrades
 

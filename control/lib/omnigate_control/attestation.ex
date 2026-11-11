@@ -196,7 +196,7 @@ defmodule OmnigateControl.Attestation do
       [model: model, accepted_statuses: setting.accepted_tcb, gpu: gpu_mode(setting.gpu)] ++
         pass ++ if(Keyword.has_key?(opts, :collateral), do: [], else: [collateral: &Tdx.fetch_collateral(&1, Keyword.take(opts, [:http]))])
 
-    with {:ok, body} <- Near.fetch_report(attestation_base(base_url), model, nonce, Keyword.take(opts, [:http])),
+    with {:ok, body} <- Near.fetch_report(api_base(base_url), model, nonce, Keyword.take(opts, [:http])),
          {:ok, verified} <- Near.verify_all(body, nonce, verify_opts),
          :ok <- measurements(verified, setting.measurements) do
       {:ok, verified}
@@ -207,9 +207,11 @@ defmodule OmnigateControl.Attestation do
   defp gpu_mode("skip"), do: :skip
   defp gpu_mode(_), do: :if_present
 
-  # An upstream's base URL is where `/v1/...` hangs; the attestation report
-  # is under `/v1` too.
-  defp attestation_base(base_url), do: base_url |> String.trim_trailing("/") |> String.replace_suffix("/v1", "")
+  @doc """
+  Where an attested upstream's `/v1/attestation/report` and
+  `/v1/signature/<id>` hang: its base URL without a trailing `/v1`.
+  """
+  def api_base(base_url), do: base_url |> String.trim_trailing("/") |> String.replace_suffix("/v1", "")
 
   @doc """
   The operator's policy on what was measured. An empty list accepts any

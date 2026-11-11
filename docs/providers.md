@@ -249,12 +249,16 @@ request goes there. All of it: [Attested upstreams](attestation.md).
 - `config/omnigate.near.json` is a complete config with this upstream, a
   relayed model and an unattested route to compare.
 
-Status: **attestation verified against the real service** on 11 November
-2026 without a key (`tools/near_live.py`): gateway and model reports, GPU
-evidence, re-checks, refusal of a relayed model, routing by the verdict up
-to NEAR's own 401. **No completion has been run**: no key was at hand, so
-chat, streaming, tool calls and metering through this upstream are
-untested beyond what any OpenAI-compatible upstream shares.
+Status: **verified against the real service** on 11 November 2026
+(`tools/near_live.py`). Without a key: gateway and model reports, GPU
+evidence, re-checks, refusal of a relayed model, routing by the verdict.
+With a key: three short chat completions through the attested target, one
+with redaction, one whole and one streamed, the last two with a
+[receipt](attestation.md#a-receipt-for-each-answer) that verified. Tool
+calls, the Responses API and metering against NEAR's own bill are untested
+beyond what any OpenAI-compatible upstream shares. The models are
+reasoning models: an answer can take tens of seconds, and a small
+`max_tokens` can be used up before any text is written.
 
 ### Other OpenAI-compatible providers
 
@@ -339,8 +343,9 @@ the contents of `input` differ per adapter. Common behaviour:
   refused. The three settings change what is billed and accepted; they are
   not sent to the provider, which generates whatever length it would have
   anyway.
-- **For `openai_images`, `elevenlabs`, `gemini` and `gemini_interactions`
-  no duration is counted from the request.** A per-second price on such a
+- **For `openai_images`, `gemini`, `gemini_interactions` and the speech
+  and image products of `elevenlabs` no duration is counted from the
+  request.** A per-second price on such a
   target is billed from `default_seconds` and `min_seconds` alone: a
   `duration` the client writes is not what is billed. If you price such a
   target per second, set
@@ -382,7 +387,7 @@ None of them has been used with a real provider.
 | `replicate` | Replicate predictions | submit and poll | verified |
 | `fal` | fal queue | submit and poll | mock only |
 | `openai_images` | OpenAI image generation | one call | verified |
-| `elevenlabs` | ElevenLabs text to speech | one call | verified |
+| `elevenlabs` | ElevenLabs speech, sound effects, music (one call each); images and videos (submit and poll) | by the target's `api` | speech, sound and music verified; a successful image or video job mock only (see [ElevenLabs](#elevenlabs)) |
 | `gemini` | Gemini `generateContent` (image, speech) | one call | verified |
 | `gemini_interactions` | Gemini Interactions API (video) | one call, or submit and poll | verified in the foreground; background polling mock only |
 | `xai_video` | xAI video generation | submit and poll | verified |
@@ -517,37 +522,91 @@ this adapter.
 { "name": "elevenlabs", "kind": "elevenlabs", "base_url": "https://api.elevenlabs.io", "api_key_env": "ELEVENLABS_API_KEY" }
 ```
 
+One upstream, five products. Which one a target uses is its `"api"`
+setting (`"speech"` when it is left out), never guessed from a model name:
+
 ```json
-{
-  "model": "speech",
-  "cache_ttl_s": 2592000,
-  "targets": [
-    { "upstream": "elevenlabs", "model": "<elevenlabs model_id>", "price": { "per_input_char_usd": 0.0 } }
-  ]
-}
+[
+  { "model": "speech", "cache_ttl_s": 2592000, "targets": [
+    { "upstream": "elevenlabs", "model": "eleven_flash_v2_5", "price": { "per_input_char_usd": 0.0 } } ] },
+  { "model": "sound", "targets": [
+    { "upstream": "elevenlabs", "model": "eleven_text_to_sound_v2", "api": "sound", "default_seconds": 5, "max_seconds": 30, "price": { "per_second_usd": 0.0 } } ] },
+  { "model": "music", "timeout_s": 600, "targets": [
+    { "upstream": "elevenlabs", "model": "music_v1", "api": "music", "default_seconds": 30, "max_seconds": 120, "price": { "per_second_usd": 0.0 } } ] },
+  { "model": "image", "targets": [
+    { "upstream": "elevenlabs", "model": "gemini-2.5-flash-image", "api": "image", "price": { "per_output_usd": 0.0 } } ] },
+  { "model": "video", "timeout_s": 900, "targets": [
+    { "upstream": "elevenlabs", "model": "bytedance-seedance-v2-mini", "api": "video", "max_seconds": 10,
+      "price": { "variants": [ { "when": { "resolution": "480p" }, "per_second_usd": 0.0 }, { "when": { "resolution": "720p" }, "per_second_usd": 0.0 } ] } } ] }
+]
 ```
 
-One synchronous `POST /v1/text-to-speech/{voice_id}`. Job `input`:
+(The zeros are placeholders: take the prices from your ElevenLabs plan.)
 
-| Field | Required | Meaning |
+The target's model is sent as `model_id`. Job `input` by product:
+
+| `"api"` | Call | `input` |
 |---|---|---|
-| `text` | yes | What to say. |
-| `voice_id` | yes | The ElevenLabs voice (letters, digits, `_` and `-` only). |
-| `output_format` | no | Default `mp3_44100_128`. |
-| anything else | no | Passed through in the request body. |
-
-`model_id` is set to the target's model.
+| `speech` | one `POST /v1/text-to-speech/{voice_id}` | `text` (required), `voice_id` (required; letters, digits, `_` and `-`), `output_format` (default `mp3_44100_128`); anything else is passed through in the body. |
+| `sound` | one `POST /v1/sound-generation` | `text` (required: what the effect is), `duration` (seconds, 0.5 to 30; the provider picks a length without it), `loop`, `prompt_influence`, `output_format` (default `mp3_44100_128`). Nothing else is forwarded. |
+| `music` | one `POST /v1/music` | `prompt`, or `composition_plan` (ElevenLabs' own structure), never both; with a prompt, `duration` (seconds, 3 to 600); `seed`, `force_instrumental`, `finetune_id`, `respect_sections_durations`, `sign_with_c2pa`, `output_format` (the provider's choice without it). Nothing else is forwarded; in particular not `store_for_inpainting`, which keeps the song at the provider. |
+| `image` | `POST /v1/flows/image`, then `GET /v1/flows/image/{id}` until it ends | `prompt` (required) and whatever the model takes (`aspect_ratio`, `resolution`, `images`, `seed`, ...), passed through. |
+| `video` | `POST /v1/flows/video`, then `GET /v1/flows/video/{id}` until it ends | `prompt` (required), `duration` (whole seconds), and whatever the model takes (`resolution`, `aspect_ratio`, `generate_audio`, `start_frame`, ...), passed through. |
 
 ```bash
 curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer <gateway key>" -d '{"model":"speech","input":{"text":"Hello from omnigate.","voice_id":"<voice id>"}}'
 ```
 
+```bash
+curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer <gateway key>" -d '{"model":"sound","input":{"text":"a door closing softly","duration":2}}'
+```
+
+- **`duration` is the gateway's name for the length, in seconds, for every
+  product.** It is what `max_seconds` and a per-second price apply to, and
+  it is sent under the provider's own name (`duration_seconds` for a sound,
+  `music_length_ms` for music, `duration_secs` for a video). Those names
+  are not taken from the input: a request cannot ask the provider for more
+  than it told the gateway. A per-second price on a `speech` or `image`
+  target needs `default_seconds`, as for every provider that is sent no
+  length.
+- **Music from a `composition_plan`** carries its lengths in the plan; it
+  is billed for the sum of its sections (or chunks), and `max_seconds` is
+  not applied to it.
+- **Images and videos are jobs at ElevenLabs too.** A generation is
+  `pending`, `generating`, `completed` (with a signed link that is good for
+  about an hour) or `failed`. The file is downloaded and stored like any
+  other output. ElevenLabs does not charge a failed generation, and neither
+  does the gateway. A caller's `webhook` field is never forwarded
+  (ElevenLabs would call the workspace's own webhooks; use the gateway's
+  `webhook_url`).
+- **No cancel.** ElevenLabs documents no way to stop a generation.
+  Cancelling an image or video job ends it at the gateway at once; the
+  generation runs on, nothing is fetched, and it is billed if it completes
+  (the job shows the cost when that is known).
+- **Errors** keep the provider's own code and words:
+  `elevenlabs_paid_plan_required: This endpoint requires a Pro plan or
+  above.` (the image and video endpoints refuse a workspace below Pro;
+  the job moves on to the route's next target),
+  `elevenlabs_validation_error: duration_secs: Input should be greater than
+  or equal to 4` (a value a model does not take), and for a generation that
+  fails `elevenlabs_<reason>: <message>` (`moderated`, `model_error`,
+  `timeout`, ...). For a private job only the first word is kept.
+- **Not supported**, because they take an uploaded audio or video file,
+  which the jobs API has no way to carry yet: speech to text, dubbing, the
+  voice changer and audio isolation. Nor: streaming variants, the "detailed"
+  music endpoints, Studio projects.
+
 Speech is a good fit for `cache_ttl_s`: an identical request then reuses the
 stored audio with no provider call and no charge.
 
-Status: verified with `eleven_flash_v2_5`: real MP3 generated, re-hosted and
-downloaded; an identical request served from cache; an unknown voice failed
-with the provider's reason.
+Status, by product:
+
+| Product | Status |
+|---|---|
+| `speech` | Verified with `eleven_flash_v2_5`: real MP3 generated, re-hosted and downloaded; an identical request served from cache; an unknown voice failed with the provider's reason. |
+| `sound` | Verified on 11 November 2026 with one job (`eleven_text_to_sound_v2`, 0.5 s): real MPEG audio (8,820 bytes), re-hosted, hash recorded, billed for the half second asked for. Looping, other formats and failures have only met the mock. |
+| `music` | Verified on 11 November 2026 with one job (`music_v1`, a prompt, 3 s, instrumental): real MPEG audio (48,945 bytes), re-hosted, billed for 3 s. A composition plan, longer pieces and a plan's refusal have only met the mock. |
+| `image`, `video` | **Mock only for a successful job.** The test workspace is on the Creator plan, and both endpoints answer `402 paid_plan_required` below Pro. That refusal was run through the gateway on 11 November 2026: the job failed cleanly with the provider's message, unbilled; with a second target it moved on; a video length the model does not take came back as a validation error naming the field. Create, polling, the signed link and the download are written from ElevenLabs' documentation and have run only against `tools/mock_media.py`. |
 
 ### Gemini image and speech
 

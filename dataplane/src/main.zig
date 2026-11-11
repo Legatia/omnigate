@@ -610,6 +610,7 @@ test {
     _ = @import("errors.zig");
     _ = @import("models.zig");
     _ = quirks;
+    _ = @import("receipt.zig");
     _ = @import("redact.zig");
     _ = logging;
     _ = watchdog;

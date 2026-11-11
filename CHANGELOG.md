@@ -49,9 +49,35 @@ only met a mock, is tracked in the README's
   through the data plane with a managed key of its own (`private-chat`) and
   keeps nothing. `OMNIGATE_GATEWAY_URL` tells the control plane where the
   data plane is.
+- **A receipt for each answer from an attested upstream**
+  ([docs/attestation.md](docs/attestation.md#a-receipt-for-each-answer)).
+  The data plane hashes the exact request body it sent and the exact
+  response body it received and reports the two hashes with the provider's
+  completion id (no content); the control plane fetches the provider's
+  signature (`GET /v1/signature/<id>`), checks that it covers exactly those
+  hashes, that it is valid, and that its key is the key of exactly one
+  report verified before the request, and keeps the result:
+  `GET /v1/attestations/<request id>` for the key that made the request,
+  `GET /admin/receipts` for the operator, `omnigate_receipts{verdict}`,
+  `retention.receipts_days`, `OMNIGATE_RECEIPTS`. Anything missing, late,
+  unknown or ambiguous is `not_verified`. `tools/verify_receipt.py` checks
+  a receipt offline against the two bodies (standard library only). The
+  Private chat page shows the receipt of each answer and offers it as a
+  download. Requests to an attested upstream now carry
+  `x-no-aliasing: true`.
 - `GET /admin/attestations`, `POST /admin/attestations/verify`, and the
   metrics `omnigate_attestation_verified`, `omnigate_attestation_age_seconds`
   and `omnigate_attestation_checks_total`.
+- **ElevenLabs beyond speech** ([docs/providers.md](docs/providers.md#elevenlabs)).
+  A target on an `elevenlabs` upstream may name `"api"`: `"sound"` (sound
+  effects), `"music"`, `"image"` or `"video"` (the image and video models
+  ElevenLabs relays, as jobs that are polled); without it the target is
+  text to speech, as before. `input.duration` is the length in seconds for
+  every product and is what `max_seconds` and per-second prices apply to;
+  it is sent under the provider's own field name, and those names are not
+  taken from the request. Music from a composition plan is billed for the
+  sum of its sections. Not supported: the products that take an uploaded
+  file (speech to text, dubbing, voice changer, audio isolation).
 - `config/omnigate.near.json`, `tools/near_live.py` (the integration
   against the real service; `--serve` starts the gateway with that config)
   and `OmnigateControl.Attestation.Live` (the check alone, from the command
@@ -88,16 +114,33 @@ only met a mock, is tracked in the README's
 - The error text for a malformed `x-omnigate-privacy` header names
   `attested` among the parts.
 
+### Fixed
+
+- **A private media job could be read as finished before its input was
+  erased.** It became terminal in one write and lost its input and metadata
+  in a second, so a `GET /v1/jobs/{id}` in between showed `succeeded` with
+  the input still there and without `input_erased`. Both now happen in the
+  write that ends the job (for a canceled job with an open provider call,
+  in the write that closes its account); the files are deleted right after,
+  and again at the next start if a stop came in between.
+
 ### Verified
 
-- Against the real NEAR AI Cloud, without an API key, on 11 November 2026:
-  `tools/near_live.py`, 11 checks (see
-  [docs/attestation.md](docs/attestation.md#what-has-been-tested)). No
-  completion has been run through an attested target: no key was at hand.
-- Not implemented, and said so in the documentation: image provenance,
-  binding the data plane's TLS connections to the report, and checking
-  NEAR's per-response signatures (the verification function exists and is
-  tested with keys made in the test only).
+- Against the real NEAR AI Cloud on 11 November 2026: `tools/near_live.py`,
+  11 checks without an API key and 27 with one (see
+  [docs/attestation.md](docs/attestation.md#what-has-been-tested)): a real
+  completion with redaction through the attested target, and a whole and a
+  streamed completion whose receipts verified (signed by the model's
+  machine and by NEAR's gateway respectively) and were confirmed by
+  `tools/verify_receipt.py` from the bytes sent and received.
+- Not implemented, and said so in the documentation: image provenance, and
+  binding the data plane's TLS connections to the report.
+- Against the real ElevenLabs API on 11 November 2026, through the gateway:
+  one sound effect (0.5 s) and one piece of music (3 s) generated,
+  re-hosted and billed; the image and video endpoints refused the test
+  workspace's plan (`402 paid_plan_required`), and that refusal failed the
+  job cleanly or moved it to the next target. A successful image or video
+  job has only run against the mock.
 
 ## [0.1.0-rc.1] - 2026-11-11
 

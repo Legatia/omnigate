@@ -270,7 +270,9 @@ defmodule OmnigateControl.Jobs do
             # The runner still needs to know which provider call this was.
             Map.put(finished, "run", job["run"])
           else
-            arm_webhook(finished, now)
+            # (A private job is ended and erased in this one write: nobody
+            # can read it as finished and still find what it was asked.)
+            finished |> mark_erased() |> arm_webhook(now)
           end
         end
       end)
@@ -292,19 +294,41 @@ defmodule OmnigateControl.Jobs do
   file is outside this program's reach.)
   """
   def erase_private(%{"private" => true, "id" => id} = job) do
-    if terminal?(job) and not provider_pending?(job) and job["erased"] != true do
-      Store.delete_input(id)
+    cond do
+      not terminal?(job) or provider_pending?(job) ->
+        job
 
-      case Store.update(id, &Map.merge(&1, %{"input" => nil, "input_file" => false, "metadata" => nil, "metadata_file" => false, "erased" => true})) do
-        {:ok, erased} -> erased
-        _ -> job
-      end
-    else
-      job
+      # The record already says so (it does from the write that ended the
+      # job): what is left is the files. Deleting them again is harmless,
+      # and catches a stop between that write and this.
+      job["erased"] == true ->
+        Store.delete_input(id)
+        job
+
+      true ->
+        result = Store.update(id, &mark_erased/1)
+        Store.delete_input(id)
+
+        case result do
+          {:ok, erased} -> erased
+          _ -> job
+        end
     end
   end
 
   def erase_private(job), do: job
+
+  # The record of a private job that has ended, without what it was asked.
+  # The record first, the files after (`erase_private/1`): a stop in between
+  # leaves files that the next start deletes, never a finished private job
+  # whose record still points at its input.
+  defp mark_erased(%{"private" => true} = job) do
+    if terminal?(job) and not provider_pending?(job),
+      do: Map.merge(job, %{"input" => nil, "input_file" => false, "metadata" => nil, "metadata_file" => false, "erased" => true}),
+      else: job
+  end
+
+  defp mark_erased(job), do: job
 
   @doc """
   Close the account of a canceled job whose provider call was still in flight
@@ -322,6 +346,7 @@ defmodule OmnigateControl.Jobs do
           job
           |> Map.merge(Map.take(changes, ~w(cost_usd upstream target_model attempts)))
           |> Map.merge(%{"provider_pending" => false, "run" => nil})
+          |> mark_erased()
           |> arm_webhook(now)
         else
           :noop
@@ -877,7 +902,7 @@ defmodule OmnigateControl.Jobs do
       # duration is billed on the target's default whatever the input says,
       # exactly as `job_cost/5` does (its adapter reports 0 seconds).
       upstream = ConfigStore.media_upstream(target.upstream)
-      requested = if upstream && Adapter.takes_duration?(upstream.kind), do: in_request, else: 0
+      requested = if upstream && Adapter.takes_duration?(upstream.kind, target), do: in_request, else: 0
 
       cond do
         requested <= 0 and is_nil(Map.get(target, :default_seconds)) ->

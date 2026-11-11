@@ -44,6 +44,7 @@ KEY_BUDGET = "og-e2e-budget"
 KEY_RPM = "og-e2e-rpm"
 KEY_OTHER = "og-e2e-other"
 KEY_SUME = "og-e2e-sume"
+KEY_ELEVEN = "og-e2e-eleven"
 KEY_LIMITED = "og-e2e-limited"
 # Privacy mode: everything on; redaction of two classes only; job outputs
 # encrypted to an age recipient.
@@ -279,6 +280,7 @@ def text_config():
             {"name": "rpm", "key": KEY_RPM, "rpm": 3},
             {"name": "other", "key": KEY_OTHER},
             {"name": "sume", "key": KEY_SUME},
+            {"name": "eleven", "key": KEY_ELEVEN},
             # May use the "direct" route and nothing else.
             {"name": "limited", "key": KEY_LIMITED, "models": ["direct"]},
             {"name": "private", "key": KEY_PRIVATE, "privacy": True, "webhook_secret": WEBHOOK_SECRET},
@@ -1086,9 +1088,8 @@ def privacy_text_checks():
 
 
 def wait_private_job(job_id, key):
-    """A private job once it is terminal AND erased: the erasing is a second write, a moment after the first."""
-    done = wait_job(job_id, key=key)
-    return wait_until(lambda: (lambda j: j if j.get("input_erased") else None)(get_job(job_id, key)), 5, 0.1) or done
+    """A private job the moment it is terminal: it is erased in the same write, so there is nothing more to wait for."""
+    return wait_job(job_id, key=key)
 
 
 def privacy_media_checks():
@@ -1158,6 +1159,8 @@ class FakeControl:
         fake = self
         self.snapshot = snapshot
         self.answering = True
+        # Usage events the data plane reported, by request id.
+        self.events = {}
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -1167,13 +1170,15 @@ class FakeControl:
 
             def answer(self):
                 length = int(self.headers.get("content-length") or 0)
-                if length:
-                    self.rfile.read(length)
+                sent = self.rfile.read(length) if length else b""
                 if self.headers.get("x-omnigate-internal") != TOKEN or not fake.answering:
                     status, body = 503, b'{"error":{"message":"not now"}}'
                 elif self.path == "/internal/config":
                     status, body = 200, json.dumps(fake.snapshot).encode()
                 else:
+                    if self.path == "/internal/usage/batch":
+                        for event in json.loads(sent).get("events", []):
+                            fake.events[event.get("id")] = event
                     status, body = 200, b'{"accepted":0,"duplicates":0}'
                 self.send_response(status)
                 self.send_header("content-type", "application/json")
@@ -1243,6 +1248,16 @@ def attestation_checks(stack):
     check("a media job is refused: no media provider is attested", status == 503 and error_code(body) == "attestation_unverified", (status, body))
     status, _, body = jcall("POST", GATEWAY + "/v1/jobs", key=KEY_PLAIN, headers={"x-omnigate-privacy": "attested"}, body={"model": "image", "input": {"prompt": "x"}})
     check("... also when only the header asks", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+
+    status, _, body = jcall("GET", GATEWAY + "/v1/attestations/req_does-not-exist", key=KEY_PLAIN)
+    check("the receipt of a request that has none is a 404", status == 404 and error_code(body) == "receipt_not_found", (status, body))
+    codes = [jcall(method, GATEWAY + path, key=key)[0] for method, path, key in (
+        ("GET", "/v1/attestations/req_x", None), ("GET", "/v1/attestations/req_x", "og-not-a-key"), ("POST", "/v1/attestations/req_x", KEY_PLAIN),
+        ("GET", "/v1/attestations/a%2Fb", KEY_PLAIN), ("GET", "/v1/attestations/" + "a" * 129, KEY_PLAIN))]
+    check("... it needs a gateway key, is read-only, and takes nothing but a request id", codes == [401, 401, 405, 400, 404], codes)
+    status, _, listed = admin("GET", "/admin/receipts")
+    check("no receipt exists while no attestation verifies: nothing is claimed for an unverified provider",
+          status == 200 and listed.get("receipts") == [] and listed.get("counts") == {"verified": 0, "not_verified": 0, "pending": 0}, (status, listed))
 
     status, _, verdict = admin("POST", "/admin/attestations/verify", {"upstream": "mock-attested", "model": "attest-stale-1"})
     check("\"verify now\" runs a fresh check and reports the verdict", status == 200 and verdict.get("state") == "failed" and verdict.get("checks", 0) >= 2, (status, verdict))
@@ -1348,6 +1363,32 @@ def attestation_checks(stack):
         status, _, body = ask("open", KEY_ATTESTED, base=GATEWAY2)
         check("the attested key is refused on the ordinary model here too", status == 503 and error_code(body) == "attestation_unverified", (status, body))
 
+        # What the data plane reports for an answer's receipt: hashes of the
+        # exact bytes it sent and received, and the provider's id. (The
+        # signature check on them is the control plane's; `receipts_test.exs`.)
+        reported = lambda headers: wait_until(lambda: fake.events.get(headers.get("x-omnigate-request-id")), 10) or {}
+        mock_saw = lambda: jcall("GET", "http://127.0.0.1:9002/__last?model=ok-1")[2]
+        status, headers, body = ask("tee", KEY_PLAIN, base=GATEWAY2)
+        seen, receipt = mock_saw(), reported(headers).get("receipt") or {}
+        check("an answer from a verified target is reported with the SHA-256 of the request body as the provider received it",
+              status == 200 and receipt.get("request_sha256") == seen.get("body_sha256") == sha(seen.get("body", "")), (receipt, seen.get("body_sha256")))
+        check("... the SHA-256 of the response body as the provider sent it, and the provider's id for it",
+              receipt.get("response_sha256") == seen.get("response_sha256") and receipt.get("completion_id") == body.get("id") == "chatcmpl-mock", (receipt, seen.get("response_sha256")))
+        check("... and the provider was asked not to substitute another model", seen.get("headers", {}).get("x-no-aliasing") == "true", seen.get("headers"))
+        conn = http.client.HTTPConnection("127.0.0.1", GATEWAY2_PORT, timeout=30)
+        conn.request("POST", "/v1/chat/completions", body=json.dumps({"model": "tee", "stream": True, "messages": [{"role": "user", "content": "hi"}]}),
+                     headers={"content-type": "application/json", "authorization": f"Bearer {KEY_PLAIN}"})
+        resp = conn.getresponse()
+        streamed = resp.read()
+        conn.close()
+        seen, receipt = mock_saw(), reported({"x-omnigate-request-id": resp.getheader("x-omnigate-request-id")}).get("receipt") or {}
+        check("a streamed answer is hashed as it arrived, every event and blank line of it",
+              resp.status == 200 and b"[DONE]" in streamed and receipt.get("response_sha256") == seen.get("response_sha256")
+              and receipt.get("request_sha256") == seen.get("body_sha256") and receipt.get("completion_id") == "chatcmpl-mock", (receipt, seen.get("response_sha256")))
+        status, headers, _ = ask("open", KEY_PLAIN, base=GATEWAY2)
+        check("an answer from an ordinary target carries none of this",
+              status == 200 and "id" in reported(headers) and reported(headers).get("receipt") is None and "x-no-aliasing" not in mock_saw().get("headers", {}), reported(headers))
+
         fake.answering = False
         time.sleep(4.5)
         status, _, body = ask("tee", KEY_ATTESTED, base=GATEWAY2)
@@ -1360,6 +1401,62 @@ def attestation_checks(stack):
     finally:
         stack.stop("gateway2")
         fake.stop()
+
+
+def receipt_tool_checks(work):
+    """tools/verify_receipt.py against a receipt whose signatures were made
+    with Erlang's own Ed25519 (the control plane's), so that the script's
+    pure-Python verification is checked against another implementation."""
+    section("receipts: checked offline with tools/verify_receipt.py")
+    tool = os.path.join(ROOT, "tools", "verify_receipt.py")
+    request = b'{"model":"vendor/tee-model-1","messages":[{"role":"user","content":"hi"}]}'
+    response = b'data: {"id":"chatcmpl-vector","choices":[{"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n\n'
+    public = "3c403e79e5471b95fb743cc42f5c4d25de2e400d861613a0ef1be976c1ca746e"
+    pair = hashlib.sha256(request).hexdigest() + ":" + hashlib.sha256(response).hexdigest()
+    signatures = {
+        "provider_tee": ("vendor/tee-model-1:" + pair, "8f5965b5f7e4022a28f1328a6750e3534da994eef0df459a53b41397d5557a065ca0a181fd49d0c03cdf142703b9eec529ae242cb15014896f941f9fb1c0b208"),
+        "gateway": (pair, "eddac1ed2ae26791d311958a5339123edb5052aaffb07cfd9567e559e5306b77ad827b1ddb1aa5ea884f3839ff023a21f761ff57cfdb7a03a081e67f5e789801"),
+    }
+
+    def receipt(kind, **changes):
+        text, signature = signatures[kind]
+        r = {"object": "attestation.receipt", "id": "req_vector", "model": "vendor/tee-model-1", "verdict": "verified",
+             "request_sha256": hashlib.sha256(request).hexdigest(), "response_sha256": hashlib.sha256(response).hexdigest(),
+             "signature": {"kind": kind, "text": text, "signature": signature, "signing_address": public, "signing_algo": "ed25519"},
+             "attestation": {"verified_at": 1762850000, "reports": [{"role": "model", "tcb_status": "UpToDate", "signed_this_answer": True}]}}
+        r.update(changes)
+        return r
+
+    def run(r, req=request, resp=response, extra=()):
+        paths = [os.path.join(work, name) for name in ("receipt.json", "request.bin", "response.bin")]
+        for path, data in zip(paths, (json.dumps(r).encode(), req or b"", resp or b"")):
+            with open(path, "wb") as f:
+                f.write(data)
+        p = subprocess.run([sys.executable, tool, *(paths if req is not None else paths[:1]), *extra], capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout.strip().splitlines()[-1] if p.stdout.strip() else p.stderr.strip()
+
+    p = subprocess.run([sys.executable, tool, "--self-test"], capture_output=True, text=True, timeout=120)
+    check("its Ed25519 code passes the RFC 8032 test vectors", p.returncode == 0 and p.stdout.count("PASS") == 3, p.stdout + p.stderr)
+    check("a model-signed receipt with its two bodies: VERIFIED", run(receipt("provider_tee")) == (0, "VERIFIED"), run(receipt("provider_tee")))
+    check("a gateway-signed receipt: VERIFIED", run(receipt("gateway")) == (0, "VERIFIED"), run(receipt("gateway")))
+    check("... and with the expected signer named", run(receipt("gateway"), extra=("--signer", public)) == (0, "VERIFIED"))
+    flipped = bytearray(response)
+    flipped[10] ^= 1
+    outcomes = {
+        "one byte of the response changed": run(receipt("provider_tee"), resp=bytes(flipped)),
+        "one byte of the request changed": run(receipt("provider_tee"), req=request + b" "),
+        "the signature altered": run(receipt("provider_tee", signature=dict(receipt("provider_tee")["signature"], signature="9" + signatures["provider_tee"][1][1:]))),
+        "a gateway signature passed off as the model's": run(receipt("provider_tee", signature=dict(receipt("gateway")["signature"], kind="provider_tee"))),
+        "another model named": run(receipt("provider_tee", model="vendor/other-model")),
+        "the hashes in the receipt swapped for others": run(receipt("gateway", response_sha256="0" * 64), req=None, resp=None),
+        "another key named": run(receipt("gateway", signature=dict(receipt("gateway")["signature"], signing_address="d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"))),
+        "an unexpected signer": run(receipt("gateway"), extra=("--signer", "00" * 32)),
+        "no signature at all": run(receipt("gateway", signature=None, verdict="not_verified")),
+        "an unknown kind of signer": run(receipt("gateway", signature=dict(receipt("gateway")["signature"], kind="relay"))),
+    }
+    check("anything else is NOT VERIFIED, with exit status 1: a changed byte, a changed signature, the wrong signer, the wrong model",
+          all(o == (1, "NOT VERIFIED") for o in outcomes.values()), {k: v for k, v in outcomes.items() if v != (1, "NOT VERIFIED")})
+    check("without the bodies it says so, and checks the signature against the hashes alone", run(receipt("gateway"), req=None, resp=None) == (0, "VERIFIED"))
 
 
 def leftovers(work):
@@ -1405,6 +1502,8 @@ def media_config(work, storage="local"):
     return {
         "public_base_url": GATEWAY,
         "poll_interval_ms": 200,
+        # Small enough for one mock file ("huge", 3 MiB) to be over it.
+        "max_output_bytes": 2 * 1024 * 1024,
         "upstreams": [
             up("replicate-broken", "replicate", MOCK["replicate_broken"]),
             up("replicate", "replicate", MOCK["replicate"]),
@@ -1444,6 +1543,18 @@ def media_config(work, storage="local"):
                     {"when": {"resolution": "720p", "generate_audio": None}, "per_second_usd": 0.10}]}}]},
             {"model": "tts", "cache_ttl_s": 3600, "targets": [
                 {"upstream": "elevenlabs", "model": "mock_multilingual_v2", "price": {"per_input_char_usd": 0.00003}}]},
+            # ElevenLabs beyond speech: which product a target uses is said.
+            {"model": "el-sound", "targets": [
+                {"upstream": "elevenlabs", "model": "eleven_text_to_sound_v2", "api": "sound", "default_seconds": 5, "max_seconds": 30, "price": {"per_second_usd": 0.01}}]},
+            {"model": "el-music", "timeout_s": 60, "targets": [
+                {"upstream": "elevenlabs", "model": "music_v1", "api": "music", "default_seconds": 30, "price": {"per_second_usd": 0.02}}]},
+            {"model": "el-image", "timeout_s": 60, "targets": [
+                {"upstream": "elevenlabs", "model": "mock-image-model", "api": "image", "price": {"per_output_usd": 0.05}},
+                {"upstream": "replicate", "model": "mock/image", "price": {"per_output_usd": 0.003}}]},
+            {"model": "el-video", "timeout_s": 60, "targets": [
+                {"upstream": "elevenlabs", "model": "mock-video-model", "api": "video", "max_seconds": 10, "price": {"variants": [
+                    {"when": {"resolution": "480p"}, "per_second_usd": 0.05},
+                    {"when": {"resolution": "720p"}, "per_second_usd": 0.10}]}}]},
         ],
         "storage": stores[storage],
         "webhooks": {"allow_private": True, "retry_schedule_ms": [300, 300, 600, 1000], "max_attempts": 5},
@@ -1563,6 +1674,118 @@ def sume_checks():
     st, _, sealed = call("GET", out.get("url", GATEWAY))
     check("a key with encrypt_to gets a Sume output as an age file",
           job.get("status") == "succeeded" and job.get("upstream") == "sume" and out.get("encryption") == "age"
+          and st == 200 and sealed.startswith(b"age-encryption.org/v1\n") and b"\x89PNG" not in sealed, (job, sealed[:40]))
+
+
+def elevenlabs_checks():
+    """ElevenLabs beyond speech against tools/mock_media.py, which follows
+    ElevenLabs' public documentation."""
+    def run(body, key=KEY_ELEVEN, timeout=30):
+        status, _, job = create_job(body, key=key)
+        return status, wait_job(job.get("id", "missing"), timeout, key=key) if status == 202 else job
+    outcome = lambda job, i=0: ((job.get("attempts") or [{}] * (i + 1))[i]).get("outcome", "")
+    last = lambda: jcall("GET", MOCK["elevenlabs"] + "/_last")[2]
+    fetch = lambda job: call("GET", ((job.get("outputs") or [{}])[0]).get("url", GATEWAY))
+    leaked = stats("elevenlabs")["leaked_fields"]
+
+    section("ElevenLabs: sound effects and music, one call each, billed by the second")
+    status, job = run({"model": "el-sound", "input": {"text": "glass breaking", "duration": 2, "loop": True, "voice_id": "ignored"}})
+    st, _, audio = fetch(job)
+    check("a sound effect is one call that answers with audio, re-hosted and billed for the seconds asked for",
+          status == 202 and job.get("status") == "succeeded" and job.get("upstream") == "elevenlabs" and close(job.get("cost_usd"), 0.02)
+          and st == 200 and audio[:3] == b"ID3" and (job.get("outputs") or [{}])[0].get("content_type") == "audio/mpeg", (job, audio[:20]))
+    seen = last()
+    check("the provider got the length under its own name, the model as model_id, and no field of another product",
+          seen.get("path") == "/v1/sound-generation" and seen.get("query") == "output_format=mp3_44100_128"
+          and seen.get("body") == {"text": "glass breaking", "loop": True, "duration_seconds": 2, "model_id": "eleven_text_to_sound_v2"}, seen)
+    status, job = run({"model": "el-sound", "input": {"text": "rain on a roof", "duration_seconds": 30}})
+    check("the provider's own name for the length is not taken from the request: no length is sent, and the default is billed",
+          job.get("status") == "succeeded" and close(job.get("cost_usd"), 0.05) and "duration_seconds" not in last().get("body", {}), (job, last()))
+    status, _, refused = create_job({"model": "el-sound", "input": {"text": "x", "duration": 45}}, key=KEY_ELEVEN)
+    check("a length above the target's max_seconds is refused before anything is sent", status == 400 and "at most 30" in json.dumps(refused), (status, refused))
+    status, job = run({"model": "el-sound", "input": {"text": "x", "duration": 0.2}})
+    check("a length the product does not take fails the job with a reason, unbilled",
+          job.get("status") == "failed" and outcome(job).startswith("invalid_input") and not job.get("cost_usd"), job)
+
+    status, job = run({"model": "el-music", "input": {"prompt": "a slow piano waltz", "duration": 3, "force_instrumental": True, "store_for_inpainting": True}})
+    seen = last()
+    check("music from a prompt: the length goes out in milliseconds, and the song is not kept at the provider",
+          job.get("status") == "succeeded" and close(job.get("cost_usd"), 0.06) and fetch(job)[2][:3] == b"ID3" and seen.get("path") == "/v1/music"
+          and seen.get("body") == {"prompt": "a slow piano waltz", "force_instrumental": True, "music_length_ms": 3000, "model_id": "music_v1"}
+          and seen.get("query") == "" and stats("elevenlabs")["leaked_fields"] == leaked, (job, seen))
+    plan = {"positive_global_styles": ["waltz"], "negative_global_styles": [], "sections": [
+        {"section_name": "a", "positive_local_styles": [], "negative_local_styles": [], "duration_ms": 3000, "lines": []},
+        {"section_name": "b", "positive_local_styles": [], "negative_local_styles": [], "duration_ms": 4000, "lines": []}]}
+    status, job = run({"model": "el-music", "input": {"composition_plan": plan}})
+    check("music from a composition plan is billed for the sum of its sections", job.get("status") == "succeeded" and close(job.get("cost_usd"), 0.14), job)
+    status, job = run({"model": "el-music", "input": {"prompt": "x", "composition_plan": plan}})
+    check("a prompt and a plan together are refused by the adapter", job.get("status") == "failed" and outcome(job).startswith("invalid_input"), job)
+    status, job = run({"model": "el-music", "input": {"prompt": "a paid plan please", "duration": 3}})
+    check("a refusal for lack of a paid plan fails the job with the provider's code and words, unbilled",
+          job.get("status") == "failed" and outcome(job) == "elevenlabs_paid_plan_required: The Music API requires a paid plan." and not job.get("cost_usd"), job)
+
+    section("ElevenLabs: images and videos, started and asked about until they end")
+    before = stats("elevenlabs")
+    status, job = run({"model": "el-image", "input": {"prompt": "a ceramic cup", "aspect_ratio": "1:1", "webhook": {"url": "https://example.com/hook"}, "model_id": "something-else"}})
+    st, _, image = fetch(job)
+    after = stats("elevenlabs")
+    check("an image job is created, polled, and its file fetched from the signed link and re-hosted",
+          job.get("status") == "succeeded" and job.get("upstream") == "elevenlabs" and close(job.get("cost_usd"), 0.05) and st == 200 and image[:8] == b"\x89PNG\r\n\x1a\n"
+          and after["image"] == before["image"] + 1 and after["polls"] > before["polls"] and after["downloads"] == before["downloads"] + 1, (job, before, after))
+    seen = last()
+    check("the provider got the target's model and never the caller's webhook",
+          seen.get("path") == "/v1/flows/image" and seen.get("body") == {"prompt": "a ceramic cup", "aspect_ratio": "1:1", "model_id": "mock-image-model"}
+          and after["leaked_fields"] == before["leaked_fields"], seen)
+    status, job = run({"model": "el-image", "input": {"prompt": "needs a paid plan"}})
+    check("402 paid_plan_required moves the job to the route's next provider, with the provider's words in the attempt",
+          job.get("status") == "succeeded" and job.get("upstream") == "replicate" and close(job.get("cost_usd"), 0.003)
+          and outcome(job) == "elevenlabs_paid_plan_required: This endpoint requires a Pro plan or above.", job)
+    status, job = run({"model": "el-image", "input": {"prompt": "fail this one"}})
+    check("a generation the provider fails is reported with its reason, and the next provider runs the job",
+          job.get("status") == "succeeded" and job.get("upstream") == "replicate" and outcome(job) == "elevenlabs_moderated: The prompt was flagged by moderation.", job)
+    status, job = run({"model": "el-image", "input": {"prompt": "a huge poster"}})
+    check("an output over media.max_output_bytes is not stored; the next provider runs the job",
+          job.get("status") == "succeeded" and job.get("upstream") == "replicate" and outcome(job).startswith("output_fetch_failed"), job)
+
+    status, job = run({"model": "el-video", "input": {"prompt": "steam over a cup", "duration": 4, "resolution": "480p", "duration_secs": 60}})
+    st, _, clip = fetch(job)
+    seen = last()
+    check("a video job is billed for the seconds asked for at the rate of its resolution",
+          job.get("status") == "succeeded" and close(job.get("cost_usd"), 0.20) and st == 200 and clip[4:8] == b"ftyp"
+          and seen.get("path") == "/v1/flows/video" and seen.get("body") == {"prompt": "steam over a cup", "resolution": "480p", "duration_secs": 4, "model_id": "mock-video-model"}, (job, seen))
+    status, _, refused = create_job({"model": "el-video", "input": {"prompt": "x", "duration": 12, "resolution": "480p"}}, key=KEY_ELEVEN)
+    check("a video longer than max_seconds is refused at once", status == 400 and "at most 10" in json.dumps(refused), (status, refused))
+    status, _, refused = create_job({"model": "el-video", "input": {"prompt": "x", "duration": 4, "resolution": "4k"}}, key=KEY_ELEVEN)
+    check("a resolution without a price is refused at once", status == 400 and "no price for this combination" in json.dumps(refused), (status, refused))
+    status, job = run({"model": "el-video", "input": {"prompt": "x", "duration": 4.5, "resolution": "480p"}})
+    check("a fraction of a second fails the job: the provider takes whole seconds", job.get("status") == "failed" and outcome(job).startswith("invalid_input"), job)
+    status, job = run({"model": "el-video", "input": {"prompt": "too short for this model", "duration": 2, "resolution": "480p"}})
+    check("a request the provider's validation refuses fails the job with the field and what is wrong with it",
+          job.get("status") == "failed" and outcome(job) == "elevenlabs_validation_error: duration_secs: Input should be greater than or equal to 4", job)
+
+    before = stats("elevenlabs")
+    _, _, started = create_job({"model": "el-video", "input": {"prompt": "to be canceled", "duration": 2, "resolution": "720p"}}, key=KEY_ELEVEN)
+    wait_until(lambda: stats("elevenlabs")["video"] > before["video"] or None, 10)
+    _, _, at_once = jcall("POST", f"{GATEWAY}/v1/jobs/{started.get('id')}/cancel", key=KEY_ELEVEN, body={})
+    billed = wait_until(lambda: (lambda j: j if close(j.get("cost_usd"), 0.20) else None)(get_job(started.get("id", "missing"), KEY_ELEVEN)), 15) or {}
+    check("a cancel ends the job here at once; the provider has no cancel, so the generation is billed when it completes, and nothing is fetched",
+          at_once.get("status") == "canceled" and billed.get("status") == "canceled" and close(billed.get("cost_usd"), 0.20) and billed.get("outputs") == []
+          and stats("elevenlabs")["downloads"] == before["downloads"], (at_once, billed))
+    # 0.02 + 0.05 + 0.06 + 0.14 + 0.05 + 0.003 + 0.003 + 0.003 + 0.20 + 0.20
+    row = wait_until(lambda: (lambda r: r if close(r.get("cost_usd"), 0.729) else None)(usage_row("eleven")), 10) or usage_row("eleven")
+    check("the key's ledger holds exactly what these jobs cost", close(row.get("cost_usd"), 0.729), row)
+
+    section("ElevenLabs: privacy mode")
+    status, _, job = create_job({"model": "el-video", "input": {"prompt": f"{CANARY} fail", "duration": 2, "resolution": "480p"}}, key=KEY_PRIVATE)
+    job = wait_job(job.get("id", "missing"), key=KEY_PRIVATE)
+    check("a private job that fails keeps the provider's reason and none of its words",
+          job.get("status") == "failed" and outcome(job) == "elevenlabs_moderated" and job.get("input_erased") is True, job)
+    status, _, job = create_job({"model": "el-image", "input": {"prompt": "a sealed cup"}}, key=KEY_SEALED)
+    job = wait_job(job.get("id", "missing"), key=KEY_SEALED)
+    out = (job.get("outputs") or [{}])[0]
+    st, _, sealed = call("GET", out.get("url", GATEWAY))
+    check("a key with encrypt_to gets the image as an age file",
+          job.get("status") == "succeeded" and job.get("upstream") == "elevenlabs" and out.get("encryption") == "age"
           and st == 200 and sealed.startswith(b"age-encryption.org/v1\n") and b"\x89PNG" not in sealed, (job, sealed[:40]))
 
 
@@ -1786,6 +2009,7 @@ def media_checks(stack):
           close((row.get("cost_usd") or 0.0) - spent, 0.05) and stats("openai_images").get("downloads", 0) == files_before, (row, spent))
 
     sume_checks()
+    elevenlabs_checks()
 
     section("control-plane restart in the middle of a job")
     submits_before = stats("fal")["submits"]
@@ -1871,6 +2095,7 @@ def main():
             build_around_checks(work)
             privacy_text_checks()
             attestation_checks(stack)
+            receipt_tool_checks(work)
         if run_media:
             media_checks(stack)
         if run_text:

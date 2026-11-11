@@ -102,6 +102,23 @@ defmodule OmnigateControl.Jobs.Adapter do
   def takes_duration?(kind), do: kind in ~w(replicate fal xai_video sume)
 
   @doc """
+  The same question for one target: an ElevenLabs upstream takes a duration
+  for the products that have one (sound, music, video; the target's `api`),
+  not for speech or images.
+  """
+  def takes_duration?("elevenlabs", target), do: Adapters.ElevenLabs.takes_duration?(Map.get(target, :api) || "speech")
+  def takes_duration?(kind, _target), do: takes_duration?(kind)
+
+  @doc """
+  `billable/1` of the adapter for this target. An adapter whose products
+  differ in what they are billed for (ElevenLabs) exports `billable/2` and
+  is given the target.
+  """
+  def billable(adapter, input, target) do
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :billable, 2), do: adapter.billable(input, target), else: adapter.billable(input)
+  end
+
+  @doc """
   Seconds requested by `input`: the largest of the given fields, never below
   zero. Values are numbers, numeric strings (some providers take `"5"`) or a
   number with an `s` after it (`"5s"`, which others take).

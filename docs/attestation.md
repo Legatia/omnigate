@@ -29,6 +29,7 @@ Contents:
 - [What the data plane does with the verdict](#what-the-data-plane-does-with-the-verdict)
 - [Requests that may only go to attested providers](#requests-that-may-only-go-to-attested-providers)
 - [Seeing what a provider would be sent](#seeing-what-a-provider-would-be-sent)
+- [A receipt for each answer](#a-receipt-for-each-answer)
 - [Looking at it: the admin API, metrics, logs](#looking-at-it-the-admin-api-metrics-logs)
 - [The Private chat page](#the-private-chat-page)
 - [Trying it against the real service](#trying-it-against-the-real-service)
@@ -160,17 +161,12 @@ fails until you add the new values: that is what pinning is.
   compare a fingerprint with the certificate of the connections it sends
   requests on. The connection is ordinary verified TLS to the provider's
   host name.
-- **That one particular answer came from that machine.** NEAR signs
-  responses with the attested keys (`GET /v1/signature/<id>`). Nothing in
-  the request path fetches or checks those signatures: the data plane would
-  have to hash the exact bytes it sent and received, and it does not. The
-  verification function exists (`Near.verify_response_signature/5`) and is
-  tested with keys made in the test; it has never seen a real signature.
-  So the claim is about the provider's deployment at the time of the last
-  check, not about each response. The provider's own documentation makes
-  the same caveat in another form: instances of a model share one signing
-  key, so even a verified signature does not tie an answer to the instance
-  whose report was checked.
+- **Which machine produced an answer.** The provider's signature on each
+  answer is checked ([A receipt for each answer](#a-receipt-for-each-answer)),
+  with limits that are the provider's own: instances of a model share one
+  signing key, so a verified signature does not tie an answer to the
+  instance whose report was checked, and a streamed answer is signed by the
+  provider's gateway, not by the model's machine.
 - **NVIDIA's verdict token.** Its content is read; its own signature is
   not checked. It is trusted because it arrives over verified TLS from
   NVIDIA's host.
@@ -254,7 +250,8 @@ x-omnigate-attestation: verified; tcb=UpToDate; since=1794416000
 `since` is the Unix time from which the pair has been verified without a
 gap. The header describes the provider's deployment as last checked (see
 [What is not checked](#what-is-not-checked)); it is not a signature over
-the response.
+the response. That is the [receipt](#a-receipt-for-each-answer), fetched
+with the response's `x-omnigate-request-id`.
 
 **How stale can "verified" be?** At most `max_age_s` after the last pass as
 the control plane counts, plus, if the control plane stops answering right
@@ -327,6 +324,156 @@ to the ledger, and the values it replaced are counted in
 the header twice, is `400 invalid_request`, so that a request meant to stay
 in the gateway is never sent on because of a typo. It is refused on
 `POST /v1/jobs`.
+
+## A receipt for each answer
+
+The checks above are about the provider's deployment. A receipt is about
+one answer: the provider's signature over the exact bytes of the request
+and of the response, checked against the attestation that had been verified
+before the request.
+
+For every answer (status 2xx, read to its end) from a target on an attested
+upstream:
+
+1. **The data plane hashes what crossed the wire**: SHA-256 of the request
+   body exactly as it sent it to the provider (after redaction, with the
+   provider's model name), and SHA-256 of the response body exactly as it
+   arrived (before anything is translated or restored; for a stream, every
+   event and blank line). It sends the request with `x-no-aliasing: true`,
+   so that the provider refuses rather than serve another model under the
+   name, and asks for an uncompressed answer. The two hashes and the
+   provider's id for the completion go to the control plane with the usage
+   event. No content does.
+2. **The control plane asks the provider for its signature**:
+   `GET /v1/signature/<completion id>?signing_algo=ed25519`, with the
+   upstream's API key (`api_key_env` must therefore be set for the control
+   plane too). A signature is recorded a moment after the answer, so "not
+   found" is asked again after 1, 2, 4 and 8 seconds, then given up on.
+3. **It checks the signature**:
+   - the signed text is exactly `<model>:<request hash>:<response hash>`
+     when the model's machine signed (`provider_tee`), or
+     `<request hash>:<response hash>` when the provider's gateway did
+     (`gateway`);
+   - the Ed25519 signature is valid;
+   - its key is the key of exactly one report that this gateway had
+     verified **before the request started**: a model report for
+     `provider_tee`, the gateway report for `gateway`. A report fetched
+     afterwards is never used for this, and a key named by no report, or by
+     two, does not pass. (The last four passes per model are kept, so a
+     re-check that finished while a request was under way does not take its
+     evidence away.)
+4. **It keeps a receipt**: `verified`, or `not_verified` with the reason.
+   Anything missing, late, unknown or ambiguous is `not_verified`: no
+   signature after the retries, a provider that says it has none, a
+   signature that does not say who signed, a request that started before
+   any attestation had been verified, an answer without a completion id.
+
+```bash
+curl http://127.0.0.1:8080/v1/attestations/<x-omnigate-request-id> -H "Authorization: Bearer $KEY"
+```
+
+answers the key that made the request (any other key, and an id without a
+receipt, get the same `404 receipt_not_found`):
+
+```json
+{
+  "object": "attestation.receipt",
+  "id": "b65bc543b0d001df8e2cc7f99faf3111",
+  "created": 1794423638,
+  "upstream": "near-ai",
+  "model": "z-ai/glm-5.3-flash",
+  "route_model": "private",
+  "stream": false,
+  "completion_id": "07280ebbfe224a289176da572f5d23f0",
+  "request_sha256": "3ee5aaea...",
+  "response_sha256": "d613c6d9...",
+  "verdict": "verified",
+  "reason": null,
+  "reason_code": null,
+  "signature": {
+    "kind": "provider_tee",
+    "text": "z-ai/glm-5.3-flash:3ee5aaea...:d613c6d9...",
+    "signature": "<128 hexadecimal characters>",
+    "signing_address": "5a0210f2442c7935...",
+    "signing_algo": "ed25519"
+  },
+  "attestation": {
+    "verified_at": 1794423626,
+    "nonce": "f8fbf294...",
+    "reports": [
+      { "role": "gateway", "tcb_status": "UpToDate", "signing_address": "40599fb2...", "signing_algo": "ed25519",
+        "app_compose_sha256": "73dbb78c...", "mr_td": "7fe60787...", "rtmr3": "f30f282d...", "signed_this_answer": false },
+      { "role": "model", "tcb_status": "UpToDate", "signing_address": "5a0210f2...", "signing_algo": "ed25519",
+        "app_compose_sha256": "a0e3c6f4...", "mr_td": "df4d77c8...", "rtmr3": "1e5b2b85...", "signed_this_answer": true }
+    ]
+  },
+  "checked_at": 1794423639
+}
+```
+
+A receipt is `pending` for the second or so the check takes (it is made
+when the usage event arrives, a moment after the answer; until then the id
+is a 404). It holds hashes, a signature and public measurements: no prompt,
+no answer, no key. `GET /admin/receipts?limit=N` lists the newest with the
+name of the key that made each request and counts by verdict;
+`GET /admin/receipts/<id>` is one; the metric is
+`omnigate_receipts{verdict}`. A `not_verified` receipt is logged as a
+warning.
+
+**Checking a receipt yourself.**
+
+```bash
+python tools/verify_receipt.py receipt.json request.bin response.bin
+```
+
+recomputes the two hashes from the bodies, rebuilds the text that must have
+been signed, and verifies the Ed25519 signature under the key in the
+receipt, with the standard library only (its Ed25519 code is checked
+against RFC 8032's vectors: `--self-test`). It prints `VERIFIED` and exits
+0, or `NOT VERIFIED` with the reason and exits 1; one changed byte in
+either body is enough. Without the two bodies it checks the signature
+against the hashes in the receipt and says so.
+
+The two bodies are the bytes on the provider's side of the gateway. For a
+request sent without redaction and without `no-store`, a client can say
+what they are: the request it sent with the route's name replaced by the
+provider's model name, and the response body it received (for a stream,
+when the client itself asked for `stream_options.include_usage`).
+`tools/near_live.py` does exactly this. With redaction the gateway changes
+the request before it is sent and the answer after it arrives; the receipt
+is then about those changed bytes, which only the gateway saw, and a client
+can check the signature but not recompute the hashes.
+
+**What a receipt does not prove.**
+
+- **That the key belongs to an enclave** cannot be checked offline from the
+  receipt: it names the reports the gateway verified and when, not the
+  quotes themselves (a report is about 300 kB and is not kept). To check
+  it independently, fetch a fresh report (public; `tools/near_live.py`
+  prints the keys it verifies) and compare the signing key, or pass it to
+  `verify_receipt.py --signer`.
+- **A `gateway` signature is not the model's.** The provider's gateway
+  signs whenever it changes the bytes it relays, which includes every
+  streamed answer. It proves that the verified gateway passed on exactly
+  these bytes, not that the verified model produced them. Only
+  `provider_tee` ties an answer to a model machine.
+- **Not one particular machine.** Machines serving the same model share
+  one signing key, so a model signature says "a machine holding this
+  model's key", not "the machine whose report was checked".
+- **Not the whole path.** The provider's documentation says the same of
+  its own scheme: preflight evidence plus one signature do not form a
+  complete chain from model to gateway to client.
+- **Not the answer the client saw**, when the gateway restored
+  placeholders or translated protocols: the receipt covers the provider's
+  bytes.
+- Answers that were cut off, errors, cached answers and media jobs have no
+  receipt.
+
+Receipts are kept in memory and in one file (`OMNIGATE_RECEIPTS`, default
+`data/receipts.json`): the newest 10,000, and none older than
+`retention.receipts_days` (30 unless set). A check that was under way when
+the control plane stopped is `not_verified` after the restart, since the
+evidence it would be matched to went with the old process.
 
 ## Looking at it: the admin API, metrics, logs
 
@@ -412,6 +559,13 @@ from its top bar) is a chat with three panels:
 - **Verified**: the checks of [the list above](#what-is-verified-in-order)
   for the chosen model's attested target, each of which opens to the raw
   values, the time of the last check, and a button that runs one now.
+  After an answer from an attested target it gains **This answer**: the
+  [receipt](#a-receipt-for-each-answer) of that answer, once the control
+  plane has checked the provider's signature (a second or two): who signed
+  (the model's machine, or the provider's gateway), the hashes and the
+  signature, or why it is not verified, and a button that downloads the
+  receipt as JSON. Until the check is done it says so; an answer without a
+  valid signature is never shown as verified.
 
 Two switches: redaction, and "attested providers only". The model list has
 every text route, marked attested or not, so the refusal can be seen by
@@ -458,7 +612,10 @@ not); and checks that a request for attested providers only is let through
 to the first and refused, unsent, on the others. With `NEAR_AI_API_KEY`
 set it also sends one real completion with an e-mail address and a card
 number in it, and checks that the answer has them back and the response
-says `x-omnigate-attestation: verified`.
+says `x-omnigate-attestation: verified`; then one more completion whole
+and one streamed, fetches the receipt of each, and checks it with
+`tools/verify_receipt.py` from the bytes it sent and received (and that one
+changed byte fails). Three short completions in all.
 
 ```bash
 python tools/near_live.py --serve
@@ -486,7 +643,7 @@ calls it otherwise would not:
 
 | Host | For |
 |---|---|
-| the upstream's own host (`cloud-api.near.ai`) | The attestation report. No API key is sent. |
+| the upstream's own host (`cloud-api.near.ai`) | The attestation report (no API key is sent), and for each answer from it `GET /v1/signature/<id>` with the upstream's API key: the control plane needs `api_key_env` in its environment for [receipts](#a-receipt-for-each-answer). |
 | `api.trustedservices.intel.com`, `certificates.trustedservices.intel.com` | Intel's collateral: patch-level lists, the quoting enclave's identity, revocation lists. Once a day per platform family. |
 | `nras.attestation.nvidia.com` | NVIDIA's verdict on a model's GPU evidence, unless `gpu` is `skip`. The evidence (public, from the report) is posted there at every check. |
 
@@ -507,6 +664,11 @@ Upgrade both, data plane included, before telling anyone a route is
 attested, and check `GET /admin/attestations` and a response's
 `x-omnigate-attestation` header afterwards.
 
+Receipts came after the verdict: a data plane from before them reports no
+hashes (no receipt is made, and `GET /v1/attestations/<id>` is a 404 from
+it), and a control plane from before them ignores the hashes a newer data
+plane reports. Neither breaks anything else.
+
 ## What has been tested
 
 - **Against the real service** (11 November 2026, no API key):
@@ -518,9 +680,34 @@ attested, and check `GET /admin/attestations` and a response's
   for lack of a key) and refuses it, unsent, on the other two routes. The
   standalone prototype of the same code verified all ten text models NEAR
   served itself that day.
-- **Not run for lack of a key**: a real completion through an attested
-  target. The request path up to NEAR's own 401 is exercised; an answer
-  coming back, with redaction restored, is not.
+- **With a key** (11 November 2026, the same tool, 27 checks): a real
+  completion through the attested target with an e-mail address and a card
+  number redacted and restored; then a whole and a streamed completion with
+  their receipts. The whole answer was signed by the model's machine
+  (`provider_tee`), the streamed one by NEAR's gateway (`gateway`), each
+  with the key of the report verified before the request; both receipts
+  were `verified`, their hashes were those of the bytes the script sent and
+  received, `tools/verify_receipt.py` said `VERIFIED` for each and
+  `NOT VERIFIED` with one byte of the answer changed. The Private chat page
+  showed a real answer with its receipt. Not tried against the real
+  service: the Responses API, an answer translated from the Anthropic
+  protocol, a signature that arrives late or never.
+- **Receipts, offline** (`control/test/receipts_test.exs`, with keys made
+  in the test and a signature endpoint played by the test): verified for a
+  model signature and for a gateway signature; a signature that arrives
+  late; and `not_verified` for a signed text that is not these hashes, a
+  missing model name, a key no report names, a key two reports name, a
+  gateway signature made with the model's key, an invalid signature, no or
+  an unknown `signature_kind`, a provider that says it has none, one that
+  never has, refuses or cannot be reached, a request that began before any
+  attestation, an answer without an id, a missing provider key. The
+  evidence reaches these tests as a function argument; they verify no
+  quote. The hashing itself is tested in `dataplane/src/receipt.zig`, and
+  end to end in `tools/e2e.py` (the hashes a data plane reports are those
+  of the bytes a mock provider received and sent, whole and streamed), as
+  is `tools/verify_receipt.py`, against signatures made with Erlang's
+  Ed25519. No test joins the two halves with a real quote: only the run
+  with a key above does.
 - **Offline, on a saved real report** (`control/test/attestation_test.exs`,
   96 checks): the saved report and Intel's collateral as fetched with it
   verify at the recorded time, and each tampering fails with its own error:

@@ -412,7 +412,8 @@ defmodule OmnigateControl.Dashboard do
         ["Ledger ids kept", days(c.retention.ledger_ids_days)],
         ["Usage history kept", days(c.retention.ledger_days)],
         ["Expired jobs' bucket objects", if(c.retention.delete_bucket_objects, do: "deleted with the job", else: "left in the bucket")],
-        ["Private jobs' outputs kept", private_outputs(Map.get(c.retention, :private_outputs_hours, 24))]
+        ["Private jobs' outputs kept", private_outputs(Map.get(c.retention, :private_outputs_hours, 24))],
+        ["Attestation receipts kept", days(Map.get(c.retention, :receipts_days, 30))]
       ]),
       ~s(</div></div></section>)
     ]

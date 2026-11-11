@@ -75,6 +75,7 @@ Run:  python tools/mock_upstream.py
 """
 
 import base64
+import hashlib
 import json
 import select
 import sys
@@ -135,6 +136,12 @@ class Base(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{self.server.server_port}] {fmt % args}", flush=True)
 
+    def handle_one_request(self):
+        # One handler serves every request of a connection: what `sent`
+        # counts belongs to one exchange.
+        self._last = self._sent = None
+        super().handle_one_request()
+
     def read_json(self):
         length = int(self.headers.get("content-length", 0))
         raw = self.rfile.read(length) or b"{}"
@@ -146,12 +153,26 @@ class Base(BaseHTTPRequestHandler):
                     WATCH["seen"][needle.decode()] += 1
         if isinstance(req, dict):
             with LAST_LOCK:
-                LAST[(self.server.server_port, str(req.get("model")))] = {
+                # `body_sha256` and `response_sha256` are of the exact bytes
+                # received and sent: what an attested provider would sign.
+                self._last = LAST[(self.server.server_port, str(req.get("model")))] = {
                     "path": self.path,
                     "headers": {k.lower(): v for k, v in self.headers.items()},
                     "body": raw.decode("utf-8", "replace"),
+                    "body_sha256": hashlib.sha256(raw).hexdigest(),
+                    "response_sha256": None,
                 }
         return req
+
+    def sent(self, data):
+        """Count `data` as part of this response's body (see `read_json`)."""
+        if getattr(self, "_last", None) is None:
+            return
+        if getattr(self, "_sent", None) is None:
+            self._sent = hashlib.sha256()
+        self._sent.update(data)
+        with LAST_LOCK:
+            self._last["response_sha256"] = self._sent.hexdigest()
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
@@ -200,6 +221,7 @@ class Base(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
+        self.sent(data)
 
     def send_bytes(self, status, data, content_type="application/json"):
         self.send_response(status)
@@ -207,6 +229,7 @@ class Base(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+        self.sent(data)
 
     def start_sse(self, headers=None):
         self.send_response(200)
@@ -220,6 +243,7 @@ class Base(BaseHTTPRequestHandler):
         data = text.encode()
         self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
         self.wfile.flush()
+        self.sent(data)
         time.sleep(0.05)
 
     def end_sse(self):

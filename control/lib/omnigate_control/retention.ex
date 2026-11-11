@@ -107,12 +107,27 @@ defmodule OmnigateControl.Retention do
 
     private_outputs = expire_private_outputs(Map.get(retention, :private_outputs_hours, 24), now_ms)
 
-    result = %{jobs: jobs, files: files, bucket_objects: objects, ledger_ids: ledger_ids, ledger_segments: ledger_segments, private_outputs: private_outputs}
+    # Receipts of answers from attested upstreams; none without such an upstream.
+    receipts =
+      case cutoff(Map.get(retention, :receipts_days, 30), now_ms) do
+        nil -> 0
+        cutoff_ms -> prune_receipts(div(cutoff_ms, 1000))
+      end
 
-    if jobs + files + objects + ledger_ids + ledger_segments + private_outputs > 0 do
+    result = %{
+      jobs: jobs,
+      files: files,
+      bucket_objects: objects,
+      ledger_ids: ledger_ids,
+      ledger_segments: ledger_segments,
+      private_outputs: private_outputs,
+      receipts: receipts
+    }
+
+    if jobs + files + objects + ledger_ids + ledger_segments + private_outputs + receipts > 0 do
       Logger.info(
         "retention sweep removed #{jobs} finished jobs, #{files} stored files, #{objects} bucket objects, " <>
-          "#{ledger_ids} ledger dedup ids, #{ledger_segments} ledger segments, and the outputs of #{private_outputs} private jobs"
+          "#{ledger_ids} ledger dedup ids, #{ledger_segments} ledger segments, the outputs of #{private_outputs} private jobs, and #{receipts} receipts"
       )
     end
 
@@ -140,6 +155,13 @@ defmodule OmnigateControl.Retention do
   end
 
   defp expire_private_outputs(_hours, _now_ms), do: 0
+
+  defp prune_receipts(cutoff_s) do
+    OmnigateControl.Receipts.prune(cutoff_s)
+  catch
+    # Not running (a test without the application): nothing to prune.
+    :exit, _ -> 0
+  end
 
   defp cutoff(days, now_ms) when is_number(days) and days > 0, do: now_ms - round(days * @day_ms)
   defp cutoff(_, _now_ms), do: nil

@@ -286,7 +286,9 @@ python tools/upgrade_test.py 6d5ed6e --variant both --mixed
   line, then both processes with `config/omnigate.near.json`, the
   manager's verdicts, and what the data plane does with them. It needs the
   network (NEAR, Intel's and NVIDIA's attestation services) and no API key;
-  with `NEAR_AI_API_KEY` set it also sends one real completion. `--serve`
+  with `NEAR_AI_API_KEY` set it also sends three short real completions
+  (one with redaction, then a whole and a streamed one whose receipts it
+  fetches and checks with `tools/verify_receipt.py`). `--serve`
   starts the gateway with that config on ports 4000 and 8080 for the
   Private chat page. Run it when you touch `control/lib/omnigate_control/attestation*`
   or the attestation handling in `proxy.zig`. The offline counterpart,
@@ -394,7 +396,8 @@ tools/                Python, standard library only (sdk_compat.py excepted; e2e
   load_test.py                      load and soak test against a running gateway
   privacy_soak.py                   soak test of privacy mode on a stack it starts (long; not in check.py)
   upgrade_test.py                   an older commit's files read by the current build, and mixed pairs (long; not in check.py)
-  near_live.py                      attestation and attested-only routing against the real NEAR AI Cloud (network; not in check.py)
+  near_live.py                      attestation, attested-only routing and receipts against the real NEAR AI Cloud (network; not in check.py)
+  verify_receipt.py                 checks a receipt against the request and response bodies, offline (run by e2e.py)
   bench.py                          latency measurement
   import_litellm.py, test_import_litellm.py
 

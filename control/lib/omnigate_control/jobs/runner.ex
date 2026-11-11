@@ -112,7 +112,7 @@ defmodule OmnigateControl.Jobs.Runner do
   # What the job is billed for: the request as the adapter sends it, and the
   # seconds the provider says it made in place of those asked for.
   defp billable(t, input) do
-    billable = t.adapter.billable(input)
+    billable = Adapter.billable(t.adapter, input, t.target)
 
     case Map.get(t, :measured, %{}) do
       %{seconds: s} when is_number(s) and s > 0 -> Map.put(billable, :seconds, s)
@@ -229,7 +229,14 @@ defmodule OmnigateControl.Jobs.Runner do
         {:error, "missing_api_key_env:#{upstream.api_key_env}"}
 
       true ->
-        ctx = %{api_key: api_key, timeout_ms: route.timeout_s * 1000, max_inline_bytes: inline_cap(), router: Map.get(target, :router)}
+        ctx = %{
+          api_key: api_key,
+          timeout_ms: route.timeout_s * 1000,
+          max_inline_bytes: inline_cap(),
+          router: Map.get(target, :router),
+          api: Map.get(target, :api)
+        }
+
         {:ok, %{upstream: upstream, adapter: adapter, ctx: ctx}}
     end
   end

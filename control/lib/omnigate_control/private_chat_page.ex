@@ -59,10 +59,13 @@ defmodule OmnigateControl.PrivateChatPage do
       ~s(<p id="proof-hint" class="hint muted"></p>),
       ~s(<ol id="checks" class="checks"></ol>),
       ~s(<div class="row"><button type="button" id="verify" class="ghost" hidden>Verify again now</button><span id="verify-status" class="muted" role="status"></span></div>),
+      # The receipt of the last answer (`OmnigateControl.Receipts`).
+      ~s(<div id="answer" class="answer" hidden><h3>This answer</h3><ol id="answer-checks" class="checks"></ol>),
+      ~s(<div class="row"><button type="button" id="receipt" class="ghost" hidden>Download receipt</button><span id="answer-status" class="muted" role="status"></span></div></div>),
       ~s(<details id="limits" class="limits"><summary>What this does not show</summary><ul>),
       ~s(<li>Whether the measured software is software to trust: that takes an allowlist of measurements \(<code>attestation.measurements</code>, empty unless set\) and a check of where its images were built, which is not done.</li>),
       ~s(<li>That the connection a request travels on ends inside the attested machine: the data plane does not bind its TLS connections to the report.</li>),
-      ~s(<li>That one particular answer came from that machine: the provider's response signatures are not checked.</li>),
+      ~s(<li>Which machine produced an answer: machines serving the same model share one signing key, and a signature by the provider's gateway \(every streamed answer\) covers what the gateway passed on, not what the model produced.</li>),
       ~s(</ul><p class="muted">Details: docs/attestation.md.</p></details></section>),
       ~s(</div></main><script nonce="),
       nonce,
@@ -113,6 +116,7 @@ defmodule OmnigateControl.PrivateChatPage do
     .what{flex:1 1 auto;min-width:0}.what b{display:block;font-weight:600;font-size:13.5px}.what span{display:block;color:var(--muted);font-size:12.5px;overflow-wrap:anywhere}
     .raw{margin:0;padding:8px 10px 10px 40px;border-top:1px solid var(--line);display:grid;grid-template-columns:max-content minmax(0,1fr);gap:3px 10px;font-size:12px}
     .raw dt{color:var(--muted)}.raw dd{margin:0;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+    .answer{margin-top:6px;padding-top:12px;border-top:1px solid var(--line)}.answer h3{margin:0 0 8px;font-size:14px}
     .limits{font-size:12.5px;margin-top:10px}.limits summary{cursor:pointer;color:var(--muted)}.limits ul{margin:8px 0;padding-left:18px}.limits li{margin-bottom:5px}
     .limits code{font-size:12px}
     nav a[aria-current=page]{border-bottom-color:var(--accent)}
@@ -226,12 +230,44 @@ defmodule OmnigateControl.PrivateChatPage do
       else{row('Refused',res.error.code+' (HTTP '+res.status+')');row('Why',cap(res.error.message));if(res.error.attempts&&res.error.attempts.length)row('Targets',res.error.attempts.map(function(a){return a.upstream+': '+a.outcome}).join(', '));row('Sent to a provider',res.upstream?'yes, '+res.upstream:'no')}
       row('Request id',res.request_id);box.appendChild(dl)}
 
+    // The receipt of the answer just shown: the provider's signature over
+    // the exact bytes, checked by the control plane a moment after the answer.
+    var receiptOf=null,receiptTimer=null;
+    function answerProof(res){
+      var box=$('answer'),list=$('answer-checks'),st=$('answer-status'),dl=$('receipt');
+      if(receiptTimer){clearTimeout(receiptTimer);receiptTimer=null}
+      clear(list);dl.hidden=true;receiptOf=null;st.textContent='';
+      if(!res||!res.ok||!res.attestation||!res.request_id){box.hidden=true;return}
+      box.hidden=false;var id=res.request_id,tries=0;
+      list.appendChild(check(null,'Signature: being checked','The provider is asked for its signature over this request and this answer.',[['request id',id]]));
+      (function poll(){
+        api('GET','/admin/receipts/'+encodeURIComponent(id)).then(function(r){
+          if(r.verdict==='pending')throw new Error('pending');showReceipt(r)})
+        .catch(function(){tries++;
+          if(tries<30){receiptTimer=setTimeout(poll,1000)}
+          else{clear(list);list.appendChild(check(null,'No receipt','The gateway has no receipt for this answer after 30 seconds. It is not verified.',[['request id',id]]))}})})()}
+    function showReceipt(r){
+      var list=$('answer-checks'),sig=r.signature,ok=r.verdict==='verified',dl=$('receipt');clear(list);
+      var att=r.attestation,signer=att&&att.reports?att.reports.filter(function(x){return x.signed_this_answer})[0]:null;
+      var raw=[['request sha256',r.request_sha256],['response sha256',r.response_sha256],['completion id',r.completion_id]];
+      if(sig)raw=raw.concat([['signed text',sig.text],['signature',sig.signature],['key',(sig.signing_algo||'')+':'+(sig.signing_address||'')],['signed by',sig.kind]]);
+      if(att)raw.push(['matched to evidence verified at',new Date(att.verified_at*1000).toISOString()]);
+      if(ok){
+        var model=sig.kind==='provider_tee';
+        list.appendChild(check(true,model?'Signed by the model\'s machine':'Signed by the provider\'s gateway',
+          'The exact bytes of this request and this answer were signed with '+sig.signing_algo+':'+short(sig.signing_address)+', the key of the '+(signer?signer.role:'')+' report this gateway verified before the request'+(model?'.':'. A gateway signature covers what the gateway passed on, not what the model produced.'),raw))}
+      else{list.appendChild(check(false,'This answer is not verified',cap(r.reason||'no valid signature')+'.',raw.concat([['reason code',r.reason_code]])))}
+      receiptOf=r;dl.hidden=false;$('answer-status').textContent=ok?'Check it yourself: tools/verify_receipt.py':''}
+    $('receipt').addEventListener('click',function(){
+      if(!receiptOf)return;var a=document.createElement('a'),url=URL.createObjectURL(new Blob([JSON.stringify(receiptOf,null,2)+'\n'],{type:'application/json'}));
+      a.href=url;a.download='receipt-'+receiptOf.id+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(url)},1000)});
+
     $('send').addEventListener('submit',function(ev){
       ev.preventDefault();if(sending||!state)return;var text=$('text').value.trim();if(!text)return;
       sending=true;$('go').disabled=true;$('status').textContent='Sending…';
       var turn=history.concat([{role:'user',content:text}]);bubble('user',text);$('text').value='';
       api('POST','/admin/private-chat/send',{model:$('model').value,messages:turn,redact:$('redact').checked,attested:$('attested').checked})
-        .then(function(out){renderWire(out.dry_run);renderOutcome(out.asked,out.response);
+        .then(function(out){renderWire(out.dry_run);renderOutcome(out.asked,out.response);answerProof(out.response);
           if(out.response.ok){history=turn.concat([{role:'assistant',content:out.response.text}]);bubble('assistant',out.response.text);$('status').textContent=''}
           else{var er=out.response.error,up=out.response.upstream;
             bubble('assistant',er.code==='attestation_unverified'?'Not sent. '+cap(er.message)+'.':
@@ -242,7 +278,7 @@ defmodule OmnigateControl.PrivateChatPage do
     $('text').addEventListener('keydown',function(ev){if(ev.key==='Enter'&&!ev.shiftKey){ev.preventDefault();$('go').click()}});
     $('sample').addEventListener('click',function(){$('text').value=SAMPLE;$('text').focus()});
     $('reset').addEventListener('click',function(){history=[];var log=$('log');clear(log);var p=el('p','muted empty','Nothing sent yet.');p.id='log-empty';log.appendChild(p);
-      clear($('wire'));$('wire').appendChild(el('p','muted empty','Send a message to see it here.'));clear($('wire-meta'));$('outcome').hidden=true});
+      clear($('wire'));$('wire').appendChild(el('p','muted empty','Send a message to see it here.'));clear($('wire-meta'));$('outcome').hidden=true;answerProof(null)});
     $('model').addEventListener('change',renderProof);
     $('verify').addEventListener('click',function(){
       if(!lastPair)return;var b=$('verify'),s=$('verify-status');b.disabled=true;s.textContent='Asking for a report with a new nonce…';var started=Date.now();

@@ -112,6 +112,12 @@ defmodule OmnigateControl.NetGuard do
 
   def private?({a, b, _, _, _, _, _, _}) do
     cond do
+      # Public unicast IPv6 is 2000::/3 and nothing else. Everything outside
+      # it is refused, whatever it is today: the IPv4-translated ::ffff:0:a.b.c.d
+      # (SIIT, which a translator turns into a call to a.b.c.d), space that is
+      # reserved, and space that is yet to be given a meaning. (The NAT64
+      # prefix 64:ff9b::/96 is judged by the address inside it, above.)
+      band(a, 0xE000) != 0x2000 -> true
       # discard-only 100::/64
       a == 0x0100 and b == 0 -> true
       # IETF protocol assignments 2001::/23: Teredo, ORCHID, benchmarking, ...

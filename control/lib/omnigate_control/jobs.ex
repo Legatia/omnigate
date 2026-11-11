@@ -18,6 +18,16 @@ defmodule OmnigateControl.Jobs do
   # instead of in the job record (see "Large inputs" in `Jobs.Store`).
   @inline_input_bytes 8 * 1024
 
+  # A job's metadata stays in the job record, which is held in memory and
+  # copied on every read for as long as the job is kept: it is small, or it is
+  # refused. In a list of jobs, metadata above `@listed_metadata_bytes` is
+  # left out, as a large input is.
+  @max_metadata_bytes 16 * 1024
+  @listed_metadata_bytes 1024
+
+  # A webhook URL is kept in the job record too, and sent in a request line.
+  @max_webhook_url_bytes 2048
+
   @terminal ~w(succeeded failed canceled)
   @public ~w(id status model input metadata error cost_usd cached upstream target_model attempts
              created_at updated_at started_at finished_at)
@@ -37,6 +47,7 @@ defmodule OmnigateControl.Jobs do
     with {:ok, route} <- route(params["model"]),
          {:ok, input} <- object(params["input"], "input", true),
          {:ok, metadata} <- object(params["metadata"], "metadata", false),
+         :ok <- metadata_small(metadata),
          {:ok, input_json} <- small_enough(input, metadata),
          :ok <- fields_allowed(input, route),
          :ok <- quantities_ok(input, route),
@@ -156,14 +167,26 @@ defmodule OmnigateControl.Jobs do
     end
   end
 
-  @doc "Cancel a job that has not finished. Finished jobs are returned unchanged."
+  @doc """
+  Cancel a job that has not finished. Finished jobs are returned unchanged.
+
+  A job whose provider call has already started is canceled at once for the
+  client, but what it owes is not known yet: a provider that cannot be told
+  to stop (or was already done) still completes the call and charges for it.
+  Such a job is marked `"provider_pending"`: it stays out of the ledger, keeps
+  its place in the key's open-jobs limit, and holds its webhook back, until
+  its runner has seen how the provider call ended and calls
+  `settle_canceled/2` with the cost. Canceling is therefore not a way to get
+  a provider call for free, nor to run more of them at once than
+  `max_open_jobs` allows.
+  """
   def cancel(key_sha256, id) do
     case get(key_sha256, id) do
       nil ->
         nil
 
       job ->
-        case finish(id, "canceled", %{}) do
+        case finish(id, "canceled", fn current -> if provider_in_flight?(current), do: %{"provider_pending" => true}, else: %{} end) do
           {:ok, canceled} ->
             # The runner notices on its next step; tell the provider now.
             Task.Supervisor.start_child(OmnigateControl.Jobs.TaskSup, fn -> Runner.cancel_provider(job) end)
@@ -175,9 +198,20 @@ defmodule OmnigateControl.Jobs do
     end
   end
 
+  # Has a provider been (or is it being) asked to do this job's work? From
+  # the moment a submit is recorded as started until the attempt is given up.
+  defp provider_in_flight?(%{"status" => "running", "run" => %{"attempt_started_ms" => ms}}) when is_integer(ms), do: true
+  defp provider_in_flight?(_job), do: false
+
+  @doc "Is this a canceled job whose provider call has not been accounted for yet (see `cancel/2`)?"
+  def provider_pending?(%{"status" => "canceled", "provider_pending" => true}), do: true
+  def provider_pending?(_job), do: false
+
   @doc """
   Move a job to a terminal status, exactly once. Later calls are no-ops, so a
-  runner finishing a job that was canceled in the meantime changes nothing.
+  runner finishing a job that was canceled in the meantime changes nothing
+  (it then calls `settle_canceled/2`). `changes` is a map, or a function of
+  the job as it is at that moment that returns one.
   """
   def finish(id, status, changes) when status in @terminal do
     now = DateTime.utc_now()
@@ -187,15 +221,52 @@ defmodule OmnigateControl.Jobs do
         if terminal?(job) do
           :noop
         else
+          changes = if is_function(changes, 1), do: changes.(job), else: changes
+
+          finished =
+            job
+            |> Map.merge(changes)
+            |> Map.merge(%{
+              "status" => status,
+              "finished_at" => iso(now),
+              "finished_ms" => DateTime.to_unix(now, :millisecond),
+              "run" => nil
+            })
+
+          if provider_pending?(finished) do
+            # The runner still needs to know which provider call this was.
+            Map.put(finished, "run", job["run"])
+          else
+            arm_webhook(finished, now)
+          end
+        end
+      end)
+
+    with {:ok, job} <- result do
+      settle(job)
+      {:ok, Store.get(id)}
+    end
+  end
+
+  @doc """
+  Close the account of a canceled job whose provider call was still in flight
+  (`cancel/2`): record what that call cost (`changes`: `cost_usd`, `upstream`,
+  `target_model`, `attempts`; an empty map when it cost nothing), write the
+  ledger event and send the webhook. A no-op for any other job, so it is safe
+  to call whenever a runner finds its job finished under it.
+  """
+  def settle_canceled(id, changes) when is_map(changes) do
+    now = DateTime.utc_now()
+
+    result =
+      Store.update(id, fn job ->
+        if provider_pending?(job) do
           job
-          |> Map.merge(changes)
-          |> Map.merge(%{
-            "status" => status,
-            "finished_at" => iso(now),
-            "finished_ms" => DateTime.to_unix(now, :millisecond),
-            "run" => nil
-          })
+          |> Map.merge(Map.take(changes, ~w(cost_usd upstream target_model attempts)))
+          |> Map.merge(%{"provider_pending" => false, "run" => nil})
           |> arm_webhook(now)
+        else
+          :noop
         end
       end)
 
@@ -218,8 +289,18 @@ defmodule OmnigateControl.Jobs do
     ledgered =
       Enum.count(unledgered, fn id ->
         case Store.get(id) do
-          %{"ledgered" => false} = job -> record_cost(job) == :ok
-          _ -> false
+          %{"ledgered" => false} = job ->
+            cond do
+              not provider_pending?(job) -> record_cost(job) == :ok
+              # A canceled job is settled by its runner, which has until the
+              # route's timeout. One still open well after that has lost its
+              # runner: start another, which closes the account.
+              now - (job["finished_ms"] || now) > pending_grace_ms(job) -> start_runner(id) && false
+              true -> false
+            end
+
+          _ ->
+            false
         end
       end)
 
@@ -235,10 +316,17 @@ defmodule OmnigateControl.Jobs do
   """
   def resume_all do
     now = System.os_time(:millisecond)
+    # Before any runner starts: downloads a stop or a crash cut off.
+    Storage.sweep_tmp()
 
     for job <- Store.all() do
       cond do
         not terminal?(job) ->
+          start_runner(job["id"])
+
+        # Canceled while its provider call was in flight, and then we stopped:
+        # the runner closes the account (see `cancel/2`).
+        provider_pending?(job) ->
           start_runner(job["id"])
 
         true ->
@@ -276,11 +364,18 @@ defmodule OmnigateControl.Jobs do
         true -> {nil, true}
       end
 
+    # Metadata is capped when a job is created; a list still leaves out all
+    # but small ones, so that its size does not depend on what clients stored.
+    metadata_omitted =
+      not Keyword.get(opts, :input, true) and is_map(job["metadata"]) and map_size(job["metadata"]) > 0 and
+        byte_size(JSON.encode!(job["metadata"])) > @listed_metadata_bytes
+
     job
     |> Map.take(@public)
     |> Map.merge(%{
       "object" => "job",
       "input" => input,
+      "metadata" => if(metadata_omitted, do: nil, else: job["metadata"]),
       "outputs" =>
         Enum.map(job["outputs"] || [], fn o ->
           %{
@@ -297,6 +392,7 @@ defmodule OmnigateControl.Jobs do
         end
     })
     |> then(&if(omitted, do: Map.put(&1, "input_omitted", true), else: &1))
+    |> then(&if(metadata_omitted, do: Map.put(&1, "metadata_omitted", true), else: &1))
   end
 
   @doc """
@@ -391,14 +487,32 @@ defmodule OmnigateControl.Jobs do
   # -- internals -------------------------------------------------------------
 
   # Ledger first, then the webhook: both are safe to repeat after a crash
-  # (the ledger dedups on job id; webhook state is in the job).
+  # (the ledger dedups on job id; webhook state is in the job). Not yet for a
+  # canceled job whose provider call is still in flight: the ledger takes one
+  # event per job, so it waits for the real cost (`settle_canceled/2`).
   defp settle(job) do
-    record_cost(job)
+    if provider_pending?(job) do
+      :ok
+    else
+      record_cost(job)
 
-    case job["webhook"] do
-      %{"status" => "pending"} -> Webhooks.schedule(job["id"], 0)
-      _ -> :ok
+      case job["webhook"] do
+        %{"status" => "pending"} -> Webhooks.schedule(job["id"], 0)
+        _ -> :ok
+      end
     end
+  end
+
+  # How long after its cancellation a job's runner may still be busy with the
+  # provider: the route's timeout, and a margin.
+  defp pending_grace_ms(job) do
+    timeout_s =
+      case ConfigStore.media_route(job["model"]) do
+        %{timeout_s: s} when is_integer(s) -> s
+        _ -> 3_600
+      end
+
+    timeout_s * 1000 + 120_000
   end
 
   # `:ok` once the job's cost is in the ledger and the job says so. If the
@@ -494,6 +608,16 @@ defmodule OmnigateControl.Jobs do
   defp object(nil, _name, false), do: {:ok, nil}
   defp object(map, _name, _required) when is_map(map), do: {:ok, map}
   defp object(_, name, _), do: {:error, 400, "invalid_request", "\"#{name}\" must be an object"}
+
+  defp metadata_small(nil), do: :ok
+
+  defp metadata_small(metadata) do
+    if byte_size(JSON.encode!(metadata)) > @max_metadata_bytes do
+      {:error, 413, "payload_too_large", "\"metadata\" must not exceed #{@max_metadata_bytes} bytes as JSON"}
+    else
+      :ok
+    end
+  end
 
   # A job's input is kept on disk for as long as the job is. Returns the
   # input's JSON, which is what gets written when it is large.
@@ -609,6 +733,10 @@ defmodule OmnigateControl.Jobs do
   end
 
   defp webhook_url(nil, _key), do: {:ok, nil}
+
+  defp webhook_url(url, _key_sha256) when is_binary(url) and byte_size(url) > @max_webhook_url_bytes do
+    {:error, 400, "invalid_webhook_url", "\"webhook_url\" must not be longer than #{@max_webhook_url_bytes} bytes"}
+  end
 
   defp webhook_url(url, key_sha256) when is_binary(url) do
     cond do

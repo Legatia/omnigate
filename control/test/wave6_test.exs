@@ -1759,7 +1759,8 @@ defmodule OmnigateControl.Wave6Test do
       # The minute was not over: the line is stamped when it was written, never in the future.
       {:ok, at, 0} = DateTime.from_iso8601(summary["ts"])
       assert DateTime.compare(at, DateTime.utc_now()) != :gt
-      assert %{"address" => ^address, "repeats" => 3} = hd(Audit.recent(1))
+      # Other tests' summary lines may be written in the same stop: look for ours.
+      assert %{"address" => ^address, "repeats" => 3} = Enum.find(Audit.recent(50), &(&1["address"] == address and &1["repeats"]))
 
       page = conn(:get, "/") |> bearer() |> call()
       assert page.resp_body =~ ~s(<span class="muted sub">3 more</span>)

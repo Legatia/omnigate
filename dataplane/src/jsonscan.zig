@@ -19,7 +19,15 @@
 //!   * `model`, `stream` and `stream_options` may each appear once at the top
 //!     level; a duplicate is refused, since parsers disagree on which wins;
 //!   * a top-level key that only spells one of those names through escapes
-//!     (`"mod\u0065l"`) is refused for the same reason.
+//!     (`"mod\u0065l"`) is refused for the same reason;
+//!   * so is a key that is one of those names to a parser that matches field
+//!     names without regard to case (Go's encoding/json does, and takes the
+//!     last match): `"Model"`, `"STREAM"`, and the letters Unicode folds onto
+//!     ASCII ones (`"ſtream"`). The same holds for `include_usage` inside
+//!     `stream_options`;
+//!   * `stream` and `stream_options.include_usage` must be `true`, `false`
+//!     or `null`: servers that coerce types read `"true"` or `1` as true
+//!     where this module would read false.
 //!
 //! The same pass enforces the bounds that keep later, tree-building steps
 //! (translation, the response cache) cheap: nesting depth, members per
@@ -66,6 +74,11 @@ pub const Error = error{
     DuplicateField,
     /// One of those names written with escapes.
     EscapedFieldName,
+    /// One of those names (or `include_usage` in `stream_options`) in another
+    /// letter case, or with letters that case folding maps onto its own.
+    AmbiguousFieldName,
+    /// `stream` or `stream_options.include_usage` that is not a boolean.
+    InvalidFieldType,
 };
 
 const Name = enum { model, stream, stream_options, include_usage, other };
@@ -237,6 +250,68 @@ const Walker = struct {
     }
 };
 
+/// What a key is to a parser that ignores case: its raw bytes, escapes
+/// decoded and every character folded (ASCII letters to lower case, and the
+/// few other characters Unicode case folding maps onto ASCII letters).
+/// `.other` when that spells none of the names this module cares about.
+fn foldedName(raw: []const u8) Name {
+    // "stream_options" is the longest name: 14 characters, each at most six
+    // bytes escaped. (The two ligatures below are one character for two.)
+    if (raw.len > 14 * 6) return .other;
+    var buf: [15]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) {
+        var cp: u21 = raw[i];
+        if (cp == '\\') {
+            // Only \uXXXX can spell a letter or an underscore.
+            if (i + 6 > raw.len or raw[i + 1] != 'u') return .other;
+            cp = std.fmt.parseInt(u16, raw[i + 2 .. i + 6], 16) catch return .other;
+            i += 6;
+        } else if (cp < 0x80) {
+            i += 1;
+        } else {
+            const len = std.unicode.utf8ByteSequenceLength(raw[i]) catch return .other;
+            if (i + len > raw.len) return .other;
+            cp = std.unicode.utf8Decode(raw[i..][0..len]) catch return .other;
+            i += len;
+        }
+        var one: [1]u8 = undefined;
+        const folded: []const u8 = switch (cp) {
+            0...0x7f => ascii: {
+                one[0] = std.ascii.toLower(@intCast(cp));
+                break :ascii &one;
+            },
+            0x017f => "s", // LATIN SMALL LETTER LONG S
+            0x212a => "k", // KELVIN SIGN
+            0xfb05, 0xfb06 => "st", // the ligatures "long s t" and "st"
+            // Fullwidth forms are not case variants, but a parser that
+            // normalises would read them as the letters.
+            0xff21...0xff3a => wide: {
+                one[0] = @as(u8, @intCast(cp - 0xff21)) + 'a';
+                break :wide &one;
+            },
+            0xff41...0xff5a => wide: {
+                one[0] = @as(u8, @intCast(cp - 0xff41)) + 'a';
+                break :wide &one;
+            },
+            0xff3f => "_",
+            else => return .other,
+        };
+        if (n + folded.len > buf.len) return .other;
+        @memcpy(buf[n..][0..folded.len], folded);
+        n += folded.len;
+    }
+    return nameOf(buf[0..n]);
+}
+
+/// `true`, `false` or `null` (which every parser reads as "not set").
+fn flagValue(text: []const u8) Error!bool {
+    if (std.mem.eql(u8, text, "true")) return true;
+    if (std.mem.eql(u8, text, "false") or std.mem.eql(u8, text, "null")) return false;
+    return error.InvalidFieldType;
+}
+
 /// What a key's raw bytes (which contain escapes) decode to, when that could
 /// be one of the names this module cares about; `.other` otherwise.
 fn escapedName(raw: []const u8) Name {
@@ -295,8 +370,19 @@ pub fn scan(body: []const u8, bounds: Bounds) Error!Top {
         const raw = body[k.start..k.end];
         const name: Name = if (k.escaped) blk: {
             if (escapedName(raw) != .other) return error.EscapedFieldName;
+            switch (foldedName(raw)) {
+                .model, .stream, .stream_options => return error.AmbiguousFieldName,
+                .include_usage, .other => {},
+            }
             break :blk .other;
-        } else nameOf(raw);
+        } else blk: {
+            const exact = nameOf(raw);
+            if (exact == .other or exact == .include_usage) switch (foldedName(raw)) {
+                .model, .stream, .stream_options => return error.AmbiguousFieldName,
+                .include_usage, .other => {},
+            };
+            break :blk exact;
+        };
 
         w.ws();
         if (try w.peek() != ':') return error.InvalidJson;
@@ -313,7 +399,7 @@ pub fn scan(body: []const u8, bounds: Bounds) Error!Top {
             .stream => {
                 if (seen_stream) return error.DuplicateField;
                 seen_stream = true;
-                top.stream = std.mem.eql(u8, body[span.start..span.end], "true");
+                top.stream = try flagValue(body[span.start..span.end]);
             },
             .stream_options => {
                 if (top.stream_options != null) return error.DuplicateField;
@@ -340,13 +426,13 @@ pub fn scan(body: []const u8, bounds: Bounds) Error!Top {
     if (w.i != body.len) return error.InvalidJson;
     top.max_members = @max(w.max_members, members);
 
-    if (top.stream_options) |so| readStreamOptions(body[so.start..so.end], &top);
+    if (top.stream_options) |so| try readStreamOptions(body[so.start..so.end], &top);
     return top;
 }
 
 /// `include_usage` inside a `stream_options` value that has already been
 /// walked once (so it is well-formed).
-fn readStreamOptions(text: []const u8, top: *Top) void {
+fn readStreamOptions(text: []const u8, top: *Top) Error!void {
     var w: Walker = .{ .s = text, .bounds = .{} };
     if (text.len == 0 or text[0] != '{') {
         top.stream_options_plain = false;
@@ -360,6 +446,9 @@ fn readStreamOptions(text: []const u8, top: *Top) void {
         const k = w.string() catch return;
         const raw = text[k.start..k.end];
         const is_flag = if (k.escaped) escapedName(raw) == .include_usage else nameOf(raw) == .include_usage;
+        // `Include_Usage`: the flag to a parser that ignores case, and not
+        // to this one.
+        if (!is_flag and foldedName(raw) == .include_usage) return error.AmbiguousFieldName;
         w.ws();
         w.i += 1; // the colon
         w.ws();
@@ -372,7 +461,7 @@ fn readStreamOptions(text: []const u8, top: *Top) void {
                 return;
             }
             seen = true;
-            top.include_usage = std.mem.eql(u8, text[vstart..w.i], "true");
+            top.include_usage = try flagValue(text[vstart..w.i]);
         }
         w.ws();
         if ((w.peek() catch return) == ',') w.i += 1;
@@ -418,8 +507,8 @@ test "finds model, stream and stream_options without a tree" {
     try testing.expectEqual(@as(u8, '}'), body[top.close]);
     try testing.expectEqual(@as(u32, 5), top.max_members);
 
-    const quiet = try scan("{\"model\":\"m\",\"stream\":\"true\"}", .{});
-    try testing.expect(!quiet.stream); // a string is not the boolean
+    const quiet = try scan("{\"model\":\"m\",\"stream\":null}", .{});
+    try testing.expect(!quiet.stream);
     try testing.expect(quiet.stream_options == null);
     try testing.expect((try scan("{}", .{})).model == null);
 }
@@ -436,6 +525,44 @@ test "refuses what a provider's parser could read differently" {
     _ = try scan("{\"model\":\"a\",\"a\\/b\":1,\"caf\\u00e9\":2}", .{});
     // Nested, the names mean nothing.
     _ = try scan("{\"model\":\"a\",\"x\":{\"model\":\"b\",\"model\":\"c\"}}", .{});
+}
+
+test "a field name in another letter case is refused, as is a flag that is not a boolean" {
+    // Go's encoding/json matches field names case-insensitively and lets the
+    // last match win: to it every one of these names a model, or a stream.
+    const ambiguous = [_][]const u8{
+        "{\"model\":\"a\",\"Model\":\"b\"}",
+        "{\"model\":\"a\",\"MODEL\":\"b\"}",
+        "{\"Model\":\"b\"}",
+        "{\"model\":\"a\",\"Stream\":true}",
+        "{\"model\":\"a\",\"\xc5\xbftream\":true}", // long s
+        "{\"model\":\"a\",\"\\u017ftream\":true}", // the same, escaped
+        "{\"model\":\"a\",\"\xef\xac\x86ream\":true}", // the st ligature
+        "{\"model\":\"a\",\"\xef\xac\x85ream_options\":{}}",
+        "{\"model\":\"a\",\"Stream_Options\":{\"include_usage\":false}}",
+        "{\"model\":\"a\",\"stream\":true,\"stream_options\":{\"Include_Usage\":false}}",
+        "{\"model\":\"a\",\"stream_options\":{\"include_usage\":true,\"INCLUDE_USAGE\":false}}",
+        "{\"model\":\"a\",\"stream_options\":{\"include_u\xc5\xbfage\":false}}",
+        "{\"model\":\"a\",\"\xef\xbd\x8dodel\":\"b\"}", // fullwidth m
+    };
+    for (ambiguous) |b| try testing.expectError(error.AmbiguousFieldName, scan(b, .{}));
+    // An ASCII letter written as an escape was refused before, and still is.
+    try testing.expectError(error.EscapedFieldName, scan("{\"model\":\"a\",\"\\u006dodel\":\"b\"}", .{}));
+    try testing.expectError(error.AmbiguousFieldName, scan("{\"model\":\"a\",\"\\u004dodel\":\"b\"}", .{}));
+
+    const mistyped = [_][]const u8{
+        "{\"model\":\"a\",\"stream\":\"true\"}",
+        "{\"model\":\"a\",\"stream\":1}",
+        "{\"model\":\"a\",\"stream\":[true]}",
+        "{\"model\":\"a\",\"stream\":{}}",
+        "{\"model\":\"a\",\"stream\":true,\"stream_options\":{\"include_usage\":\"false\"}}",
+        "{\"model\":\"a\",\"stream_options\":{\"include_usage\":0}}",
+    };
+    for (mistyped) |b| try testing.expectError(error.InvalidFieldType, scan(b, .{}));
+
+    // Other keys may be spelled however the client likes, at any depth.
+    const fine = try scan("{\"model\":\"a\",\"Models\":1,\"streams\":2,\"x\":{\"Model\":\"b\",\"Stream\":\"yes\"},\"include_Usage\":3,\"stream\":false,\"stream_options\":{\"include_usage\":null,\"Other\":1}}", .{});
+    try testing.expect(!fine.stream and !fine.include_usage and fine.stream_options_plain);
 }
 
 test "stream_options that cannot be spliced safely are flagged, not guessed" {
@@ -523,7 +650,8 @@ test "agrees with std's parser on random documents" {
                 // The only documents std takes and the walker refuses are the
                 // ones with a duplicated or escaped field of ours.
                 const dup = scan(text, .{});
-                try testing.expect(dup == error.DuplicateField or dup == error.EscapedFieldName);
+                try testing.expect(dup == error.DuplicateField or dup == error.EscapedFieldName or
+                    dup == error.AmbiguousFieldName or dup == error.InvalidFieldType);
             } else both += 1;
         } else |_| {
             try testing.expect(ours == null);

@@ -258,7 +258,7 @@ gateway's reason in `error.code`. What is new is listed here.
 | Status | `error.code` | From | When |
 |---|---|---|---|
 | 400 | `request_too_complex` | data plane | A request that must be translated (or have its `stream_options` rewritten) has an object with more than 1,024 members, or needs a tree of more than 128 times its size plus 1 MiB (at most 96 MiB). |
-| 400 | `invalid_request` | data plane | An object with more than 65,536 members, a key over 8 KiB, or `model`, `stream` or `stream_options` twice or spelled with escapes. |
+| 400 | `invalid_request` | data plane | An object with more than 65,536 members, a key over 8 KiB, or `model`, `stream` or `stream_options` twice, spelled with escapes or (from the [third-review commit](#the-third-review-commit)) in another letter case; a `stream` or `include_usage` that is not a boolean. |
 | 411 | `invalid_request` | data plane | **A chunked request body.** `Transfer-Encoding: chunked` on a `POST` was accepted before; now every request with a body needs a `Content-Length`. |
 | 429 | `concurrency_limit_exceeded` | data plane | The key has 512 requests in flight. `retry-after: 1`. |
 | 429 | `request_memory_exceeded` | data plane | The key's share of the request-memory or tree budget is in use. `retry-after: 1`. |
@@ -434,6 +434,52 @@ can notice:
 **Going back** from this commit to 55a294d needs nothing: remove
 `max_concurrent` from file keys only if you want to (older control planes
 ignore it).
+
+## The third-review commit
+
+The commit that follows 1cc721f fixes what the third security review
+found ([advisories](../SECURITY.md#past-advisories)). Either process can
+be upgraded first. On disk: a managed key in `keys.json` can gain
+`carried_totals`, and a job in the job log `provider_pending`; older code
+ignores both. What an installation can notice:
+
+**What clients can notice**
+
+| Change | Before | Now |
+|---|---|---|
+| `"Model"`, `"STREAM"`, `"Stream_Options"` or another case of `model`, `stream`, `stream_options` at the top level of a text request; another case of `include_usage` inside `stream_options` | Ignored by the gateway, passed on to the provider | `400 invalid_request` |
+| `"stream"` or `"stream_options.include_usage"` that is not `true`, `false` or `null` (`"true"`, `1`) | Read as false, passed on | `400 invalid_request` |
+| A stream whose provider never reports usage (it ignores `stream_options`) | Recorded with zero tokens, free | Billed an estimate, `"estimated": true` ([Operations](operations.md#streams-that-end-early)) |
+| `POST /v1/jobs` with `metadata` over 16 KiB as JSON | Accepted up to `media.max_input_bytes` together with the input | `413 payload_too_large` |
+| `POST /v1/jobs` with a `webhook_url` over 2,048 bytes | Accepted | `400 invalid_webhook_url` |
+| `GET /v1/jobs`: a job whose `metadata` is over 1 KiB | In the list | `"metadata": null, "metadata_omitted": true`; `GET /v1/jobs/{id}` shows it |
+| Cancelling a job whose provider call had started | `cost_usd` 0, always; webhook at once | `cost_usd` is the route's price if the provider completed the call anyway; the job counts as open, and its webhook waits, until that is known (at most the route's timeout) ([API](api.md#cancel-a-job)) |
+| A job whose provider returns more than 16 outputs, or more than 2 GiB of them | All downloaded | That attempt fails (`too_many_outputs`, `output_fetch_failed`); raise `media.max_outputs_per_job` or `media.max_job_output_bytes` if a model of yours needs more |
+
+**What operators can notice**
+
+- **Two new settings**, `media.max_outputs_per_job` (16) and
+  `media.max_job_output_bytes` (2 GiB, or `media.max_output_bytes` if that
+  is larger) ([Configuration](configuration.md#media)).
+- **Estimated usage is more common** if you route to providers that do
+  not report usage on streams: those calls now cost the estimate.
+- **Outputs stored in a bucket** from now on have `application/octet-stream`
+  as their content type unless the type is an image, video or audio type
+  (or JSON), as outputs served by the gateway already had. Objects stored
+  earlier keep the type they were stored with.
+- **Webhook and output URLs on IPv6** are only called when the address is
+  in `2000::/3`.
+- **The download directory is emptied of leftovers at start** (files named
+  `job_<id>-<n>`; ones of jobs this instance does not hold only when they
+  are a day old).
+- **Admin sign-in throttling** counts an attempt before it compares, so a
+  burst of parallel wrong attempts is cut off at the limit rather than
+  after it. Correct tokens never use the allowance up.
+
+**Going back** to 1cc721f needs nothing. A job cancelled under the new
+code whose account is still open (`"provider_pending": true`) is not
+settled by the old code: let such jobs finish (at most a route's timeout)
+before going back, or accept that they stay out of the ledger.
 
 ## Going back
 

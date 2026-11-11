@@ -447,6 +447,14 @@ pub const Usage = struct {
 /// until its blank line arrives.
 pub const UsageChunkFilter = struct {
     pending: std.ArrayList(u8) = .empty,
+    /// How much of `pending` has been searched for the end of an event
+    /// without finding one. The search resumes there: looking through all of
+    /// a long unfinished event again on every read made the cost of a stream
+    /// quadratic in the size of its events (a megabyte per byte received).
+    searched: usize = 0,
+    /// Bytes examined in search of event ends, in total. Linear in what was
+    /// fed, whatever the sizes it arrived in; the tests hold it to that.
+    work: u64 = 0,
 
     /// An event this large is not a usage chunk; stop holding bytes back.
     const max_pending = 1024 * 1024;
@@ -457,36 +465,48 @@ pub const UsageChunkFilter = struct {
 
     pub fn feed(f: *UsageChunkFilter, gpa: std.mem.Allocator, chunk: []const u8, out: *std.Io.Writer) !void {
         try f.pending.appendSlice(gpa, chunk);
+        const items = f.pending.items;
         var start: usize = 0;
-        while (eventEnd(f.pending.items[start..])) |len| {
-            const event = f.pending.items[start .. start + len];
+        while (f.eventEnd(items, start)) |end| {
+            const event = items[start..end];
             if (!isUsageOnly(event)) try out.writeAll(event);
-            start += len;
+            start = end;
+            f.searched = end;
         }
-        if (f.pending.items.len - start > max_pending) {
-            try out.writeAll(f.pending.items[start..]);
-            start = f.pending.items.len;
+        // No event ends in what is left: none of it is looked at again.
+        f.searched = items.len;
+        if (items.len - start > max_pending) {
+            try out.writeAll(items[start..]);
+            start = items.len;
         }
-        const rest = f.pending.items.len - start;
-        std.mem.copyForwards(u8, f.pending.items[0..rest], f.pending.items[start..]);
+        if (start == 0) return;
+        const rest = items.len - start;
+        std.mem.copyForwards(u8, items[0..rest], items[start..]);
         f.pending.shrinkRetainingCapacity(rest);
+        f.searched -= start;
     }
 
     /// The upstream ended: pass on whatever is left.
     pub fn finish(f: *UsageChunkFilter, out: *std.Io.Writer) !void {
         if (f.pending.items.len > 0 and !isUsageOnly(f.pending.items)) try out.writeAll(f.pending.items);
         f.pending.clearRetainingCapacity();
+        f.searched = 0;
     }
 
-    /// Length of the first complete SSE event (through its blank line).
-    fn eventEnd(bytes: []const u8) ?usize {
-        const lf = std.mem.find(u8, bytes, "\n\n");
-        const crlf = std.mem.find(u8, bytes, "\r\n\r\n");
-        if (lf) |a| {
-            if (crlf) |b| return if (b < a) b + 4 else a + 2;
-            return a + 2;
+    /// Where the first complete SSE event of `bytes[start..]` ends (after
+    /// its blank line: `\n\n` or `\r\n\r\n`, whichever comes first). One
+    /// pass, starting where the last search stopped.
+    fn eventEnd(f: *UsageChunkFilter, bytes: []const u8, start: usize) ?usize {
+        // A terminator may straddle the mark by up to three bytes.
+        var i = @max(start, f.searched -| 3);
+        while (std.mem.findScalarPos(u8, bytes, i, '\n')) |lf| {
+            f.work += lf + 1 - i;
+            if (lf + 1 < bytes.len and bytes[lf + 1] == '\n') return lf + 2;
+            if (lf > start and bytes[lf - 1] == '\r' and lf + 2 < bytes.len and bytes[lf + 1] == '\r' and bytes[lf + 2] == '\n') return lf + 3;
+            i = lf + 1;
         }
-        return if (crlf) |b| b + 4 else null;
+        f.work += bytes.len - @min(bytes.len, i);
+        return null;
     }
 
     fn isUsageOnly(event: []const u8) bool {
@@ -497,6 +517,61 @@ pub const UsageChunkFilter = struct {
             std.mem.find(u8, event, "\"choices\": []") != null;
     }
 };
+
+test "usage chunk filter: the work is linear however the stream is cut up" {
+    const gpa = std.testing.allocator;
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+
+    // One event of nearly the size the filter will hold back, a byte at a
+    // time: this used to search the whole of it again for every byte.
+    {
+        var f: UsageChunkFilter = .{};
+        defer f.deinit(gpa);
+        const total: usize = 900 * 1024;
+        for (0..total) |_| try f.feed(gpa, "x", &discard.writer);
+        try std.testing.expect(f.work <= 8 * total);
+        try std.testing.expectEqual(total, f.pending.items.len);
+    }
+    // Many small events in one read: each used to be found by searching to
+    // the end of the read twice.
+    {
+        var f: UsageChunkFilter = .{};
+        defer f.deinit(gpa);
+        const events = 20_000;
+        const text = try gpa.alloc(u8, events * 9);
+        defer gpa.free(text);
+        for (0..events) |i| @memcpy(text[i * 9 ..][0..9], "data: 1\n\n");
+        try f.feed(gpa, text, &discard.writer);
+        try std.testing.expect(f.work <= 8 * text.len);
+        try std.testing.expectEqual(@as(usize, 0), f.pending.items.len);
+    }
+}
+
+test "usage chunk filter: same output at every split, both line endings" {
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\\n\\nb\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}],\"usage\":null}\r\n\r\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\r\n\r\n" ++
+        ": comment\r\n\r\n" ++
+        "data: {\"choices\": [],\"usage\":{\"prompt_tokens\":1}}\n\n" ++
+        "data: [DONE]\n\n" ++ "data: unfinished";
+    const expected =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\\n\\nb\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}],\"usage\":null}\r\n\r\n" ++
+        ": comment\r\n\r\n" ++
+        "data: [DONE]\n\n" ++ "data: unfinished";
+    for ([_]usize{ stream.len, 1, 2, 3, 4, 5, 7, 11, 64 }) |step| {
+        var f: UsageChunkFilter = .{};
+        defer f.deinit(gpa);
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var i: usize = 0;
+        while (i < stream.len) : (i += step) try f.feed(gpa, stream[i..@min(stream.len, i + step)], &out.writer);
+        try f.finish(&out.writer);
+        try std.testing.expectEqualStrings(expected, out.written());
+    }
+}
 
 test "openai non-streaming usage" {
     var u: Usage = .{};

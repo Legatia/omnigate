@@ -21,7 +21,10 @@ defmodule OmnigateControl.Storage.S3 do
   def put(config, job_id, name, tmp_path, meta) do
     with {:ok, creds} <- creds(config) do
       url = object_url(config, job_id, name)
-      content_type = meta["content_type"] || "application/octet-stream"
+      # What a browser is told the object is. The type came from a provider
+      # (a header, or a field of its answer); only types that cannot run as a
+      # page are passed on, as for outputs the gateway serves itself.
+      content_type = OmnigateControl.Storage.served_type(meta["content_type"])
 
       # content-type is signed, but handed to the HTTP client separately.
       headers =

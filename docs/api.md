@@ -100,7 +100,7 @@ job error's reason from `error.type` must read `error.code` now.
 |---|---|---|---|---|
 | 400 | `invalid_json` | `invalid_request_error` | `invalid_request_error` | The body is not a JSON object, or its arrays and objects are nested deeper than 64 levels. |
 | 400 | `missing_model` | `invalid_request_error` | `invalid_request_error` | No `"model"` string in the body. |
-| 400 | `invalid_request` | `invalid_request_error` | `invalid_request_error` | The request head is malformed or ambiguous, the path is not in canonical form, the query string has characters outside the allowed set, an `anthropic-version` or `anthropic-beta` header (or, on a job request, `Idempotency-Key`) has a value the gateway will not forward, or the JSON body has an object with more than 65,536 members, a key longer than 8 KiB, or `model`, `stream` or `stream_options` twice or spelled with escapes. See [Request heads, paths and queries](#request-heads-paths-and-queries). |
+| 400 | `invalid_request` | `invalid_request_error` | `invalid_request_error` | The request head is malformed or ambiguous, the path is not in canonical form, the query string has characters outside the allowed set, an `anthropic-version` or `anthropic-beta` header (or, on a job request, `Idempotency-Key`) has a value the gateway will not forward, or the JSON body has an object with more than 65,536 members, a key longer than 8 KiB, `model`, `stream` or `stream_options` twice, spelled with escapes or in another letter case (`"Model"`, `"STREAM"`; `include_usage` inside `stream_options` likewise), or a `stream` or `stream_options.include_usage` that is not `true`, `false` or `null`. See [Request heads, paths and queries](#request-heads-paths-and-queries). |
 | 400 | `request_too_complex` | `invalid_request_error` | `invalid_request_error` | The request has to be parsed into a tree (to translate it for a provider of the other protocol, or to rewrite its `stream_options`) and is too costly for that: an object with more than 1,024 members, or far more values than its size suggests. The same body is accepted on a route that needs no such step. See [Limits on what one request and one key may hold](#limits-on-what-one-request-and-one-key-may-hold). |
 | 400 | `endpoint_not_supported` | `invalid_request_error` | `invalid_request_error` | The route exists, but every one of its upstreams speaks the other protocol and this endpoint is not translated (only chat completions and messages are). Nothing was sent to a provider. |
 | 400 | `untranslatable_request` | `invalid_request_error` | `invalid_request_error` | No target could be sent the request: it would have to be translated and uses something that cannot be (audio or file parts). Nothing was sent to a provider. |
@@ -548,6 +548,10 @@ not make it free: the provider charges for what it generated.
   on, or the gateway was stopped), the call is billed an **estimate**, and
   its usage event is marked `"estimated": true`. The estimate is never
   below what was actually metered.
+- The same goes for an event stream that reaches its proper end without
+  the provider ever reporting usage: some OpenAI-compatible servers ignore
+  `stream_options.include_usage`. Such a call is billed the estimate, not
+  nothing.
   - Input that was not reported is taken as the request body's size in
     bytes divided by 4, plus 1,600 tokens for every image, document, file
     or audio part the request names.
@@ -837,7 +841,9 @@ Creating jobs is limited in these ways:
 - **Unfinished jobs per key.** A key may have at most `max_open_jobs` jobs
   that are queued or running (100 unless the key or `media.max_open_jobs`
   says otherwise; `0` means no limit). One more answers
-  `429 too_many_open_jobs`. Jobs made under the key's earlier secrets count
+  `429 too_many_open_jobs`. A job that was canceled while its provider call
+  was in flight counts until that call is over
+  ([Cancel a job](#cancel-a-job)). Jobs made under the key's earlier secrets count
   too, and a replay by `Idempotency-Key` is never refused for this.
 - **Jobs per day per key.** A key may create at most `max_jobs_per_day`
   jobs per UTC day (10,000 unless the key or `media.max_jobs_per_day` says
@@ -846,8 +852,9 @@ Creating jobs is limited in these ways:
   `Retry-After` counts down to it. Jobs made under the key's earlier
   secrets count too.
 - **Size.** `input` and `metadata` together may be at most
-  `media.max_input_bytes` (1 MiB by default) as JSON; more answers
-  `413 payload_too_large`.
+  `media.max_input_bytes` (1 MiB by default) as JSON, and `metadata` alone
+  at most 16 KiB; more answers `413 payload_too_large`. A `webhook_url`
+  may be at most 2,048 bytes.
 - **What the route accepts.** A route can list the `input` fields it
   takes (`allowed_input`), the values a field may have
   (`price_multipliers`) and a longest duration (`max_seconds`); see
@@ -877,8 +884,8 @@ Request body:
 |---|---|---|---|
 | `model` | string | yes | Name of a media route. |
 | `input` | object | yes | Passed to the provider adapter. What goes in it depends on the adapter; see [Providers](providers.md#media-providers). |
-| `webhook_url` | string | no | Where to POST the result. See [Webhooks](#webhooks). |
-| `metadata` | object | no | Stored with the job and returned unchanged. |
+| `webhook_url` | string | no | Where to POST the result; at most 2,048 bytes. See [Webhooks](#webhooks). |
+| `metadata` | object | no | Stored with the job and returned unchanged. At most 16 KiB as JSON. A list of jobs leaves out metadata over 1 KiB (`"metadata": null, "metadata_omitted": true`); the job itself always shows it. |
 | `cache` | boolean | no | `true` allows reuse of a stored output; `false` forbids it. See [Caching](#caching). |
 
 Optional header: `Idempotency-Key` (1 to 255 visible ASCII characters,
@@ -986,7 +993,7 @@ Fields:
 | `status` | `queued`, `running`, `succeeded`, `failed` or `canceled`. The last three are final. |
 | `outputs[]` | One entry per stored file: `url`, `content_type`, `bytes`, `sha256`. The URL is generated fresh on every fetch. |
 | `error` | `null`, or `{"type", "message"}` for a failed job. |
-| `cost_usd` | The configured price of the target that delivered, applied to what its adapter sent to the provider ([Configuration](configuration.md#mediaroutes)). `0` until the job succeeds, and for failed, canceled and cached jobs. |
+| `cost_usd` | The configured price of the target that delivered, applied to what its adapter sent to the provider ([Configuration](configuration.md#mediaroutes)). `0` until the job succeeds, and for failed and cached jobs. A canceled job costs `0` unless the provider completed the call all the same ([Cancel a job](#cancel-a-job)). |
 | `cached` | `true` when the outputs were reused from an earlier identical job. |
 | `upstream`, `target_model` | Which target delivered. |
 | `attempts[]` | Each target tried, with its `outcome` (`ok`, `cache_hit`, `timeout`, `no_outputs`, or the reason it failed). |
@@ -1026,11 +1033,25 @@ hundred megabyte-sized inputs.) Listing is rate-limited; see
 curl -X POST http://127.0.0.1:8080/v1/jobs/job_5f0c2a9e4b7d81c3a6e2f490/cancel -H "Authorization: Bearer og-unlimited-key"
 ```
 
-Returns the job. An unfinished job becomes `canceled` and is not billed; the
-gateway also asks the provider to cancel, on a best-effort basis, for the
-adapters that have a cancel call (Replicate-style and fal-style). A job that
+Returns the job. An unfinished job becomes `canceled` at once; a job that
 had already finished is returned unchanged. The README notes that
 cancellation at a real provider has not been verified.
+
+Whether a canceled job costs anything depends on what the provider did:
+
+| When the cancel arrives | What happens | `cost_usd` |
+|---|---|---|
+| Before any provider was asked (the job was `queued`, or between two targets) | Nothing more | `0` |
+| The provider has the job and can be told to stop (Replicate-style, fal-style) | It is told, and asked once more how the job ended | `0`, or the route's price if it had already finished |
+| The provider cannot be told to stop (xAI video, Gemini's Interactions API), or answers a request with the result (images, speech) | The call runs on at the provider; the gateway waits for its end (at most the route's `timeout_s`), fetches nothing and keeps nothing | The route's price if the call completed; `0` if it failed or timed out |
+| While the outputs are being fetched and stored | What was stored is deleted | The route's price |
+
+Until that is known the job, though `canceled`, has `cost_usd` `0`, still
+counts towards the key's `max_open_jobs`, and its webhook is held back;
+the webhook is sent with the final cost. In the ledger a canceled job has
+status 499, and its attempts end with `completed_after_cancel` when it was
+billed. Canceling is therefore not a way to have a provider work for
+nothing.
 
 ### Idempotency
 
@@ -1079,14 +1100,14 @@ shape, with the reason in `error.code` (see [Shape](#shape)), and the same
 | 400 | `invalid_json` | The body is not valid JSON. |
 | 400 | `invalid_request` | `input` is missing or not an object; `metadata` is not an object; `input.duration` or `input.seconds` is negative or not a duration; `input.n`, `input.num_outputs` or `input.num_images` is not a whole number of 0 or more; the route is priced per second and the job names no duration (and the route has no default), or more than the route's `max_seconds`; `input` has a field the route's `allowed_input` does not list, or a value the route's `price_multipliers` do not list; the `Idempotency-Key` is empty, longer than 255 bytes or not printable text; or the request path contains a percent-encoded character (job ids and file names never need one). The data plane refuses most odd paths and idempotency keys before the control plane sees them. |
 | 401 | `invalid_api_key` | The control plane no longer knows the key the data plane accepted: it was deleted, disabled or rotated within the last poll interval. |
-| 413 | `payload_too_large` | `input` and `metadata` together are larger than `media.max_input_bytes` (1 MiB by default); or the whole body is larger than 8,000,000 bytes, the limit of the control plane's JSON parser, which the data plane applies to job requests itself so that both give the same answer. |
+| 413 | `payload_too_large` | `input` and `metadata` together are larger than `media.max_input_bytes` (1 MiB by default); `metadata` alone is larger than 16 KiB; or the whole body is larger than 8,000,000 bytes, the limit of the control plane's JSON parser, which the data plane applies to job requests itself so that both give the same answer. |
 | 429 | `rate_limit_exceeded` | Create: the control plane's own count of the key's `rpm` (a token bucket, like the data plane's) is used up. List: the key is listing jobs too often (its `rpm`, or 600 per minute when it has none). |
 | 429 | `too_many_open_jobs` | Create only: the key already has its limit of unfinished jobs. Wait for some to finish, or cancel some. |
 | 429 | `too_many_jobs_today` | Create only: the key already created its limit of jobs this UTC day (`max_jobs_per_day`). The count starts again at midnight UTC; `Retry-After` is the seconds until then, at most 3,600. |
 | 503 | `storage_unavailable` | Create only: the job could not be written to the job store (its disk, most likely). Nothing was created; try again shortly. |
 | 500 | `internal_error` | The control plane failed while handling the request. The error carries a `request_id` that is also in the control plane's log, and is the id in the response's `x-omnigate-request-id`; nothing else about the failure is disclosed. |
 | 400 | `webhook_not_configured` | `webhook_url` was given but no signing secret is configured for this key. |
-| 400 | `invalid_webhook_url` | The URL is not http(s), has no host, contains credentials, does not resolve, or resolves to a private or loopback address. |
+| 400 | `invalid_webhook_url` | The URL is not http(s), is longer than 2,048 bytes, has no host, contains credentials, does not resolve, or resolves to an address that is not public (private, loopback, link-local; for IPv6, anything outside `2000::/3`). |
 | 402 | `budget_exceeded` | Create only: the key has spent its budget for the current period. The control plane checks this itself, without waiting for the data plane's next config poll. |
 | 403 | `model_not_allowed` | The key's `models` list does not include this model. |
 | 404 | `model_not_found` | No media route has this name. |

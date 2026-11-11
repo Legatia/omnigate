@@ -23,7 +23,9 @@ defmodule OmnigateControl.Keys do
 
   alias OmnigateControl.{ConfigStore, Ledger}
 
-  @name_format ~r/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+  # `\A...\z`, not `^...$`: `$` also matches before a trailing newline, and a
+  # name ends up in log lines, file names and the audit log.
+  @name_format ~r/\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/
   @fields [:budget_usd, :budget_period, :rpm, :max_concurrent, :models, :max_open_jobs, :max_jobs_per_day, :webhook_secret, :disabled]
   @max_old_hashes 50
 
@@ -58,12 +60,30 @@ defmodule OmnigateControl.Keys do
   @doc "Every hash usage may be recorded under for this key: the current one first."
   def hashes(key), do: [key.key_sha256 | Map.get(key, :old_hashes, [])]
 
-  @doc "Ledger totals for a key, across rotations."
+  @doc "Ledger totals for a key, across rotations (those too long ago to have kept their hash included)."
   def totals(key) do
     key
     |> hashes()
     |> Enum.map(&Ledger.totals/1)
-    |> Enum.reduce(fn t, sum -> Map.merge(sum, t, fn _field, a, b -> a + b end) end)
+    |> Kernel.++(List.wrap(carried(key)))
+    |> Enum.reduce(fn t, sum -> Map.merge(sum, t, fn _field, a, b -> if(is_number(a) and is_number(b), do: a + b, else: a) end) end)
+  end
+
+  # Lifetime totals of the secrets this key no longer lists (see `rotate`),
+  # in the shape of `Ledger.totals/1`; nil when there are none.
+  defp carried(key) do
+    case Map.get(key, :carried_totals) do
+      %{} = stored when map_size(stored) > 0 ->
+        empty = Ledger.totals("")
+
+        Map.new(empty, fn {field, zero} ->
+          value = Map.get(stored, field, Map.get(stored, Atom.to_string(field)))
+          {field, if(is_number(value) and is_number(zero), do: value, else: zero)}
+        end)
+
+      _ ->
+        nil
+    end
   end
 
   @doc "`total`, `monthly` or `daily`: what the key's budget covers."
@@ -72,7 +92,14 @@ defmodule OmnigateControl.Keys do
   @doc "Spend in the key's current budget period (its whole history for a total budget), across rotations."
   def period_spend(key, now \\ DateTime.utc_now()) do
     period = budget_period(key)
-    key |> hashes() |> Enum.map(&Ledger.period_spend(&1, period, now)) |> Enum.sum()
+    listed = key |> hashes() |> Enum.map(&Ledger.period_spend(&1, period, now)) |> Enum.sum()
+
+    # A total budget covers the key's whole history, including what was spent
+    # under secrets that have since dropped off the list.
+    case {period, carried(key)} do
+      {"total", %{cost_usd: usd}} -> listed + usd
+      _ -> listed
+    end
   end
 
   @doc "ISO 8601 time at which the key's budget period ends, or nil for a total budget."
@@ -160,7 +187,8 @@ defmodule OmnigateControl.Keys do
             disabled: false,
             source: :managed,
             created_at: now_iso(),
-            old_hashes: []
+            old_hashes: [],
+            carried_totals: %{}
           },
           fields
         )
@@ -185,8 +213,21 @@ defmodule OmnigateControl.Keys do
     case managed_key(name, state) do
       {:ok, key} ->
         raw = new_secret()
-        old = Enum.take([key.key_sha256 | key.old_hashes], @max_old_hashes)
-        updated = %{key | key_sha256: OmnigateControl.sha256_hex(raw), old_hashes: old}
+        {old, dropped} = Enum.split([key.key_sha256 | key.old_hashes], @max_old_hashes)
+
+        # Usage is found by hash. A hash that drops off the list takes its
+        # lifetime totals along in `carried_totals`, so that a key's spend
+        # (and with it a total budget) does not shrink at its 51st rotation.
+        carried =
+          Enum.reduce(dropped, Map.get(key, :carried_totals) || %{}, fn hash, sum ->
+            hash
+            |> Ledger.totals()
+            |> Enum.filter(fn {_field, v} -> is_number(v) end)
+            |> Map.new(fn {field, v} -> {Atom.to_string(field), v} end)
+            |> Map.merge(sum, fn _field, a, b -> if(is_number(b), do: a + b, else: a) end)
+          end)
+
+        updated = key |> Map.merge(%{key_sha256: OmnigateControl.sha256_hex(raw), old_hashes: old}) |> Map.put(:carried_totals, carried)
         commit(state, replace(state.keys, updated), {:ok, updated, raw})
 
       error ->
@@ -356,7 +397,8 @@ defmodule OmnigateControl.Keys do
           disabled: k["disabled"] == true,
           source: :managed,
           created_at: k["created_at"],
-          old_hashes: if(is_list(k["old_hashes"]), do: k["old_hashes"], else: [])
+          old_hashes: if(is_list(k["old_hashes"]), do: k["old_hashes"], else: []),
+          carried_totals: if(is_map(k["carried_totals"]), do: Map.filter(k["carried_totals"], fn {f, v} -> is_binary(f) and is_number(v) end), else: %{})
         }
       end
     else

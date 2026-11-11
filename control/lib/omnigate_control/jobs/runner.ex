@@ -20,6 +20,22 @@ defmodule OmnigateControl.Jobs.Runner do
   Whatever a provider says about a failure is treated as bytes from outside:
   it becomes one line of valid UTF-8 (`OmnigateControl.Text.line/2`) before
   it is logged or stored.
+
+  ## A job canceled while its provider call is in flight
+
+  The client's cancel ends the job at once, marked `"provider_pending"`
+  (`Jobs.cancel/2`). The runner is the one who learns how the provider call
+  ended, and it always closes the account with `Jobs.settle_canceled/2`:
+
+    * the provider finished (a submit that answers with the result, a poll
+      that says "done", a result that was being stored): the job's price is
+      recorded against the key; nothing is downloaded, and anything already
+      stored is deleted;
+    * the provider can be told to stop: it is told, asked once more how the
+      job ended, and billed only if it had finished anyway;
+    * the provider cannot be told to stop: it is polled on, to the route's
+      timeout, to see whether it finishes;
+    * the attempt failed, or timed out: nothing is owed.
   """
   require Logger
 
@@ -33,6 +49,9 @@ defmodule OmnigateControl.Jobs.Runner do
       %{"status" => s} = job when s in ["queued", "running"] ->
         attempt(job, get_in(job, ["run", "target_index"]) || 0)
 
+      %{"status" => "canceled", "provider_pending" => true} = job ->
+        resume_canceled(job)
+
       _ ->
         :ok
     end
@@ -41,6 +60,62 @@ defmodule OmnigateControl.Jobs.Runner do
       Logger.error("job #{id} crashed: " <> Exception.format(:error, e, __STACKTRACE__))
       finish(id, "failed", %{"error" => %{"type" => "internal_error", "message" => "the gateway failed while running this job"}})
   end
+
+  # After a restart (or a lost runner): a job that was canceled while its
+  # provider call was in flight. With a provider job id the question "did it
+  # finish?" can still be asked; a call that had not answered when we stopped
+  # is lost with the process, like that of any job interrupted by a restart.
+  defp resume_canceled(job) do
+    run = job["run"] || %{}
+    index = run["target_index"]
+    route = ConfigStore.media_route(job["model"])
+    target = route && is_integer(index) && Enum.at(route.targets, index)
+
+    with true <- is_binary(run["provider_id"]),
+         %{} <- target,
+         {:ok, t} <- resolve(target, route) do
+      after_cancel(job, index, Map.merge(t, %{route: route, target: target, timeout_ms: route.timeout_s * 1000}))
+    else
+      _ -> settle_canceled(job["id"], %{})
+    end
+  end
+
+  # The job was canceled and the provider has it under an id.
+  defp after_cancel(job, index, t) do
+    run = job["run"]
+
+    if function_exported?(t.adapter, :cancel, 5) do
+      cancel_provider(job)
+
+      # Told to stop. If it had finished before that, it has been paid for.
+      case apply(t.adapter, :poll, [t.upstream, t.target.model, run["provider_id"], run["provider_state"] || %{}, t.ctx]) do
+        {:done, [_ | _] = outputs} -> settle_canceled(job["id"], completed(job, t, length(outputs)))
+        _ -> settle_canceled(job["id"], %{})
+      end
+    else
+      # It cannot be stopped: see whether it finishes.
+      poll_loop(job, index, t, 0)
+    end
+  end
+
+  defp settle_canceled(id, changes), do: with_store(fn -> Jobs.settle_canceled(id, changes) end)
+
+  # What a canceled job owes for a provider call that completed with `count` outputs.
+  defp completed(job, t, count) do
+    input = Jobs.input!(job)
+    unpriced(job, t)
+    Logger.info("job #{job["id"]}: canceled, but #{t.upstream.name} completed the call (#{count} output(s)); its price is recorded, nothing is stored")
+
+    %{
+      "upstream" => t.upstream.name,
+      "target_model" => t.target.model,
+      "cost_usd" => Jobs.job_cost(t.route, t.target, t.adapter.billable(input), input, count),
+      "attempts" =>
+        ((with_store(fn -> Store.get(job["id"]) end) || %{})["attempts"] || []) ++ [%{"upstream" => t.upstream.name, "outcome" => "completed_after_cancel"}]
+    }
+  end
+
+  defp canceled_pending?(id), do: Jobs.provider_pending?(with_store(fn -> Store.get(id) end) || %{})
 
   # Run `fun`, which reads or writes job state. While the store is restarting
   # its tables do not exist (reads raise) and its process is gone (calls
@@ -60,7 +135,15 @@ defmodule OmnigateControl.Jobs.Runner do
     with_store(fun, tries - 1)
   end
 
-  defp finish(id, status, changes), do: with_store(fn -> Jobs.finish(id, status, changes) end)
+  # A job that was finished under the runner (canceled) may still be waiting
+  # for its account to be closed; whatever the runner was about to record,
+  # nothing more is owed for it.
+  defp finish(id, status, changes) do
+    case with_store(fn -> Jobs.finish(id, status, changes) end) do
+      :noop -> settle_canceled(id, %{})
+      other -> other
+    end
+  end
 
   @doc "Best-effort cancel of the provider-side job recorded in `job`."
   def cancel_provider(%{"run" => %{"provider_id" => pid, "target_index" => index} = run} = job) when is_binary(pid) do
@@ -134,14 +217,22 @@ defmodule OmnigateControl.Jobs.Runner do
       with {:ok, job} <- started do
         case t.adapter.submit(t.upstream, t.target.model, Jobs.input!(job), t.ctx) do
           {:async, provider_id, state} ->
+            # Recorded also for a job canceled while the submit was in flight:
+            # its account is still open, and closing it takes the id.
             recorded =
-              update_running(job["id"], fn j ->
-                Map.put(j, "run", Map.merge(j["run"], %{"provider_id" => provider_id, "provider_state" => state}))
+              with_store(fn ->
+                Store.update(job["id"], fn j ->
+                  if Jobs.terminal?(j) and not Jobs.provider_pending?(j) do
+                    :noop
+                  else
+                    Map.put(j, "run", Map.merge(j["run"] || %{}, %{"provider_id" => provider_id, "provider_state" => state}))
+                  end
+                end)
               end)
 
             case recorded do
+              {:ok, %{"status" => "canceled"} = job} -> after_cancel(job, index, t)
               {:ok, job} -> poll_loop(job, index, t, 0)
-              # Canceled while the submit was in flight.
               _ -> cancel_provider(put_in(job, ["run", "provider_id"], provider_id))
             end
 
@@ -161,10 +252,19 @@ defmodule OmnigateControl.Jobs.Runner do
     run = job["run"]
 
     cond do
-      current == nil or Jobs.terminal?(current) ->
+      current == nil ->
         cancel_provider(job)
 
-      System.os_time(:millisecond) > run["attempt_started_ms"] + t.timeout_ms ->
+      # Canceled by the client just now, on a provider that can be told so.
+      Jobs.provider_pending?(current) and function_exported?(t.adapter, :cancel, 5) ->
+        after_cancel(current, index, t)
+
+      # Finished some other way. (A canceled job on a provider that cannot be
+      # stopped is polled on below, to learn whether the call completes.)
+      Jobs.terminal?(current) and not Jobs.provider_pending?(current) ->
+        cancel_provider(job)
+
+      System.os_time(:millisecond) > (run["attempt_started_ms"] || 0) + t.timeout_ms ->
         cancel_provider(job)
         next(job, index, t.upstream.name, "timeout")
 
@@ -200,9 +300,9 @@ defmodule OmnigateControl.Jobs.Runner do
         # job stays as it is and is picked up again at the next start.
         Logger.error("job #{job["id"]}: could not record a failed attempt (#{Text.line(reason, 100)}); leaving it for the next start")
 
-      # Finished in the meantime (canceled).
-      other ->
-        other
+      # Finished in the meantime (canceled): the attempt failed, nothing is owed.
+      _other ->
+        settle_canceled(job["id"], %{})
     end
   end
 
@@ -211,28 +311,64 @@ defmodule OmnigateControl.Jobs.Runner do
   defp rehost(job, index, t, []), do: next(job, index, t.upstream.name, "no_outputs")
 
   defp rehost(job, index, t, outputs) do
-    max = ConfigStore.get().media.max_output_bytes
+    media = ConfigStore.get().media
+    # (Defaults for a config built without them, as the tests do.)
+    media = Map.merge(%{max_outputs_per_job: 16, max_job_output_bytes: max(2 * 1024 * 1024 * 1024, media.max_output_bytes)}, media)
+    count = length(outputs)
+
+    cond do
+      # Canceled while the provider was working: the call completed and is
+      # billed, but nothing of it is fetched or kept.
+      canceled_pending?(job["id"]) ->
+        settle_canceled(job["id"], completed(job, t, min(count, media.max_outputs_per_job)))
+
+      # What a provider's answer lists is not ours to trust: each entry is a
+      # download of up to `max_output_bytes`.
+      count > media.max_outputs_per_job ->
+        next(
+          job,
+          index,
+          t.upstream.name,
+          "too_many_outputs: the provider returned #{count}, at most #{media.max_outputs_per_job} are taken (media.max_outputs_per_job)"
+        )
+
+      true ->
+        fetch_all(job, index, t, outputs, media)
+    end
+  end
+
+  defp fetch_all(job, index, t, outputs, media) do
     tmp_dir = Storage.tmp_dir()
+    tmps = for i <- 0..(length(outputs) - 1), do: Path.join(tmp_dir, "#{job["id"]}-#{i}")
 
-    fetched =
-      outputs
-      |> Enum.with_index()
-      |> Enum.reduce_while({:ok, []}, fn {output, i}, {:ok, acc} ->
-        tmp = Path.join(tmp_dir, "#{job["id"]}-#{i}")
+    try do
+      fetched =
+        outputs
+        |> Enum.zip(tmps)
+        |> Enum.with_index()
+        |> Enum.reduce_while({:ok, [], media.max_job_output_bytes}, fn {{output, tmp}, i}, {:ok, acc, left} ->
+          # Never more than one file's limit, nor than what is left of the job's.
+          case fetch(output, tmp, min(media.max_output_bytes, left)) do
+            {:ok, meta} ->
+              {:cont, {:ok, acc ++ [{i, tmp, meta, output}], left - meta["bytes"]}}
 
-        case fetch(output, tmp, max) do
-          {:ok, meta} -> {:cont, {:ok, acc ++ [{i, tmp, meta, output}]}}
-          {:error, reason} -> {:halt, {:error, reason, acc}}
-        end
-      end)
+            {:error, :output_too_large} when left < media.max_output_bytes ->
+              {:halt, {:error, "the outputs together exceed media.max_job_output_bytes (#{media.max_job_output_bytes})"}}
 
-    case fetched do
-      {:ok, files} ->
-        store(job, t, files)
+            {:error, reason} ->
+              {:halt, {:error, reason}}
+          end
+        end)
 
-      {:error, reason, files} ->
-        Enum.each(files, fn {_i, tmp, _meta, _o} -> File.rm(tmp) end)
-        next(job, index, t.upstream.name, "output_fetch_failed: #{describe(reason)}")
+      case fetched do
+        {:ok, files, _left} -> store(job, t, files)
+        {:error, reason} -> next(job, index, t.upstream.name, "output_fetch_failed: #{describe(reason)}")
+      end
+    after
+      # Whatever happened (a download that failed half way, a raise, storage
+      # that refused): no file of this job stays in the temp directory. Files
+      # that were stored have been moved out of it already.
+      Enum.each(tmps, &File.rm/1)
     end
   end
 
@@ -243,7 +379,7 @@ defmodule OmnigateControl.Jobs.Runner do
 
         case Storage.put(job["id"], name, tmp, meta) do
           {:ok, record} -> {:cont, {:ok, acc ++ [record]}}
-          {:error, reason} -> {:halt, {:error, reason}}
+          {:error, reason} -> {:halt, {:error, reason, acc}}
         end
       end)
 
@@ -252,16 +388,33 @@ defmodule OmnigateControl.Jobs.Runner do
         input = Jobs.input!(job)
         unpriced(job, t)
 
-        finish(job["id"], "succeeded", %{
-          "outputs" => records,
-          "upstream" => t.upstream.name,
-          "target_model" => t.target.model,
-          "cost_usd" => Jobs.job_cost(t.route, t.target, t.adapter.billable(input), input, length(records)),
-          "attempts" => (with_store(fn -> Store.get(job["id"]) end)["attempts"] || []) ++ [%{"upstream" => t.upstream.name, "outcome" => "ok"}]
-        })
+        finished =
+          with_store(fn ->
+            Jobs.finish(job["id"], "succeeded", %{
+              "outputs" => records,
+              "upstream" => t.upstream.name,
+              "target_model" => t.target.model,
+              "cost_usd" => Jobs.job_cost(t.route, t.target, t.adapter.billable(input), input, length(records)),
+              "attempts" => ((Store.get(job["id"]) || %{})["attempts"] || []) ++ [%{"upstream" => t.upstream.name, "outcome" => "ok"}]
+            })
+          end)
 
-      {:error, reason} ->
-        Enum.each(files, fn {_i, tmp, _meta, _o} -> File.rm(tmp) end)
+        case finished do
+          {:ok, _} = ok ->
+            ok
+
+          # The job ended under us while its outputs were being fetched and
+          # stored (canceled, as a rule). Nobody will ever be given these
+          # files, so they do not stay; and if it was a cancel, the provider
+          # call that produced them is billed all the same.
+          _ ->
+            Storage.discard(job["id"], records)
+            settle_canceled(job["id"], completed(job, t, length(records)))
+        end
+
+      {:error, reason, records} ->
+        # The ones that made it into storage before the failure go too.
+        Storage.discard(job["id"], records)
         Logger.error("job #{job["id"]}: storing outputs failed: #{describe(reason)}")
 
         # Another provider would hit the same broken storage; fail the job.
@@ -291,7 +444,9 @@ defmodule OmnigateControl.Jobs.Runner do
 
   defp fetch({:url, url}, tmp, max), do: fetch({:url, url, nil}, tmp, max)
 
-  defp fetch({:url, url, hint}, tmp, max) do
+  defp fetch(_output, _tmp, max) when max <= 0, do: {:error, :output_too_large}
+
+  defp fetch({:url, url, hint}, tmp, max) when is_binary(url) do
     # The URL came out of a provider's answer: never fetch it, or anything
     # it redirects to, from an address we would not call for a webhook.
     with {:ok, meta} <- Http.download(url, tmp, max, guard: &NetGuard.target(&1, "output url")) do
@@ -299,7 +454,7 @@ defmodule OmnigateControl.Jobs.Runner do
     end
   end
 
-  defp fetch({:binary, bytes, content_type}, tmp, max) do
+  defp fetch({:binary, bytes, content_type}, tmp, max) when is_binary(bytes) do
     if byte_size(bytes) > max do
       {:error, :output_too_large}
     else
@@ -313,6 +468,8 @@ defmodule OmnigateControl.Jobs.Runner do
       end
     end
   end
+
+  defp fetch(_output, _tmp, _max), do: {:error, "the provider's answer names an output that is neither a URL nor bytes"}
 
   @types %{
     "image/png" => ".png",
@@ -341,21 +498,29 @@ defmodule OmnigateControl.Jobs.Runner do
       Map.get(@by_ext, url_ext(url), "application/octet-stream")
   end
 
-  defp clean(nil), do: nil
-  defp clean(type), do: type |> String.split(";") |> hd() |> String.trim() |> String.downcase()
+  # A type as a provider gave it (a header, or a field of its JSON, which
+  # need not be a string at all): the media type alone, in lower case, and
+  # only if it looks like one.
+  defp clean(type) when is_binary(type) do
+    type = type |> String.split(";") |> hd() |> String.trim() |> String.downcase()
+    if type =~ ~r|\A[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\z|, do: type
+  end
+
+  defp clean(_), do: nil
 
   defp extension(content_type, output) do
     case Map.get(@types, content_type) do
       nil ->
         ext = if match?({:url, _, _}, output) or match?({:url, _}, output), do: url_ext(elem(output, 1)), else: ""
-        if ext =~ ~r/^\.[a-z0-9]{1,5}$/, do: ext, else: ".bin"
+        if ext =~ ~r/\A\.[a-z0-9]{1,5}\z/, do: ext, else: ".bin"
 
       ext ->
         ext
     end
   end
 
-  defp url_ext(url), do: (URI.parse(url).path || "") |> Path.extname() |> String.downcase()
+  defp url_ext(url) when is_binary(url), do: (URI.parse(url).path || "") |> Path.extname() |> String.downcase()
+  defp url_ext(_), do: ""
 
   defp update_running(id, fun) do
     with_store(fn -> Store.update(id, fn job -> if Jobs.terminal?(job), do: :noop, else: fun.(job) end) end)

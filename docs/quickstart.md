@@ -53,8 +53,8 @@ If you have the official OpenAI and Anthropic Python SDKs installed,
 A third tool, `python tools/malformed_test.py`, starts the same kind of
 stack and sends it malformed and hostile requests; the gateway must
 survive all of them. It also plays an upstream and a control plane that
-answer like an attacker (for which it uses ports 4300 and 8190 besides the
-ones above), checks the limits that apply before a request body is read,
+answer like an attacker (for which it uses ports 4300, 8190 and 9006 besides
+the ones above), checks the limits that apply before a request body is read,
 and checks that a client which hangs up or stops reading is still billed
 ([Operations](operations.md#hostile-input-testing)). And
 `python tools/check.py` runs every suite a change

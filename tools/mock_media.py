@@ -411,6 +411,9 @@ class OpenAIImages(Base):
         if not isinstance(req.get("prompt"), str) or not req.get("model"):
             return self.send(400, {"error": {"message": "prompt and model are required", "type": "invalid_request_error"}})
         self.bump("calls")
+        # A prompt with "mock-slow" in it takes two seconds, as a real image does.
+        if "mock-slow" in req["prompt"]:
+            time.sleep(2)
         n = int(req.get("n", 1))
         if req.get("response_format") == "url":
             data = [{"url": "%s/files/%s.png" % (self.base_url(), uuid.uuid4().hex)} for _ in range(n)]

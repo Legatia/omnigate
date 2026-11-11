@@ -15,6 +15,9 @@ Special model names, on the working mocks (9002 and 9003):
   rid-1            answers carry the provider's own request id header
                    (`x-request-id` on 9002, `request-id` on 9003)
   sig-1            (9002) earlier tool calls must carry a thought signature
+  no-usage-1       (9002) streams, and ends properly, without ever reporting
+                   usage, whatever `stream_options` asks for (as several
+                   OpenAI-compatible servers do)
 
 Error bodies that are not the protocol's error envelope, as real providers
 send them (the gateway puts them into the envelope), and one that is:
@@ -241,7 +244,7 @@ class OpenAIOk(Base):
         for delta, finish in deltas:
             chunk = dict(head, choices=[{"index": 0, "delta": delta, "finish_reason": finish}])
             self.sse(f"data: {json.dumps(chunk)}\n\n")
-        if (req.get("stream_options") or {}).get("include_usage"):
+        if (req.get("stream_options") or {}).get("include_usage") and req.get("model") != "no-usage-1":
             self.sse(f"data: {json.dumps(dict(head, choices=[], usage=usage))}\n\n")
         self.sse("data: [DONE]\n\n")
         self.end_sse()

@@ -19,6 +19,10 @@ defmodule OmnigateControl.Http do
   # Status line plus headers.
   @max_head_bytes 64 * 1024
   @max_redirects 5
+  # Longest a single write may wait for the peer to take it.
+  @send_timeout 60_000
+  # A body is written in pieces of this size.
+  @write_chunk 65_536
 
   @doc """
   One request. `headers` is a list of `{name, value}` binaries.
@@ -28,6 +32,10 @@ defmodule OmnigateControl.Http do
 
     * `:timeout` — ms for the whole exchange (default 30 s)
     * `:connect_timeout` — ms (default 10 s)
+    * `:send_timeout` — ms one write may wait for the peer to take it
+      (default 60 s, and never more than what is left of `:timeout`); a body
+      is written in pieces of 64 KiB, so a peer that stops reading fails
+      the request instead of holding its process for ever
     * `:content_type` — for a request with a body (default `application/json`)
     * `:max_body` — most response-body bytes to read (default 4 MiB)
     * `:overflow` — what a larger body means: `:error` (default) gives
@@ -193,10 +201,10 @@ defmodule OmnigateControl.Http do
     {url, headers, opts} = pin(url, headers, opts)
     uri = URI.parse(url)
 
-    with :ok <- plain(url, headers),
+    with :ok <- plain(url, headers, opts),
          {:ok, sock} <- connect(uri, opts, deadline) do
       try do
-        with :ok <- send_request(sock, method, uri, headers, body, opts),
+        with :ok <- send_request(sock, method, uri, headers, body, opts, deadline),
              {:ok, status, resp_headers, rest} <- read_head(sock, "", deadline, idle) do
           case handler.(status, resp_headers) do
             {:stop, value} ->
@@ -216,13 +224,15 @@ defmodule OmnigateControl.Http do
     end
   end
 
-  # Nothing that could break out of the request line or a header line.
-  defp plain(url, headers) do
+  # Nothing that could break out of the request line or a header line. The
+  # `:content_type` option becomes a header line too.
+  defp plain(url, headers, opts) do
     bad = fn text -> not is_binary(text) or text =~ ~r/[\x00-\x1f\x7f]/ end
 
     cond do
       url =~ ~r/[\x00-\x20\x7f]/ -> {:error, :invalid_url}
       Enum.any?(headers, fn {k, v} -> bad.(k) or bad.(v) or k =~ ~r/[\s:]/ end) -> {:error, :invalid_header}
+      Keyword.has_key?(opts, :content_type) and bad.(Keyword.get(opts, :content_type)) -> {:error, :invalid_header}
       true -> :ok
     end
   end
@@ -238,7 +248,15 @@ defmodule OmnigateControl.Http do
         {:error, _} -> {String.to_charlist(host), []}
       end
 
-    with {:ok, tcp} <- :gen_tcp.connect(address, port, [:binary, active: false, nodelay: true] ++ family, max(timeout, 1)) do
+    # A write that the peer does not take (it stopped reading, and the
+    # kernel's buffers are full) would otherwise block for ever: `send` has no
+    # timeout of its own, and the deadline is only looked at between writes.
+    # With these a write that makes no progress for `:send_timeout` fails and
+    # closes the socket; TLS writes go through the same socket.
+    send_timeout = max(min(Keyword.get(opts, :send_timeout, @send_timeout), remaining(deadline)), 1)
+    socket_opts = [:binary, active: false, nodelay: true, send_timeout: send_timeout, send_timeout_close: true]
+
+    with {:ok, tcp} <- :gen_tcp.connect(address, port, socket_opts ++ family, max(timeout, 1)) do
       if scheme == "https" do
         # The name to present and to check the certificate against: the real
         # host when connecting to a pinned address, else the URL's own host
@@ -268,7 +286,7 @@ defmodule OmnigateControl.Http do
 
   defp connect(_uri, _opts, _deadline), do: {:error, :invalid_url}
 
-  defp send_request(sock, method, uri, headers, body, opts) do
+  defp send_request(sock, method, uri, headers, body, opts, deadline) do
     given = MapSet.new(headers, fn {k, _} -> String.downcase(k) end)
     default_port = if uri.scheme == "https", do: 443, else: 80
     host = if uri.port in [nil, default_port], do: uri.host, else: "#{uri.host}:#{uri.port}"
@@ -312,20 +330,41 @@ defmodule OmnigateControl.Http do
     case body do
       nil -> write(sock, head)
       # Head and body in one write, so a small request is one packet.
-      bin when is_binary(bin) -> write(sock, [head, bin])
-      {:file, path, _size} -> with :ok <- write(sock, head), do: send_file(sock, path)
+      bin when is_binary(bin) and byte_size(bin) <= @write_chunk -> write(sock, [head, bin])
+      bin when is_binary(bin) -> with :ok <- write(sock, head), do: send_binary(sock, bin, deadline)
+      {:file, path, _size} -> with :ok <- write(sock, head), do: send_file(sock, path, deadline)
     end
   end
 
-  defp send_file(sock, path) do
+  # A long body goes out in pieces: each has the socket's send timeout to be
+  # taken by the peer, and the exchange's deadline is checked between them.
+  defp send_binary(_sock, <<>>, _deadline), do: :ok
+
+  defp send_binary(sock, bin, deadline) do
+    size = min(byte_size(bin), @write_chunk)
+    <<piece::binary-size(^size), rest::binary>> = bin
+
+    cond do
+      remaining(deadline) <= 0 -> {:error, :timeout}
+      true -> with :ok <- write(sock, piece), do: send_binary(sock, rest, deadline)
+    end
+  end
+
+  defp send_file(sock, path, deadline) do
     with {:ok, io} <- File.open(path, [:read, :binary, :raw]) do
       try do
-        Stream.repeatedly(fn -> :file.read(io, 65_536) end)
+        Stream.repeatedly(fn -> :file.read(io, @write_chunk) end)
         |> Enum.reduce_while(:ok, fn
           {:ok, data}, :ok ->
-            case write(sock, data) do
-              :ok -> {:cont, :ok}
-              error -> {:halt, error}
+            cond do
+              remaining(deadline) <= 0 ->
+                {:halt, {:error, :timeout}}
+
+              true ->
+                case write(sock, data) do
+                  :ok -> {:cont, :ok}
+                  error -> {:halt, error}
+                end
             end
 
           :eof, :ok ->

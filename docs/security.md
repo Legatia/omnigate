@@ -360,7 +360,10 @@ generous on purpose. Decide each one for your deployment.
   receivers can make it hold are in the config file: `max_open_jobs` and
   `max_jobs_per_day` per key, `media.max_input_bytes` (1 MiB),
   `media.max_output_bytes` (512 MiB; a provider answer that carries the
-  media inline is held in memory, up to 256 MiB), the webhook delivery
+  media inline is held in memory, up to 256 MiB),
+  `media.max_outputs_per_job` (16) and `media.max_job_output_bytes`
+  (2 GiB), which bound what one provider answer can put on the disk, the
+  webhook delivery
   caps, and `retention.ledger_ids_days`, which decides how many
   duplicate-detection ids are held (about 61 MiB per million).
 - **Alert on the refusals.** A rise of
@@ -428,6 +431,7 @@ admin panel).
   addresses: loopback, private, link-local (which includes cloud metadata
   addresses), carrier NAT, documentation, benchmarking and multicast ranges
   are refused, as are the IPv6 forms that carry an IPv4 address inside.
+  Of IPv6, only global unicast (`2000::/3`) is called at all.
 - The host is resolved once, every address is checked, and the connection
   goes to the checked address, so a DNS answer that changes between the
   check and the call cannot redirect it.
@@ -596,6 +600,13 @@ No release has been tagged, so "current" means a recent commit of `main`.
 - What an update changes on disk, in defaults and for clients, and the
   order to upgrade the two processes (the control plane first, then the
   data planes), is in [Upgrading](upgrading.md).
+
+Coming from 1cc721f or earlier: the commit after it fixes what a third
+review found (a provider made unreachable by one failed write, field
+names a lax provider reads differently, free provider calls through
+cancel, unbounded downloads). Update both processes; nothing needs
+rotating. What changes is in
+[Upgrading](upgrading.md#the-third-review-commit).
 
 Coming from a commit before e4e30e4 or d79406b (November 2026), in short
 (the full list is in [Upgrading](upgrading.md)):

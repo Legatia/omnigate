@@ -367,7 +367,8 @@ defmodule OmnigateControl.Router do
     address = AdminAuth.client_address(conn)
 
     cond do
-      AdminAuth.throttled?(address) ->
+      # Counted before the password is compared (see `AdminAuth.begin_attempt/3`).
+      AdminAuth.begin_attempt(address) == :throttled ->
         Audit.anonymous(conn, "login", "throttled", auth: "password")
         send_html(conn, 429, login_page("Too many failed attempts. Wait a minute and try again."))
 
@@ -385,7 +386,6 @@ defmodule OmnigateControl.Router do
         |> redirect("/")
 
       true ->
-        AdminAuth.note_failure(address)
         Audit.anonymous(conn, "login", "denied", auth: "password")
         send_html(conn, 401, login_page("That is not the admin token."))
     end
@@ -590,7 +590,7 @@ defmodule OmnigateControl.Router do
       # as a download from a sandboxed, script-less context, and never as a
       # type a browser would render as a page on this origin.
       conn
-      |> put_resp_header("content-type", safe_type(output["content_type"]))
+      |> put_resp_header("content-type", OmnigateControl.Storage.served_type(output["content_type"]))
       |> put_resp_header("content-disposition", "attachment; filename=\"#{safe_filename(output["name"])}\"")
       |> put_resp_header("x-content-type-options", "nosniff")
       |> put_resp_header("content-security-policy", "sandbox; default-src 'none'")
@@ -601,20 +601,8 @@ defmodule OmnigateControl.Router do
     end
   end
 
-  @inline_safe ~w(image/png image/jpeg image/webp image/gif video/mp4 video/webm video/quicktime
-                  audio/mpeg audio/wav audio/x-wav audio/ogg audio/flac audio/pcm application/json)
-
-  # Media types that cannot carry script keep their type; anything else
-  # (text/html, image/svg+xml, XML, unknown) is served as opaque bytes.
-  defp safe_type(type) when is_binary(type) do
-    base = type |> String.split(";") |> hd() |> String.trim() |> String.downcase()
-    if base in @inline_safe, do: base, else: "application/octet-stream"
-  end
-
-  defp safe_type(_), do: "application/octet-stream"
-
   defp safe_filename(name) when is_binary(name) do
-    if name =~ ~r/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/, do: name, else: "output.bin"
+    if name =~ ~r/\A[A-Za-z0-9][A-Za-z0-9._-]{0,99}\z/, do: name, else: "output.bin"
   end
 
   defp safe_filename(_), do: "output.bin"

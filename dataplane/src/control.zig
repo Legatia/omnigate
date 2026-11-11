@@ -40,11 +40,10 @@ fn call(app: *App, method: http.Method, path: []const u8, payload: ?[]const u8, 
         },
         .extra_headers = &extra,
     });
-    defer {
-        // The response body is read here, never by std (see framing.zig).
-        framing.disown(&req);
-        req.deinit();
-    }
+    // The response body is read here, never by std, and the connection is
+    // closed unless the exchange is proven complete (see framing.finish).
+    var head_received = false;
+    defer framing.finish(&req, head_received);
 
     if (payload) |p| {
         req.transfer_encoding = .{ .content_length = p.len };
@@ -57,6 +56,7 @@ fn call(app: *App, method: http.Method, path: []const u8, payload: ?[]const u8, 
     }
 
     var response = try req.receiveHead(&.{});
+    head_received = true;
     const status = response.head.status;
 
     // The control plane is ours, but what answers on its address is still

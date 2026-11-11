@@ -146,16 +146,19 @@ defmodule OmnigateControl.AdminAuth do
       true ->
         address = client_address(conn)
 
-        cond do
-          bearer_throttled?(address) ->
+        # Counted before it is looked at, and given back when it was right:
+        # see `begin_attempt/3`.
+        case begin_attempt({:bearer, address}, max_bearer_failures()) do
+          :throttled ->
             :throttled
 
-          bearer?(conn) ->
-            :token
-
-          true ->
-            note_bearer_failure(address)
-            :denied
+          :ok ->
+            if bearer?(conn) do
+              end_attempt({:bearer, address})
+              :token
+            else
+              :denied
+            end
         end
     end
   end
@@ -237,8 +240,42 @@ defmodule OmnigateControl.AdminAuth do
     end
   end
 
+  # An IPv4 peer seen through a dual-stack socket arrives as ::ffff:a.b.c.d.
+  # It is that IPv4 address: cut to a /64 like other IPv6, every IPv4 client
+  # would share one allowance, and one of them could use it up for all.
+  defp network({0, 0, 0, 0, 0, 0xFFFF, hi, lo}), do: {div(hi, 256), rem(hi, 256), div(lo, 256), rem(lo, 256)}
   defp network({a, b, c, d, _, _, _, _}), do: {a, b, c, d, 0, 0, 0, 0}
   defp network(ip), do: ip
+
+  @doc """
+  Count one attempt for `key` (an address, or `{:bearer, address}`) and say
+  whether it may go ahead: `:ok` while the window's count, this attempt
+  included, is at most `max`, else `:throttled`.
+
+  The count is taken with one atomic `:ets.update_counter`, before the
+  secret is compared. Looking first and counting the failure afterwards let
+  every request that was in flight at the same moment through: a burst of
+  parallel guesses all saw the count as it was before any of them failed. An
+  attempt that turns out right is given back with `end_attempt/1`, so right
+  ones never use the allowance up; a wrong one simply stays counted.
+  """
+  def begin_attempt(key, max \\ @max_failures, now \\ System.os_time(:second)) do
+    case :ets.lookup(@failures, key) do
+      # The window is over: start a new one. (Deletes this exact row only,
+      # so a row another request just started is left alone.)
+      [{_, _count, window_start} = row] when now - window_start >= @window_s -> :ets.delete_object(@failures, row)
+      [] -> forget_expired(now)
+      _ -> :ok
+    end
+
+    if :ets.update_counter(@failures, key, {2, 1}, {key, 0, now}) <= max, do: :ok, else: :throttled
+  end
+
+  @doc "Give back an attempt that `begin_attempt/3` counted and that turned out to be right."
+  def end_attempt(key) do
+    :ets.update_counter(@failures, key, {2, -1, 0, 0}, {key, 0, System.os_time(:second)})
+    :ok
+  end
 
   @doc "Has this address used up its failed attempts for the current window?"
   def throttled?(address, now \\ System.os_time(:second)) do

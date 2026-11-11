@@ -63,7 +63,7 @@ defmodule OmnigateControl.Rejections do
 
   defp valid?(key, reason, count) do
     count > 0 and count <= 1_000_000_000 and byte_size(key) in 1..64 and String.printable?(key) and
-      reason =~ ~r/^[a-z0-9_]{1,64}$/
+      reason =~ ~r/\A[a-z0-9_]{1,64}\z/
   end
 
   # A pair seen before keeps its own series; a new one gets one only while there is room.

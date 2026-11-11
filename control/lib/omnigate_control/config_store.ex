@@ -422,11 +422,17 @@ defmodule OmnigateControl.ConfigStore do
   defp build_media(m) do
     webhooks = m["webhooks"] || %{}
     schedule = retry_schedule!(webhooks["retry_schedule_ms"])
+    max_output_bytes = int!(m["max_output_bytes"], 512 * 1024 * 1024, 1..1_099_511_627_776, "media.max_output_bytes")
 
     %{
       public_base_url: String.trim_trailing(m["public_base_url"] || "http://127.0.0.1:8080", "/"),
       poll_interval_ms: int!(m["poll_interval_ms"], 2_000, 1..3_600_000, "media.poll_interval_ms"),
-      max_output_bytes: int!(m["max_output_bytes"], 512 * 1024 * 1024, 1..1_099_511_627_776, "media.max_output_bytes"),
+      max_output_bytes: max_output_bytes,
+      # What one provider answer may make the gateway download and keep: so
+      # many files, and so many bytes in all. (The answer is the provider's;
+      # without these it could list a thousand files of the largest size.)
+      max_outputs_per_job: int!(m["max_outputs_per_job"], 16, 1..1_000, "media.max_outputs_per_job"),
+      max_job_output_bytes: int!(m["max_job_output_bytes"], max(2 * 1024 * 1024 * 1024, max_output_bytes), 1..17_592_186_044_416, "media.max_job_output_bytes"),
       # A job's input and metadata are kept on disk while the job exists.
       max_input_bytes: int!(m["max_input_bytes"], 1_048_576, 1..8_000_000, "media.max_input_bytes"),
       # Unfinished jobs one key may have at a time (a key can set its own); 0 = no limit.

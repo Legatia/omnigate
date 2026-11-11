@@ -413,6 +413,8 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             error.KeyTooLong => respondError(acc, request, .bad_request, "invalid_request", "a key in the request body is too long"),
             error.DuplicateField => respondError(acc, request, .bad_request, "invalid_request", "\"model\", \"stream\" and \"stream_options\" may each appear only once"),
             error.EscapedFieldName => respondError(acc, request, .bad_request, "invalid_request", "\"model\", \"stream\" and \"stream_options\" must be spelled without escapes"),
+            error.AmbiguousFieldName => respondError(acc, request, .bad_request, "invalid_request", "\"model\", \"stream\", \"stream_options\" and \"include_usage\" must be spelled exactly so, in lower case"),
+            error.InvalidFieldType => respondError(acc, request, .bad_request, "invalid_request", "\"stream\" and \"stream_options.include_usage\" must be true or false"),
         };
     };
 
@@ -733,10 +735,19 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             .drop_sampling, .add_thought_signature => unreachable,
             .done => |status| {
                 app.health.recordSuccess(app.io, up.name);
-                const used = usage.normalized(up.kind);
+                // An event stream that ended without the provider's closing
+                // figures: the upstream ignored `stream_options` (many
+                // OpenAI-compatible servers do), or streamed although this
+                // module read the request as not a stream. The provider
+                // charges all the same, so what came back is billed as an
+                // estimate, as for a stream that was cut off: never nothing.
+                const estimated = ep.metered and usage.framing == .sse and !usage.final_seen and
+                    @backingInt(status) >= 200 and @backingInt(status) < 300;
+                const used = if (estimated) usage.estimated(up.kind, usage_mod.estimateInput(body)) else usage.normalized(up.kind);
                 acc.status = @backingInt(status);
                 acc.upstream.set(up.name);
                 acc.attempts = tried;
+                acc.estimated = estimated;
                 acc.input_tokens = used.input_tokens;
                 acc.cached_input_tokens = used.cached_input_tokens +| used.cache_write_input_tokens;
                 acc.output_tokens = used.output_tokens;
@@ -761,6 +772,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     .cached_input_tokens = used.cached_input_tokens,
                     .cache_write_input_tokens = used.cache_write_input_tokens,
                     .output_tokens = used.output_tokens,
+                    .estimated = estimated,
                     .latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds(),
                     .attempts = attempts.items,
                 });
@@ -1147,13 +1159,17 @@ const UpstreamCall = struct {
     body: ?[]u8,
     req: http.Client.Request = undefined,
     req_live: bool = false,
+    /// The response head arrived. Until then std has no idea that anything
+    /// went wrong on the connection: a write that failed half way, a write
+    /// that was cancelled by the timeout, a head that never came all leave
+    /// its reader in the state "ready for the next exchange", and a request
+    /// torn down in that state hands its socket back to the pool.
+    head_received: bool = false,
 
     fn deinit(call: *UpstreamCall) void {
         if (call.req_live) {
-            // Whatever is left of the response body is not for std to read
-            // (see framing.zig): the connection is closed instead.
-            framing.disown(&call.req);
-            call.req.deinit();
+            // Closed unless proven reusable: see `framing.finish`.
+            framing.finish(&call.req, call.head_received);
         }
         call.req_live = false;
     }
@@ -1167,7 +1183,9 @@ const UpstreamCall = struct {
         } else {
             try call.req.sendBodiless();
         }
-        return call.req.receiveHead(&.{});
+        const response = try call.req.receiveHead(&.{});
+        call.head_received = true;
+        return response;
     }
 
     /// `open`, but give up with `error.UpstreamTimeout` after `timeout_ms`

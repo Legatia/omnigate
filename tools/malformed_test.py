@@ -18,7 +18,10 @@ deeply nested JSON, request-smuggling attempts and non-canonical paths.
 When it started the stack itself it also plays the other side: an upstream
 that answers with chunk sizes that overflow, bodies shorter than their
 content-length, both framings at once and a header smuggled into the content
-type (special model names of tools/mock_upstream.py on :9005), and a control
+type (special model names of tools/mock_upstream.py on :9005), an upstream
+that breaks connections (inside this script on :9006: it resets them while
+they idle, resets them while a request is being written, or never reads the
+request, and the next request must work on a new connection), and a control
 plane that does the same (a stand-in inside this script on :4300, with a
 second gateway on :8190 pointed at it). And it checks the limits that apply
 before a request body is read: the per-key concurrency cap, the rate limit,
@@ -47,6 +50,7 @@ import random
 import select
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -353,6 +357,43 @@ def second_review():
          check=lambda raw, status: "refused for its idempotency key" if b"idempotency-key" in raw.lower() else None)
 
 
+def third_review():
+    """Third review, finding 2: the gateway reads `model`, `stream` and `stream_options` with an
+    exact, case-sensitive scanner, and the provider parses the same bytes again. A parser that
+    matches names without regard to case (Go's encoding/json) or coerces types reads them
+    differently: another model than the one the key was checked for, or a stream nobody meters."""
+    section("third review: names and flags a provider's parser could read differently")
+    model = json.dumps(ARGS.model)
+
+    def body(text):
+        return post("/v1/chat/completions", (text % {"m": model}).encode("utf-8"))
+
+    msgs = '"messages":[{"role":"user","content":"hi"}]'
+    for name, text in [
+        ('a second model spelled "Model"', '{"model":%(m)s,"Model":"other",' + msgs + '}'),
+        ('"MODEL" alone', '{"MODEL":%(m)s,' + msgs + '}'),
+        ('"Stream": true beside the model', '{"model":%(m)s,"Stream":true,' + msgs + '}'),
+        ('"stream" with a long s (U+017F)', '{"model":%(m)s,"\u017ftream":true,' + msgs + '}'),
+        ('... written as an escape', '{"model":%(m)s,"\\u017ftream":true,' + msgs + '}'),
+        ('"stream" with the st ligature (U+FB06)', '{"model":%(m)s,"\ufb06ream":true,' + msgs + '}'),
+        ('"Stream_Options"', '{"model":%(m)s,"stream":true,"Stream_Options":{"include_usage":false},' + msgs + '}'),
+        ('"Include_Usage" inside stream_options', '{"model":%(m)s,"stream":true,"stream_options":{"Include_Usage":false},' + msgs + '}'),
+        ('"include_usage" twice in two cases', '{"model":%(m)s,"stream":true,"stream_options":{"include_usage":true,"INCLUDE_USAGE":false},' + msgs + '}'),
+    ]:
+        case(name + ": 400", body(text), expect=400, read_timeout=3, keep_reading=5)
+    for name, text in [
+        ('"stream": "true" (a string)', '{"model":%(m)s,"stream":"true",' + msgs + '}'),
+        ('"stream": 1', '{"model":%(m)s,"stream":1,' + msgs + '}'),
+        ('"include_usage": "false"', '{"model":%(m)s,"stream":true,"stream_options":{"include_usage":"false"},' + msgs + '}'),
+        ('"include_usage": 0', '{"model":%(m)s,"stream":true,"stream_options":{"include_usage":0},' + msgs + '}'),
+    ]:
+        case(name + ": 400, it must be true or false", body(text), expect=400, read_timeout=3, keep_reading=5)
+    case('"stream": null and "include_usage": null are "not set": served', body('{"model":%(m)s,"stream":null,"stream_options":{"include_usage":null},' + msgs + '}'),
+         expect=200, read_timeout=5, keep_reading=8)
+    case('other keys in any case, and the names nested deeper, are the client\'s business: served',
+         body('{"model":%(m)s,"Models":1,"metadata":{"Model":"x","Stream":"yes"},"User":"u",' + msgs + '}'), expect=200, read_timeout=5, keep_reading=8)
+
+
 def limits_before_body():
     section("limits that apply before a body is read")
     host, port = host_port()
@@ -571,6 +612,162 @@ def hostile_upstream():
     record("after such a 502 the same keep-alive connection serves the next request", answers == [502, 200], answers)
 
 
+# an upstream that breaks connections: while they idle, while a request is
+# being written to them, or by never reading the request at all
+
+BREAKER_PORT = 9006
+BREAKER = {"next": [], "connections": 0, "served": []}
+BREAKER_LOCK = threading.Lock()
+
+
+def reset_close(sock):
+    """Close with a reset (RST), as a load balancer does to a flow it has forgotten."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("hh", 1, 0))
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def breaker_connection(conn, index):
+    """One connection to the breaking upstream. What happens to each request is the next entry of
+    BREAKER["next"] ("ok" when it is empty):
+      ok              read the request, answer 200, keep the connection
+      ok_then_reset   the same, then reset the connection while it idles
+      reset_mid_write read the head and a little of the body, then reset
+      never_read      read nothing at all, and say nothing, until the peer gives up"""
+    answer = json.dumps({"id": "chatcmpl-breaker", "object": "chat.completion", "model": "breaker-1",
+                         "choices": [{"index": 0, "message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}],
+                         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
+    try:
+        while True:
+            first = conn.recv(1, socket.MSG_PEEK)
+            if not first:
+                return
+            with BREAKER_LOCK:
+                action = BREAKER["next"].pop(0) if BREAKER["next"] else "ok"
+            if action == "never_read":
+                with BREAKER_LOCK:
+                    BREAKER["served"].append((index, action))
+                conn.settimeout(30)
+                time.sleep(4)  # longer than the upstream timeout of the route (1.5 s)
+                return reset_close(conn)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                more = conn.recv(65536)
+                if not more:
+                    return
+                buf += more
+            head, rest = buf.split(b"\r\n\r\n", 1)
+            length = 0
+            for line in head.split(b"\r\n")[1:]:
+                name, _, value = line.partition(b":")
+                if name.strip().lower() == b"content-length":
+                    length = int(value.strip())
+            if action == "reset_mid_write":
+                with BREAKER_LOCK:
+                    BREAKER["served"].append((index, action))
+                return reset_close(conn)
+            while len(rest) < length:
+                more = conn.recv(1 << 20)
+                if not more:
+                    return
+                rest += more
+            conn.sendall(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n%s" % (len(answer), answer))
+            with BREAKER_LOCK:
+                BREAKER["served"].append((index, action))
+            if action == "ok_then_reset":
+                return reset_close(conn)
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def breaker_server():
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", BREAKER_PORT))
+    listener.listen(64)
+
+    def accept():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            with BREAKER_LOCK:
+                BREAKER["connections"] += 1
+                index = BREAKER["connections"]
+            threading.Thread(target=breaker_connection, args=(conn, index), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    return listener
+
+
+def broken_connections():
+    """Third review, finding 1. A request that could not be written in full (or was cancelled while
+    being written, or never got a head) left its socket in the HTTP client's pool, marked as ready
+    for the next request: every later request to that upstream was handed the dead socket, failed,
+    and put it back. Only a restart ended it."""
+    section("an upstream that breaks connections (on :%d): the next request gets a fresh one" % BREAKER_PORT)
+    listener = breaker_server()
+
+    def ask(size=0):
+        body = {"model": "breaker", "messages": [{"role": "user", "content": "hi" + "x" * size}]}
+        raw, _ = exchange(post("/v1/chat/completions", json.dumps(body)), read_timeout=8, keep_reading=12)
+        return status_of(raw)
+
+    def fresh_after(mark):
+        """Were the requests since `mark` (a length of BREAKER["served"]) that broke each on a connection
+        of their own, and the ones answered after them on yet another?"""
+        with BREAKER_LOCK:
+            since = BREAKER["served"][mark:]
+        broken = [c for c, action in since if action in ("reset_mid_write", "never_read")]
+        answered = [c for c, action in since if action == "ok"]
+        return len(set(broken)) == len(broken) and bool(answered) and not set(answered) & set(broken)
+
+    big = 6 * 1024 * 1024
+    try:
+        with BREAKER_LOCK:
+            BREAKER["next"] = ["ok_then_reset"]
+        record("a request to the breaking upstream works while it behaves", ask() == 200)
+        time.sleep(0.5)  # the upstream has now reset the pooled, idle connection
+        first = ask(big)
+        record("a 6 MiB request after the upstream reset the idle connection: retried on a fresh connection, 200", first == 200, first)
+        after = [ask() for _ in range(4)]
+        record("... and the requests after it all work (they used to fail for ever, on the same dead socket)", after == [200] * 4, after)
+
+        with BREAKER_LOCK:
+            BREAKER["next"] = ["reset_mid_write", "reset_mid_write"]
+            mark = len(BREAKER["served"])
+        status = ask(big)
+        record("a connection reset while the request is being written, twice in a row: 502", status == 502, status)
+        after = [ask() for _ in range(3)]
+        record("... the next requests work, on a connection that is neither of the two that broke",
+               after == [200] * 3 and fresh_after(mark), (after, BREAKER["served"][mark:]))
+
+        with BREAKER_LOCK:
+            BREAKER["next"] = ["never_read"]
+            mark = len(BREAKER["served"])
+        started = time.time()
+        status = ask(big)
+        took = time.time() - started
+        record("an upstream that never reads the request: the write is cancelled at the upstream timeout (1.5 s), a failed upstream",
+               status in (502, 504) and 1.0 <= took <= 6, (status, round(took, 1)))
+        after = [ask() for _ in range(3)]
+        record("... the next requests work, on a new connection (the one whose write was cancelled never answers)",
+               after == [200] * 3 and fresh_after(mark), (after, BREAKER["served"][mark:]))
+    finally:
+        listener.close()
+
+
 def own_answers_stall():
     """A client that sends requests and never reads the answers. The answers
     here are the gateway's own (the model list), which used to be written
@@ -613,7 +810,7 @@ STANDIN_PORT = 4300
 SECOND_GATEWAY_PORT = 8190
 STANDIN_KEY = "og-standin-key"
 STANDIN_TOKEN = "standin-internal-token"
-STANDIN = {"config_mode": "ok"}
+STANDIN = {"config_mode": "ok", "reset": {}, "served": {}}
 
 
 class StandIn(BaseHTTPRequestHandler):
@@ -661,23 +858,52 @@ class StandIn(BaseHTTPRequestHandler):
             return
         return self.good(200, {"id": "job_1", "status": "succeeded"})
 
+    def breaks(self, what):
+        """Reset this connection instead of answering, as often as STANDIN["reset"][what] says."""
+        if STANDIN["reset"].get(what, 0) <= 0:
+            STANDIN["served"][what] = STANDIN["served"].get(what, 0) + 1
+            return False
+        STANDIN["reset"][what] -= 1
+        STANDIN["served"][what + " (reset)"] = STANDIN["served"].get(what + " (reset)", 0) + 1
+        reset_close(self.connection)
+        self.close_connection = True
+        return True
+
     def do_GET(self):
         if self.path == "/internal/config":
+            if self.breaks("config"):
+                return
             if STANDIN["config_mode"] != "ok":
                 return self.hostile(STANDIN["config_mode"])
             return self.good(200, {
                 "version": "standin-1",
                 "keys": [{"key_sha256": hashlib.sha256(STANDIN_KEY.encode()).hexdigest(), "name": "standin"}],
                 # One route, to the mock that sends the head of an answer and then nothing (tools/mock_upstream.py).
-                "upstreams": [{"name": "silent", "kind": "openai", "base_url": "http://127.0.0.1:9005", "api_key_env": "MOCK_API_KEY"}],
-                "routes": [{"model": "stall-body", "targets": [{"upstream": "silent", "model": "stall-body-1"}]}],
+                "upstreams": [{"name": "silent", "kind": "openai", "base_url": "http://127.0.0.1:9005", "api_key_env": "MOCK_API_KEY"},
+                              {"name": "ok", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY"}],
+                "routes": [{"model": "stall-body", "targets": [{"upstream": "silent", "model": "stall-body-1"}]},
+                           {"model": "ok", "targets": [{"upstream": "ok", "model": "ok-1"}]}],
             })
         if self.path.startswith("/internal/v1/jobs/"):
             return self.hostile(self.path.rsplit("/", 1)[1])
         self.good(200, {})
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("content-length") or 0))
+        length = int(self.headers.get("content-length") or 0)
+        what = "usage" if self.path == "/internal/usage/batch" else "jobs" if self.path.startswith("/internal/v1/jobs") else "other"
+        if STANDIN["reset"].get(what, 0) > 0:
+            # Take a little of the body first: the reset arrives while the rest is being written.
+            self.rfile.read(min(length, 4096))
+        if self.breaks(what):
+            return
+        body = self.rfile.read(length)
+        if what == "usage":
+            try:
+                STANDIN["served"]["usage events"] = STANDIN["served"].get("usage events", 0) + len(json.loads(body).get("events", []))
+            except ValueError:
+                pass
+        if what == "jobs":
+            return self.good(202, {"id": "job_1", "status": "queued"})
         self.good(200, {"accepted": 0})
 
 
@@ -802,7 +1028,44 @@ def hostile_control(stack):
             record(f"a config poll answered with '{mode}' is a failed poll: the gateway keeps its config and keeps serving",
                    alive() and status_of(raw) == 200, status_of(raw))
         STANDIN["config_mode"] = "ok"
+
+        # Third review, finding 1, on the control-plane link: a call that broke before its answer
+        # left the dead socket in the pool, and every later call (config, usage, jobs) took it.
+        def served(what):
+            return STANDIN["served"].get(what, 0)
+
+        def wait_for(what, more_than, seconds=6):
+            deadline = time.time() + seconds
+            while time.time() < deadline and served(what) <= more_than:
+                time.sleep(0.1)
+            return served(what) > more_than
+
+        STANDIN["reset"]["config"] = 2
+        while STANDIN["reset"]["config"] > 0:
+            time.sleep(0.1)
+        polls = served("config")
+        record("two config polls answered with a connection reset: the polls after them arrive, on new connections",
+               wait_for("config", polls + 2), (polls, served("config")))
+
+        chat = post("/v1/chat/completions", json.dumps({"model": "ok", "messages": [{"role": "user", "content": "hi"}]}), key=STANDIN_KEY)
+        events = served("usage events")
+        STANDIN["reset"]["usage"] = 2
+        raw, _ = exchange(chat, read_timeout=5, keep_reading=8)
+        record("a usage report that is reset twice while being sent is sent again, and arrives",
+               status_of(raw) == 200 and wait_for("usage events", events, 10) and STANDIN["reset"]["usage"] == 0,
+               (status_of(raw), served("usage events"), STANDIN["reset"]["usage"]))
+
+        create = post("/v1/jobs", json.dumps({"model": "image", "input": {"prompt": "p" * 4_000_000}}), key=STANDIN_KEY)
+        STANDIN["reset"]["jobs"] = 1
+        raw, _ = exchange(create, read_timeout=8, keep_reading=10)
+        record("a job request reset by the control plane while its 4 MB body is being written: 502 or 503, no hang",
+               status_of(raw) in (502, 503), status_of(raw))
+        raw, _ = exchange(create, read_timeout=8, keep_reading=10)
+        record("... and the same request right after it goes through, on a new connection", status_of(raw) == 202, (status_of(raw), (raw or b"")[-200:]))
+        raw, _ = exchange(job("fine"), read_timeout=5, keep_reading=8)
+        record("... as does the next read of a job", status_of(raw) == 200, status_of(raw))
     finally:
+        STANDIN["reset"].clear()
         TARGET = None
         stack.stop("gateway2")
         server.shutdown()
@@ -943,6 +1206,11 @@ def start_own_stack():
     # (Under names of their own: the hostile answers above put "mock-stall" into its cooldown, where it would be tried last.)
     for name in ("mock-silent-a", "mock-silent-b"):
         config["upstreams"].append({"name": name, "kind": "openai", "base_url": "http://127.0.0.1:9005", "api_key_env": "MOCK_API_KEY"})
+    # An upstream inside this script that breaks connections (see `broken_connections`).
+    config["upstreams"].append({"name": "mock-breaker", "kind": "openai", "base_url": "http://127.0.0.1:%d" % BREAKER_PORT,
+                                "api_key_env": "MOCK_API_KEY", "timeout_ms": 1500})
+    config["routes"].append({"model": "breaker", "targets": [dict(upstream="mock-breaker", model="breaker-1", **price)]})
+    config["routes"].append({"model": "no-usage", "targets": [dict(upstream="mock-ok", model="no-usage-1", **price)]})
     config["routes"].append({"model": "stall-body-only", "targets": [dict(upstream="mock-silent-a", model="stall-body-1", **price)]})
     config["routes"].append({"model": "stall-body", "targets": [dict(upstream="mock-silent-b", model="stall-body-1", **price),
                                                                dict(upstream="mock-ok", model="ok-1", **price)]})
@@ -1045,6 +1313,22 @@ def billing_on_disconnect():
         ok = e.get("output_tokens") == 4242 and e.get("input_tokens") == 55 and not e.get("estimated")
         record("stopped reading without hanging up: given up on after the stall timeout, the answer read to its end, billed the real figures", ok, e)
 
+    if OVERVIEW:
+        # Third review, finding 2: a stream read to its proper end whose provider never reports usage.
+        for asked in (False, True):
+            req = {"model": "no-usage", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            if asked:
+                req["stream_options"] = {"include_usage": True}
+            raw, _ = exchange(post("/v1/chat/completions", json.dumps(req)), read_timeout=5, keep_reading=10)
+            rid = None
+            for line in (raw or b"").split(b"\r\n"):
+                if line.lower().startswith(b"x-omnigate-request-id:"):
+                    rid = line.split(b":", 1)[1].strip().decode()
+            e = event_for(rid, 10) or {}
+            ok = status_of(raw) == 200 and b"[DONE]" in raw and e.get("estimated") is True and e.get("output_tokens", 0) > 0 and e.get("input_tokens", 0) > 0
+            record("a whole stream from a provider that never reports usage (%s): billed an estimate, marked as one, not nothing"
+                   % ("the client asked for usage" if asked else "the gateway asked for usage"), ok, e)
+
     if ARGS.drip_model:
         estimated_case(ARGS.drip_model, "left a stream that goes on without ever reporting usage: billed an estimate, marked as one")
     if ARGS.stall_model:
@@ -1119,10 +1403,12 @@ def run(stack=None):
     second_review()
     paths()
     expensive_bodies()
+    third_review()
     generated(random.Random(ARGS.seed), ARGS.count)
     limits_before_body()
     if stack:
         hostile_upstream()
+        broken_connections()
         own_answers_stall()
         hostile_control(stack)
         healthcheck_command()

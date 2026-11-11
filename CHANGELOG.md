@@ -23,6 +23,63 @@ only met a mock, is tracked in the README's
 
 ### Security
 
+**Third review (November 2026), fixed in the commit that follows 1cc721f.**
+A third independent review found no way past authentication and no crash,
+and one high, five medium and seven low findings, all fixed here with a
+regression test each. Advisories for the first five are in
+[SECURITY.md](SECURITY.md#past-advisories); what an installation can
+notice is in [docs/upgrading.md](docs/upgrading.md#the-third-review-commit).
+Update both processes; nothing needs rotating and nothing changes on disk
+that older code cannot read.
+
+- **High: one failed write to a provider could take that provider away
+  until a restart** (data plane). A request that could not be written in
+  full, was cancelled by the upstream timeout while being written, or got
+  no response head, left its socket in the HTTP client's pool marked as
+  ready; every later request to that upstream was handed the dead socket,
+  failed and put it back. A provider that resets an idle connection while a
+  large request is being sent to it was enough. A connection now goes back
+  to the pool only when the exchange ended at a clean message boundary;
+  everything else closes it. The same rule holds for calls to the control
+  plane.
+- **Medium: a provider that reads JSON more loosely than the gateway could
+  be sent another model or an unmetered stream.** `"Model"`, `"STREAM"`,
+  `"ſtream"` and `"Include_Usage"` are not the fields the gateway acts on,
+  but they are to a parser that ignores case. Such names are refused (400
+  `invalid_request`), as are a `stream` or `stream_options.include_usage`
+  that is not `true`, `false` or `null`. Independently, an event stream
+  that ends without the provider's usage figures is now billed an estimate
+  (`"estimated": true`) instead of nothing, which also covers providers
+  that ignore `stream_options`.
+- **Medium: a job's `webhook_url` and `metadata` were held in memory
+  without a limit of their own** (control plane). The URL is capped at
+  2,048 bytes and metadata at 16 KiB (413); a list of jobs leaves out
+  metadata over 1 KiB (`"metadata_omitted": true`).
+- **Medium: cancelling a media job after the provider call had started
+  made that call free**, and let a key run more provider calls at once
+  than `max_open_jobs`. A job cancelled while its provider call is in
+  flight stays out of the ledger and in the open-jobs count until the
+  runner knows how the call ended; a call that completed is billed on the
+  cancelled job (`cost_usd`), and nothing of it is fetched or kept.
+- **Medium: a provider's answer could fill the disk.** Outputs per job are
+  capped (`media.max_outputs_per_job`, 16) and so are their bytes together
+  (`media.max_job_output_bytes`, 2 GiB); a download that fails or a type
+  hint that is not text no longer leaves files in the download directory,
+  which is also swept at start.
+- **Medium: quadratic CPU in the filter that hides the usage chunk** (data
+  plane): an upstream that sent one long event a byte at a time cost a
+  megabyte of searching per byte. The search now resumes where it stopped.
+- **Low:** the admin throttles count an attempt before comparing the
+  secret, so parallel guesses cannot all slip through one check; a write
+  to a peer that stops reading ends at the request's timeout (it could
+  block for ever); outputs in a bucket get the same reduced content type
+  as ones the gateway serves; names are matched to the end of the string
+  (`\A...\z`), so a key name cannot end in a newline; an IPv4 client on a
+  dual-stack socket is throttled as itself, not as one /64 with every
+  other IPv4 client; a managed key keeps its lifetime spend past its 51st
+  rotation; and output and webhook URLs are only fetched from public
+  unicast IPv6 (`2000::/3`), which closes `::ffff:0:a.b.c.d`.
+
 Five commits fix what two independent reviews of the code found in
 November 2026: 97cf396, fde530c and 3a0b147 after the first review,
 e4e30e4 (data plane) and d79406b (control plane) after the second.

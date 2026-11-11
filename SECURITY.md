@@ -451,10 +451,11 @@ vulnerabilities to report.
 ## Past advisories
 
 No release has been tagged, so these are identified by commit. All of them
-were found by two independent reviews of the code in November 2026, by
+were found by three independent reviews of the code in November 2026, by
 reading and small proofs of concept: the first led to commits 97cf396,
-fde530c and 3a0b147, the second to e4e30e4 and d79406b. **None is known to
-have been exploited.**
+fde530c and 3a0b147, the second to e4e30e4 and d79406b, the third to the
+commit that follows 1cc721f ("the third-review commit" below). **None is
+known to have been exploited.**
 
 | Class | Fixed in | Needed | Worst case |
 |---|---|---|---|
@@ -469,6 +470,12 @@ have been exploited.**
 | [Memory exhaustion of the control plane through webhook receivers](#memory-exhaustion-of-the-control-plane-through-webhook-receivers) | d79406b | A gateway key that may create media jobs with a webhook | The control plane is killed; jobs, the dashboard and usage intake stop |
 | [Crash of the control plane by text that is not valid UTF-8](#crash-of-the-control-plane-by-text-that-is-not-valid-utf-8) | d79406b | A provider answer with such bytes, or network access to the control plane's port | The control plane stops |
 | [Other hardening from the second review](#other-hardening-from-the-second-review) | e4e30e4, d79406b | varies | varies |
+| [A provider made unreachable by one failed write](#a-provider-made-unreachable-by-one-failed-write) | third-review commit | A gateway key and a provider (or network path) that resets connections; or no one at all | Every request to one upstream fails until the data plane is restarted |
+| [Model limits and metering bypassed through field names a provider reads differently](#model-limits-and-metering-bypassed-through-field-names-a-provider-reads-differently) | third-review commit | A gateway key, and an upstream whose JSON parser ignores case or coerces types | A model the key may not use; streams that are not billed |
+| [Unbounded memory per media job](#unbounded-memory-per-media-job) | third-review commit | A gateway key that may create media jobs | The control plane's memory grows by up to a megabyte per job kept |
+| [Provider calls made free by cancelling the job](#provider-calls-made-free-by-cancelling-the-job) | third-review commit | A gateway key that may create media jobs | Media the operator pays for and the key is not billed for; more provider calls at once than `max_open_jobs` |
+| [Disk exhaustion through a provider's answer](#disk-exhaustion-through-a-providers-answer) | third-review commit | Control of a media provider's answers | The control plane's disk fills with downloads |
+| [Other hardening from the third review](#other-hardening-from-the-third-review) | third-review commit | varies | varies |
 
 **For everyone who ran an earlier commit:** update both processes to
 d79406b or later; the fixes are on both sides. Read
@@ -481,7 +488,9 @@ gateway keys as described under the first advisory, and split the Compose
 environment file as described in
 [docs/deployment.md](docs/deployment.md#coming-from-a-commit-before-3a0b147).
 Nothing in the four advisories of the second review requires rotating a
-credential.
+credential, and nothing in those of the third does either: update both
+processes to the third-review commit or later
+([docs/upgrading.md](docs/upgrading.md#the-third-review-commit)).
 
 ### Authentication bypass on the control plane through percent-encoded paths
 
@@ -1074,3 +1083,234 @@ above. None needs action beyond updating, except where noted.
   ASCII.
 - **The data-plane image had no health check.** `omnigate-dp healthcheck`
   backs a `HEALTHCHECK`.
+
+### A provider made unreachable by one failed write
+
+Fixed in the third-review commit (the one that follows 1cc721f, November
+2026). Data plane.
+
+**What was wrong.** The data plane keeps connections to providers in the
+standard library's HTTP client pool. When a request was torn down, the
+connection went back to the pool unless the client's reader said the
+exchange was unfinished; and the reader only learns anything once a
+response head has arrived. A request that could not be written in full, a
+write that the upstream timeout cancelled half way, and a request that
+never got a head all left the reader in its initial state, "ready for the
+next exchange". The socket, which the peer had reset or which still held
+half a request, was pooled as healthy. The next request to that upstream
+took it, failed the same way, and put it back.
+
+**What it allowed.** One such failure made every later request to that
+upstream fail (`502`, or a failover on every request) until the data plane
+was restarted. Cooldowns did not help: the connection was never closed.
+The proof of concept needed nothing unusual: a provider that resets an
+idle keep-alive connection, as load balancers do, at the moment a large
+request is being written to it. A key holder could raise the odds with
+large bodies; an operator could meet it with no attacker at all. Nothing
+was disclosed and nothing was billed wrongly.
+
+**Who was affected.** Every commit from the one that introduced the
+gateway's own response reader (e4e30e4) up to 1cc721f, for upstreams that
+are reached over keep-alive connections, which is all of them.
+
+**What to do.** Update the data plane. If an upstream ever "went away"
+until a restart while the provider itself was up, this may have been why.
+
+**The fix.** A connection is closed unless it is proven reusable: it goes
+back to the pool only when a response head arrived and the body was read
+to the end of the message by the gateway's own reader. Every other way a
+request can end, including the ones nobody has thought of, closes it. The
+calls to the control plane follow the same rule (they were not pooled, and
+are now closed by the same code rather than by an option).
+`tools/malformed_test.py` plays an upstream that resets idle connections,
+resets while a request is being written, and never reads a request at all,
+and checks that the next request works on a new connection.
+
+### Model limits and metering bypassed through field names a provider reads differently
+
+Fixed in the third-review commit. Data plane.
+
+**What was wrong.** The gateway reads `model`, `stream` and
+`stream_options` from a request with an exact, case-sensitive scanner and
+forwards the client's bytes; the provider parses those bytes again. The
+earlier fix refused duplicates and escaped spellings, on the assumption
+that every parser matches names exactly. Not every one does: Go's
+`encoding/json`, which many OpenAI-compatible servers are built on,
+matches field names without regard to case (and folds `ſ` and the Kelvin
+sign onto `s` and `k`), taking the last match; and servers that coerce
+types read `"stream": "true"` or `1` as true.
+
+**What it allowed**, against such an upstream and with a valid key:
+
+- `{"model": "allowed", "Model": "other"}`: the gateway checked and billed
+  `allowed`'s route; the provider ran whatever the last spelling named, as
+  far as the upstream's own model names allowed.
+- `{"Stream": true}` or `{"stream": "true"}`: the gateway treated the
+  request as not a stream and asked for no usage; the provider streamed,
+  the stream carried no usage, and the call was recorded with zero tokens.
+  The same went for `"Include_Usage": false` inside `stream_options`.
+
+Against OpenAI's and Anthropic's own APIs, whose parsers are exact,
+neither worked.
+
+**Who was affected.** Deployments with an upstream of kind `openai` served
+by software with a case-insensitive or coercing JSON parser (self-hosted
+inference servers, some proxies), and keys in hands the operator does not
+fully trust. Separately, and with no attacker: any upstream that ignores
+`stream_options` streamed without usage, and those calls were billed
+nothing.
+
+**What to do.** Update the data plane. If you bill from the ledger and
+route to such an upstream, look for streamed calls with zero tokens.
+
+**The fix.** A top-level name, or a name inside `stream_options`, that
+equals `model`, `stream`, `stream_options` or `include_usage` after case
+folding (ASCII case, `ſ`, the Kelvin sign, the `st` ligatures, fullwidth
+letters) but is not spelled exactly so is refused with `400
+invalid_request`; so is a `stream` or `include_usage` that is not `true`,
+`false` or `null`. And whatever the request looked like: when the answer
+is an event stream that ends without the provider's closing usage, the
+call is billed an estimate (input from the request's size, output from
+what was streamed) and marked `"estimated": true`, as a stream that was
+cut off already was.
+
+**What it costs.** A client that sends `"stream": "true"` or `1` gets a
+400 where it got a non-streamed answer. Streams from providers that never
+report usage now cost what the estimate says instead of nothing; see
+[docs/operations.md](docs/operations.md#streams-that-end-early).
+
+### Unbounded memory per media job
+
+Fixed in the third-review commit. Control plane.
+
+**What was wrong.** A job's `input` over 8 KiB is kept in a file, so that
+job records, which live in memory and are copied on every read, stay
+small. Two other fields had no such treatment: `metadata` was only bounded
+together with `input` (1 MiB by default), and `webhook_url` was not
+bounded at all below the 8 MB request limit.
+
+**What it allowed.** A key that may create media jobs could make each job
+record hold about a megabyte for as long as the job is kept (30 days by
+default), up to its jobs per day: gigabytes of the control plane's memory
+per key per day, every listing copying it, and the job log growing to
+match. A list of 100 jobs could answer with 100 MB.
+
+**What to do.** Update the control plane. Clients that store more than
+16 KiB of metadata per job (none of the tested SDK flows do) must store it
+elsewhere and keep a reference.
+
+**The fix.** `webhook_url` is at most 2,048 bytes (`400
+invalid_webhook_url`), `metadata` at most 16 KiB as JSON (`413
+payload_too_large`), and a list of jobs leaves out metadata over 1 KiB
+with `"metadata_omitted": true`, as it leaves out large inputs.
+
+### Provider calls made free by cancelling the job
+
+Fixed in the third-review commit. Control plane.
+
+**What was wrong.** `POST /v1/jobs/{id}/cancel` finished the job at once
+with a cost of zero and wrote that to the ledger. The runner, on finding
+its job finished, dropped whatever the provider then returned. For
+providers that answer a request with the result (images, speech) and for
+those that cannot be told to stop (xAI video, Gemini's Interactions API),
+the call still completed at the provider, and the operator paid for it.
+If the cancel arrived while outputs were being stored, the stored files
+stayed behind with no job pointing at them. And a cancelled job left the
+key's open-jobs count at once, while its provider call went on.
+
+**What it allowed.** A key holder who cancelled each job a moment after
+creating it had the provider do the work at the operator's expense, with
+nothing billed to the key and nothing counted against its budget; by
+cancelling and creating in a loop, more provider calls at once than
+`max_open_jobs` allows. The result itself was not handed out, so this was
+waste and budget evasion rather than free media, except where a provider
+side effect was the point.
+
+**What to do.** Update the control plane. If you bill from the ledger,
+look for keys with many cancelled jobs (status 499 with `cost_usd` 0).
+
+**The fix.** A job cancelled while its provider call is in flight is
+`canceled` for the client at once, but stays out of the ledger and in the
+open-jobs count until its runner knows how the call ended. A call that
+completed is billed on the cancelled job at the route's price for the
+outputs the provider reported (`cost_usd` on the job, status 499 in the
+ledger, attempt outcome `completed_after_cancel`); nothing is downloaded,
+and outputs that were already stored are deleted. A provider that can be
+told to stop is told, and asked once more whether it had finished anyway;
+one that cannot is polled until it finishes or the route's timeout
+passes. A failed or timed-out attempt costs nothing. The job's webhook is
+sent when the account is closed, so it carries the final cost.
+
+**What it costs.** A cancel no longer guarantees a cost of zero, and a
+`job.canceled` webhook can arrive up to the route's timeout after the
+cancel.
+
+### Disk exhaustion through a provider's answer
+
+Fixed in the third-review commit. Control plane.
+
+**What was wrong.** The list of output files in a provider's answer was
+taken as it came: every URL in it was downloaded, each up to
+`media.max_output_bytes` (512 MiB by default). The fal and Replicate
+adapters collect every URL they find anywhere in the result. And a
+`content_type` in the answer that was not a string raised an error after
+the download, which failed the job and left the downloaded file in the
+download directory, where nothing ever removed it.
+
+**What it allowed.** Whoever controls a configured media provider's
+answers (the provider, or a model on it that can shape its own output
+JSON) could make the control plane download a thousand files of the
+largest size for one job, or leave one file behind per job, until the
+disk that also holds the ledger and the job log was full.
+
+**What to do.** Update the control plane. Check the download directory
+(`<media.storage.dir>/tmp`, or `omnigate-media-tmp` in the system's temp
+directory when outputs go to a bucket) for old files; the new version
+removes them at start.
+
+**The fix.** At most `media.max_outputs_per_job` outputs (16) and
+`media.max_job_output_bytes` in all (2 GiB) are taken per job; an answer
+beyond either fails that attempt. The download files of a job are removed
+however the attempt ends, outputs that reached storage before a failure
+are deleted, a type hint is used only if it is text that looks like a
+media type, and the download directory is swept when the control plane
+starts.
+
+### Other hardening from the third review
+
+Third-review commit. None needs action beyond updating.
+
+- **Quadratic CPU in the filter that hides the usage chunk** (data plane).
+  For streams where the gateway asked for usage on the client's behalf,
+  each read searched everything held back so far for the end of an event:
+  a megabyte per byte for an upstream that sends one endless line slowly.
+  The search resumes where it stopped; the work is linear in the bytes
+  received.
+- **The admin throttles looked first and counted afterwards.** Requests in
+  flight at the same moment all saw the count from before any of them
+  failed, so a burst of parallel guesses got more tries than the limit.
+  An attempt is now counted, atomically, before the secret is compared,
+  and given back when it was right.
+- **A write to a peer that stopped reading could block for ever** (control
+  plane): uploads to a bucket, webhook deliveries and provider calls with
+  large bodies had no timeout on the write itself. Writes now go out in
+  pieces, each with a send timeout, inside the request's deadline.
+- **Outputs in a bucket kept the content type the provider declared**, so
+  a provider could have a presigned link serve `text/html` from the
+  bucket's origin. They get the same reduced type as outputs the gateway
+  serves itself, and a content type with a line break is refused before
+  anything is sent.
+- **A key name could end in a newline** (`$` matches before one): names
+  are now matched to the end of the string, here and in the other
+  validations of that form.
+- **IPv4 clients on a dual-stack socket shared one throttle bucket**
+  (`::ffff:a.b.c.d` was cut to a /64 like any IPv6 address): one client's
+  failed sign-ins locked out all of them. Such an address is counted as
+  the IPv4 address it is.
+- **A managed key's 51st rotation dropped the spend of its oldest
+  secret**, which could lift a key back under a total budget. The lifetime
+  totals of a secret that drops off the list are carried forward.
+- **`::ffff:0:a.b.c.d` and unassigned IPv6 space were not refused** as
+  targets of webhooks and output downloads. Only `2000::/3` is public
+  unicast; everything else is refused (NAT64 is still judged by the IPv4
+  address inside).

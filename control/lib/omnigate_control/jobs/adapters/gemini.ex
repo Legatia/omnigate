@@ -32,7 +32,7 @@ defmodule OmnigateControl.Jobs.Adapters.Gemini do
 
   @impl true
   def submit(up, model, input, ctx) do
-    with true <- model =~ ~r/^[A-Za-z0-9._-]+$/ || {:error, "invalid_input: bad model name"},
+    with true <- model =~ ~r/\A[A-Za-z0-9._-]+\z/ || {:error, "invalid_input: bad model name"},
          {:ok, body} <- request_body(input) do
       url = "#{up.base_url}/v1beta/models/#{model}:generateContent"
 

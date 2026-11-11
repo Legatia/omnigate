@@ -78,7 +78,7 @@ defmodule OmnigateControl.Jobs.Store do
   def create(job, {limit, hashes}) when is_integer(limit) and is_list(hashes), do: create(job, open_cap: {limit, hashes})
   def create(job, caps) when is_list(caps), do: GenServer.call(__MODULE__, {:create, job, caps})
 
-  @doc "Unfinished jobs created under any of `hashes`."
+  @doc "Unfinished jobs created under any of `hashes` (canceled ones whose provider call is still in flight included)."
   def open_count(hashes) when is_list(hashes), do: sum_counters(@index, for(hash <- hashes, do: {:open, hash}))
 
   @doc "Jobs created under any of `hashes` on the UTC day of `now_ms`."
@@ -476,8 +476,11 @@ defmodule OmnigateControl.Jobs.Store do
     e -> {:error, "not encodable as JSON: " <> Exception.message(e)}
   end
 
+  # Unfinished, or canceled while its provider call is still in flight (see
+  # `Jobs.cancel/2`): that call is still running at the provider, so the job
+  # keeps its place in the key's open-jobs limit until it is accounted for.
   defp open?(nil), do: false
-  defp open?(job), do: job["status"] not in @terminal
+  defp open?(job), do: job["status"] not in @terminal or job["provider_pending"] == true
 
   defp count_open(key, delta) when is_binary(key) and delta != 0 do
     :ets.update_counter(idx(), {:open, key}, delta, {{:open, key}, 0})

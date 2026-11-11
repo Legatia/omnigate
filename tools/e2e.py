@@ -880,6 +880,12 @@ def media_checks(stack):
     check("the job records the delivery (3 attempts)", hook.get("status") == "delivered" and hook.get("attempts") == 3, hook)
     status, _, refused = create_job({"model": "image", "input": {"prompt": "x"}, "webhook_url": "file:///etc/passwd"})
     check("a non-http webhook URL is refused at submit time", status == 400, (status, refused))
+    status, _, refused = create_job({"model": "image", "input": {"prompt": "x"}, "webhook_url": MOCK["webhooks"] + "/hook?" + "a" * 2100})
+    check("a webhook URL longer than 2,048 bytes is refused (400 invalid_webhook_url)",
+          status == 400 and (refused.get("error") or {}).get("code") == "invalid_webhook_url", (status, refused))
+    status, _, refused = create_job({"model": "image", "input": {"prompt": "x"}, "metadata": {"note": "m" * 17000}})
+    check("metadata over 16 KiB is refused (413 payload_too_large)",
+          status == 413 and (refused.get("error") or {}).get("code") == "payload_too_large", (status, refused))
 
     section("other providers, cost and cache")
     status, _, video = create_job({"model": "video", "input": {"prompt": "waves", "duration": 5}})
@@ -974,6 +980,28 @@ def media_checks(stack):
     canceled = wait_job(slow.get("id", "missing"), 10)
     check("a running job can be canceled and is not billed",
           canceled.get("status") == "canceled" and close(canceled.get("cost_usd") or 0.0, 0.0), canceled)
+    # (Under another key, so that the main key's sums stay what they were.)
+    _, _, noted = create_job({"model": "image", "input": {"prompt": "listed"}, "metadata": {"note": "m" * 4000}}, key=KEY_OTHER)
+    listed = next((j for j in jcall("GET", GATEWAY + "/v1/jobs?limit=5", key=KEY_OTHER)[2].get("data", []) if j.get("id") == noted.get("id")), {})
+    check("a list of jobs leaves out metadata over 1 KiB and says so; the job itself shows it",
+          listed.get("metadata") is None and listed.get("metadata_omitted") is True
+          and get_job(noted.get("id", "missing"), KEY_OTHER).get("metadata") == {"note": "m" * 4000}, listed)
+    wait_job(noted.get("id", "missing"), key=KEY_OTHER)
+    # A provider that answers a request with the result cannot be told to stop: the
+    # call completes and is paid for, whatever the client does in the meantime.
+    spent = usage_row("other").get("cost_usd") or 0.0
+    files_before = stats("openai_images").get("downloads", 0)
+    _, _, costly = create_job({"model": "image-sync", "input": {"prompt": "mock-slow cube"}}, key=KEY_OTHER)
+    wait_job(costly.get("id", "missing"), 10, until=("running",) + TERMINAL, key=KEY_OTHER)
+    time.sleep(0.5)  # the provider call is in flight now
+    _, _, at_once = jcall("POST", f"{GATEWAY}/v1/jobs/{costly.get('id')}/cancel", key=KEY_OTHER, body={})
+    check("a job canceled while its provider is working is canceled at once ...", at_once.get("status") == "canceled", at_once)
+    billed = wait_until(lambda: (lambda j: j if close(j.get("cost_usd"), 0.05) else None)(get_job(costly.get("id", "missing"), KEY_OTHER)), 10) or {}
+    check("... and billed when the provider completes the call all the same (canceling is not free media)",
+          billed.get("status") == "canceled" and close(billed.get("cost_usd"), 0.05) and billed.get("outputs") == [], billed or get_job(costly.get("id", "missing"), KEY_OTHER))
+    row = wait_until(lambda: (lambda r: r if close((r.get("cost_usd") or 0.0) - spent, 0.05) else None)(usage_row("other")), 10) or usage_row("other")
+    check("... the key's spend in the ledger went up by the job's price, and nothing was fetched or stored",
+          close((row.get("cost_usd") or 0.0) - spent, 0.05) and stats("openai_images").get("downloads", 0) == files_before, (row, spent))
 
     section("control-plane restart in the middle of a job")
     submits_before = stats("fal")["submits"]

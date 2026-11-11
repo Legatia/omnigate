@@ -671,7 +671,13 @@ queued ──▶ running ──▶ succeeded
 5. **Re-host.** Each output is downloaded (or decoded, for inline results),
    hashed, and moved into the configured storage: a local directory, or an
    S3-compatible bucket by SigV4-signed PUT. A download is aborted once it
-   passes `media.max_output_bytes`. An output URL comes out of a
+   passes `media.max_output_bytes`; an answer that lists more than
+   `media.max_outputs_per_job` files, or whose files together pass
+   `media.max_job_output_bytes`, fails the attempt. The download files of
+   a job are removed however the attempt ends. A job that was canceled
+   while its provider call was in flight is not re-hosted at all: the
+   runner only records what the completed call cost
+   ([API](api.md#cancel-a-job)). An output URL comes out of a
    provider's answer, so it is treated like a webhook URL: the host is
    resolved once, every address is checked against the private-address
    rule, and the connection goes to the checked address. Redirects are
@@ -797,8 +803,9 @@ The reasons below are the ones stated in the code and the README.
   client and an output URL from a provider. Both go through one module
   (`net_guard.ex`) that resolves the host once, refuses anything that is
   not a public unicast address (loopback, private, link-local, carrier NAT,
-  documentation and benchmarking ranges, multicast, and the IPv6 forms that
-  carry an IPv4 address inside), and hands back the address to connect to.
+  documentation and benchmarking ranges, multicast, the IPv6 forms that
+  carry an IPv4 address inside, and all of IPv6 outside `2000::/3`), and
+  hands back the address to connect to.
 - **A limit that guards paid work is enforced where the work starts.** The
   data plane rate-limits job creation, but only for the path it recognises
   as one; the control plane counts again in the handler that creates the

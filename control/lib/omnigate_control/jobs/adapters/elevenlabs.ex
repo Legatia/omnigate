@@ -23,7 +23,7 @@ defmodule OmnigateControl.Jobs.Adapters.ElevenLabs do
   def submit(up, model, input, ctx) do
     with text when is_binary(text) and text != "" <- input["text"],
          voice when is_binary(voice) and voice != "" <- input["voice_id"],
-         true <- voice =~ ~r/^[A-Za-z0-9_-]+$/ do
+         true <- voice =~ ~r/\A[A-Za-z0-9_-]+\z/ do
       format = input["output_format"] || "mp3_44100_128"
       url = "#{up.base_url}/v1/text-to-speech/#{voice}?" <> URI.encode_query(%{"output_format" => format})
       body = input |> Map.drop(["voice_id", "output_format"]) |> Map.put("model_id", model)

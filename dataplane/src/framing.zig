@@ -254,6 +254,22 @@ pub fn disown(req: *http.Client.Request) void {
     if (req.reader.state == .received_head) req.reader.state = .closing;
 }
 
+/// Tear down `req`. The connection goes back to std's pool only when that
+/// is proven safe: the response head arrived (`head_received`) and the body
+/// was then read to the end of the message through `release`. In every other
+/// case it is closed: in particular when the request could not be written in
+/// full, was cancelled while being written, or never got a head. std's
+/// own `Request.deinit` pools the connection in all of those (its reader is
+/// still "ready"), and a pooled socket whose write failed fails every
+/// request it is handed from then on.
+pub fn finish(req: *http.Client.Request, head_received: bool) void {
+    if (!head_received) {
+        if (req.connection) |connection| connection.closing = true;
+    }
+    disown(req);
+    req.deinit();
+}
+
 /// The body was read through `body`: if that reached the end of the
 /// message, the connection may carry another exchange.
 pub fn release(req: *http.Client.Request, body: *const BodyReader) void {

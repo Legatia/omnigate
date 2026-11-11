@@ -446,6 +446,7 @@ closing usage figures were seen.
 | The client disconnected mid-response, or stopped reading for `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 seconds) | Finishes with the client's connection and keeps reading the upstream **in the background**: to the provider's closing usage, or the end of the answer, or for at most `OMNIGATE_ABORT_DRAIN_MS` (2 minutes) and `OMNIGATE_ABORT_DRAIN_MAX_MB` (64) more megabytes. Then closes the upstream connection. | The provider's real figures if they arrived; otherwise an estimate. |
 | The upstream went silent until the stream idle timeout | Closes both sides | The real figures if they had already been seen; otherwise an estimate. |
 | The upstream broke the connection mid-response, or sent less than it declared | Drops the client's connection (without the closing chunk of the chunked response) | The same. |
+| An event stream reached its proper end, and the provider never reported usage (it ignores `stream_options.include_usage`, as some OpenAI-compatible servers do) | Nothing special: the client got the whole answer, status 200 | An estimate. Before the third-review commit such a call was recorded with zero tokens. |
 
 - **Reading on happens off the client's connection.** The connection is
   free at once; the exchange with the provider is handed to a task of its
@@ -943,8 +944,14 @@ Run this way it also plays the other side and checks the limits:
   bodies shorter than their `content-length`, both framings at once, a
   header smuggled into the content type (special model names of
   `tools/mock_upstream.py` on port 9005);
+- **an upstream that breaks connections** (inside the script, on port
+  9006): it resets them while they idle, while a request is being written
+  to them, or never reads the request; the next request must work, on a
+  new connection;
 - **a control plane that does the same**, a stand-in inside the script on
   port 4300, with a second gateway on port 8190 pointed at it;
+- **names and flags a provider's parser could read differently**
+  (`"Model"`, `"Stream": true`, `"stream": "true"`): refused;
 - **the limits that apply before a request body is read**: the per-key
   concurrency cap, the rate limit, the size limit;
 - **bodies that are cheap to send and used to be expensive to parse**;
@@ -1056,7 +1063,9 @@ A media job that ends `failed`:
 | `invalid_input: ...` | The adapter needs a field the job's `input` lacks; see [Providers](providers.md#media-providers). |
 | `timeout` | The target did not finish within the route's `timeout_s`. |
 | `no_outputs`, `no_output: ...` | The provider finished without a file (for Gemini: a blocked prompt or an early stop). |
-| `output_fetch_failed: ...` | The output could not be downloaded: an HTTP error, more than `max_output_bytes`, or a stalled download. `output_fetch_failed: blocked: output url resolves to a private or loopback address` means the URL the provider returned, or one it redirected to, does not point at a public address; the control plane refuses to fetch it unless `media.webhooks.allow_private` is set. `too many redirects` means more than five. |
+| `too_many_outputs: ...` | The provider's answer listed more files than `media.max_outputs_per_job` (16). Nothing was downloaded. Raise the setting if the model really produces that many. |
+| `completed_after_cancel` | Not a failure: the job was canceled, the provider completed the call all the same, and the job was billed for it ([API](api.md#cancel-a-job)). |
+| `output_fetch_failed: ...` | The output could not be downloaded: an HTTP error, more than `max_output_bytes` (or, with `the outputs together exceed media.max_job_output_bytes`, more than that in all), or a stalled download. `output_fetch_failed: blocked: output url resolves to a private or loopback address` means the URL the provider returned, or one it redirected to, does not point at a public address; the control plane refuses to fetch it unless `media.webhooks.allow_private` is set. `too many redirects` means more than five. |
 | `storage_error` | Outputs could not be stored: bucket endpoint, credentials or permissions. The control log has the detail. |
 | `route_removed` | The media route was deleted from the config while the job was unfinished. |
 

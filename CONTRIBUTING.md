@@ -317,7 +317,7 @@ control/              Elixir control plane
     storage.ex, storage/local.ex, storage/s3.ex, sigv4.ex, url_signer.ex
     webhooks.ex       signing, delivery, retries, limits on deliveries in flight
     http.ex           outbound HTTP/1.1 on :gen_tcp and :ssl; every response is read through a cap
-  test/               unit tests; wave6_test.exs holds the regression tests of the second security review
+  test/               unit tests; wave6_test.exs and review3_test.exs hold the regression tests of the second and third security reviews
   Dockerfile
 
 config/

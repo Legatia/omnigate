@@ -307,8 +307,9 @@ jobs:
 
       # Without --gateway the tool starts its own stack and stops it again.
       # Listens on 127.0.0.1 only: 9001-9005 (text mocks), 14000 (control
-      # plane), 18080 (gateway), and for the hostile control plane 4300 (a
-      # stand-in inside the tool) and 8190 (a second gateway pointed at it).
+      # plane), 18080 (gateway), 9006 (an upstream inside the tool that breaks
+      # connections), and for the hostile control plane 4300 (a stand-in
+      # inside the tool) and 8190 (a second gateway pointed at it).
       # State and logs go to a directory named omnigate-malformed-* under
       # TMPDIR; it is kept when a case fails.
       # The generated cases use the tool's default seed and count, so a

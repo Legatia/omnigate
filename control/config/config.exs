@@ -11,6 +11,7 @@ if config_env() == :test do
     jobs_path: Path.join(System.tmp_dir!(), "omnigate-test-jobs-#{stamp}.jsonl"),
     keys_path: Path.join(System.tmp_dir!(), "omnigate-test-keys-#{stamp}.json"),
     audit_path: Path.join(System.tmp_dir!(), "omnigate-test-audit-#{stamp}.jsonl"),
+    payments_path: Path.join(System.tmp_dir!(), "omnigate-test-payments-#{stamp}.json"),
     # Stands in for OMNIGATE_INTERNAL_TOKEN, which the control plane refuses
     # to start without. Tests that call /internal set the variable themselves.
     internal_token: "test-internal-token-from-app-env",

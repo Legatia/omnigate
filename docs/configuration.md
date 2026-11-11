@@ -57,7 +57,9 @@ Top-level shape:
   "upstreams": [],
   "routes": [],
   "media": {},
-  "retention": {}
+  "retention": {},
+  "credits": {},
+  "payments": {}
 }
 ```
 
@@ -85,6 +87,7 @@ listed before the managed keys created through it
 | `disabled` | boolean | `false` | `true` switches the key off without removing it: the gateway answers it with 401, and its usage stays in the ledger. |
 | `webhook_secret` | string | none | Signing secret for this key's job webhooks. |
 | `webhook_secret_env` | string | none | Name of an environment variable (read by the control plane) holding that secret. Used when `webhook_secret` is absent. |
+| `burn_multiplier` | number, 0.01 to 100 | absent (the value of `credits.burn_multiplier`) | For a key with a total budget: how much of its credit one dollar of provider cost uses up. Ignored for a key with a monthly or daily budget, or none. See [Prepaid credit](credits.md#the-burn-multiplier). Anything else is rejected when the file is loaded. |
 | `privacy` | `true`, or an object | absent (off) | Privacy mode for every request of the key: `true`, or `{"no_store", "redact", "unlink", "encrypt_to", "attested"}` part by part. What each part does, and what none of them does, is in [Privacy mode](privacy.md). Anything it does not know (a field, a class of `redact`, a recipient that is not a valid `age1...` address) is rejected when the file is loaded. |
 
 `max_concurrent` is new with the close-out commit (the one after
@@ -556,6 +559,43 @@ The secret used for a job is the first one that exists: the key's own
 that asks for a webhook when none of these is set is refused
 (`webhook_not_configured`).
 
+### Credits
+
+`credits` sets what prepaid credit burns and earns. All of it is optional,
+and with nothing set a prepaid key behaves as it always did. The rule itself
+is in [Prepaid credit](credits.md).
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `burn_multiplier` | number, 0.01 to 100 | `1` | Credit a prepaid key burns per dollar of provider cost. A key's own `burn_multiplier` wins. |
+| `bonus_annual_rate` | number, 0 to 10 | `0` (no bonus) | Rate per year, as a fraction (`0.05` is 5%), of the weekly bonus on bonus-eligible credit. |
+| `sample_interval_s` | whole number, 1 to 86,400 | `900` | How often eligible balances are sampled for the bonus's weekly average, while a rate is set. |
+| `admin_topups_eligible` | boolean | `false` | Whether a top-up through the admin API earns the bonus when the call does not say. |
+
+A field `credits` does not know, or a value outside these ranges, is rejected
+when the file is loaded.
+
+### Payments
+
+`payments` lets the holder of a prepaid key buy credit through a payment
+provider. Absent (the default) there are no payment endpoints at all. Every
+field, and what the gateway does and does not do with money, is in
+[Payments](payments.md#switching-it-on).
+
+```json
+"payments": { "provider": "near_intents", "recipient": "your-account.near" }
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `provider` | string | required | `near_intents`, the one provider there is. |
+| `recipient` | string | required | The operator's account at the provider (a NEAR account), where the settle asset is delivered. |
+| `min_usd`, `max_usd` | numbers | `1`, `10000` | Bounds on one payment. |
+| `quote_ttl_s` | whole number, 60 to 86,400 | `1800` | How long a payer has to send the deposit. |
+| `bonus_eligible` | boolean | `true` | Whether credit bought this way earns the weekly bonus. |
+| `poll_interval_s` | whole number, 1 to 3,600 | `15` | How often an open payment's status is asked for. |
+| `settle_asset`, `settle_decimals`, `slippage_bps`, `jwt_env`, `base_url`, `public_key` | | see [Payments](payments.md#switching-it-on) | The `near_intents` provider's own settings. |
+
 ## Environment variables
 
 ### Both processes
@@ -634,6 +674,7 @@ quietly becomes a default.
 | `OMNIGATE_JOBS` | `data/jobs.jsonl` | Job state. Job inputs over 8 KiB are kept next to it in the directory `<this path>.inputs/` (`data/jobs.jsonl.inputs/`), one file per job; it belongs to the job log and must be backed up with it. |
 | `OMNIGATE_KEYS` | `data/keys.json` | Gateway keys created through the admin API or the dashboard: hashes, limits, and a key's webhook secret if it has one. See [Admin](admin.md#gateway-keys-two-sources). |
 | `OMNIGATE_AUDIT_LOG` | `data/audit.jsonl` | The admin audit log. Rotated files (`.1` to `.3`) are kept next to it. See [Admin](admin.md#the-audit-log). |
+| `OMNIGATE_PAYMENTS` | `data/payments.json` | [Payments](payments.md) for prepaid credit: deposit instructions, states, what was credited. Written only when the config has a `payments` section. |
 | `OMNIGATE_RECEIPTS` | `data/receipts.json` | [Receipts](attestation.md#a-receipt-for-each-answer) of answers from attested upstreams: hashes, signatures and verdicts, no content. Written only when there is an attested upstream. |
 | `OMNIGATE_AUDIT_MAX_MB` | `50` | Size, in megabytes (fractions allowed), at which the audit log is rotated. `0` turns rotation off. A negative value, or one that is not a number (`50MB`, say), stops the start with a message that names the variable; earlier commits replaced it by the default without a word. |
 | `OMNIGATE_MEDIA_DIR` | `data/media` | Where local output storage keeps files, unless the config names a `dir`. |

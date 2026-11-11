@@ -91,6 +91,26 @@ defmodule OmnigateControl.Audit do
   end
 
   @doc """
+  Record something the gateway did by itself (a bonus credited, a payment
+  settled): no caller, no address. Never waits for the log.
+  """
+  def system(action, target, outcome, extra \\ []) do
+    entry =
+      %{
+        "ts" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+        "action" => action,
+        "target" => target,
+        "auth" => "system",
+        "address" => nil,
+        "outcome" => to_string(outcome)
+      }
+      |> put_if("topup", extra[:topup])
+      |> put_if("payment", extra[:payment])
+
+    GenServer.cast(__MODULE__, {:record, entry})
+  end
+
+  @doc """
   Record something an anonymous caller did (a failed or throttled login).
   Never waits for the log: the first attempt per address, action and outcome
   in a minute is written in the background, later ones are only counted and

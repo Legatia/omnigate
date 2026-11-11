@@ -208,6 +208,7 @@ The images change these defaults; everything else is as in
 | control | `OMNIGATE_KEYS` | `/data/keys.json` |
 | control | `OMNIGATE_AUDIT_LOG` | `/data/audit.jsonl` |
 | control | `OMNIGATE_RECEIPTS` | `/data/receipts.json` |
+| control | `OMNIGATE_PAYMENTS` | `/data/payments.json` |
 | control | `OMNIGATE_MEDIA_DIR` | `/data/media` |
 | dataplane | `OMNIGATE_LISTEN` | `0.0.0.0:8080` |
 | dataplane | `OMNIGATE_CONTROL_URL` | `http://control:4000` |

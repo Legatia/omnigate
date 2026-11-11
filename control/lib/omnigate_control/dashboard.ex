@@ -148,7 +148,7 @@ defmodule OmnigateControl.Dashboard do
 
         budget ->
           # Against a monthly or daily budget, what counts is this period's spend.
-          spent = if k.budget_period == "total", do: k.cost_usd, else: k.period_spend_usd
+          spent = k.period_spend_usd
 
           [
             fmt(:usd, spent),
@@ -589,7 +589,7 @@ defmodule OmnigateControl.Dashboard do
       var st=td('',pill(k.state,stateClass(k.state)));if(k.privacy_summary)st.appendChild(el('span','muted sub','private: '+k.privacy_summary));r.appendChild(st);
       var s=td('spend');
       if(k.budget_usd==null){s.appendChild(document.createTextNode(usd(k.cost_usd)+' '));s.appendChild(muted('no budget'))}
-      else{var total=k.budget_period==='total'||!k.budget_period,spent=total?k.cost_usd:k.period_spend_usd;
+      else{var total=k.budget_period==='total'||!k.budget_period,spent=k.period_spend_usd;
         s.appendChild(document.createTextNode(usd(spent)+' '));s.appendChild(muted('of '+usd(k.budget_usd)+periodLabel(k.budget_period)));
         var p=el('progress');p.max=100;var pc=k.budget_usd<=0?100:Math.min(100,Math.round(spent/k.budget_usd*100));p.value=pc;p.textContent=pc+'%';s.appendChild(p);
         if(!total)s.appendChild(el('span','muted sub',usd(k.cost_usd)+' in total'))}

@@ -466,10 +466,16 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
 
     const endpoint: ?Endpoint = if (method == .POST) Endpoint.forPath(path) else null;
     const is_job_create = method == .POST and std.mem.eql(u8, path, "/v1/jobs");
+    // Payments for prepaid credit: the control plane's, and only there when
+    // it is configured to take them (it answers 404 otherwise).
+    const is_payments = std.mem.eql(u8, path, "/v1/payments") or std.mem.startsWith(u8, path, "/v1/payments/");
+    // Starting a payment or asking what one would take: both ask the provider.
+    const is_payment_ask = method == .POST and is_payments;
 
     // A key over its budget may not start anything new. It keeps access to
     // what it already has: the model list, the state and files of its jobs,
-    // and cancelling a job (which only saves money).
+    // and cancelling a job (which only saves money). And it may pay: the
+    // payment endpoints are open to it, which is the point of them.
     if (key.blocked and (endpoint != null or is_job_create))
         return respondError(acc, request, .payment_required, "budget_exceeded", "this key has exhausted its budget");
 
@@ -493,7 +499,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
 
     // --- async media jobs: owned by the control plane ---------------------
     // (which also applies the key's model limits to them)
-    if (is_jobs or is_files) {
+    if (is_jobs or is_files or is_payments) {
         if (method != .GET and method != .POST)
             return respondError(acc, request, .method_not_allowed, "method_not_allowed", "use GET or POST");
         // Forwarded to the control plane as a header, so nothing in it may
@@ -510,7 +516,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         }
         // Only requests that start work count against the rate limit;
         // polling a job does not.
-        if (is_job_create) {
+        if (is_job_create or is_payment_ask) {
             if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(acc, request, secs);
         }
         const job_body: ?[]u8 = if (method == .POST)
@@ -521,7 +527,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         if (job_body) |b| if (!guard_mod.jsonDepthOk(b, guard_mod.max_client_json_depth))
             return respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply");
         if (dry_run_privacy)
-            return respondError(acc, request, .bad_request, "invalid_request", "x-omnigate-dry-run is for text endpoints; a media job has no body that is rewritten");
+            return respondError(acc, request, .bad_request, "invalid_request", "x-omnigate-dry-run is for text endpoints; a media job or a payment has no body that is rewritten");
         // No media provider proves what it runs on, so a job that may only
         // go to an attested one cannot go anywhere.
         if (is_job_create and (privacy_request.attested or (key.privacy != null and key.privacy.?.attested)))
@@ -2239,7 +2245,7 @@ test "receipt ids are plain tokens" {
     for ([_][]const u8{ "", "a/b", "..%2f", "a b", "a?b", &@as([129]u8, @splat('a')) }) |bad| try std.testing.expect(!receiptId(bad));
 }
 
-/// Hand a `/v1/jobs*`, `/v1/files/*` or `/v1/attestations/*` request to the control plane at
+/// Hand a `/v1/jobs*`, `/v1/files/*`, `/v1/payments*` or `/v1/attestations/*` request to the control plane at
 /// `/internal<target>` and stream its answer back unchanged. `key_sha256` is
 /// null only for signed file URLs, which the control plane verifies itself.
 fn forwardToControl(
@@ -2315,7 +2321,7 @@ fn forwardToControl(
         guard.arm(app.io, app.client_stall_timeout_ms);
         // The path only: a signed URL's query is a credential.
         log.warn("control plane request {s} failed: {t}", .{ path, err });
-        return respondError(acc, request, .service_unavailable, "control_plane_unavailable", "media jobs need the control plane, which is not reachable");
+        return respondError(acc, request, .service_unavailable, "control_plane_unavailable", "this endpoint is served by the control plane, which is not reachable");
     };
     // An answer of our own may follow at once (the checks below).
     guard.arm(app.io, app.client_stall_timeout_ms);

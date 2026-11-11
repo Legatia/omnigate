@@ -232,6 +232,12 @@ current budget period reaches the budget.
   ([Admin](admin.md#budgets-and-periods)). A managed key's total budget can
   also be added to, once per payment reference
   ([top-ups](admin.md#top-ups)): that is how prepaid credit is sold.
+- **A total budget is counted in credit.** For a key with a total budget the
+  spend that is compared with the budget is its credit burned: the cost
+  times its burn multiplier (`credits.burn_multiplier`, or the key's own).
+  At the default multiplier of 1 that is the cost, as it always was. A
+  monthly or daily budget is always counted at cost. See
+  [Prepaid credit](credits.md).
 - **An event counts in the period of its own time**: when the request
   finished on the data plane (for a media job, when the job finished), not
   when the event reached the ledger. Usage spooled through an outage

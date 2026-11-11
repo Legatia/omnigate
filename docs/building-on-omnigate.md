@@ -111,10 +111,17 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer og-unli
 
 ## Taking payments: prepaid keys and top-ups
 
-omnigate has no payment code and wants none. It has a budget per key and one
-call that adds to it safely. A payment service of any kind (a chain watcher,
-a card processor's webhook receiver, a manual back-office tool) is a small
-program next to the control plane:
+omnigate has a budget per key and one call that adds to it safely. A
+payment service of any kind (a chain watcher, a card processor's webhook
+receiver, a manual back-office tool) is a small program next to the control
+plane, and this section is how to write one.
+
+(There is now also one payment provider built in, opt-in: with a `payments`
+section in the config, key holders buy credit themselves in crypto through
+NEAR Intents, with no program of yours in between. See
+[Payments](payments.md). It credits keys through the same top-up described
+here, and everything else on this page works next to it. What credit burns
+and earns, whoever paid for it, is in [Prepaid credit](credits.md).)
 
 1. **A customer gets a key with an empty prepaid budget.** A `total` budget
    is credit bought in advance: it does not start over by itself.
@@ -199,8 +206,8 @@ Three views, for three purposes:
 
 | You want | Use |
 |---|---|
-| Every single request and job, to bill or analyse | `GET /admin/events`, below |
-| Totals per key, right now | `GET /admin/keys` (`requests`, tokens, `cost_usd`, `period_spend_usd`) |
+| Every single request and job, and every top-up, to bill or analyse | `GET /admin/events`, below |
+| Totals per key, right now | `GET /admin/keys` (`requests`, tokens, `cost_usd`, `credits_burned_usd`, `period_spend_usd`, and a prepaid key's `credits`) |
 | Time series and alerts | `GET /metrics` (`omnigate_key_*` per key, never per tag) |
 
 **The usage feed.** `GET /admin/events` returns what the ledger recorded,
@@ -217,7 +224,7 @@ curl "http://127.0.0.1:4000/admin/events?limit=2" -H "Authorization: Bearer dev-
       "cursor": "1-412", "id": "0d5f...", "kind": "text", "ts": "2026-11-11T18:00:01.120Z", "received_at": "2026-11-11T18:00:01.640Z",
       "key": "customer-42", "tag": "tenant-42", "model": "demo-chat", "upstream": "mock-ok", "target_model": "ok-1",
       "status": 200, "stream": false, "input_tokens": 11, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 7,
-      "outputs": null, "cached": false, "estimated": false, "latency_ms": 31, "cost_usd": 0.0000041
+      "outputs": null, "cached": false, "estimated": false, "latency_ms": 31, "cost_usd": 0.0000041, "credits_usd": 0.0000041
     }
   ],
   "next": "1-824",
@@ -256,6 +263,16 @@ How to consume it:
   hashes are never in the feed.
 - **No content.** The ledger holds no prompt, answer, job input or output,
   so neither does the feed.
+- **`cost_usd` and `credits_usd`.** The first is what the provider cost.
+  The second is what the event burned of the key's credit: the same number,
+  unless the key is prepaid and a
+  [burn multiplier](credits.md#the-burn-multiplier) applies.
+- **`"kind": "credit"`** is credit added to a key, in the same order as its
+  usage: `amount_usd`, `source` (`admin`, a payment provider's name,
+  `bonus`), `reference`, `bonus_eligible` and `budget_usd` (the budget after
+  it); `cost_usd` and `credits_usd` are 0. A consumer that only wants usage
+  skips this kind. (New with the credits commit: a consumer written before
+  it sees rows without a model or tokens.)
 - **`estimated: true`** marks token counts the gateway had to estimate
   because a response ended before the provider's own figures arrived;
   `cached: true` marks an answer from the gateway's response cache, counted

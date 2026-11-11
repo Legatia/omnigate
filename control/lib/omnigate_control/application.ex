@@ -59,6 +59,8 @@ defmodule OmnigateControl.Application do
       {OmnigateControl.Jobs.Store, path: jobs_path()},
       {Task.Supervisor, name: OmnigateControl.Jobs.TaskSup},
       OmnigateControl.Webhooks,
+      # Samples prepaid balances for the weekly bonus; idle without a bonus rate.
+      OmnigateControl.Credits.Sampler,
       # One-shot: continue jobs and webhooks left unfinished by the last run.
       Supervisor.child_spec({Task, &OmnigateControl.Jobs.resume_all/0}, id: :jobs_resume, restart: :temporary),
       OmnigateControl.Retention
@@ -71,6 +73,8 @@ defmodule OmnigateControl.Application do
       OmnigateControl.Attestation.Manager,
       # A receipt per answer from an attested upstream; idle without one.
       {OmnigateControl.Receipts, path: receipts_path()},
+      # Payments for prepaid credit; idle unless the config has "payments".
+      {OmnigateControl.Payments, path: payments_path()},
       {OmnigateControl.Guard, name: OmnigateControl.StateGuard, supervisor_name: OmnigateControl.Supervisor, children: state, strategy: :one_for_one},
       # HTTP/1.1 only: nothing here needs HTTP/2 or WebSockets, and every
       # protocol left on is one more parser in front of the authentication.
@@ -112,6 +116,12 @@ defmodule OmnigateControl.Application do
     System.get_env("OMNIGATE_AUDIT_LOG") ||
       Application.get_env(:omnigate_control, :audit_path) ||
       Path.expand("data/audit.jsonl", File.cwd!())
+  end
+
+  defp payments_path do
+    System.get_env("OMNIGATE_PAYMENTS") ||
+      Application.get_env(:omnigate_control, :payments_path) ||
+      Path.expand("data/payments.json", File.cwd!())
   end
 
   defp receipts_path do

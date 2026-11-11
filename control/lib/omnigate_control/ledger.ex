@@ -123,6 +123,16 @@ defmodule OmnigateControl.Ledger do
   def record_media(%{"id" => _} = event), do: GenServer.call(__MODULE__, {:record_batch, [event], :media})
 
   @doc """
+  Record credit added to a key (a top-up or a bonus), so that the events
+  feed is a complete statement: usage and credit in one order. The event is
+  `%{"id", "key_sha256", "amount_usd", "source", "reference", "eligible",
+  "budget_usd"}`; it counts as no request and costs nothing.
+  """
+  def record_credit(%{"id" => id, "key_sha256" => key} = event) when is_binary(id) and is_binary(key) do
+    GenServer.call(__MODULE__, {:record_batch, [Map.put(event, "status", 200)], :credit})
+  end
+
+  @doc """
   Forget the dedup ids of every UTC day that ended at or before `cutoff_ms`
   (unix milliseconds). Returns how many ids were dropped.
   """
@@ -170,6 +180,19 @@ defmodule OmnigateControl.Ledger do
 
   @doc "Spend in USD for one key hash."
   def spend(key_sha256), do: totals(key_sha256).cost_usd
+
+  @doc """
+  What one key hash has burned in credit beyond what the provider cost: the
+  sum over its events of `credits_usd - cost_usd`. Zero for every key billed
+  at the provider cost (a burn multiplier of 1), so cost plus this is what a
+  prepaid key has used of its credit. See `OmnigateControl.Credits`.
+  """
+  def credits_extra(key_sha256) do
+    case :ets.lookup(@table, {:credits_extra, key_sha256}) do
+      [{_, extra}] -> extra
+      [] -> 0.0
+    end
+  end
 
   @doc """
   Spend in USD for one key hash in the current budget period: `"monthly"`
@@ -507,7 +530,8 @@ defmodule OmnigateControl.Ledger do
     {:reply, {:ok, counts}, state}
   end
 
-  def handle_call(:recent, _from, state), do: {:reply, state.recent, state}
+  # Requests and jobs; credit added to a key is not one.
+  def handle_call(:recent, _from, state), do: {:reply, Enum.reject(state.recent, &(&1["kind"] == "credit")), state}
 
   def handle_call({:events, cursor, limit, keep}, _from, state) do
     {:reply, Files.read_events(state.path, cursor, {state.segment, state.offset}, limit, @events_scan_bytes, keep), state}
@@ -708,19 +732,31 @@ defmodule OmnigateControl.Ledger do
     end
   end
 
+  # Credit added to a key: only the fields a statement needs.
+  defp enrich(event, :credit) do
+    amount = if is_number(event["amount_usd"]) and event["amount_usd"] >= 0 and event["amount_usd"] <= 1.0e12, do: event["amount_usd"] * 1.0, else: 0.0
+
+    event
+    |> Map.take(["id", "key_sha256", "status", "source", "reference", "budget_usd", "ts_ms"])
+    |> Map.merge(%{"kind" => "credit", "amount_usd" => amount, "eligible" => event["eligible"] == true, "cost_usd" => 0.0})
+    |> stamp()
+  end
+
   # Media job events are priced by the job runner; only timestamps are added.
   defp enrich(event, :media) do
     cost = if is_number(event["cost_usd"]) and event["cost_usd"] >= 0 and event["cost_usd"] <= 1.0e12, do: event["cost_usd"] * 1.0, else: 0.0
 
     event
     |> tagged()
+    |> Map.delete("credits_usd")
     |> Map.merge(%{"kind" => "media", "cost_usd" => cost})
+    |> burn()
     |> stamp()
   end
 
   defp enrich(usage, :text) do
-    # Only the control plane may mark an event as media.
-    usage = Map.delete(usage, "kind")
+    # Only the control plane may mark an event as media, or say what it burns.
+    usage = usage |> Map.delete("kind") |> Map.delete("credits_usd")
 
     # The caller's label (`x-omnigate-tag`): kept only in the shape the data
     # plane lets through, whoever sent the event.
@@ -745,8 +781,21 @@ defmodule OmnigateControl.Ledger do
         true -> cost(tokens, prices(usage))
       end
 
-    usage |> Map.put("cost_usd", cost) |> stamp()
+    usage |> Map.put("cost_usd", cost) |> burn() |> stamp()
   end
+
+  # What the event burns of a prepaid key's credit, when that is not simply
+  # its cost (`OmnigateControl.Credits`): the provider cost times the key's
+  # burn multiplier, written next to the cost. At a multiplier of 1 the event
+  # is exactly what it was before credit existed.
+  defp burn(%{"cost_usd" => cost, "key_sha256" => key} = event) when is_number(cost) and cost > 0 do
+    case OmnigateControl.Credits.multiplier_for_hash(key) do
+      1.0 -> event
+      multiplier -> Map.put(event, "credits_usd", cost * multiplier)
+    end
+  end
+
+  defp burn(event), do: event
 
   # An event for a route or target the config does not have is recorded at
   # no cost: there is no price to apply. That is how real spend goes missing
@@ -795,8 +844,17 @@ defmodule OmnigateControl.Ledger do
     })
   end
 
+  # Credit added to a key changes no usage total (the key store holds it).
+  defp apply_event(%{"kind" => "credit"}), do: :ok
+
   defp apply_event(event) do
     add(event["key_sha256"], event)
+
+    # What a prepaid key burned beyond the provider cost, per key hash.
+    case event["credits_usd"] do
+      credits when is_number(credits) -> add_period({:credits_extra, event["key_sha256"]}, credits - (event["cost_usd"] || 0.0))
+      _ -> :ok
+    end
 
     # One extra row per UTC day (of the event's own time), for "today" figures,
     # and the key's spend in that month and that day, for budget periods.

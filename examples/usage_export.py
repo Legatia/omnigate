@@ -34,8 +34,12 @@ import urllib.request
 
 CONTROL = os.environ.get("OMNIGATE_CONTROL", "http://127.0.0.1:4000").rstrip("/")
 TOKEN = os.environ.get("OMNIGATE_ADMIN_TOKEN", "dev-admin-token-change-me")
+# `cost_usd` is what the provider cost, `credits_usd` what the event burned of
+# a prepaid key's credit (the same unless a burn multiplier applies). Rows of
+# kind "credit" are top-ups and bonuses: `amount_usd`, `source`, `reference`.
 COLUMNS = ["id", "kind", "ts", "key", "tag", "model", "upstream", "target_model", "status", "input_tokens", "cached_input_tokens",
-           "cache_write_input_tokens", "output_tokens", "outputs", "cached", "estimated", "cost_usd"]
+           "cache_write_input_tokens", "output_tokens", "outputs", "cached", "estimated", "cost_usd", "credits_usd",
+           "amount_usd", "source", "reference"]
 
 
 def page(cursor, key, limit):

@@ -49,6 +49,7 @@ ENV OMNIGATE_CONTROL_BIND=0.0.0.0 \
     OMNIGATE_KEYS=/data/keys.json \
     OMNIGATE_AUDIT_LOG=/data/audit.jsonl \
     OMNIGATE_RECEIPTS=/data/receipts.json \
+    OMNIGATE_PAYMENTS=/data/payments.json \
     OMNIGATE_MEDIA_DIR=/data/media \
     RELEASE_DISTRIBUTION=none \
     LANG=C.UTF-8

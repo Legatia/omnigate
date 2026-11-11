@@ -20,6 +20,7 @@ defmodule OmnigateControl.Metrics do
     ledger = Ledger.stats()
     {uptime_ms, _} = :erlang.statistics(:wall_clock)
     attestations = Attestation.Manager.all()
+    payments = OmnigateControl.Payments.stats()
     now_s = System.os_time(:second)
 
     # Across rotations of a managed key, so its series never restart.
@@ -69,6 +70,12 @@ defmodule OmnigateControl.Metrics do
       ),
       metric("omnigate_key_jobs_total", :counter, "Media jobs recorded in the ledger, per gateway key.", per_key.(fn _, t -> t.jobs end)),
       metric("omnigate_key_cost_usd_total", :counter, "Spend in US dollars, per gateway key.", per_key.(fn _, t -> t.cost_usd end)),
+      metric(
+        "omnigate_key_credits_burned_usd_total",
+        :counter,
+        "Credit burned in US dollars, per gateway key: the spend times the key's burn multiplier (equal to the spend at a multiplier of 1).",
+        per_key.(fn k, _ -> Keys.credits_burned(k) end)
+      ),
       metric(
         "omnigate_key_budget_usd",
         :gauge,
@@ -138,6 +145,13 @@ defmodule OmnigateControl.Metrics do
         "Attestation checks since start, by outcome: ok, failed (the evidence did not hold), unavailable (it could not be fetched).",
         Enum.map(Attestation.Manager.counts(), fn {outcome, n} -> {[outcome: outcome], n} end)
       ),
+      metric(
+        "omnigate_payments",
+        :gauge,
+        "Payments for prepaid credit held by this control plane, by status (none unless payments are configured).",
+        Enum.map(payments.by_status, fn {status, n} -> {[status: status], n} end)
+      ),
+      metric("omnigate_payments_credited_usd", :gauge, "US dollars credited to keys from the payments held.", [{[], payments.credited_usd}]),
       metric(
         "omnigate_receipts",
         :gauge,

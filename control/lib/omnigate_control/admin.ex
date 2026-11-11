@@ -10,6 +10,7 @@ defmodule OmnigateControl.Admin do
   @doc "One key as the admin API and the dashboard show it."
   def key_view(key) do
     totals = Keys.totals(key)
+    burned = Keys.credits_burned(key)
 
     %{
       name: key.name,
@@ -43,7 +44,12 @@ defmodule OmnigateControl.Admin do
       output_tokens: totals.output_tokens,
       cached_responses: totals.cached_responses,
       jobs: totals.jobs,
-      cost_usd: totals.cost_usd
+      # What the providers cost, and what that burned of the key's credit
+      # (the same number unless a burn multiplier applies).
+      cost_usd: totals.cost_usd,
+      credits_burned_usd: burned,
+      # A prepaid key's credit (null for any other key): see `Credits`.
+      credits: OmnigateControl.Credits.view(key, burned)
     }
   end
 
@@ -133,6 +139,25 @@ defmodule OmnigateControl.Admin do
 
   def parse_cursor(_), do: :error
 
+  # Credit added to a key: a top-up or a bonus.
+  defp event_view(%{"kind" => "credit"} = e, names, position) do
+    %{
+      cursor: cursor_text(position),
+      id: e["id"],
+      kind: "credit",
+      ts: e["ts"],
+      received_at: e["received_at"],
+      key: Map.get(names, e["key_sha256"]),
+      amount_usd: e["amount_usd"] || 0.0,
+      source: e["source"],
+      reference: e["reference"],
+      bonus_eligible: e["eligible"] == true,
+      budget_usd: e["budget_usd"],
+      cost_usd: 0.0,
+      credits_usd: 0.0
+    }
+  end
+
   defp event_view(e, names, position) do
     media = e["kind"] == "media"
 
@@ -160,7 +185,10 @@ defmodule OmnigateControl.Admin do
       cached: e["cached"] == true,
       estimated: e["estimated"] == true,
       latency_ms: e["latency_ms"],
-      cost_usd: e["cost_usd"] || 0.0
+      # What the provider cost, and what the event burned of the key's
+      # credit: the cost times its burn multiplier at the time.
+      cost_usd: e["cost_usd"] || 0.0,
+      credits_usd: if(is_number(e["credits_usd"]), do: e["credits_usd"], else: e["cost_usd"] || 0.0)
     }
   end
 
@@ -189,6 +217,7 @@ defmodule OmnigateControl.Admin do
       estimated: e["estimated"] == true,
       latency_ms: e["latency_ms"],
       cost_usd: e["cost_usd"] || 0.0,
+      credits_usd: if(is_number(e["credits_usd"]), do: e["credits_usd"], else: e["cost_usd"] || 0.0),
       attempts: attempts(e["attempts"])
     }
   end

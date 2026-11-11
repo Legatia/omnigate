@@ -418,11 +418,18 @@ curl http://127.0.0.1:4000/admin/keys/my-app/topup -H "Authorization: Bearer dev
 ```
 
 The answer is `200` with `{"key": <the key as in a listing>, "topup":
-{"reference", "key", "amount_usd", "budget_usd", "at", "replayed"}}`.
+{"reference", "key", "amount_usd", "budget_usd", "at", "source", "eligible",
+"replayed"}}`.
 
 - `amount_usd` is a number above 0, at most 1e9. `reference` is the
   caller's name for the payment: 1 to 200 printable ASCII characters
   without spaces.
+- Optional: `"source"` says where the credit came from (1 to 40 lower-case
+  letters, digits, `.`, `_` or `-`; `admin` unless given; `bonus` is the
+  gateway's own), and `"bonus_eligible"` whether it earns the
+  [weekly bonus](credits.md#the-weekly-bonus) (unless given, what
+  `credits.admin_topups_eligible` says: no by default). Both are kept with
+  the top-up and shown in `GET /admin/topups`.
 - **The same reference again adds nothing** and answers with what the first
   call did, `"replayed": true`. The budget and the reference are written in
   one file write, so a top-up is applied and remembered, or neither. The
@@ -435,8 +442,20 @@ The answer is `200` with `{"key": <the key as in a listing>, "topup":
 - The newest 10,000 references, across all keys, are kept in the key store
   file; a reference older than that would be credited again.
 - The audit entry (`key.topup`) has a `topup` field: the reference, the
-  amount, the budget after it and whether it was a replay.
+  amount, the budget after it, the source, whether it is bonus-eligible and
+  whether it was a replay.
 - The blocked key works again when the data plane has polled the config.
+- A top-up is also recorded in the usage feed (`GET /admin/events`) as an
+  event of `"kind": "credit"`, so that a statement read from the feed is
+  complete.
+
+What a prepaid key's credit burns and earns (a burn multiplier, two kinds of
+credit, a weekly bonus) is in [Prepaid credit](credits.md). In a key listing
+it shows as `cost_usd` (what the providers cost), `credits_burned_usd` and,
+for a prepaid key, `"credits": {"balance_usd", "eligible_usd", "plain_usd",
+"burned_usd", "burn_multiplier", "bonus_annual_rate", "last_bonus"}`.
+`GET /admin/topups?key=NAME&limit=N` lists applied top-ups and bonuses,
+newest first.
 
 The flow around it, for a payment service, is in
 [Building on omnigate](building-on-omnigate.md#taking-payments-prepaid-keys-and-top-ups).
@@ -456,7 +475,7 @@ summed up, as described [below](#failed-and-throttled-sign-ins).
 | Field | Meaning |
 |---|---|
 | `ts` | UTC time, to the second. |
-| `action` | `key.create`, `key.update`, `key.rotate`, `key.topup`, `key.delete`, `attestation.verify`, `login`, `logout`. |
+| `action` | `key.create`, `key.update`, `key.rotate`, `key.topup`, `key.delete`, `attestation.verify`, `login`, `logout`; and, written by the gateway itself (`"auth": "system"`, no address): `key.bonus` (a [weekly bonus](credits.md#the-weekly-bonus) credited), `payment.create`, `payment.settle`, `payment.refunded`, `payment.failed` ([payments](payments.md#for-operators)). |
 | `target` | The key name as it was sent, cut to 64 characters, or `null`. |
 | `auth` | How the caller was authenticated: `token` (bearer), `session` (dashboard), `password` (a login attempt) or `none`. A key action can no longer be recorded with `none`: the admin API is not reachable without a credential. An older entry that says so was made through the bypass described in [SECURITY.md](../SECURITY.md#past-advisories). |
 | `address` | The address the caller is counted under, the same one the lockouts use, on every line, summary lines included: the peer of the connection, or with `OMNIGATE_TRUST_FORWARDED` (which `compose.yaml` sets) the last hop of `X-Forwarded-For`; an IPv6 address by its /64 (`2001:db8:1:2::`). Until the close-out commit an ordinary line had the peer here, which behind the Compose proxy was always the proxy. |
@@ -465,7 +484,8 @@ summed up, as described [below](#failed-and-throttled-sign-ins).
 | `outcome` | `ok`, or the error's reason, its `error.code` (`invalid_request`, `key_exists`, `read_only_key`, `key_not_found`, ...). For logins: `ok`, `denied` or `throttled`. |
 | `fields` | For `key.update`: the names of the fields that were sent (sorted, at most 20), never their values. |
 | `privacy` | For a `key.create` or `key.update` that set the key's [privacy mode](privacy.md): what it became, in a few words (`no-store, redact, unlink, encrypt`), or `off`. The `encrypt_to` recipient itself is never written. |
-| `topup` | For `key.topup`: `reference`, `amount_usd`, and for one that was applied `budget_usd` (the budget after it) and `replayed` (true when the reference had been applied before and nothing was added). For a refused one: the reference and amount as sent. |
+| `payment` | For the `payment.*` actions: the payment's `id`, `amount_usd`, `asset` and `reference`, and for a settled one `credited_usd`. |
+| `topup` | For `key.topup` and `key.bonus`: `reference`, `amount_usd`, and for one that was applied `budget_usd` (the budget after it), `source`, `eligible` and `replayed` (true when the reference had been applied before and nothing was added). For a refused one: the reference and amount as sent. |
 | `repeats` | Only on a summary line: how many more sign-in attempts with this outcome the address made in that minute, beyond the one that has its own line. |
 
 What is and is not recorded:
@@ -597,6 +617,8 @@ All on the control plane's port, all behind the admin token or a session.
 | `PATCH /admin/keys/{name}` | Change a managed key: `budget_usd`, `budget_period`, `rpm`, `max_concurrent`, `models`, `max_open_jobs`, `max_jobs_per_day`, `webhook_secret`, `disabled`, `privacy` ([Privacy mode](privacy.md#switching-it-on)). |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. `200`, with the new key. |
 | `POST /admin/keys/{name}/topup` | Add to a managed key's total budget, once per payment reference: `{"amount_usd": 5, "reference": "..."}`. See [Top-ups](#top-ups). |
+| `GET /admin/topups?key=NAME&limit=N` | Applied top-ups and bonuses, newest first (100 unless `limit`, at most 1000), each with its source and whether it is bonus-eligible. See [Prepaid credit](credits.md#seeing-it). |
+| `GET /admin/payments?limit=N` | [Payments](payments.md#for-operators) taken for credit, newest first, with the key and the reference each is credited under; `"configured": false` and an empty list when payments are off. |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
 | `GET /admin/events?after=CURSOR&limit=N&key=NAME` | The usage feed: every recorded text request and media job, oldest first, by cursor. See [Building on omnigate](building-on-omnigate.md#reading-usage). |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |

@@ -103,6 +103,51 @@ only met a mock, is tracked in the README's
   - `examples/`: a tool-calling agent client, a prepaid top-up service
     with a file as its payment source, and a usage exporter to CSV, each
     run by `tools/e2e.py` against the mock providers.
+- **Prepaid credit as one rule** ([docs/credits.md](docs/credits.md)),
+  whoever paid and however. A key with a total budget holds credit: one
+  credit is one US dollar when it is added, the balance is top-ups plus
+  bonuses minus burns, and a key at or below zero is blocked. Credit cannot
+  be withdrawn or refunded.
+  - **A burn multiplier.** `credits.burn_multiplier` (1 unless set), or a
+    key's own `burn_multiplier`: a request burns what the provider cost
+    times it. Usage records, the events feed, the key listing and the
+    metrics show both the provider cost and the credit burned.
+  - **Two kinds of credit.** A top-up is bonus-eligible or not (`source` and
+    `bonus_eligible` on `POST /admin/keys/{name}/topup`; plain unless the
+    call or `credits.admin_topups_eligible` says otherwise). Spending draws
+    on plain credit first.
+  - **A weekly bonus** on the time-weighted average of the eligible balance
+    over the ISO week, at `credits.bonus_annual_rate` ÷ 52 (0, that is off,
+    unless set). Credited as a top-up of its own under
+    `bonus:<key>:<ISO week>`, so a week is credited once whatever happens,
+    including weeks that ended while the control plane was not running.
+  - `GET /admin/topups`: applied top-ups and bonuses. Top-ups and bonuses
+    are also events of `"kind": "credit"` in `GET /admin/events`.
+  With the defaults (multiplier 1, rate 0) a prepaid key behaves as before.
+- **Payments, opt-in** ([docs/payments.md](docs/payments.md)). With a
+  `payments` section in the config, the holder of a prepaid managed key
+  buys credit through a payment provider, also when the key is blocked:
+  `GET /v1/payments/assets`, `POST /v1/payments/quote`, `POST /v1/payments`
+  (a deposit address and the amount to send), `GET /v1/payments/{id}`,
+  `GET /v1/payments`, `POST /v1/payments/{id}/tx`; `GET /admin/payments`
+  for operators. Without the section the endpoints answer 404 and nothing
+  else changes.
+  - Payments are a provider interface with one adapter, **NEAR Intents**
+    (its 1Click API): the payer pays with any asset it lists, on any chain
+    it supports; the operator's NEAR account receives the settle asset
+    (native USDC on NEAR unless set).
+  - The gateway holds no keys, signs nothing and moves no funds. It
+    verifies 1Click's Ed25519 signature on every quote (against the key
+    pinned from 1Click's SDK) and that the quote repeats what was asked
+    before it shows a deposit address; it believes a status only about the
+    quote it stored; and it credits a settlement once, through the
+    idempotent top-up, under `near_intents:<deposit address>`. That the
+    funds arrived is the provider's word: said plainly in the docs.
+  - `examples/agent_pays.py`: on a 402, list the assets, start a payment,
+    print what to send where, wait for the settlement, try again.
+  - `tools/mock_intents.py` (a stand-in for 1Click that signs like it) and
+    `tools/near_intents_live.py` (the real asset list and dry quotes through
+    a running gateway; `--serve` for one real payment by hand).
 
 ### Changed
 
@@ -113,6 +158,19 @@ only met a mock, is tracked in the README's
   `attestation`.
 - The error text for a malformed `x-omnigate-privacy` header names
   `attested` among the parts.
+- A key with a total budget is blocked when its **credit burned** reaches
+  the budget: its cost times its burn multiplier. At the default multiplier
+  of 1 that is its cost, as before. `period_spend_usd` of such a key, and
+  the dashboard's "spent" figure, are the credit burned.
+- `GET /admin/events`: every event has `credits_usd`; events of
+  `"kind": "credit"` (top-ups, bonuses) are new. `examples/usage_export.py`
+  writes them with `amount_usd`, `source` and `reference` columns.
+- The audit log has entries written by the gateway itself
+  (`"auth": "system"`, no address): `key.bonus` and `payment.*`.
+- `credits` and `payments` in a config file are now read and checked;
+  before, they were unknown sections and ignored.
+- The data plane's answer when the control plane cannot be reached says
+  "this endpoint is served by the control plane" (it named media jobs).
 
 ### Fixed
 
@@ -141,6 +199,14 @@ only met a mock, is tracked in the README's
   workspace's plan (`402 paid_plan_required`), and that refusal failed the
   job cleanly or moved it to the next target. A successful image or video
   job has only run against the mock.
+- Against the real NEAR Intents 1Click API on 11 November 2026, without
+  funds (`tools/near_intents_live.py`): the asset list (229 assets on 39
+  chains) and dry quotes for NEAR, Ether, Bitcoin, SOL and USDC on Base and
+  Arbitrum through a running gateway, each with its signature verified; the
+  provider's refusals relayed in its words. It showed that the service signs
+  a Bitcoin quote under the asset's other listed id, which the adapter now
+  accepts for ids the provider's own list gives the same coin. **No payment
+  has been made**: everything after a deposit has only met the mock.
 
 ## [0.1.0-rc.1] - 2026-11-11
 

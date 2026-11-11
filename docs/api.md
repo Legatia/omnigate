@@ -111,7 +111,7 @@ job error's reason from `error.type` must read `error.code` now.
 | 403 | `model_not_allowed` | `permission_error` | `permission_error` | The key's `models` list does not include this model. |
 | 404 | `not_found` | `invalid_request_error` | `not_found_error` | The path is not an endpoint the gateway serves. |
 | 404 | `model_not_found` | `invalid_request_error` | `not_found_error` | No route has this name; or, on `GET /v1/models/{id}`, the model does not exist or the key may not use it. |
-| 405 | `method_not_allowed` | `invalid_request_error` | `invalid_request_error` | A method other than GET or POST on `/v1/jobs*` or `/v1/files/*`. |
+| 405 | `method_not_allowed` | `invalid_request_error` | `invalid_request_error` | A method other than GET or POST on `/v1/jobs*`, `/v1/files/*` or `/v1/payments*`. |
 | 411 | `invalid_request` | `invalid_request_error` | (always the OpenAI shape) | A `POST`, `PUT` or `PATCH` without a `Content-Length`. A chunked request body (`Transfer-Encoding: chunked`) is not accepted and gets this answer too. |
 | 413 | `payload_too_large` | `invalid_request_error` | `request_too_large` | The request body exceeds 8 MiB; for `POST /v1/jobs`, 8,000,000 bytes (the size the control plane's parser reads). A declared length over the limit is refused without reading any of the body. |
 | 417 | `invalid_request` | `invalid_request_error` | (always the OpenAI shape) | An `Expect` header other than `100-continue`. |
@@ -123,7 +123,7 @@ job error's reason from `error.type` must read `error.code` now.
 | 502 | `all_upstreams_failed` | `server_error` | `api_error` | Every target failed and none of them answered 429. The error has `attempts`. |
 | 503 | `gateway_not_ready` | `server_error` | `api_error` | The data plane has no config yet (the control plane has never answered and there is no cached config). |
 | 503 | `attestation_unverified` | `server_error` | `api_error` | No target could be sent the request because of [attestation](attestation.md): every target of the model is on an attested upstream whose evidence is not verified right now, or the request may only go to attested providers ([privacy mode](privacy.md#attested-providers-only)'s `attested`) and no target qualifies. Also the answer to `POST /v1/jobs` with `attested`. Nothing was sent to a provider. |
-| 503 | `control_plane_unavailable` | `server_error` | `api_error` | A jobs or files request could not reach the control plane. |
+| 503 | `control_plane_unavailable` | `server_error` | `api_error` | A jobs, files, payments or receipt request could not reach the control plane. |
 | 503 | `overloaded` | `server_error` | `overloaded_error` | Two cases, both with `retry-after: 1`. (1) The data plane is already serving `OMNIGATE_MAX_CONNECTIONS` connections: sent at once, without reading the request, with `connection: close`; because the request was not read, this answer is always in the OpenAI shape and has no request id. (2) The gateway as a whole is holding as many request bodies, or converting as many requests, as its memory budgets allow (`OMNIGATE_REQUEST_MEMORY_MB`, `OMNIGATE_PARSE_MEMORY_MB`): an ordinary answer for this one request, in the client's protocol, with a request id. |
 
 The mapping is `typesFor` in `dataplane/src/errors.zig`. A reason that is
@@ -379,6 +379,7 @@ access to what it already has:
 | `GET /v1/jobs`, `GET /v1/jobs/{id}` | allowed |
 | `POST /v1/jobs/{id}/cancel` | allowed (cancelling only saves money) |
 | `GET /v1/files/...` | allowed |
+| `/v1/payments*` (where [payments](payments.md) are configured) | allowed: paying is how the key gets credit again |
 
 ## Text endpoints
 
@@ -1165,6 +1166,30 @@ receipt does and does not prove are in
 Only the key that made the request (across its rotations) can read it.
 `tools/verify_receipt.py` checks one offline.
 
+## Payments
+
+Only on a gateway whose config has a `payments` section; everywhere else
+these paths answer `404 not_found`. The holder of a prepaid key buys credit
+with them, also when the key's credit is spent. The whole of it (the flow,
+the states, the errors, what is checked and what is trusted) is in
+[Payments](payments.md#the-api).
+
+| Method and path | Purpose |
+|---|---|
+| `GET /v1/payments/assets` | What can be paid with; `?chain=` and `?symbol=` narrow it. |
+| `POST /v1/payments/quote` | `{"amount_usd", "asset", "refund_to"}`: what a payment would take, without starting one. |
+| `POST /v1/payments` | The same body: start a payment. `201` with the deposit address, the amount to send and the deadline. |
+| `GET /v1/payments/{id}` | The payment: `awaiting_deposit`, `processing`, `settled` (with `credited_usd`), `refunded`, `failed` or `expired`. |
+| `GET /v1/payments` | The key's payments, newest first. |
+| `POST /v1/payments/{id}/tx` | `{"tx_hash"}`: optional hint to the provider. |
+
+Their errors use the gateway's error shape; the codes are
+`invalid_request`, `payment_quote_refused` (400), `payment_not_found` (404),
+`not_prepaid`, `payment_closed` (409), `too_many_open_payments`,
+`rate_limited` (429), `payment_provider_error` (502) and
+`payment_provider_unavailable` (503). `POST` requests count against the
+key's `rpm`.
+
 ## File URLs
 
 ```
@@ -1447,7 +1472,9 @@ check, then the endpoint.
 | `POST /admin/keys` | Create a managed key. The answer is the only one that contains the key itself. |
 | `PATCH /admin/keys/{name}` | Change a managed key's budget, period, rate limit, models, open-job limit, jobs-per-day limit, webhook secret or disabled flag. |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. |
-| `POST /admin/keys/{name}/topup` | Add `amount_usd` to a managed key's total budget, once per `reference` (a payment id): the same call again adds nothing. |
+| `POST /admin/keys/{name}/topup` | Add `amount_usd` to a managed key's total budget, once per `reference` (a payment id): the same call again adds nothing. Optional `source` and `bonus_eligible`. |
+| `GET /admin/topups?key=NAME&limit=N` | Applied top-ups and bonuses, newest first ([Prepaid credit](credits.md#seeing-it)). |
+| `GET /admin/payments?limit=N` | [Payments](payments.md#for-operators) taken for credit, newest first; empty unless payments are configured. |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
 | `GET /admin/events?after=CURSOR&limit=N&key=NAME` | The usage feed: every recorded text request and media job, oldest first, with a cursor to continue from. No content. See [Building on omnigate](building-on-omnigate.md#reading-usage). |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
@@ -1559,7 +1586,10 @@ curl http://127.0.0.1:4000/metrics -H "Authorization: Bearer dev-admin-token-cha
 | `omnigate_key_output_tokens_total` | counter | `key` | Output tokens. |
 | `omnigate_key_cached_responses_total` | counter | `key` | Requests answered from the data plane's response cache. |
 | `omnigate_key_jobs_total` | counter | `key` | Media jobs recorded in the ledger. |
-| `omnigate_key_cost_usd_total` | counter | `key` | Spend in US dollars, over the whole ledger. |
+| `omnigate_key_cost_usd_total` | counter | `key` | Spend in US dollars, over the whole ledger: what the providers cost. |
+| `omnigate_key_credits_burned_usd_total` | counter | `key` | Credit burned: the spend times the key's [burn multiplier](credits.md#the-burn-multiplier). Equal to the spend at a multiplier of 1, and for every key that is not prepaid. |
+| `omnigate_payments` | gauge | `status` | [Payments](payments.md) held, by status. No series unless payments are configured and one was started. |
+| `omnigate_payments_credited_usd` | gauge | | US dollars credited to keys from the payments held. |
 | `omnigate_key_budget_usd` | gauge | `key` | Budget, for keys that have one. |
 | `omnigate_key_period_cost_usd` | gauge | `key` | Spend in the key's current budget period: this month, this day, or everything for a total budget. |
 | `omnigate_key_blocked` | gauge | `key` | 1 when the key has spent its budget for the current period and is refused, else 0. |

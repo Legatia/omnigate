@@ -45,6 +45,7 @@ defmodule OmnigateControl.Router do
     Keys,
     Ledger,
     Metrics,
+    Payments,
     Privacy,
     PrivateChat,
     PrivateChatPage,
@@ -305,6 +306,69 @@ defmodule OmnigateControl.Router do
     end
   end
 
+  # -- payments for prepaid credit (opt-in: `OmnigateControl.Payments`) ---------
+  # Open to a key that has spent its credit: that is when they are needed.
+
+  get "/internal/v1/payments/assets" do
+    conn = fetch_query_params(conn)
+
+    with {:ok, _key} <- gateway_key(conn),
+         {:ok, assets} <- Payments.assets(Map.take(conn.query_params, ["chain", "symbol"])) do
+      send_json(conn, 200, %{assets: assets})
+    else
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  # What a payment would take, without starting one.
+  post "/internal/v1/payments/quote" do
+    with {:ok, key} <- gateway_key(conn),
+         {:ok, quote} <- Payments.quote_only(key, json_object(conn)) do
+      send_json(conn, 200, quote)
+    else
+      {:error, 429, type, message} -> conn |> put_resp_header("retry-after", "10") |> send_error(429, type, message)
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  post "/internal/v1/payments" do
+    with {:ok, key} <- gateway_key(conn),
+         {:ok, payment} <- Payments.create(key, json_object(conn)) do
+      send_json(conn, 201, Payments.view(payment))
+    else
+      {:error, 429, type, message} -> conn |> put_resp_header("retry-after", "10") |> send_error(429, type, message)
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  get "/internal/v1/payments" do
+    with {:ok, key} <- gateway_key(conn),
+         true <- Payments.configured?() || {:error, 404, "not_found", "payments are not configured on this gateway"} do
+      send_json(conn, 200, %{payments: Enum.map(Payments.list(key), &Payments.view/1)})
+    else
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  get "/internal/v1/payments/:id" do
+    with {:ok, key} <- gateway_key(conn),
+         %{} = payment <- Payments.own(key, id) do
+      send_json(conn, 200, Payments.view(payment))
+    else
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+      nil -> send_error(conn, 404, "payment_not_found", "no such payment")
+    end
+  end
+
+  post "/internal/v1/payments/:id/tx" do
+    with {:ok, key} <- gateway_key(conn),
+         {:ok, payment} <- Payments.submit_tx(key, id, json_object(conn)["tx_hash"]) do
+      send_json(conn, 200, Payments.view(payment))
+    else
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
   # Locally stored outputs. Allowed for the gateway key that owns the job, or
   # for anyone holding a valid signed URL (`exp`, `sig`).
   get "/internal/v1/files/:job_id/:name" do
@@ -379,7 +443,7 @@ defmodule OmnigateControl.Router do
     Audit.record(conn, "key.topup", audit_name(name), outcome(result),
       topup:
         case result do
-          {:ok, _key, done} -> Map.take(done, ["reference", "amount_usd", "budget_usd", "replayed"])
+          {:ok, _key, done} -> Map.take(done, ["reference", "amount_usd", "budget_usd", "replayed", "source", "eligible"])
           # What was asked, cut to what an audit line should hold.
           _ -> %{"reference" => audit_name(attrs["reference"]), "amount_usd" => if(is_number(attrs["amount_usd"]), do: attrs["amount_usd"])}
         end
@@ -389,6 +453,33 @@ defmodule OmnigateControl.Router do
       {:ok, key, done} -> send_json(conn, 200, %{key: Admin.key_view(key), topup: done})
       {:error, status, type, message} -> send_error(conn, status, type, message)
     end
+  end
+
+  # Payments taken for credit, newest first (none unless they are configured).
+  get "/admin/payments" do
+    conn = fetch_query_params(conn)
+
+    limit =
+      case Integer.parse(conn.query_params["limit"] || "") do
+        {n, ""} when n >= 1 and n <= 1000 -> n
+        _ -> 100
+      end
+
+    send_json(conn, 200, %{configured: Payments.configured?(), payments: Enum.map(Payments.all(limit), &Payments.admin_view/1)})
+  end
+
+  # Credit added to keys, newest first: top-ups and bonuses (`Keys.topups/2`).
+  get "/admin/topups" do
+    conn = fetch_query_params(conn)
+    q = conn.query_params
+
+    limit =
+      case Integer.parse(q["limit"] || "") do
+        {n, ""} when n >= 1 and n <= 1000 -> n
+        _ -> 100
+      end
+
+    send_json(conn, 200, %{topups: Keys.topups(limit, if(q["key"] not in [nil, ""], do: q["key"]))})
   end
 
   # The usage feed: every ledger event, oldest first, by cursor.

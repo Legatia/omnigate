@@ -31,6 +31,8 @@ import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import mock_intents as mock_intents_module  # the payment provider's stand-in: its signing key goes into the config
 WINDOWS = os.name == "nt"
 CONTROL_PORT = 14000
 GATEWAY_PORT = 18080
@@ -58,6 +60,8 @@ KEY_PLAIN = "og-e2e-plain"
 KEY_ATTESTED = "og-e2e-attested"
 # A second data plane, in front of a control plane played by this script
 # (see `attestation_checks`).
+# The payment provider's stand-in (tools/mock_intents.py).
+INTENTS_PORT = 9120
 FAKE_CONTROL_PORT = 14001
 GATEWAY2_PORT = 18081
 GATEWAY2 = f"http://127.0.0.1:{GATEWAY2_PORT}"
@@ -338,6 +342,11 @@ def text_config():
             {"model": "tee-then-plain", "targets": [dict(upstream="mock-attested", model="attest-stale-1", **price),
                                                     dict(upstream="mock-ok", model="ok-1", **price)]},
         ],
+        # Payments for prepaid credit, through the NEAR Intents adapter, with
+        # tools/mock_intents.py as the provider (and its key as the one quotes
+        # must be signed with).
+        "payments": {"provider": "near_intents", "recipient": "operator.near", "base_url": f"http://127.0.0.1:{INTENTS_PORT}",
+                     "public_key": mock_intents_module.PUBLIC_KEY, "poll_interval_s": 1, "min_usd": 1, "max_usd": 1000, "quote_ttl_s": 600},
     }
 
 
@@ -345,6 +354,8 @@ class Stack:
     def __init__(self, work, config, media):
         self.work = work
         self.media = media
+        # The payment provider's stand-in runs only for a config that takes payments.
+        self.payments = "payments" in config
         self.procs = {}
         # Extra settings for the gateway, kept across its restarts.
         self.gateway_env = {}
@@ -389,13 +400,17 @@ class Stack:
     # -- individual services --------------------------------------------
 
     def start_mocks(self):
-        ports = [9001, 9002, 9003, 9004, 9005] + (MEDIA_PORTS if self.media else [])
+        ports = [9001, 9002, 9003, 9004, 9005] + (MEDIA_PORTS if self.media else []) + ([INTENTS_PORT] if self.payments else [])
         busy = [p for p in ports + [CONTROL_PORT, GATEWAY_PORT] if not port_free(p)]
         if busy:
             self.fail(f"ports already in use: {busy}. Stop whatever is listening there and rerun.")
         self.start("mock_upstream", [sys.executable, os.path.join(ROOT, "tools", "mock_upstream.py")])
         if self.media:
             self.start_media_mock()
+        if self.payments:
+            self.start("mock_intents", [sys.executable, os.path.join(ROOT, "tools", "mock_intents.py"), str(INTENTS_PORT)])
+            if not wait_port(INTENTS_PORT, 15):
+                self.fail("the payment provider mock did not start", "mock_intents")
         for port in [9001, 9002, 9003, 9004, 9005]:
             if not wait_port(port, 15):
                 self.fail(f"mock on port {port} did not start", "mock_upstream")
@@ -697,6 +712,256 @@ def build_around_checks(work):
         admin("DELETE", f"/admin/keys/{key}")
 
 
+# --------------------------------------------------------------------------
+# credit and payments
+# --------------------------------------------------------------------------
+
+INTENTS = f"http://127.0.0.1:{INTENTS_PORT}"
+# A payment left open on purpose: settled after the control plane's restart (see `text_checks`).
+OPEN_PAYMENT = {}
+
+
+def key_row(name):
+    _, _, listing = admin("GET", "/admin/keys")
+    return next((k for k in listing.get("keys", []) if k.get("name") == name), {})
+
+
+def mock_intents(path, body=None):
+    return jcall("POST" if body is not None else "GET", INTENTS + path, body=body)
+
+
+def payment(secret, payment_id):
+    return jcall("GET", f"{GATEWAY}/v1/payments/{payment_id}", key=secret)[2] or {}
+
+
+def payer(name, **attrs):
+    """A prepaid managed key with no credit, known to the gateway (which answers it 402). Returns its secret."""
+    _, _, created = admin("POST", "/admin/keys", dict({"name": name, "budget_usd": 0}, **attrs))
+    secret = created.get("key", "")
+    wait_until(lambda: chat("direct", key=secret)[0] == 402, 6, 0.2)
+    return secret
+
+
+def credit_checks():
+    """Prepaid credit: what a dollar of provider cost burns (OmnigateControl.Credits)."""
+    section("credit: a burn multiplier on a prepaid key")
+    status, _, probe = admin("POST", "/admin/keys", {"name": "e2e-credit-probe", "budget_usd": 5, "burn_multiplier": 1.2})
+    secret = probe.get("key", "")
+    usable = wait_until(lambda: chat("direct", key=secret)[0] == 200, 6, 0.2)
+    row = wait_until(lambda: (lambda r: r if r.get("requests") == 1 else None)(key_row("e2e-credit-probe")), 10, 0.2) or {}
+    cost = row.get("cost_usd") or 0
+    credits = row.get("credits") or {}
+    check("a prepaid key with a burn multiplier of 1.2 burns 1.2 times what the provider cost; the listing shows both figures and the balance",
+          status == 201 and bool(usable) and cost > 0 and close(row.get("credits_burned_usd"), cost * 1.2) and credits.get("burn_multiplier") == 1.2
+          and close(credits.get("balance_usd"), 5 - cost * 1.2) and close(credits.get("burned_usd"), cost * 1.2), row)
+    _, _, feed = admin("GET", "/admin/events?limit=100&key=e2e-credit-probe")
+    events = feed.get("events", [])
+    check("... and so does the usage feed, per event: the provider cost and the credit burned",
+          len(events) == 1 and events[0].get("kind") == "text" and close(events[0].get("cost_usd"), cost) and close(events[0].get("credits_usd"), cost * 1.2), events)
+
+    # Credit for exactly two such calls at 1.2 (a shade less, to stay clear of
+    # rounding): at the provider's price two calls would not have used it up.
+    budget = cost * 2.4 * 0.999
+    status, _, created = admin("POST", "/admin/keys", {"name": "e2e-credit", "budget_usd": budget, "burn_multiplier": 1.2})
+    secret = created.get("key", "")
+    first = wait_until(lambda: chat("direct", key=secret)[0] == 200, 6, 0.2)
+    after_one = wait_until(lambda: (lambda r: r if r.get("requests") == 1 else None)(key_row("e2e-credit")), 10, 0.2) or {}
+    second = chat("direct", key=secret)[0]
+    blocked = wait_until(lambda: (lambda r: r if r.get("state") == "blocked" else None)(key_row("e2e-credit")), 10, 0.2) or {}
+    refused = wait_until(lambda: chat("direct", key=secret)[0] == 402, 6, 0.2)
+    check("a prepaid key at 1.2 is blocked once the providers have cost 1/1.2 of its credit: after two calls, which at the provider's price would have left credit for a third",
+          bool(first) and after_one.get("state") == "active" and second == 200 and blocked.get("requests") == 2 and close(blocked.get("cost_usd"), cost * 2)
+          and blocked.get("credits_burned_usd", 0) >= budget and cost * 2 < budget and bool(refused),
+          (first, after_one.get("state"), second, blocked.get("requests"), blocked.get("cost_usd"), blocked.get("credits_burned_usd"), budget))
+    status, _, row = admin("PATCH", "/admin/keys/e2e-credit", {"burn_multiplier": 500})
+    check("a multiplier outside 0.01 to 100 is refused (400)", status == 400, (status, row))
+    for name in ("e2e-credit-probe", "e2e-credit"):
+        admin("DELETE", f"/admin/keys/{name}")
+
+
+def payment_checks():
+    """Payments for credit, through the NEAR Intents adapter against tools/mock_intents.py."""
+    section("payments: a blocked key pays and is unblocked")
+    status, _, created = admin("POST", "/admin/keys", {"name": "e2e-payer", "budget_usd": 0})
+    secret = created.get("key", "")
+    blocked = wait_until(lambda: chat("direct", key=secret)[0] == 402, 6, 0.2)
+    status, _, assets = jcall("GET", GATEWAY + "/v1/payments/assets", key=secret)
+    listed = {a.get("symbol"): a for a in assets.get("assets", [])}
+    status2, _, eth = jcall("GET", GATEWAY + "/v1/payments/assets?chain=eth", key=secret)
+    check("a key with no credit left can still ask what it may pay with: the provider's assets, by chain or symbol",
+          bool(blocked) and status == 200 and {"wNEAR", "ETH", "BTC", "USDC"} <= set(listed) and "BROKEN" not in listed
+          and listed["wNEAR"].get("asset") == "nep141:wrap.near" and listed["wNEAR"].get("chain") == "near"
+          and status2 == 200 and [a.get("symbol") for a in eth.get("assets", [])] == ["ETH"], (status, sorted(listed), status2))
+
+    status, _, pay = jcall("POST", GATEWAY + "/v1/payments", key=secret, body={"amount_usd": 2, "asset": "nep141:wrap.near", "refund_to": "payer.near"})
+    deposit = pay.get("deposit", {})
+    address = deposit.get("address", "")
+    _, _, seen = mock_intents("/__mock/seen")
+    asked = (seen.get("quotes") or [{}])[-1]
+    check("POST /v1/payments answers with where to send how much, by when; the provider was asked for exactly $2 of the settle asset to the operator's account",
+          status == 201 and pay.get("id", "").startswith("pay_") and pay.get("status") == "awaiting_deposit" and len(address) == 64 and deposit.get("symbol") == "wNEAR"
+          and float(deposit.get("amount", 0)) > 0 and deposit.get("amount_units", "").isdigit() and pay.get("deadline") and pay.get("credited_usd") is None
+          and asked.get("swapType") == "EXACT_OUTPUT" and asked.get("amount") == "2000000" and asked.get("recipient") == "operator.near"
+          and asked.get("refundTo") == "payer.near" and asked.get("dry") is False and "key" not in pay, (status, pay, asked))
+    time.sleep(2.5)
+    still = payment(secret, pay.get("id"))
+    check("nothing has arrived: the payment waits, the key stays blocked, nothing is credited",
+          still.get("status") == "awaiting_deposit" and still.get("provider_status") == "PENDING_DEPOSIT" and chat("direct", key=secret)[0] == 402 and key_row("e2e-payer").get("budget_usd") == 0,
+          still)
+
+    status, _, _ = jcall("POST", f"{GATEWAY}/v1/payments/{pay.get('id')}/tx", key=secret, body={"tx_hash": "0xdeposit-tx-1"})
+    _, _, seen = mock_intents("/__mock/seen")
+    check("the deposit's transaction hash can be passed on to the provider", status == 200 and {"depositAddress": address, "txHash": "0xdeposit-tx-1"} in seen.get("submitted", []), (status, seen.get("submitted")))
+    mock_intents("/__mock/deposit", {"depositAddress": address, "outcome": "success", "steps": True})
+    settled = wait_until(lambda: (lambda p: p if p.get("status") == "settled" else None)(payment(secret, pay.get("id"))), 20, 0.3) or {}
+    unblocked = wait_until(lambda: chat("direct", key=secret)[0] == 200, 6, 0.2)
+    row = key_row("e2e-payer")
+    check("the deposit arrives and the swap completes: the payment is settled, the key credited $2 and working again within seconds",
+          settled.get("credited_usd") == 2 and len(settled.get("tx", [])) >= 1 and bool(unblocked) and row.get("budget_usd") == 2 and row.get("state") == "active", (settled, row.get("budget_usd")))
+    _, _, topups = admin("GET", "/admin/topups?key=e2e-payer")
+    reference = "near_intents:" + address
+    _, _, feed = admin("GET", "/admin/events?limit=100&key=e2e-payer")
+    credit_events = [e for e in feed.get("events", []) if e.get("kind") == "credit"]
+    _, _, audit = admin("GET", "/admin/audit?limit=200")
+    actions = [(e.get("action"), e.get("target"), (e.get("payment") or {}).get("reference")) for e in audit.get("entries", [])]
+    _, _, listing = admin("GET", "/admin/payments")
+    credits = row.get("credits") or {}
+    check("the credit is bonus-eligible credit from near_intents, under a reference made of the deposit address: in the top-up history, the usage feed, the audit log and GET /admin/payments",
+          [(t.get("reference"), t.get("amount_usd"), t.get("source"), t.get("eligible")) for t in topups.get("topups", [])] == [(reference, 2, "near_intents", True)]
+          and len(credit_events) == 1 and credit_events[0].get("amount_usd") == 2 and credit_events[0].get("source") == "near_intents" and credit_events[0].get("bonus_eligible") is True
+          and ("payment.create", "e2e-payer", reference) in actions and ("payment.settle", "e2e-payer", reference) in actions
+          and any(p.get("id") == pay.get("id") and p.get("key") == "e2e-payer" and p.get("reference") == reference for p in listing.get("payments", []))
+          and close(credits.get("eligible_usd"), 2 - (row.get("credits_burned_usd") or 0)) and credits.get("plain_usd") == 0,
+          (topups, credit_events, credits))
+
+    # The provider keeps saying SUCCESS for as long as anyone asks.
+    _, _, before = mock_intents("/__mock/seen")
+    time.sleep(2.5)
+    _, _, after = mock_intents("/__mock/seen")
+    status, _, replay = admin("POST", "/admin/keys/e2e-payer/topup", {"amount_usd": 50, "reference": reference})
+    check("a settled payment is credited once and not asked about again; its reference cannot be used to credit the key by hand",
+          key_row("e2e-payer").get("budget_usd") == 2 and after.get("asked", {}).get(address) == before.get("asked", {}).get(address)
+          and status == 409 and replay.get("error", {}).get("code") == "reference_conflict", (before.get("asked"), after.get("asked"), status))
+
+    section("payments: refusals, refunds and answers that are not believed")
+    # (Several keys: one key may ask the provider for a quote six times a minute.)
+    ask = lambda key, **body: jcall("POST", GATEWAY + "/v1/payments", key=key, body=dict({"amount_usd": 2, "asset": "nep141:wrap.near", "refund_to": "payer.near"}, **body))
+    new = lambda **body: ask(secret, **body)
+    status, _, body = new(refund_to="invalid-address")
+    status2, _, body2 = new(asset="nep141:bsc.omft.near", refund_to="0x" + "ab" * 20)
+    status3, _, body3 = new(asset="nep141:btc.omft.near", amount_usd=1, refund_to="bc1qpayer")
+    check("what the provider refuses reaches the payer in the provider's words (400): a refund address that is not one, a chain's minimum, an amount too low for a bridge",
+          status == 400 and body.get("error", {}).get("code") == "payment_quote_refused" and "refundTo is not valid" in body["error"]["message"]
+          and status2 == 400 and "$1,000" in body2.get("error", {}).get("message", "") and status3 == 400 and "too low for bridge" in body3.get("error", {}).get("message", ""),
+          (status, body, status2, body2, status3, body3))
+    codes = [new(amount_usd=0.5)[0], new(amount_usd=1e6)[0], new(asset="not an asset")[0], new(refund_to="")[0],
+             jcall("POST", GATEWAY + "/v1/payments", key=KEY_MAIN, body={"amount_usd": 2, "asset": "nep141:wrap.near", "refund_to": "payer.near"})[0],
+             jcall("GET", GATEWAY + "/v1/payments/" + pay.get("id", "x"), key=KEY_MAIN)[0], jcall("GET", GATEWAY + "/v1/payments/assets")[0],
+             jcall("DELETE", GATEWAY + "/v1/payments/" + pay.get("id", "x"), key=secret)[0]]
+    check("an amount outside the bounds, an asset or address that is not one (400); a key that is not prepaid (409); another key's payment (404); no key (401); DELETE (405)",
+          codes == [400, 400, 400, 400, 409, 404, 401, 405], codes)
+
+    second = payer("e2e-payer-2")
+    refusals = []
+    for mode in ("bad_signature", "wrong_recipient", "wrong_amount"):
+        mock_intents("/__mock/quotes", {"mode": mode})
+        status, _, body = ask(second)
+        refusals.append((status, body.get("error", {}).get("code"), "deposit" in body))
+    mock_intents("/__mock/quotes", {"mode": None})
+    listed = jcall("GET", GATEWAY + "/v1/payments", key=second)[2].get("payments")
+    check("a quote that is not signed by the provider's key, or names another recipient or amount, is never shown: 502, no deposit address, nothing stored",
+          refusals == [(502, "payment_provider_error", False)] * 3 and listed == [], (refusals, listed))
+    status, _, btc = ask(second, asset="nep141:btc.omft.near", refund_to="bc1qpayer")
+    mock_intents("/__mock/deposit", {"depositAddress": btc.get("deposit", {}).get("address"), "outcome": "success"})
+    paid = wait_until(lambda: (lambda p: p if p.get("status") == "settled" else None)(payment(second, btc.get("id"))), 20, 0.3) or {}
+    check("an asset the provider lists twice (Bitcoin), whose quote it signs under the other id: accepted, settled and credited",
+          status == 201 and btc.get("deposit", {}).get("symbol") == "BTC" and paid.get("credited_usd") == 2 and key_row("e2e-payer-2").get("budget_usd") == 2, (status, btc, paid))
+    status, _, dry = jcall("POST", GATEWAY + "/v1/payments/quote", key=second, body={"amount_usd": 3, "asset": "nep141:eth.omft.near", "refund_to": "0x" + "ab" * 20})
+    listed = jcall("GET", GATEWAY + "/v1/payments", key=second)[2].get("payments", [])
+    check("POST /v1/payments/quote says what a payment would take without starting one: an amount, no deposit address, nothing stored",
+          status == 200 and float(dry.get("amount") or 0) > 0 and dry.get("symbol") == "ETH" and "address" not in json.dumps(dry) and len(listed) == 1, (status, dry, len(listed)))
+
+    secret = payer("e2e-payer-3")
+    new = lambda **body: ask(secret, **body)
+    payment_key = "e2e-payer-3"
+    budget = key_row(payment_key).get("budget_usd")
+    outcomes = {}
+    for outcome in ("refund", "fail", "partial"):
+        _, _, p = new()
+        mock_intents("/__mock/deposit", {"depositAddress": p.get("deposit", {}).get("address"), "outcome": outcome})
+        outcomes[outcome] = p.get("id")
+    _, _, forged = new()
+    mock_intents("/__mock/deposit", {"depositAddress": forged.get("deposit", {}).get("address"), "outcome": "success"})
+    mock_intents("/__mock/tamper", {"depositAddress": forged.get("deposit", {}).get("address"), "what": "recipient"})
+    ended = wait_until(lambda: payment(secret, outcomes["refund"]).get("status") == "refunded" and payment(secret, outcomes["fail"]).get("status") == "failed"
+                       and payment(secret, outcomes["partial"]).get("provider_status") == "INCOMPLETE_DEPOSIT", 20, 0.3)
+    time.sleep(2.5)
+    partial, lied = payment(secret, outcomes["partial"]), payment(secret, forged.get("id"))
+    check("refunded, failed and a deposit that fell short credit nothing; neither does a 'success' about a quote that is not ours (another recipient): that payment stays open",
+          bool(ended) and "refunded to the payer" in (payment(secret, outcomes["refund"]).get("detail") or "") and partial.get("status") == "awaiting_deposit" and "less than" in (partial.get("detail") or "")
+          and lied.get("status") == "awaiting_deposit" and lied.get("credited_usd") is None and key_row(payment_key).get("budget_usd") == budget,
+          (payment(secret, outcomes["refund"]), partial, lied, key_row(payment_key).get("budget_usd"), budget))
+    # The provider honest again about that quote: settled after all, and credited what arrived.
+    mock_intents("/__mock/tamper", {"depositAddress": forged.get("deposit", {}).get("address"), "what": None})
+    mock_intents("/__mock/deposit", {"depositAddress": forged.get("deposit", {}).get("address"), "outcome": "success", "amountOut": "1990000"})
+    late = wait_until(lambda: (lambda p: p if p.get("status") == "settled" else None)(payment(secret, forged.get("id"))), 20, 0.3) or {}
+    check("what arrived is what is credited: $1.99 delivered for a $2 payment credits $1.99", late.get("credited_usd") == 1.99 and close(key_row(payment_key).get("budget_usd"), budget + 1.99), late)
+
+    fourth = payer("e2e-payer-4")
+    status, _, memo = ask(fourth, asset="nep141:stellar.omft.near", refund_to="GPAYERSTELLAR")
+    check("a chain that needs a memo with the deposit: the memo is part of the instructions", status == 201 and str(memo.get("deposit", {}).get("memo", "")).isdigit(), (status, memo.get("deposit")))
+    waiting = [ask(fourth)[0] for _ in range(4)]
+    status, _, sixth = ask(fourth)
+    check("a key may have five payments waiting for a deposit; the next is refused (429)",
+          waiting == [201] * 4 and status == 429 and sixth.get("error", {}).get("code") == "too_many_open_payments", (waiting, status, sixth))
+
+    section("payments: an agent pays for its own inference (examples/agent_pays.py)")
+    agent_key = payer("e2e-agent")
+    env = dict(os.environ, OMNIGATE_GATEWAY=GATEWAY, OMNIGATE_KEY=agent_key, OMNIGATE_MODEL="direct", OMNIGATE_PAY_USD="3", OMNIGATE_PAY_SYMBOL="ETH", OMNIGATE_PAY_CHAIN="eth",
+               OMNIGATE_REFUND_TO="0x" + "cd" * 20, OMNIGATE_PAY_POLL_S="0.3", OMNIGATE_PAY_WAIT_S="60", PYTHONUNBUFFERED="1")
+    agent = subprocess.Popen([sys.executable, os.path.join(ROOT, "examples", "agent_pays.py"), "hi"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    instruction = agent.stdout.readline().strip()
+    words = instruction.split()
+    # "PAY <amount> ETH on eth to <address> before <deadline> (payment <id>)": the test plays the wallet.
+    paid_to = words[6] if len(words) > 6 and words[0] == "PAY" else ""
+    mock_intents("/__mock/deposit", {"depositAddress": paid_to, "outcome": "success", "steps": True})
+    try:
+        out, err = agent.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        agent.kill()
+        out, err = agent.communicate()
+    check("on 402 the example lists the assets, starts a payment, prints what to send where, waits for the settlement and gets its answer",
+          agent.returncode == 0 and words[:1] == ["PAY"] and words[2:5] == ["ETH", "on", "eth"] and paid_to.startswith("0x") and "CREDITED 3" in out and MOCK_TEXT in out
+          and "settled" in err and key_row("e2e-agent").get("budget_usd") == 3, (agent.returncode, instruction, out, err[-600:]))
+    # A key whose budget is an allowance (monthly), spent: there is nothing to pay into.
+    env2 = dict(env, OMNIGATE_KEY=payer("e2e-monthly", budget_period="monthly"))
+    done = subprocess.run([sys.executable, os.path.join(ROOT, "examples", "agent_pays.py"), "hi"], env=env2, capture_output=True, text=True, timeout=60)
+    check("... and stops with the gateway's reason where the key cannot be paid for (a monthly allowance, not prepaid credit)",
+          done.returncode != 0 and "not_prepaid" in done.stderr, (done.returncode, done.stdout[-200:], done.stderr[-300:]))
+
+    # One payment left waiting, for the control plane's restart at the end of the text checks.
+    restart_key = payer("e2e-restart-payer")
+    _, _, left = ask(restart_key, amount_usd=4, asset="nep141:sol.omft.near", refund_to="PayerSolanaAddress11111111111111111111111111")
+    OPEN_PAYMENT.update(secret=restart_key, id=left.get("id"), address=left.get("deposit", {}).get("address"))
+    for name in ("e2e-payer", "e2e-payer-2", "e2e-payer-3", "e2e-payer-4", "e2e-agent", "e2e-monthly"):
+        admin("DELETE", f"/admin/keys/{name}")
+
+
+def payment_after_restart_checks():
+    """The payment left open before the control plane was stopped and started again."""
+    section("payments: a control-plane restart in the middle of a payment")
+    secret, payment_id, address = OPEN_PAYMENT.get("secret", ""), OPEN_PAYMENT.get("id"), OPEN_PAYMENT.get("address")
+    before = payment(secret, payment_id)
+    mock_intents("/__mock/deposit", {"depositAddress": address, "outcome": "success"})
+    settled = wait_until(lambda: (lambda p: p if p.get("status") == "settled" else None)(payment(secret, payment_id)), 30, 0.3) or {}
+    row = key_row("e2e-restart-payer")
+    time.sleep(2.5)
+    check("a payment that was waiting when the control plane stopped is still there after the restart, settles when the deposit arrives, and is credited once",
+          before.get("status") == "awaiting_deposit" and before.get("deposit", {}).get("address") == address and settled.get("credited_usd") == 4
+          and row.get("budget_usd") == 4 and key_row("e2e-restart-payer").get("budget_usd") == 4 and chat("direct", key=secret)[0] == 200, (before, settled, row.get("budget_usd")))
+    admin("DELETE", "/admin/keys/e2e-restart-payer")
+
+
 def empty_prepaid_key():
     """A managed key with nothing in its prepaid budget, known to the gateway."""
     admin("DELETE", "/admin/keys/e2e-empty")
@@ -906,6 +1171,7 @@ def text_checks(stack):
     stack.start_control()
     row = wait_until(lambda: main_row_with(main_calls), 30)
     check(f"after recovery every outage call is billed exactly once ({main_calls} total)", bool(row), usage_row("main"))
+    payment_after_restart_checks()
 
 
 # --------------------------------------------------------------------------
@@ -1485,6 +1751,7 @@ def control_env(work):
         # run only: a payment reference used here must not be known already.
         "OMNIGATE_KEYS": os.path.join(work, "keys.json"),
         "OMNIGATE_AUDIT_LOG": os.path.join(work, "audit.jsonl"),
+        "OMNIGATE_PAYMENTS": os.path.join(work, "payments.json"),
         # Where the control plane reaches the data plane (the Private chat page).
         "OMNIGATE_GATEWAY_URL": GATEWAY,
         "E2E_S3_ACCESS_KEY": "mock-access-key",
@@ -2093,6 +2360,8 @@ def main():
         key_checks()
         if run_text:
             build_around_checks(work)
+            credit_checks()
+            payment_checks()
             privacy_text_checks()
             attestation_checks(stack)
             receipt_tool_checks(work)

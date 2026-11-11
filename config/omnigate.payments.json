@@ -1,0 +1,36 @@
+{
+  "keys": [],
+  "upstreams": [
+    {
+      "name": "near-ai",
+      "kind": "openai",
+      "base_url": "https://cloud-api.near.ai",
+      "api_key_env": "NEAR_AI_API_KEY"
+    }
+  ],
+  "routes": [
+    {
+      "model": "chat",
+      "targets": [
+        {
+          "upstream": "near-ai",
+          "model": "z-ai/glm-5.3-flash",
+          "price_in_per_mtok": 0.5,
+          "price_out_per_mtok": 2.0
+        }
+      ]
+    }
+  ],
+  "credits": {
+    "burn_multiplier": 1.2,
+    "bonus_annual_rate": 0.05
+  },
+  "payments": {
+    "provider": "near_intents",
+    "recipient": "letobias.near",
+    "min_usd": 1,
+    "max_usd": 1000,
+    "quote_ttl_s": 1800,
+    "bonus_eligible": true
+  }
+}

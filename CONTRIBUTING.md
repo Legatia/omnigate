@@ -295,6 +295,19 @@ python tools/upgrade_test.py 6d5ed6e --variant both --mixed
   which CI runs, is `control/test/attestation_test.exs` on a saved real
   report (`control/test/fixtures/attestation`, valid only at the time
   recorded in `verified_at.txt`, which the tests pass as "now").
+- **`tools/near_intents_live.py`** runs the payments code against the real
+  NEAR Intents 1Click API without funds: both processes with a config that
+  takes payments, the real asset list and dry quotes for several chains
+  through the gateway (each passes only if 1Click's signature on it
+  verifies), and the provider's refusals. It needs the network and no
+  credentials, creates nothing at the provider, and takes about two minutes
+  (one key may ask for six quotes a minute). `--serve` starts the gateway
+  with `config/omnigate.payments.json` on ports 4000 and 8080 with a prepaid
+  key, for one real payment by hand. Run it when you touch
+  `control/lib/omnigate_control/payments*`. The offline counterparts, which
+  CI runs, are `control/test/payments_test.exs` (with real signed quotes in
+  `control/test/fixtures/payments`) and the `payments:` sections of
+  `tools/e2e.py` against `tools/mock_intents.py`.
 - **`tools/upgrade_test.py <commit>`** checks out an older commit into a
   temporary git worktree, builds it, lets it write realistic state (keys,
   usage, ledger segments and a snapshot, finished, failed, cancelled and
@@ -383,6 +396,7 @@ config/
   omnigate.dev.json       mock providers; the default config for local runs
   omnigate.example.json   template for real providers
   omnigate.near.json      NEAR AI Cloud as an attested upstream (tools/near_live.py)
+  omnigate.payments.json  prepaid credit and payments through NEAR Intents (tools/near_intents_live.py --serve)
 
 examples/             Python, standard library only: what outside programs look like (docs/building-on-omnigate.md)
   agent_client.py, prepaid_topup.py, usage_export.py   each is run by tools/e2e.py; keep them working when an interface they use changes
@@ -397,6 +411,8 @@ tools/                Python, standard library only (sdk_compat.py excepted; e2e
   privacy_soak.py                   soak test of privacy mode on a stack it starts (long; not in check.py)
   upgrade_test.py                   an older commit's files read by the current build, and mixed pairs (long; not in check.py)
   near_live.py                      attestation, attested-only routing and receipts against the real NEAR AI Cloud (network; not in check.py)
+  mock_intents.py                   a stand-in for the NEAR Intents 1Click API, signing its quotes like the real one (payments in e2e.py)
+  near_intents_live.py              payments against the real 1Click API with dry quotes only (network; not in check.py)
   verify_receipt.py                 checks a receipt against the request and response bodies, offline (run by e2e.py)
   bench.py                          latency measurement
   import_litellm.py, test_import_litellm.py

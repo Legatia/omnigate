@@ -201,6 +201,9 @@ defmodule OmnigateControl.ConfigStore do
             disabled: k["disabled"] == true,
             # Privacy mode (`OmnigateControl.Privacy`); nil = none.
             privacy: OmnigateControl.Privacy.normalize!(k["privacy"], "key #{inspect(k["name"])}"),
+            # What a dollar of provider cost burns of this key's credit, for a
+            # key with a total budget; nil = `credits.burn_multiplier`.
+            burn_multiplier: OmnigateControl.Credits.multiplier!(k["burn_multiplier"], "key #{inspect(k["name"])}: \"burn_multiplier\""),
             source: :file,
             created_at: nil,
             old_hashes: []
@@ -257,7 +260,12 @@ defmodule OmnigateControl.ConfigStore do
           }
         end),
       media: normalize_media(raw["media"] || %{}),
-      retention: normalize_retention(raw["retention"] || %{})
+      retention: normalize_retention(raw["retention"] || %{}),
+      # What prepaid credit burns and earns (`OmnigateControl.Credits`); the
+      # defaults are the behaviour without it.
+      credits: OmnigateControl.Credits.normalize!(raw["credits"]),
+      # Taking payments for credit (`OmnigateControl.Payments`); nil = off.
+      payments: OmnigateControl.Payments.normalize!(raw["payments"])
     }
   end
 

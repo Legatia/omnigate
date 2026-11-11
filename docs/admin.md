@@ -33,15 +33,29 @@ There is one admin token and no user accounts; changing the token ends
 every session. The token must be at least 16 characters long, or the
 control plane does not start.
 
+The sign-in form is the only request body the control plane reads from a
+caller without a credential, and it may be at most 4,096 bytes, declared in
+`Content-Length` (`413 payload_too_large` otherwise). Every other body is
+parsed only after the admin token, a session or the internal token has been
+checked; see [API](api.md#errors-and-request-paths).
+
 **Guessing is throttled, per client address, for both ways in.**
 
 | | Limit | Then |
 |---|---|---|
-| Sign-in form | 5 wrong passwords within a minute | `429` on `POST /login` until the minute is over. A correct sign-in clears the count. |
-| Bearer token | 20 wrong tokens on `/admin/*` or `/metrics` within a minute | `429 too_many_attempts` with `retry-after: 60` for **every** bearer token from that address, the right one included, until the minute is over. |
+| Sign-in form | 5 wrong passwords within a minute | `429` on `POST /login` until the minute is over, for the right password too. A correct sign-in before that clears the count. |
+| Bearer token | 20 wrong tokens within a minute, counted wherever the token is accepted: `/admin/*`, `/metrics`, the dashboard page (`/`), `/login` and `/logout` | `429 too_many_attempts` with `retry-after: 60` on `/admin/*`, `/metrics` and `/` for **every** bearer token from that address, the right one included, until the minute is over. On `/login` and `/logout` a bearer token from that address is ignored for that time, as if none had been sent. |
 
 - The minute starts with the first failure. A request with no
-  `Authorization` header at all is answered `401` and is not counted.
+  `Authorization` header at all is not a guess and is not counted
+  (`/admin/*` and `/metrics` answer it `401`, the dashboard page sends it
+  to `/login`). Any `Authorization` header that is not the admin token as
+  a bearer token counts, another scheme such as `Basic` included.
+- The token is compared in one place for all of these paths. Until commit
+  d79406b the dashboard page and `/login` compared it on their own, outside
+  the count. During a lockout the token is not compared at all, so the
+  answer says nothing about whether it was right. A correct token does not
+  clear the bearer count; the count ends with its minute.
 - The bearer limit is the higher one on purpose: scripts share an address
   more often than people do, and a lockout also stops your own automation
   (a Prometheus scrape from the same address, for example) for that minute.
@@ -53,9 +67,10 @@ control plane does not start.
   everyone, so one person guessing locks everybody out. With
   `OMNIGATE_TRUST_FORWARDED=1` the last hop of `X-Forwarded-For` is used
   instead, which is right when the proxy is the only way in and writes that
-  header itself; `compose.yaml` sets it. Do not set it when clients can
-  reach the control plane directly: they could then choose the address
-  they are counted under.
+  header itself; `compose.yaml` sets it, and `deploy/Caddyfile` replaces
+  whatever a client sent under that name with the address of the
+  connection. Do not set it when clients can reach the control plane
+  directly: they could then choose the address they are counted under.
 
 ## The dashboard
 
@@ -94,8 +109,8 @@ at once.
 Below the table is the **Create a key** form: name, optional budget in US
 dollars, what the budget covers (everything, each calendar month, each day),
 optional requests per minute, and an optional comma-separated model list.
-(A key's limit on unfinished media jobs, `max_open_jobs`, is not in the
-form or the table; set it with the API.)
+(A key's limits on media jobs, `max_open_jobs` and `max_jobs_per_day`, are
+not in the form or the table; set them with the API.)
 After creating or rotating a key the page shows the key itself in a panel
 with a Copy button. **That is the only time the key is shown**; only its
 SHA-256 is stored.
@@ -114,7 +129,11 @@ upstream, cost, links to the outputs, and the webhook's delivery state.
 reason. These counts are kept in memory and start from zero whenever the
 control plane restarts; see [Operations](operations.md#refused-requests).
 
-**Admin activity.** The ten newest entries of the [audit log](#the-audit-log).
+**Admin activity.** The ten newest entries of the [audit log](#the-audit-log):
+time, action, target, outcome, how the caller was authenticated, and the
+address. A summary line for repeated failed sign-ins is listed like any
+other entry; its `repeats` count is not shown here, only in the file and
+in `GET /admin/audit`.
 
 **Configuration.** A read-only view of what the config file says: text
 upstreams (name, protocol, host), text routes (strategy, cache time,
@@ -173,6 +192,9 @@ Things to know about the keys file:
   secret itself. Protect the data directory.
 - If the file exists but cannot be read or parsed, the control plane refuses
   to start rather than start with no managed keys.
+- A managed key stored with an `rpm` above 1,000,000 (possible in a file
+  written before commit d79406b, which introduced the bound) is read as
+  1,000,000.
 - Back it up with the ledger; see [Deployment](deployment.md#backups).
 
 A change reaches the data planes with their next config poll
@@ -208,9 +230,11 @@ curl -X POST http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admi
   "rpm": 600,
   "models": ["demo-chat", "demo-claude"],
   "max_open_jobs": 100,
+  "max_jobs_per_day": 10000,
   "disabled": false,
   "blocked": false,
   "state": "active",
+  "shadowed": false,
   "has_webhook_secret": false,
   "requests": 0,
   "errors": 0,
@@ -229,16 +253,21 @@ Save `key` now: no later call returns it. Only `name` is required.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | required | 1 to 64 characters: letters, digits, `.`, `_`, `-`, starting with a letter or digit. Cannot be changed later. |
-| `budget_usd` | number, 0 or more, or `null` | `null` (no budget) | See [Budgets and periods](#budgets-and-periods). |
-| `budget_period` | `"total"`, `"monthly"` or `"daily"` | `"total"` | What the budget covers. |
-| `rpm` | whole number, 0 or more | `0` (no limit) | Requests per minute, per data-plane process. |
-| `models` | list of route names, or `null` | `null` (all) | Text and media routes the key may use. |
-| `max_open_jobs` | whole number, 0 or more, or `null` | `null` (the config's `media.max_open_jobs`, 100 unless set) | Media jobs the key may have unfinished at one time; `0` for no limit. Listings show the limit in force, so a key without its own shows the default. |
-| `webhook_secret` | string up to 256 characters, or `null` | `null` | Signing secret for this key's job webhooks. `""` also clears it. Never returned; listings show `has_webhook_secret`. |
+| `budget_usd` | number, 0 to 1,000,000,000,000, or `null` | `null` (no budget) | See [Budgets and periods](#budgets-and-periods). |
+| `budget_period` | `"total"`, `"monthly"` or `"daily"` | `"total"` | What the budget covers. `null` also means `"total"`. |
+| `rpm` | whole number, 0 to 1,000,000 | `0` (no limit) | Requests per minute, per data-plane process. `null` also means `0`. |
+| `models` | list of at most 1,000 route names, each 1 to 256 bytes, or `null` | `null` (all) | Text and media routes the key may use. A name given twice is kept once; an empty list allows none. |
+| `max_open_jobs` | whole number, 0 to 1,000,000,000, or `null` | `null` (the config's `media.max_open_jobs`, 100 unless set) | Media jobs the key may have unfinished at one time; `0` for no limit. Listings show the limit in force, so a key without its own shows the default. |
+| `max_jobs_per_day` | whole number, 0 to 1,000,000,000, or `null` | `null` (the config's `media.max_jobs_per_day`, 10,000 unless set) | Media jobs the key may create per UTC day, whatever became of them; `0` for no limit. One job more answers `429 too_many_jobs_today`. Listings show the limit in force, as for `max_open_jobs`. |
+| `webhook_secret` | string up to 256 bytes, or `null` | `null` | Signing secret for this key's job webhooks. `""` also clears it. Never returned; listings show `has_webhook_secret`. |
 | `disabled` | boolean | `false` | A disabled key is refused. |
 
 Unknown fields are ignored. A bad value answers `400 invalid_request` with a
-message naming the field.
+message naming the field. The whole numbers are read strictly: a fraction
+(`600.0`), a string (`"600"`) or a value above the range is a bad value.
+The upper bound on `rpm` is there because data planes hold it in a 32-bit
+field; the same bounds on the numbers apply to keys in the config file
+([Configuration](configuration.md#gateway-keys)).
 
 ### List
 
@@ -367,7 +396,8 @@ What spend is made of, including prompt-cache token prices, is in
 Every state-changing admin action appends one JSON line to
 `OMNIGATE_AUDIT_LOG` (default `data/audit.jsonl`; `/data/audit.jsonl` in the
 container image) and is synced to disk before the action's response is
-sent.
+sent. Failed and throttled sign-ins are the exception: they are counted and
+summed up, as described [below](#failed-and-throttled-sign-ins).
 
 ```json
 {"ts": "2026-11-10T18:02:11Z", "action": "key.update", "target": "my-app", "auth": "token", "address": "203.0.113.7", "outcome": "ok", "fields": ["budget_usd", "rpm"]}
@@ -377,23 +407,33 @@ sent.
 |---|---|
 | `ts` | UTC time, to the second. |
 | `action` | `key.create`, `key.update`, `key.rotate`, `key.delete`, `login`, `logout`. |
-| `target` | The key name, or `null`. |
+| `target` | The key name as it was sent, cut to 64 characters, or `null`. |
 | `auth` | How the caller was authenticated: `token` (bearer), `session` (dashboard), `password` (a login attempt) or `none`. A key action can no longer be recorded with `none`: the admin API is not reachable without a credential. An older entry that says so was made through the bypass described in [SECURITY.md](../SECURITY.md#past-advisories). |
-| `address` | The peer address of the connection. Behind a reverse proxy that is the proxy, also when `OMNIGATE_TRUST_FORWARDED` is set: that setting changes which address the lockouts count, not what is recorded here. |
-| `forwarded_for` | Present when the request had an `X-Forwarded-For` header: its value, cut to 200 characters. A direct caller can fake it, so it is recorded, not trusted. |
+| `address` | The peer address of the connection. Behind a reverse proxy that is the proxy, also when `OMNIGATE_TRUST_FORWARDED` is set: that setting changes which address the lockouts count, not what is recorded here. A summary line is different; see [below](#failed-and-throttled-sign-ins). |
+| `forwarded_for` | Present when the request had an `X-Forwarded-For` header: the first 400 bytes of its value, made one line of valid UTF-8 and cut to 200 characters. A direct caller can fake it, so it is recorded, not trusted. |
 | `outcome` | `ok`, or the error's reason, its `error.code` (`invalid_request`, `key_exists`, `read_only_key`, `key_not_found`, ...). For logins: `ok`, `denied` or `throttled`. |
-| `fields` | For `key.update`: the names of the fields that were sent, never their values. |
+| `fields` | For `key.update`: the names of the fields that were sent (sorted, at most 20), never their values. |
+| `repeats` | Only on a summary line: how many more sign-in attempts with this outcome the address made in that minute, beyond the one that has its own line. |
 
 What is and is not recorded:
 
 - Failed attempts are recorded too (a refused create, a wrong password, a
-  sign-in refused by the lockout).
-  Requests refused before they reach a handler are not: a change without a
-  valid admin token (`401`), one refused by the bearer-token lockout
-  (`429`) or one without the CSRF token (`403`) leaves no line.
+  sign-in refused by the lockout). Failed and throttled sign-ins are
+  counted rather than written one by one.
+  Requests refused before they reach a handler are not recorded: a change
+  without a valid admin token (`401`), one refused by the bearer-token
+  lockout (`429`), one without the CSRF token (`403`) or a sign-in form
+  over 4,096 bytes (`413`) leaves no line. Wrong bearer tokens are counted
+  for the lockout but never written here, on any path.
 - A logout is recorded only when it ends a session.
 - Reads (`GET`) are not recorded.
 - Never a key, a token, a password or a webhook secret.
+- Every text value in an entry is made valid UTF-8 before the entry is
+  encoded (invalid bytes become U+FFFD), and in `forwarded_for` control
+  characters, line breaks included, become spaces. Bytes a caller chose
+  can therefore neither start a line of their own nor stop the log. An
+  entry that still cannot be encoded is left out and reported in the
+  control plane's log.
 - If the line cannot be written (a full disk, say), the action is still
   carried out and the control plane logs an error.
 
@@ -418,6 +458,50 @@ off and the file grows without bound. The file is opened for each entry,
 so you can also move or rotate it from outside at any time without
 restarting the control plane.
 
+### Failed and throttled sign-ins
+
+A failed sign-in (`denied`) or one refused by the lockout (`throttled`) is
+something anyone who can reach the form can cause, as often as they like.
+So these do not get one line each (until commit d79406b they did):
+
+- The first such attempt from an address in a minute is written as an
+  ordinary line. The sign-in request does not wait for it, and the line is
+  not synced by itself.
+- Further attempts from that address with the same outcome in the same
+  minute are only counted.
+- When the minute is over, one summary line says how many more there were.
+  It is written, and synced, within 15 seconds after the minute ends. An
+  address with a single attempt gets no summary line.
+
+```json
+{"ts": "2026-11-10T18:03:00Z", "action": "login", "target": null, "auth": "password", "address": "203.0.113.7", "outcome": "denied", "repeats": 418}
+```
+
+An address therefore costs at most two lines per outcome and minute: at
+most four a minute, whatever it sends.
+
+- **The minute** is the clock minute, not the lockout's minute, which
+  starts with the first failure. A summary line's `ts` is the end of the
+  minute it sums up.
+- **The address** the attempts are grouped by is the one the lockout
+  counts: the peer, or with `OMNIGATE_TRUST_FORWARDED` the last hop of
+  `X-Forwarded-For`, and an IPv6 address by its /64. A summary line carries
+  that address in `address` and has no `forwarded_for`. The first line is
+  an ordinary entry: `address` is the peer and `forwarded_for` is what the
+  header said. Behind the Compose proxy the two lines for one client
+  therefore differ: the first has the proxy's address in `address` and the
+  client's in `forwarded_for`, the summary has the client's in `address`.
+- **A cap on what is followed.** At most 2,000 combinations of address and
+  outcome are counted at a time. Attempts beyond that are counted together
+  under the address `"(others)"`, which gets its own first line (without
+  `forwarded_for`) and its own summary line.
+- The counts are in memory: if the control plane stops before a summary
+  line is written, that count is lost.
+- Because repeats are only counted, a flood of failed sign-ins does not put
+  a queue of synced writes in front of an operator's own action. A
+  successful sign-in is an ordinary entry: one line, synced before the
+  answer.
+
 ## CSRF: scripts and browsers
 
 Requests that change something (`POST`, `PATCH`, `DELETE` on `/admin/*`, and
@@ -434,6 +518,11 @@ rule applies depends on how the request is authenticated:
   form field `_csrf`). Without it the answer is `403 csrf_failed`. The token
   is derived from the session cookie, so it is different for every session
   and nothing is stored on the server.
+- **Both at once: the session rule applies.** A request that carries a
+  valid session cookie is treated as a session request, whatever its
+  `Authorization` header says, so it needs the CSRF token even when it also
+  sends the admin token. (Until commit d79406b the bearer token won.) A
+  script should send the token and no cookie.
 
 If you script against the admin API, use the bearer token. Driving it with
 a session cookie works only if the script also reads the token out of the
@@ -448,7 +537,7 @@ All on the control plane's port, all behind the admin token or a session.
 |---|---|
 | `GET /admin/keys` | Every key with its usage. |
 | `POST /admin/keys` | Create a managed key. `201`, with the key itself. |
-| `PATCH /admin/keys/{name}` | Change a managed key: `budget_usd`, `budget_period`, `rpm`, `models`, `max_open_jobs`, `webhook_secret`, `disabled`. |
+| `PATCH /admin/keys/{name}` | Change a managed key: `budget_usd`, `budget_period`, `rpm`, `models`, `max_open_jobs`, `max_jobs_per_day`, `webhook_secret`, `disabled`. |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. `200`, with the new key. |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |

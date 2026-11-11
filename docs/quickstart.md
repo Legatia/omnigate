@@ -52,7 +52,12 @@ If you have the official OpenAI and Anthropic Python SDKs installed,
 
 A third tool, `python tools/malformed_test.py`, starts the same kind of
 stack and sends it malformed and hostile requests; the gateway must
-survive all of them. And `python tools/check.py` runs every suite a change
+survive all of them. It also plays an upstream and a control plane that
+answer like an attacker (for which it uses ports 4300 and 8190 besides the
+ones above), checks the limits that apply before a request body is read,
+and checks that a client which hangs up or stops reading is still billed
+([Operations](operations.md#hostile-input-testing)). And
+`python tools/check.py` runs every suite a change
 should pass (builds, unit tests, formatting, these three) with one command;
 `--quick` runs only the unit tests and formatting checks.
 
@@ -175,8 +180,14 @@ To throw malformed requests at the gateway you just started, instead of
 letting the tool start its own (it must survive all of them):
 
 ```bash
-python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key --model demo-direct --rpm-key og-ratelimited-key
+python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key --model demo-direct
 ```
+
+Run this way it leaves out the hostile upstream and the hostile control
+plane, which need a stack of its own, and the billing checks, which need
+further options. Its `--rpm-key` option adds two checks of the rate limit,
+but it expects a key limited to 3 requests per minute; the dev config's
+`og-ratelimited-key` allows 5, so it is not given here.
 
 ### Create a key without editing the config
 
@@ -224,7 +235,7 @@ Routes in `config/omnigate.dev.json`:
 | `demo-slow` | First upstream takes 3 s and is abandoned after 1 s |
 | `demo-direct` | One healthy upstream, for benchmarks |
 | `demo-image` | Media job on the Replicate-style adapter; the first target fails, the second delivers |
-| `demo-video` | Media job on the fal-style adapter |
+| `demo-video` | Media job on the fal-style adapter. Priced per second, so a job must name a duration: `"input":{"prompt":"waves","duration":5}`. Without one it is refused with `400 invalid_request` |
 | `demo-image-sync` | Media job on the OpenAI-images-style adapter |
 | `demo-tts` | Media job on the ElevenLabs-style adapter; cached (input: `text`, `voice_id`) |
 

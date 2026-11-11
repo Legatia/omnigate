@@ -27,7 +27,8 @@ decided; the release process is in [docs/releasing.md](docs/releasing.md).
 
 Operators: the checklist for running this safely is
 [docs/security.md](docs/security.md). If you ran a commit older than
-3a0b147, read [Past advisories](#past-advisories).
+d79406b, read [Past advisories](#past-advisories); what an upgrade changes
+is in [docs/upgrading.md](docs/upgrading.md).
 
 ## Security model in brief
 
@@ -41,7 +42,7 @@ private network behind a TLS proxy. See
 
 | Credential | Held by | Sent as | Opens |
 |---|---|---|---|
-| Gateway key | Applications | `Authorization: Bearer` or `x-api-key`, to the data plane | Text endpoints, the jobs API and file downloads, within that key's model list, rate limit, budget and limit on unfinished jobs |
+| Gateway key | Applications | `Authorization: Bearer` or `x-api-key`, to the data plane | Text endpoints, the jobs API and file downloads, within that key's model list, rate limit, budget, limits on unfinished jobs and jobs per day, and the data plane's limits on what one key may have in flight |
 | Internal token (`OMNIGATE_INTERNAL_TOKEN`) | The two processes | `x-omnigate-internal`, from data plane to control plane | `/internal/*` on the control plane: the config snapshot, usage and refusal-count intake, the forwarded jobs API |
 | Admin token (`OMNIGATE_ADMIN_TOKEN`) | Operators | `Authorization: Bearer`, or once as the dashboard password | The dashboard, `/admin/*` (which includes creating and revoking gateway keys) and `/metrics` on the control plane |
 
@@ -66,10 +67,11 @@ None of them works in another's place.
   token itself is sent once.
 - **Guessing the admin token is throttled, per client address.** Five
   failed sign-ins within a minute lock that address out of the sign-in
-  form, and 20 wrong bearer tokens on `/admin/*` or `/metrics` within a
-  minute lock it out of bearer access (`429`, the right token included),
-  in both cases until the minute is over. A request with no token at all
-  is not counted. The address is the connection's, or, with
+  form, and 20 wrong bearer tokens within a minute lock it out of bearer
+  access (`429`, the right token included), in both cases until the minute
+  is over. The bearer count covers every place the token is accepted:
+  `/admin/*`, `/metrics`, the dashboard page and the sign-in page. A
+  request with no token at all is not counted. The address is the connection's, or, with
   `OMNIGATE_TRUST_FORWARDED=1`, the last hop of `X-Forwarded-For`, which is
   only safe when a proxy that writes that header is the only way in. See
   [docs/admin.md](docs/admin.md#two-ways-in).
@@ -86,7 +88,9 @@ None of them works in another's place.
 - **Admin actions are recorded.** Key changes, sign-ins (successful, denied
   and throttled) and sign-outs are appended to an audit log with the time,
   how the caller was authenticated and the peer address, never with a
-  secret. See [docs/admin.md](docs/admin.md#the-audit-log).
+  secret. Failed and throttled sign-ins, which anyone can cause, are
+  aggregated: at most two lines per address, outcome and minute. See
+  [docs/admin.md](docs/admin.md#the-audit-log).
 
 ### Deny by default
 
@@ -98,17 +102,27 @@ Both processes refuse what they do not recognise instead of passing it on.
   router always see the same path. The first path segment decides which
   credential is needed, and a segment the control plane does not serve is
   a `404` at that check, so a route added later stays closed until it is
-  deliberately opened. Credentials are checked before a request body is
-  read, and the one body an anonymous caller may send (the sign-in form) is
-  limited to 4,096 bytes. The listener speaks HTTP/1.1 only.
+  deliberately opened. A request body is read and parsed only for a caller
+  who has authenticated, and for the sign-in form, which is limited to
+  4,096 bytes; any other body is left unread and the connection closed
+  after the answer. The listener speaks HTTP/1.1 only.
 - **The data plane.** A request head is validated before anything else
   reads it: a header line without a colon, a bare line feed, a control
   byte, two lengths, a length together with chunked encoding, or a body on
-  a method that has none is answered `400`; a body without a length `411`;
-  an unknown expectation `417`. A path has exactly one accepted spelling
-  (no percent-encoding, no trailing slash, no dot segments), a query string
-  a small character set, and JSON at most 64 levels of nesting. See
+  a method that has none is answered `400`; a body without a
+  `Content-Length`, a chunked one included, `411`; an unknown expectation
+  `417`. A path has exactly one accepted spelling (no percent-encoding, no
+  trailing slash, no dot segments), a query string a small character set,
+  and a JSON body bounded nesting (64 levels), bounded objects and one
+  spelling of the fields the gateway acts on. See
   [docs/api.md](docs/api.md#request-heads-paths-and-queries).
+- **Upstreams and the control plane are network peers too.** The data
+  plane reads every response body, a provider's or the control plane's,
+  with its own bounded framing: a head with two framings is refused, chunk
+  sizes are bounded, and a body that ends before its declared length is an
+  error. It frames its answer to the client itself and never forwards a
+  length a peer declared. A relayed `content-type` with a control byte in
+  it is refused.
 - **Between the two.** The request the data plane sends to the internal API
   carries the internal token, so the client's share of it is kept narrow:
   a validated path and query, set as separate URL components, and one
@@ -118,6 +132,13 @@ Both processes refuse what they do not recognise instead of passing it on.
   connection, so input is validated before any code that could assert on
   its shape; if a panic happens anyway, the process logs one line and exits
   with status 70 for its supervisor to restart.
+- **Text from outside is made safe before it is kept.** In the control
+  plane, a provider's error body, a forwarded header and a job's input are
+  turned into valid UTF-8 (and, for log lines, into a single line) before
+  they are logged, stored in a job, written to the audit log or put in the
+  ledger. The stores answer an error instead of dying on something they
+  cannot write, and they run in a group that is restarted without touching
+  the listener.
 
 ### Secrets, per process
 
@@ -169,17 +190,30 @@ able to lower its own bill.
 - Token counts are read only from the places the protocols put usage
   (`usage.*` and its equivalents), never from matching text elsewhere in a
   response.
-- A response that ends early is still billed: the provider's real figures
-  if they can still be read within `OMNIGATE_ABORT_DRAIN_MS` after a client
-  disconnects, otherwise an estimate marked as one.
+- A response that ends early is still billed. When a client disconnects
+  or stops reading, the provider's answer is read to its end in the
+  background (for at most `OMNIGATE_ABORT_DRAIN_MS` and
+  `OMNIGATE_ABORT_DRAIN_MAX_MB`) and the provider's real figures are
+  billed; without them, an estimate marked as one, floored by the request's
+  size, its media parts and the text that came back.
 - A media job is priced from what the adapter sent to the provider, not
   from labels in the client's input; every part of the price is at least
-  zero; negative durations, counts and prices are refused.
+  zero; negative durations, counts and prices are refused. A per-second
+  price is never applied to a duration the client left out: the job is
+  refused unless the operator configured a default, and a minimum can be
+  set. A route can list the input fields it accepts and put a factor on
+  the price by the value of a field, so that an option the provider
+  charges for cannot be sent without the price following it.
 - Job creation is rate-limited in the control plane as well as the data
-  plane, the number of unfinished jobs per key is capped, and so is the
-  size of a job's input.
+  plane, the number of unfinished jobs per key and of jobs per key per day
+  is capped, and so is the size of a job's input.
 - Usage events are deduplicated by request id, so a resent batch never
   bills twice.
+- A key that is over its budget stays blocked while the ledger restarts:
+  without loaded totals the control plane hands out no config snapshot.
+- Usage for a route or target the config does not have, and media jobs on
+  a target without a price, are recorded at $0 and counted in a metric, so
+  that spend going missing this way is visible.
 
 ### Files and webhooks
 
@@ -199,6 +233,16 @@ able to lower its own bill.
 - Webhooks are signed the [Standard Webhooks](https://www.standardwebhooks.com/)
   way (HMAC-SHA256 over id, timestamp and body). Receivers should verify the
   signature and the timestamp; see [docs/api.md](docs/api.md#webhooks).
+- **A webhook receiver is not trusted with the control plane's resources.**
+  Only the status of its answer is used and at most 16 KiB of the body are
+  read. An attempt is recorded before its request is sent, so a receiver
+  gets at most `max_attempts` requests per job whatever happens to the
+  control plane in between. Deliveries in flight are capped overall and
+  per gateway key.
+- **Every outbound response is read through a cap.** Provider and bucket
+  API answers up to 4 MiB (an answer that carries the media inline up to
+  four thirds of `media.max_output_bytes`, at most 256 MiB), downloads up
+  to `media.max_output_bytes`; beyond the cap the connection is closed.
 - **URLs that somebody else chose are not trusted.** A client's webhook URL
   and the output URLs in a provider's answer go through the same check.
   They must be http(s), without embedded credentials, and must resolve only
@@ -217,15 +261,35 @@ able to lower its own bill.
 On the public port:
 
 - A request head may be at most 16 KiB with at most 100 header lines, and a
-  request body at most 8 MiB, nested at most 64 levels deep.
+  request body at most 8 MiB, nested at most 64 levels deep, with at most
+  65,536 members in any object and keys of at most 8 KiB.
+- **Limits come before the body.** Before a request body is read, the key's
+  requests in flight (`OMNIGATE_MAX_CONCURRENT_PER_KEY`, 512), the memory
+  its requests hold (a quarter of `OMNIGATE_REQUEST_MEMORY_MB`, 1,024), the
+  memory all requests hold, and the key's rate limit are checked, and a
+  declared length over the limit is refused unread.
+- **A body is not parsed into a tree unless it has to be.** A request for a
+  provider of the client's own protocol is forwarded as the client's bytes
+  with the model name replaced. Where a tree is needed (translation, the
+  response cache, provider quirks), an object may have at most 1,024
+  members, the tree is built in an arena capped at 128 times the text plus
+  1 MiB and at most 96 MiB, and all trees together are held to
+  `OMNIGATE_PARSE_MEMORY_MB` (1,024; half per key).
 - A client that does not finish sending a request, or leaves a connection
   idle, is disconnected after `OMNIGATE_CLIENT_TIMEOUT_MS` (30 seconds).
-- A response that stops moving, because the upstream went silent or the
-  client stopped reading, is cut off after
+- A client that stays connected but takes none of a response is
+  disconnected after `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 seconds); a
+  response whose upstream goes silent is cut off after
   `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (5 minutes). That includes the
   gateway's own answers and file downloads.
+- At most 256 upstream answers are read on after their client left, each
+  for at most `OMNIGATE_ABORT_DRAIN_MS` and `OMNIGATE_ABORT_DRAIN_MAX_MB`,
+  and each still counts against its key's concurrency cap.
 - At most `OMNIGATE_MAX_CONNECTIONS` (4096) connections are served at once;
   further ones get an immediate 503.
+- The usage queue holds at most 100,000 events and 128 MiB; an upstream
+  response that must be buffered to be translated at most 16 MiB; a
+  control-plane answer at most 256 MiB.
 - Requests the gateway refuses are counted per key name and reason, with a
   cap on the number of distinct series, so a flood of made-up keys cannot
   grow memory. The table of learned model quirks is capped as well.
@@ -233,16 +297,31 @@ On the public port:
 On the control plane:
 
 - A job's `input` and `metadata` may be at most `media.max_input_bytes`
-  (1 MiB) together, and a key may have at most `max_open_jobs` (100)
-  unfinished jobs.
-- An anonymous request body is limited to 4,096 bytes; any other body is
-  read only after the credential check, up to 8,000,000 bytes.
+  (1 MiB) together; an input over 8 KiB is kept in a file, not in memory.
+  A key may have at most `max_open_jobs` (100) unfinished jobs and create
+  at most `max_jobs_per_day` (10,000) per UTC day, and listing jobs is
+  rate-limited per key.
+- An anonymous request body is limited to 4,096 bytes (the sign-in form;
+  no other anonymous body is read); any other body is read only after the
+  credential check, up to 8,000,000 bytes.
+- Every outbound response is read through a cap (see Files and webhooks),
+  and at most 16 webhook deliveries run at once, 4 per gateway key.
 - The table of failed attempts is swept once it has grown, so guesses from
-  many addresses cannot fill memory.
+  many addresses cannot fill memory; anonymous sign-in attempts cost the
+  audit log at most two lines per address and minute.
+- Duplicate-detection ids are held in memory at about 61 MiB per million,
+  for `retention.ledger_ids_days` (3 days by default).
 
-These bound what one client can hold; they are not a defence against a
-volumetric attack. Put the data plane behind a proxy or load balancer that
-you would trust with that.
+The Compose deployment gives each of the two containers a memory limit
+(1 GiB unless changed), so that a process that grows past it is restarted
+instead of taking the host down. The data plane's default memory budgets
+add up to more than that limit; see
+[docs/deployment.md](docs/deployment.md#memory-limits).
+
+These bound what one client, one key, one upstream or one webhook receiver
+can make a process hold; they are not a defence against a volumetric
+attack. Put the data plane behind a proxy or load balancer that you would
+trust with that.
 
 ### What must stay private
 
@@ -255,8 +334,10 @@ you would trust with that.
   holds only host names and the allow-list, unless you kept secrets in it
   from an earlier commit.)
 - The control plane's data directory: the ledger files (`ledger.jsonl`,
-  its sealed segments and its two snapshots) and `jobs.jsonl` (usage per
-  key; job inputs, metadata and webhook URLs), `keys.json` (key hashes, and
+  its sealed segments, its two snapshots and the per-day id files
+  `ledger.ids.*`), `jobs.jsonl` and the directory `jobs.jsonl.inputs/`
+  (usage per key; job inputs, metadata and webhook URLs), `keys.json` (key
+  hashes, and
   the webhook secret of any managed key that has one, in clear text),
   `audit.jsonl` and its rotated files (who did what, from which address),
   and the media directory or bucket. Backups of it are as sensitive.
@@ -303,14 +384,33 @@ vulnerabilities to report.
   enforces, and it judges the address the proxy sees. Behind another proxy
   or Docker Desktop's network that is not the client's address.
 - **Estimated usage is an estimate.** A stream that ends without the
-  provider's closing figures is billed from the size of the request and
-  the number of events received. It is meant to be close, not exact. The
-  mark (`estimated`) is in the ledger line, in the text access log and,
-  for the newest requests, in `GET /admin/overview`; the dashboard page,
-  the metrics and the JSON access log do not show it.
+  provider's closing figures is billed from the size of the request, its
+  media parts, and the events and text received. It is meant to be close,
+  not exact, and has not been compared with what a provider charged. The
+  mark (`estimated`) is in the ledger line, in the access log (both
+  formats) and, for the newest requests, in `GET /admin/overview`; the
+  dashboard page and the metrics do not show it.
+- **Reading on costs provider money.** After a client leaves, the provider
+  keeps generating until the gateway has read the answer to its end, for
+  up to `OMNIGATE_ABORT_DRAIN_MS` (two minutes). That is billed to the key,
+  exactly; set the variable lower if you would rather stop the provider
+  sooner and bill an estimate.
 - **Strictness has a cost.** Paths with percent-encoding or a trailing
-  slash, unusual query characters and deeply nested JSON are refused. A
-  client that sent them to an earlier commit and was served now gets `400`.
+  slash, unusual query characters, deeply nested JSON, chunked request
+  bodies and a duplicated `model` field are refused. A client that sent
+  them to an earlier commit and was served now gets `400` or `411`.
+- **The rate limit is charged before a request is judged.** A request
+  refused for its body or its model has used up one request of the key's
+  `rpm`. That is deliberate: nothing a request costs comes before a limit.
+- **The per-key concurrency cap is one number for all keys**
+  (`OMNIGATE_MAX_CONCURRENT_PER_KEY`); there is no per-key setting.
+- **The memory budgets are not the process's memory.** They bound request
+  bodies and parse trees; the response cache, the usage queue and
+  per-connection buffers come on top. With the defaults they admit more
+  than the Compose file's 1 GiB container limit.
+- **An upstream that frames its answer by closing the connection** (no
+  length, no chunking) cannot be told from one that was cut off: such an
+  answer is taken as complete wherever it ends.
 - **Budgets are enforced after the fact**, with up to one poll interval of
   lag, and cannot newly block a key during a control-plane outage. A
   monthly or daily budget unblocks by itself when its UTC period turns; a
@@ -328,8 +428,10 @@ vulnerabilities to report.
   data-plane process, so several data planes each allow the full limit;
   job creation is counted once more in the control plane. Both reset on a
   restart of the process that holds them.
-- **Duplicate-detection ids expire** (14 days by default). A usage event
-  that a data plane resends later than that would be counted twice.
+- **Duplicate-detection ids expire** (3 days by default, in whole UTC
+  days). A usage event that a data plane resends later than that would be
+  counted twice; raise `retention.ledger_ids_days` if a data plane can
+  hold undelivered usage for longer.
 - **The media output cache is shared across gateway keys.** An identical
   cacheable job request from another key reuses the stored output.
 - **Output downloads send no provider credentials**, so an output URL that
@@ -337,17 +439,21 @@ vulnerabilities to report.
 - **Refusal counts and the access log are for diagnosis, not for audit**:
   the counts are best effort and kept in memory only.
 - **The hostile-input fixes have been tested, not attacked.** They are
-  covered by unit and fuzz tests, `tools/malformed_test.py` and the
-  container test, all written by the project. There has been no external
-  penetration test.
+  covered by unit and fuzz tests, `tools/malformed_test.py` (which also
+  plays a hostile upstream and a hostile control plane) and the container
+  test, all written by the project. There has been no external penetration
+  test. The control plane's new HTTP client and the data plane's new
+  response reader have met the real providers only on an error path; see
+  the README's [What has been verified](README.md#what-has-been-verified).
 - **Nothing has run under production load.**
 
 ## Past advisories
 
 No release has been tagged, so these are identified by commit. All of them
-were found by an independent review of the code in November 2026, by
-reading and small proofs of concept. **None is known to have been
-exploited.**
+were found by two independent reviews of the code in November 2026, by
+reading and small proofs of concept: the first led to commits 97cf396,
+fde530c and 3a0b147, the second to e4e30e4 and d79406b. **None is known to
+have been exploited.**
 
 | Class | Fixed in | Needed | Worst case |
 |---|---|---|---|
@@ -357,14 +463,24 @@ exploited.**
 | [Billing evasion](#billing-evasion) | fde530c, 3a0b147 | A gateway key | Usage that is not billed, or billed too low |
 | [Server-side request forgery through provider outputs](#server-side-request-forgery-through-provider-outputs) | 3a0b147 | A gateway key with a media route, and a provider answer that can be steered | The control plane fetches an internal address and stores the answer as a job output |
 | [Other hardening from the same review](#other-hardening-from-the-same-review) | fde530c, 3a0b147 | varies | varies |
+| [Resource exhaustion of the data plane by a valid key](#resource-exhaustion-of-the-data-plane-by-a-valid-key) | e4e30e4 | A gateway key | The gateway process runs out of memory or CPU, for everyone |
+| [Crashes of the data plane from malformed upstream responses](#crashes-of-the-data-plane-from-malformed-upstream-responses) | e4e30e4 | Control of a configured upstream's answers, or of the network path to it | The gateway process ends, for everyone |
+| [Memory exhaustion of the control plane through webhook receivers](#memory-exhaustion-of-the-control-plane-through-webhook-receivers) | d79406b | A gateway key that may create media jobs with a webhook | The control plane is killed; jobs, the dashboard and usage intake stop |
+| [Crash of the control plane by text that is not valid UTF-8](#crash-of-the-control-plane-by-text-that-is-not-valid-utf-8) | d79406b | A provider answer with such bytes, or network access to the control plane's port | The control plane stops |
+| [Other hardening from the second review](#other-hardening-from-the-second-review) | e4e30e4, d79406b | varies | varies |
 
 **For everyone who ran an earlier commit:** update both processes to
-3a0b147 or later (10bc009 or later if clients reach the data plane without
-the included proxy, so that stored outputs carry their download headers). If the control plane's port, or the dashboard's host
-name, could be reached by anyone you do not trust, also set a new admin
-token and rotate gateway keys as described under the first advisory. The
-Compose deployment changed with these fixes; the steps are in
+d79406b or later; the fixes are on both sides. Read
+[docs/upgrading.md](docs/upgrading.md) first: defaults changed, the
+control plane rewrites its ledger snapshot at the first start, and a config
+file that loaded before can be refused. If you come from before 3a0b147:
+when the control plane's port, or the dashboard's host name, could be
+reached by anyone you do not trust, also set a new admin token and rotate
+gateway keys as described under the first advisory, and split the Compose
+environment file as described in
 [docs/deployment.md](docs/deployment.md#coming-from-a-commit-before-3a0b147).
+Nothing in the four advisories of the second review requires rotating a
+credential.
 
 ### Authentication bypass on the control plane through percent-encoded paths
 
@@ -674,5 +790,284 @@ above. None needs action beyond updating, except where noted.
   checksum catches accidents, not tampering), and the control plane's
   listener is HTTP/1.1 only.
 - **Duplicate-detection ids were kept for ever**, growing memory and
-  snapshots with every request served. They now expire after 14 days by
-  default.
+  snapshots with every request served. They now expire (after 14 days by
+  default in 3a0b147, after 3 days since d79406b).
+
+### Resource exhaustion of the data plane by a valid key
+
+Fixed in commit e4e30e4 (November 2026).
+
+**What was wrong.** The data plane read and parsed a request body before
+it consulted the key's rate limit, and nothing bounded what a body could
+cost once it was parsed or how many requests one key had in flight.
+
+- Every text request body, up to 8 MiB, was parsed into a JSON value tree.
+  A tree can be hundreds of times the size of its text: an 8 MiB body made
+  of tiny values took 1,096 MiB at its peak.
+- The tree's objects are hash maps with a fixed seed. A body whose keys
+  were chosen to collide cost seconds of CPU (4 seconds for one body in
+  the proof of concept).
+- The rate limit was checked after all of that, so a key limited to a few
+  requests a minute could still send such bodies as fast as it liked; and
+  there was no cap on concurrent requests per key.
+- A chunked request body reached the standard library's chunked decoder,
+  which overflows on a chunk size that does not fit its integer; in the
+  build that ships, an overflow is a panic.
+
+**What it allowed.** The holder of any valid gateway key, even one with a
+tight `rpm` or a list of allowed models, could make the gateway process
+use gigabytes of memory or pin its CPU with a handful of requests, and end
+it: killed by the operating system for its memory, or by a panic. One
+process serves every connection, so every request in flight was dropped
+and the in-memory state lost (rate-limit buckets, cooldowns, the response
+cache). Nothing was disclosed and nothing was billed wrongly. A key that
+was over its budget was refused before its body was read, as before.
+
+**Who was affected.** Every commit before e4e30e4, for deployments that
+hand gateway keys to parties they do not fully trust, or whose keys can
+leak (keys embedded in client applications, for instance). No key, no
+exposure: without a valid key a request was refused before its body was
+read.
+
+**What to do.** Update the data plane to e4e30e4 or later. There is
+nothing to rotate. Then look at the new limits
+([docs/operations.md](docs/operations.md#connection-limits-and-shutdown)):
+lower `OMNIGATE_MAX_CONCURRENT_PER_KEY` from its 512 if your keys are held
+by strangers, and size `OMNIGATE_REQUEST_MEMORY_MB` and
+`OMNIGATE_PARSE_MEMORY_MB` to the memory the process may use. If your
+data-plane container was killed for memory, or restarted, without a reason
+you could find, this may have been why.
+
+**The fix.** The key's requests in flight, the memory its requests hold
+and its rate limit are checked before a byte of the body is read. The body
+is then walked once, in place, for the three fields the gateway acts on,
+and a request for a provider of the same protocol is forwarded as the
+client's own bytes; so that the provider cannot read those bytes
+differently, a duplicated or escaped `model`, `stream` or `stream_options`
+is refused. A tree is built only where one is needed, in an arena capped
+at a multiple of the text, with the caps of all trees reserved against a
+budget, and with at most 1,024 members per object. Chunked request bodies
+are refused with `411`. The same attack body now peaks at 30 MiB, and the
+collision body costs nothing measurable. `tools/malformed_test.py` sends
+both.
+
+**What it costs.** A request refused for its model or its JSON now uses
+up one request of the key's rate limit, a request that must be translated
+and has an object with more than 1,024 members is refused
+(`400 request_too_complex`), and clients must send a `Content-Length`.
+
+### Crashes of the data plane from malformed upstream responses
+
+Fixed in commit e4e30e4 (November 2026).
+
+**What was wrong.** The data plane read upstream response bodies with the
+standard library's readers and passed the upstream's framing on to the
+client. Three responses ended the process:
+
+- a chunked response with a chunk size too large for the integer it is
+  kept in (an overflow, which is a panic in the build that ships);
+- a response whose body was shorter than the `Content-Length` it declared:
+  the gateway had promised the client that length and the standard library
+  asserts when a response ends with a different number of bytes;
+- a response that declared both a `Content-Length` and chunked encoding.
+
+The same code read the control plane's answers for the jobs and files API
+and for the config. A fourth finding from the same place: a `Content-Type`
+with a bare line feed inside passed the standard library's head parser,
+and written out again it started a header line of the upstream's choosing
+in the gateway's answer to the client.
+
+**What it allowed.** Whoever controlled what a configured upstream
+answered could end the gateway process, for every client, with one
+response, as often as a request reached that upstream; or add response
+headers to what a client received. Nothing was disclosed.
+
+**Who was affected.** Every commit before e4e30e4. How exposed a
+deployment was depends on its upstreams: a provider reached over HTTPS can
+only be impersonated by the provider itself, or by something that answers
+in its place (a compromised or misbehaving endpoint; a proxy between you
+and it). An upstream reached over plain HTTP, such as a self-hosted
+OpenAI-compatible server on another machine, could be impersonated by
+anyone on the network path. The link to the control plane is plain HTTP on
+a private network. A buggy upstream that truncated a response could
+trigger the second case by accident.
+
+**What to do.** Update the data plane. There is nothing to rotate. If your
+data-plane container exited with a panic (status 70 since fde530c) around
+upstream trouble, this may have been why.
+
+**The fix.** The gateway decides a response's framing itself from the raw
+head, strictly (two framings, two different lengths or an unknown transfer
+coding are refused), and reads the body with its own reader, in which
+every size is bounded and a body that ends early is an error. It frames
+its own answer: a short answer that is not a stream is buffered and sent
+with a length the gateway counted, everything else is sent chunked, and an
+upstream's length is never forwarded. When an upstream breaks off after
+the client's response has started, the client's connection is dropped
+without the closing chunk. A relayed content type may hold no control
+byte. The control plane's answers go through the same reader.
+`tools/malformed_test.py` plays such an upstream, and such a control
+plane, against the gateway.
+
+**What it costs.** File downloads over 64 KiB no longer carry a
+`content-length`, and a response the provider cut short now ends with a
+dropped connection rather than a clean end.
+
+### Memory exhaustion of the control plane through webhook receivers
+
+Fixed in commit d79406b (November 2026).
+
+**What was wrong.** The control plane made its outbound HTTP calls with a
+client that hands back a whole response body, however large. That covered
+webhook deliveries, provider API calls, bucket calls, and the error answer
+to an output download. A webhook URL is chosen by the client that creates
+the job.
+
+**What it allowed.** The holder of a gateway key that may create media
+jobs with a webhook could point the webhook at a server of their own and
+have it answer each delivery with an endless body. The control plane
+buffered it until it ran out of memory and was killed. Because a delivery
+was only recorded after it returned, the delivery that killed the process
+had not used up an attempt and was made again after the restart, and
+nothing limited how many deliveries one key had in flight. While the
+control plane is down, the jobs API answers `503`, the dashboard and the
+admin API are unreachable, keys cannot be changed or newly blocked, and
+usage waits in the data planes' spools; text traffic goes on. Nothing was
+disclosed. A provider that answered with an oversized body had the same
+effect.
+
+**Who was affected.** Deployments before d79406b with media routes, where
+a key that has a webhook signing secret (its own, or the global one) is
+held by a party you do not fully trust; or where a configured media
+provider is not fully trusted. Text-only deployments were not affected.
+
+**What to do.** Update the control plane to d79406b or later. There is
+nothing to rotate. If the control plane was killed for memory without a
+reason you could find, look at the webhook URLs of the jobs of that time
+(`webhook.url` in `jobs.jsonl`).
+
+**The fix.** A small HTTP client of the control plane's own reads every
+response through a cap and closes the connection when the cap is reached:
+16 KiB for a webhook receiver's answer (only its status is used), 4 MiB
+for a provider or bucket API answer, the output limit for a download and
+for an answer that carries media inline. A webhook attempt is written to
+the job before its request is sent. Deliveries in flight are capped at 16
+overall and 4 per gateway key, and the jobs a key may create per day are
+capped. The Compose file gives both containers a memory limit.
+
+### Crash of the control plane by text that is not valid UTF-8
+
+Fixed in commit d79406b (November 2026).
+
+**What was wrong.** The control plane's stores (the job store, the audit
+log, the ledger) write JSON, and the JSON encoder raises on a string that
+is not valid UTF-8. Text from outside reached them unchecked: a provider's
+error body, kept in a job's attempts; a forwarded header
+(`X-Forwarded-For`), kept in an audit entry. The raise ended the store's
+process. All stores and the HTTP listener sat under one supervisor, which
+gives up after a few crashes in a short time: four crashes within five
+seconds stopped the whole control plane.
+
+**What it allowed.** Sending such bytes a few times in quick succession
+stopped the control plane until its own supervisor (Docker, systemd)
+started it again, as often as the sender liked. The effects of a stopped
+control plane are those listed in the advisory above. There was a second
+effect: while the ledger was restarting, its totals read as "nothing
+spent", so a config snapshot built in that moment showed keys that were
+over their budget as unblocked. Nothing was disclosed.
+
+**Who was affected.** Commits before d79406b.
+
+- Through a provider: deployments with media routes, where a provider's
+  error answer can contain bytes that are not UTF-8. That needs a provider
+  that is hostile, compromised or broken, or one that echoes input chosen
+  by a job's creator into its error text.
+- Through the audit log: anyone who could send a sign-in attempt with a
+  crafted `X-Forwarded-For` header to the control plane's port. Behind the
+  included Caddy proxy a client's own value of that header is not passed
+  on, so this route needed the control plane's port to be reachable
+  directly, or through a proxy that forwards the client's header. That the
+  included proxy stops every form of it was not established before the
+  fix; the container test now sends such headers through it.
+
+**What to do.** Update the control plane. There is nothing to rotate. If
+keys with a budget matter to you, compare the budget with the recorded
+spend for keys that should have been blocked around any unexplained
+control-plane restart.
+
+**The fix.** Everything from outside is made valid UTF-8 (and, for logs, a
+single line of bounded length) before it is logged, stored or encoded. The
+stores answer an error to their caller instead of dying on something they
+cannot write. They run as a group under a guard that restarts the group,
+with a pause that grows from half a second to thirty, without touching the
+listener: `/healthz` keeps answering, `/readyz` says what is not ready.
+The ledger's tables only become readable once they are loaded, and the
+config snapshot is refused (`503 not_ready`) until then, so data planes
+keep the snapshot they have and no key is unblocked by a restart. A usage
+event that cannot be written even after repair is dropped and counted
+(`omnigate_ledger_invalid_events_total`) instead of taking the ledger
+down.
+
+### Other hardening from the second review
+
+Commits e4e30e4 and d79406b. Smaller findings, fixed together with the
+above. None needs action beyond updating, except where noted.
+
+- **A per-second media price was not applied when the client left the
+  duration out.** A job without `input.duration` on a route priced per
+  second was accepted and billed nothing per second. Such a job is now
+  refused unless the target has `default_seconds`, and `min_seconds` and
+  `max_seconds` bound what is billed and accepted. **Action:** set
+  `default_seconds` on per-second targets if your clients do not send a
+  duration.
+- **Options the provider charges for were not in the price.** A client
+  could ask for a higher quality or a larger size at the price of the
+  smallest. A media route can now list the input fields it accepts
+  (`allowed_input`) and multiply the price by the value of a field
+  (`price_multipliers`). **Action:** configure them where your provider's
+  price depends on an input.
+- **An abandoned stream could be billed far too low.** The client's
+  connection waited at most five seconds for the provider's closing
+  figures; a generation that ran longer was billed an estimate of one
+  token per event received, and a client that stayed connected without
+  reading was not handled at all until the five-minute idle timeout. The
+  provider's answer is now read to its end in the background, a stalled
+  client is given up on after 30 seconds, and the estimate is floored by
+  the text received and allows for images and documents in the request.
+- **The admin token could be probed without the throttle** on the
+  dashboard page and the sign-in page, which accepted it as a bearer token
+  and compared it on their own. Every place that accepts the token now
+  goes through the throttled check.
+- **Anonymous callers could make the control plane read and parse request
+  bodies** on paths that take none. Bodies are parsed only for
+  authenticated requests and the sign-in form.
+- **Failed sign-ins could flood the audit log and delay operators' own
+  actions**, since each was written and synced in line. They are now
+  aggregated and written without making anyone wait.
+- **Jobs that end at once were not bounded by the open-jobs limit.** A key
+  could create jobs that fail immediately without limit, each costing a
+  log line, a ledger event and a webhook call. Jobs per key per day are
+  capped (`max_jobs_per_day`, 10,000), and listing jobs is rate-limited.
+- **A number that did not fit 32 bits in the config made the snapshot
+  unreadable for every data plane**, which then kept its old config for
+  good. Whole-number settings are bounded and validated strictly, in the
+  config file and in the admin API.
+- **Duplicate-detection ids were part of every ledger snapshot**, which
+  stalled the ledger for seconds per million ids each time one was
+  written. They live in per-day files now.
+- **A usage spool larger than the queue stopped the data plane from
+  starting**, and the spool file only shrank when the queue was empty. A
+  spool of any size is now loaded as far as it fits, and the file is
+  compacted as events are acknowledged.
+- **The proxy's `X-Forwarded-For` was left to the proxy's defaults.** The
+  included Caddy configuration now sets it explicitly from the address of
+  the connection, so that a later change to the proxy's trust settings
+  cannot let a client choose the address its failed sign-ins are counted
+  under. **Action:** if you run your own proxy with
+  `OMNIGATE_TRUST_FORWARDED=1`, make sure it replaces the header.
+- **`Idempotency-Key` was validated on every endpoint**, against a narrow
+  character set, which refused keys that SDKs attach to ordinary calls. It
+  is now validated only where it is forwarded (job requests), as visible
+  ASCII.
+- **The data-plane image had no health check.** `omnigate-dp healthcheck`
+  backs a `HEALTHCHECK`.

@@ -7,6 +7,21 @@ tested. The "Status" lines repeat the README's
 real keys. Nothing has run
 under sustained or concurrent load against real providers.
 
+**After commits e4e30e4 and d79406b**, which replaced the control plane's
+HTTP client and the data plane's response reader: the control plane's new
+HTTP client and the data plane's new response reader were each run against
+the real hosts of OpenAI, Anthropic, Gemini, xAI, ElevenLabs, Replicate and
+fal with deliberately invalid keys; every provider's own auth error came
+back intact. The successful paths that were verified earlier with real keys
+(text, images, speech, video, bucket storage) have NOT been re-run on the
+new client and reader.
+
+Read every "Status: verified" line on this page, and the status column of
+the media table, with that in mind: each records a check made before those
+two commits, on the client and the reader they replaced. The check with
+invalid keys changes no status below. It covers no successful request, and
+the fal adapter is still not verified.
+
 - [Text providers](#text-providers): OpenAI, Anthropic, Gemini, xAI, other
   OpenAI-compatible services
 - [Media providers](#media-providers): Replicate, fal, OpenAI images,
@@ -38,6 +53,60 @@ from ordinary input when it meters a call
 ([Operations](operations.md#budgets)). Both are covered by unit tests on
 OpenAI- and Anthropic-format responses; the "Status" lines below predate
 them and do not include them.
+
+What a text provider is sent, and how its answer is read, is the same for
+all of them:
+
+- **A request in the provider's own protocol is the client's own bytes.**
+  The gateway replaces the value of `"model"` with the target's model id
+  and changes nothing else, so key order, whitespace and the spelling of
+  numbers reach the provider as the client wrote them. Two exceptions, both
+  on streamed `/v1/chat/completions` and `/v1/completions` requests whose
+  client did not set `stream_options.include_usage` to `true`: the gateway
+  appends `"stream_options":{"include_usage":true}` to the body, or, when
+  the body already has a `stream_options`, parses the body and writes it
+  out again with the flag set, under the limits of the next point
+  ([API](api.md#streaming)).
+- **A translated request is rebuilt.** A request for a provider of the
+  other protocol is parsed and written in that protocol. That step accepts
+  at most 1,024 members in any one object and a bounded amount of memory; a
+  request beyond either is refused with `400 request_too_complex` before
+  anything is sent to a provider
+  ([API](api.md#limits-on-what-one-request-and-one-key-may-hold)).
+- **Clients must declare the length of a request body.** A chunked request
+  body (`Transfer-Encoding: chunked`) is refused with `411`.
+- **Answers are re-framed.** The gateway reads the provider's response body
+  with its own bounded reader and frames the client's response itself; the
+  provider's `content-length` is never passed on. An answer that is not an
+  event stream and is at most 64 KiB is sent with a length the gateway
+  counted; everything else is sent chunked.
+- **An answer the provider cuts short.** Before anything was sent to the
+  client it is a failed attempt and the next target is tried. Once the
+  client's response has started, the client's connection is dropped
+  without the closing chunk, so the client sees an incomplete response,
+  and the call is recorded with status 499.
+- **An answer with an ambiguous length** (both a `content-length` and
+  chunked encoding, two different lengths, a transfer coding other than
+  `chunked`) or a chunk size that does not parse is a failed attempt
+  (`UpstreamUnparseable`); the next target is tried.
+- **Timeouts.** A provider gets the upstream's `timeout_ms`
+  (`OMNIGATE_UPSTREAM_TIMEOUT_MS` when that is `0`) to send its response
+  headers. After that, a provider that sends nothing for
+  `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (300,000 by default) ends the response.
+  A client that is connected but takes none of the response is a separate
+  case with its own, shorter timeout, `OMNIGATE_CLIENT_STALL_TIMEOUT_MS`
+  (30,000).
+- **A stream the client abandons is read on.** When the client hangs up or
+  stalls, the gateway keeps reading the provider's answer in the background
+  for the closing usage figures, for at most `OMNIGATE_ABORT_DRAIN_MS`
+  (120,000, two minutes, by default) and `OMNIGATE_ABORT_DRAIN_MAX_MB` (64)
+  more. The connection to the provider is closed only then, so the provider
+  may go on generating until that point ([API](api.md#streaming)).
+
+The details are in [API](api.md#response). `tools/malformed_test.py` plays
+a provider that sends such answers (the special models of
+`tools/mock_upstream.py`). What has been run against real providers since
+this reader replaced the old one is recorded at the top of this page.
 
 ### OpenAI
 
@@ -218,13 +287,59 @@ the contents of `input` differ per adapter. Common behaviour:
   ([API](api.md#file-urls)).
 - Per-character and per-second prices are applied to what the adapter
   sends to the provider, as listed per adapter in
-  [Configuration](configuration.md#mediaroutes). `duration`, `seconds`,
-  `n`, `num_outputs` and `num_images` in a job's `input` must not be
-  negative, whatever the adapter.
+  [Configuration](configuration.md#mediaroutes).
+- **Durations and counts are checked when the job is created,** whatever
+  the adapter. `input.duration` and `input.seconds` may be a number of 0 or
+  more, a string that is one, or a number followed by `s`: `5`, `"5"`,
+  `"2.5"`, `"5s"`. `input.n`, `input.num_outputs` and `input.num_images`
+  must be whole numbers of 0 or more. Anything else is refused with
+  `400 invalid_request`. The value is forwarded as the client wrote it; the
+  gateway does not turn `"5s"` into `5`.
+- **A per-second price needs a duration.** On a route with a target whose
+  `per_second_usd` is above 0, a job that names no duration (or `0`) is
+  refused with `400 invalid_request`, unless that target has
+  `default_seconds`: then that many seconds are billed. `min_seconds` is
+  the least that is billed, and a request for more than `max_seconds` is
+  refused. The three settings change what is billed and accepted; they are
+  not sent to the provider, which generates whatever length it would have
+  anyway.
+- **For `openai_images`, `elevenlabs`, `gemini` and `gemini_interactions`
+  no duration is counted from the request.** A per-second price on such a
+  target is billed from `default_seconds` and `min_seconds` alone: a
+  `duration` the client writes is not what is billed. If you price such a
+  target per second, set
+  `default_seconds`. Without it a job that names no duration is refused,
+  and one that names any duration above 0 is accepted and billed only
+  `min_seconds` for that part of the price (nothing, when that is not set
+  either).
+- **A route can restrict and price input options.** `allowed_input` lists
+  the top-level `input` fields a job may carry; a job with any other field
+  is refused instead of forwarded. `price_multipliers` puts a factor on the
+  job's price by the value of an input field (a quality, a size), and then
+  only the listed values are accepted. Both are described in
+  [Configuration](configuration.md#price-multipliers). They matter most for
+  adapters that forward the whole `input`: the provider charges for options
+  your price otherwise knows nothing about.
+- **Provider answers are read through caps.** An API answer (a submit, a
+  poll, a result) may be at most 4 MiB. An answer that carries the media
+  inline (`elevenlabs`, `gemini`, `gemini_interactions`, `openai_images`)
+  may be four thirds of `media.max_output_bytes` plus 64 KiB, and never
+  more than 256 MiB; it is held in memory. A download may be at most
+  `media.max_output_bytes`. A larger answer is a failed call
+  (`request_failed: :response_too_large`) or a failed download
+  (`output_fetch_failed: :output_too_large`), and the attempt fails; a
+  poll is tried five times in a row first.
+- **A provider's error text is cut before it is stored.** What a provider
+  says about a failure ends up in the job's `attempts[].outcome`: at most
+  300 characters, made one line of valid UTF-8 first.
 - Targets in a route are tried in order. A failed submit, a provider-side
   failure, a timeout (`timeout_s`) or an answer with no outputs moves on to
   the next target.
 - No per-upstream concurrency limits, and no transcoding.
+
+The duration, input and multiplier settings are covered by the control
+plane's unit tests (`control/test/wave6_test.exs`) against a stub provider.
+None of them has been used with a real provider.
 
 | `kind` | Provider API | Style | Status |
 |---|---|---|---|
@@ -281,10 +396,13 @@ form, and job cancellation at a real provider.
   "model": "video",
   "timeout_s": 900,
   "targets": [
-    { "upstream": "fal", "model": "<fal video model id>", "price": { "per_second_usd": 0.0 } }
+    { "upstream": "fal", "model": "<fal video model id>", "price": { "per_second_usd": 0.0 }, "default_seconds": 5, "min_seconds": 1, "max_seconds": 10 }
   ]
 }
 ```
+
+(As in `config/omnigate.example.json`. The three `_seconds` settings take
+effect once `per_second_usd` is above 0.)
 
 The job's `input` is sent as the body of `POST {base_url}/{model}`. The
 queue is polled until `COMPLETED`; every object with a `url` field in the
@@ -297,10 +415,13 @@ curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer <gateway key>" -d '
 ```
 
 With `per_second_usd`, the price is multiplied by the larger of
-`input.duration` and `input.seconds`. With `per_input_char_usd`, the
-characters of `input.prompt`, `input.text` and `input.input` are added
-together, because the whole `input` is sent. The same holds for the
-Replicate and xAI video adapters.
+`input.duration` and `input.seconds` (each a number, a numeric string or a
+number followed by `s`), or by the target's `default_seconds` when the job
+names neither, and never by less than `min_seconds`; see
+[Media providers](#media-providers) above for when a job is refused. With
+`per_input_char_usd`, the characters of `input.prompt`, `input.text` and
+`input.input` are added together, because the whole `input` is sent. The
+same holds for the Replicate and xAI video adapters.
 
 Status: **not verified.** The fal adapter has only run against a mock
 written from public documentation; expect details to differ.
@@ -316,14 +437,31 @@ written from public documentation; expect details to differ.
   "model": "image-sync",
   "targets": [
     { "upstream": "openai-images", "model": "<openai image model id>", "price": { "per_output_usd": 0.0 } }
-  ]
+  ],
+  "allowed_input": ["prompt", "size", "quality", "background", "output_format"],
+  "price_multipliers": {
+    "quality": { "low": 1, "medium": 4, "high": 16, "default": 16 },
+    "size": { "1024x1024": 1, "1024x1536": 1.5, "1536x1024": 1.5, "default": 1.5 }
+  }
 }
 ```
+
+(As in `config/omnigate.example.json`. Check the fields and the factors
+against your provider's documentation and price list.)
 
 One synchronous `POST /v1/images/generations`. The job's `input` is the
 request body, with `model` set to the target's model. Results may come back
 as `b64_json` or as a `url`; both are stored. For base64 results the stored
 content type follows `input.output_format` (`jpeg`, `webp`, otherwise PNG).
+
+Because the whole `input` is forwarded, a client can ask for options that
+change what the provider charges. With the route above:
+
+- a job may carry only the five listed fields; one with `n`, say, is
+  refused with `400 invalid_request`;
+- `quality` and `size` must be one of the listed values, and the job's
+  price is multiplied by both factors (`"default"` is the factor for a job
+  that does not send the field).
 
 ```bash
 curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer <gateway key>" -d '{"model":"image-sync","input":{"prompt":"a red cube"}}'
@@ -485,7 +623,7 @@ mock).
   "model": "grok-video",
   "timeout_s": 900,
   "targets": [
-    { "upstream": "xai-video", "model": "<xai video model id>", "price": { "per_second_usd": 0.0 } }
+    { "upstream": "xai-video", "model": "<xai video model id>", "price": { "per_second_usd": 0.0 }, "default_seconds": 5, "min_seconds": 1, "max_seconds": 10 }
   ]
 }
 ```
@@ -500,9 +638,20 @@ curl http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer <gateway key>" -d '
 ```
 
 Price it with `per_second_usd`, which is multiplied by `input.duration`
-(or `input.seconds`, whichever is larger). If the client leaves both out,
-that part of the price is zero, whatever length the provider then
-generates; a negative value is refused when the job is created.
+(or `input.seconds`, whichever is larger). With a price above 0:
+
+- If the client leaves both out, the target's `default_seconds` are
+  billed, whatever length the provider then generates. Without
+  `default_seconds` the job is refused with `400 invalid_request`. (Until
+  commit d79406b such a job was accepted and that part of its price was
+  zero.)
+- Never less than `min_seconds` is billed, and a request for more than
+  `max_seconds` is refused.
+- A negative value, or one that is not a duration, is refused when the job
+  is created.
+
+None of the three settings is sent to xAI: set them to what the model
+does.
 
 Status: verified with `grok-imagine-video-1.5-lite`: a one-second clip
 submitted, polled to completion, copied off xAI and downloaded from the

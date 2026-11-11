@@ -96,9 +96,15 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "version $version, publish=$publish, prerelease=$prerelease"
 
-      # control/mix.exs is where the control plane's version comes from (it is
-      # what the omnigate_build_info metric reports); dataplane/build.zig.zon
-      # carries the same number for the data plane.
+      # The version is written in exactly two places, and every version string
+      # in the two programs is derived from them at build time, so comparing
+      # these two with the tag is the whole check:
+      #   control/mix.exs          -> OmnigateControl.version/0: the
+      #                               omnigate_build_info metric and the
+      #                               control plane's outbound user-agents
+      #   dataplane/build.zig.zon  -> build.zig -> build_options.version:
+      #                               the data plane's user-agent
+      # (Nothing else in the source carries a version number to drift.)
       - name: The tag matches the versions in the source
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -202,9 +208,16 @@ jobs:
             echo "::endgroup::"
           done
 
-      # The only binary this runner can execute. Without the internal token
-      # the data plane refuses to start: it must exit by itself with an
-      # ordinary error status, not hang and not crash.
+      # The only binary this runner can execute. Two checks.
+      #
+      # Without the internal token the data plane refuses to start: it must
+      # exit by itself with its startup-error status (1), not hang, not take
+      # the missing token for a bad argument (2) and not panic (70).
+      #
+      # With a token it must come up and answer its own `healthcheck`
+      # subcommand, which is what the image's HEALTHCHECK runs. No control
+      # plane is needed for that: the data plane listens and serves /healthz
+      # while it waits for one (here it is pointed at a port nothing is on).
       - name: Smoke test the x86-64 Linux binary
         run: |
           set -uo pipefail
@@ -218,11 +231,42 @@ jobs:
           code=$?
           set -e
           cat smoke.log
-          if [ "$code" -le 0 ] || [ "$code" -ge 124 ]; then
+          if [ "$code" -ne 1 ]; then
             echo "::error::expected the data plane to refuse to start without OMNIGATE_INTERNAL_TOKEN (exit status 1); got status $code"
             exit 1
           fi
           echo "refused to start without the internal token (status $code), as it should"
+
+          # Its own port, and no files left in the runner's temp directory.
+          export OMNIGATE_LISTEN=127.0.0.1:18080 OMNIGATE_SPOOL=off OMNIGATE_CONFIG_CACHE=off
+          # Nothing is listening yet: the subcommand must say so (status 1).
+          set +e
+          timeout 30 "$bin" healthcheck
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected 'omnigate-dp healthcheck' to exit with status 1 while nothing is listening; got status $code"
+            exit 1
+          fi
+          OMNIGATE_INTERNAL_TOKEN=release-smoke-test-token OMNIGATE_CONTROL_URL=http://127.0.0.1:9 "$bin" > serve.log 2>&1 &
+          pid=$!
+          healthy=false
+          for _ in $(seq 1 30); do
+            if timeout 10 "$bin" healthcheck; then
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          # A stop signal ends it cleanly; its status is of no interest here.
+          kill -TERM "$pid" 2> /dev/null || true
+          wait "$pid" 2> /dev/null || true
+          cat serve.log
+          if [ "$healthy" != "true" ]; then
+            echo "::error::the data plane did not answer its own healthcheck subcommand within 30 seconds of starting"
+            exit 1
+          fi
+          echo "started, and 'omnigate-dp healthcheck' reported it healthy"
 
       # omnigate-dp-<version>-<target>.tar.gz (.zip for Windows), each holding
       # one directory of the same name with the binary in it, and next to each
@@ -334,9 +378,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # The release Dockerfile is used nowhere else, so run what it produces
-      # once before publishing it: the container must start the binary as the
-      # runtime user and exit with the data plane's own "no internal token"
-      # error, not with a Docker error (status 125 and above).
+      # once before publishing it. First: the container must start the binary
+      # as the runtime user and exit with the data plane's own "no internal
+      # token" error, not with a Docker error (status 125 and above). Then,
+      # with a token: it must stay up and Docker must come to call it
+      # "healthy", which exercises the image's HEALTHCHECK (the binary's
+      # `healthcheck` subcommand) and the writable /data of the runtime user.
       - name: Smoke test the data plane image (amd64)
         run: |
           set -uo pipefail
@@ -351,6 +398,28 @@ jobs:
             echo "::error::expected the container to exit with the data plane's own error status (1); got $code"
             exit 1
           fi
+
+          # No control plane here: the address is one nothing listens on, so
+          # the data plane starts at once and serves /healthz while it waits.
+          docker run -d --name omnigate-smoke \
+            -e OMNIGATE_INTERNAL_TOKEN=release-smoke-test-token \
+            -e OMNIGATE_CONTROL_URL=http://127.0.0.1:9 \
+            omnigate-dataplane:smoke
+          status=starting
+          for _ in $(seq 1 60); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' omnigate-smoke 2> /dev/null || echo gone)"
+            if [ "$status" != "starting" ]; then
+              break
+            fi
+            sleep 2
+          done
+          docker logs omnigate-smoke || true
+          docker rm -f omnigate-smoke > /dev/null 2>&1 || true
+          if [ "$status" != "healthy" ]; then
+            echo "::error::expected the container to become healthy through the image's HEALTHCHECK; its health status was '$status'"
+            exit 1
+          fi
+          echo "the container became healthy"
 
       # The same for arm64, under emulation. A failure here may be the
       # emulator's rather than the binary's, so it warns instead of failing.

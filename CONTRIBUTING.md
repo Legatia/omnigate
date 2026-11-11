@@ -97,6 +97,14 @@ The tests use their own port (4999) and throwaway files in the system temp
 directory, so they do not disturb a running dev instance. If the formatting
 check fails, run `mix format` and commit the result.
 
+`control/test/wave6_test.exs` holds the regression tests for the second
+security review of the control plane, at least one per finding, grouped
+under the finding's label. It starts a stub provider and webhook receiver
+of its own on a free port. Its last test reads `typesFor` out of
+`dataplane/src/errors.zig` and compares it, row for row, with the table in
+`errors.ex`; it does nothing when the Zig source is not there (a checkout
+of `control/` alone).
+
 LiteLLM importer tests:
 
 ```bash
@@ -150,17 +158,48 @@ python tools/malformed_test.py
 
 It starts the mock providers, the control plane and the gateway through
 the end-to-end harness (so it cannot run at the same time as the
-end-to-end or SDK suites) and sends, over raw sockets, the requests that
-used to crash the data plane or slip past a check (a header line without a
-colon, a `POST` without a length, deeply nested JSON, smuggling attempts,
-non-canonical paths) and 250 generated variations of broken request heads,
-asking `/healthz` after every one. Then it checks that a client which
-hangs up mid-stream is still billed: the provider's real figures when they
-arrive, an estimate marked as one when they never do. It passes only if
-the gateway survived all of it and every case with one right answer got
-that answer. The generated cases are seeded: a failure prints the seed,
-and `--seed` replays it; `--count` sets how many, and `--thorough` runs
-1,500. When a case fails the logs are kept and their directory printed.
+end-to-end or SDK suites) and asks `/healthz` on a fresh connection after
+every case. It passes only if the gateway survived all of it and every
+case with one right answer got that answer. What it covers:
+
+- **Hostile clients**, over raw sockets: the requests that used to crash
+  the data plane or slip past a check (a header line without a colon, a
+  `POST` without a length, deeply nested JSON, smuggling attempts,
+  non-canonical paths), and 250 generated variations of broken request
+  heads.
+- **Bodies that are cheap to send and were expensive to parse**: 8 MiB of
+  tiny values and objects with thousands of members, to a same-protocol
+  route and to a translated one; `model` given twice or spelled with an
+  escape.
+- **Limits before the body**: a declared length over the limit (413) and a
+  key over its rate limit (429) are answered before any of the body has
+  been sent; a key at its concurrency cap gets 429 while reads and other
+  keys go on being served.
+- **A hostile upstream**: the mock on `:9005` answers, by model name, with
+  chunk sizes that overflow, bodies shorter than their `content-length`,
+  both framings at once, a header smuggled into the content type, and an
+  interim status as the final answer. `tools/mock_upstream.py` lists these
+  special models (`hostile-*`, and `drip`, `late-usage` and `flood` for the
+  billing checks) in its docstring.
+- **A hostile control plane**: a stand-in inside the script on `:4300`,
+  and a second gateway on `:8190` that takes its config from it, with the
+  same kinds of answers on a job request and on the config poll.
+- **The `healthcheck` subcommand** of the data-plane binary: exit 0
+  against a gateway that answers, 1 when nothing listens or the listener
+  never answers, 2 for an unknown argument.
+- **Billing of clients that stop listening**: a client that hangs up
+  mid-stream, or stays connected and stops reading, is still billed: the
+  provider's real figures when they arrive, an estimate marked as one when
+  they never do.
+
+So besides the harness's ports (control plane 14000, gateway 18080, mocks
+9001-9005) the tool needs `:4300` and `:8190` free. It starts its gateway
+with a concurrency cap of 8 and short stream-idle, client-stall and
+abort-drain timeouts, so that those cases finish in seconds.
+
+The generated cases are seeded: a failure prints the seed, and `--seed`
+replays it; `--count` sets how many, and `--thorough` runs 1,500. When a
+case fails the logs are kept and their directory printed.
 
 To test a gateway you started yourself instead (as in the
 [Quickstart](docs/quickstart.md#3-run-the-pieces-by-hand)):
@@ -169,8 +208,12 @@ To test a gateway you started yourself instead (as in the
 python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key --model demo-direct --rpm-key og-ratelimited-key
 ```
 
-The billing checks then run only with `--events-url`, `--drip-model` and
-`--stall-model`. Never point it at a production gateway.
+Against your own gateway the hostile-upstream, hostile-control-plane and
+`healthcheck` parts do not run. `--other-key`, `--concurrency-cap` and
+`--translated-model` add the cases that need them. The billing checks run
+only with `--events-url`, and each of `--drip-model`, `--stall-model`,
+`--late-model` and `--flood-model` adds one. Never point it at a
+production gateway.
 
 Container test (needs a Linux Docker daemon):
 
@@ -184,8 +227,14 @@ TLS proxy on `127.0.0.1:18443` (a second proxy with a closed admin
 allow-list listens on `127.0.0.1:18444`). The checks include requests sent
 byte for byte through the proxy: odd spellings of guarded paths, malformed
 and oversized requests, and that the data-plane container holds no admin
-token. Without `--compose` it uses plain `docker` commands; `--no-build`
-reuses images built earlier; `--keep` leaves the containers running.
+token. It also checks `X-Forwarded-For` through the proxy: that a client
+cannot pick the address its failed logins are counted under, that values
+which are not text do not stop the control plane, that the audit log holds
+the address the proxy saw, and that a dozen failed logins are a few audit
+lines. With `--compose` it checks that both services have the memory limit
+`compose.yaml` gives them (1 GiB). Without `--compose` it uses plain
+`docker` commands; `--no-build` reuses images built earlier; `--keep`
+leaves the containers running.
 
 No test needs an API key. Checks against real providers were done by hand
 and are recorded in the README.
@@ -201,22 +250,26 @@ python tools/load_test.py --gateway http://127.0.0.1:8080 --key og-unlimited-key
 Run it when you touch connection handling, timeouts, the usage queue or
 shutdown in the data plane; that is where it found the bugs it was written
 for. Run the hostile-input test as well when you touch request parsing,
-path handling or anything that forwards client bytes.
+path handling, anything that forwards client bytes, or anything that reads
+a response from an upstream or the control plane.
 
 ## Layout
 
 ```
 dataplane/            Zig data plane: the public port
   build.zig, build.zig.zon
-  src/main.zig        startup, environment variables (read strictly), the accept loop, stop signals and shutdown
-  src/proxy.zig       request handling: auth, limits, routing, failover, streaming, job passthrough
-  src/guard.zig       checks on bytes from the network before anything else reads them: request heads, paths, JSON depth
+  src/main.zig        startup, environment variables (read strictly, all listed in its header), the accept loop, stop signals and shutdown, `healthcheck`
+  src/proxy.zig       request handling: auth, limits, routing, failover, streaming, re-framing, draining abandoned streams, job passthrough
+  src/guard.zig       checks on bytes from the network before anything else reads them: request heads, paths, JSON depth and members per object
+  src/limits.zig      per-key concurrency and request memory (`Gate`), the budget and the capped allocator for JSON trees (`Tree`)
+  src/jsonscan.zig    one pass over a request body, in place: `model`, `stream`, `stream_options`, bounds on members and key length, the model splice
+  src/framing.zig     how long a response body from an upstream or the control plane is, and the bounded reader for it
   src/translate.zig   OpenAI chat completions <-> Anthropic messages (pure functions)
   src/errors.zig      the gateway's own errors in each protocol's shape; reason -> category table
   src/models.zig      GET /v1/models and /v1/models/{id} in each protocol's shape
   src/config.zig      the config snapshot and its lookups
   src/control.zig     talks to the control plane: config pull, usage and counter push, config cache
-  src/reporter.zig    the usage spool and its delivery loop
+  src/reporter.zig    the usage spool (bounded, compacted as events are acknowledged) and its delivery loop
   src/usage.zig       token counting from the response stream (a small JSON reader), prompt-cache tokens, estimates
   src/cache.zig       the exact-match response cache
   src/headers.zig     which provider and control-plane response headers reach the client
@@ -232,13 +285,16 @@ dataplane/            Zig data plane: the public port
 control/              Elixir control plane
   mix.exs, config/config.exs, .formatter.exs
   lib/omnigate_control/
-    application.ex    supervision tree, paths, bind address, startup checks
+    application.ex    supervision tree (the stores as one group under a guard), paths, bind address, startup checks
+    guard.ex          restarts a group of processes with a pause, without letting its failures reach the HTTP listener
     env.ex            numeric environment variables, read strictly
+    text.ex           makes text from outside valid UTF-8, and one line, before it is logged, stored or encoded
+    counters.ex       a few process-wide counters for /metrics (ledger events that were invalid or had no price)
     errors.ex         the one error envelope and its category table
     config_store.ex   loads, normalizes and hot-reloads the config file
     router.ex         every HTTP route: /internal, /admin, /metrics, dashboard, login
     admin_auth.ex     admin token, sessions, CSRF tokens, the throttles for failed logins and wrong tokens
-    rate_limit.ex     per-key requests per minute for job creation
+    rate_limit.ex     per-key requests per minute for creating and listing jobs (the data plane's token bucket)
     net_guard.ex      which addresses may be called when the URL came from a client or a provider
     keys.ex           managed gateway keys and the keys file
     admin.ex          what operators see: key listings, the overview document
@@ -247,17 +303,18 @@ control/              Elixir control plane
     rejections.ex     refused-request counts reported by data planes
     ledger.ex         the usage ledger: totals, spend per budget period, snapshots, sealing
     ledger/files.ex   the ledger on disk: segments, snapshot files, crash safety
+    ledger/ids.ex     the ids of recorded events, for dropping duplicates: one table and one file per UTC day
     metrics.ex        Prometheus output
     retention.ex      periodic cleanup
     jobs.ex           the job API's logic: create, cancel, cost, cache, resume
-    jobs/store.ex     durable job state
+    jobs/store.ex     durable job state; inputs over 8 KiB in files of their own
     jobs/runner.ex    runs one job: submit, poll, re-host, fail over
     jobs/adapter.ex   the adapter behaviour (submit, poll, cancel, billable) and the kind -> module table
     jobs/adapters/    one module per provider shape
     storage.ex, storage/local.ex, storage/s3.ex, sigv4.ex, url_signer.ex
-    webhooks.ex       signing, delivery, retries
-    http.ex           outbound HTTP on OTP's httpc
-  test/
+    webhooks.ex       signing, delivery, retries, limits on deliveries in flight
+    http.ex           outbound HTTP/1.1 on :gen_tcp and :ssl; every response is read through a cap
+  test/               unit tests; wave6_test.exs holds the regression tests of the second security review
   Dockerfile
 
 config/
@@ -268,16 +325,16 @@ tools/                Python, standard library only (sdk_compat.py excepted)
   mock_upstream.py, mock_media.py   mock providers, object store, webhook receiver
   e2e.py, container_test.py         the two system tests
   sdk_compat.py                     the official OpenAI and Anthropic SDKs as clients
-  malformed_test.py                 hostile input against a gateway it starts (or one you name)
+  malformed_test.py                 hostile clients, upstreams and control plane against a gateway it starts (clients only against one you name)
   check.py                          runs every suite but the container test, with a summary
   load_test.py                      load and soak test against a running gateway
   bench.py                          latency measurement
   import_litellm.py, test_import_litellm.py
 
 compose.yaml, deploy/Caddyfile                 the Compose deployment
-.env.example                                   host names and the admin allow-list (read by Compose)
+.env.example                                   host names, the admin allow-list and the two memory limits (read by Compose)
 .env.control.example, .env.dataplane.example   one environment file per container
-docs/                                          documentation
+docs/                                          documentation (README.md is the index; upgrading.md: what changes between commits)
 
 .github/
   workflows/ci.yml                  CI: seven jobs
@@ -297,7 +354,10 @@ not to, and say the reason in the commit.
   against real providers from what has only met a mock, and most adapter
   modules repeat it in their documentation. When you add or change provider
   behaviour, update those statements in the same change, and do not claim
-  more than you ran.
+  more than you ran. When you replace something the earlier checks ran on,
+  say that they predate it: the README does so for commits e4e30e4 and
+  d79406b, which replaced the control plane's HTTP client and the data
+  plane's response reader.
 - **Keep the README honest and short.** A new limitation goes into its
   "Known limits" when it is introduced, and a limitation the code no longer
   has comes out in the same change. Something checked against a real
@@ -313,10 +373,11 @@ not to, and say the reason in the commit.
   `.env.dataplane.example`), never into both for convenience, and nothing
   the data plane does not read goes into its file.
 - **Dependencies are a cost.** The data plane uses only the Zig standard
-  library, the control plane has two direct Hex packages (Bandit and Plug),
-  and the tools use only the Python standard library (`tools/sdk_compat.py`
-  imports the two SDKs it tests, inside a function, so that nothing else
-  gains the dependency). Adding one needs a reason.
+  library, the control plane has two direct Hex packages (Bandit and Plug)
+  and makes its outbound calls with a client of its own on OTP's sockets
+  (`http.ex`), and the tools use only the Python standard library
+  (`tools/sdk_compat.py` imports the two SDKs it tests, inside a function,
+  so that nothing else gains the dependency). Adding one needs a reason.
 - **Error answers have one shape, written in two places.** The gateway's
   reason (`<snake_case>`) is `error.code`; `error.type` is the provider's
   broader category for it.
@@ -328,11 +389,30 @@ not to, and say the reason in the commit.
   - Control plane: every error goes through `send_error` in `router.ex`,
     which builds the OpenAI-style envelope with
     `OmnigateControl.Errors.body/4`. `errors.ex` holds a copy of the OpenAI
-    column of `typesFor`; change the two tables together, so that a client
-    of `/v1/jobs` cannot tell which process refused it.
-  - Either way a new reason is part of the API: add it to `docs/api.md` (or
-    `docs/admin.md` for the admin API) and to the troubleshooting table in
-    `docs/operations.md`.
+    column of `typesFor` in `@by_reason`; change the two tables together,
+    so that a client of `/v1/jobs` cannot tell which process refused it. A
+    test compares them row for row, and the fallback by status too
+    ("errors.ex mirrors dataplane/src/errors.zig" in
+    `control/test/wave6_test.exs`), so `mix test` fails when only one side
+    was changed.
+  - A reason whose category is the default for its status needs no row in
+    either table (`request_too_complex` and `concurrency_limit_exceeded`
+    have none). One that needs another category needs a row in both.
+  - Either way a new reason is part of the API: add it to the error tables
+    in `docs/api.md` (or `docs/admin.md` for the admin API) and to the
+    troubleshooting table in `docs/operations.md`.
+- **A new setting is documented where operators look.** A new environment
+  variable of the data plane goes into the header comment of
+  `dataplane/src/main.zig`, which lists every one, and into
+  `docs/configuration.md`; one of the control plane goes into
+  `docs/configuration.md`. A new config field goes into
+  `docs/configuration.md` and `config/omnigate.example.json`.
+- **A change an existing installation can notice gets an entry in
+  `docs/upgrading.md`**: a default that changed, a config value that used
+  to load and no longer does, a file on disk whose format or place changed,
+  an answer a client can now get. That page is what someone reads before
+  moving to a newer commit, and it says what going back costs; a change
+  that is only in the changelog is found after it has bitten.
 - Files use LF line endings (`.gitattributes`).
 
 ### Zig (data plane)
@@ -359,6 +439,36 @@ not to, and say the reason in the commit.
   standard library's, and anything a client sent is copied into a request
   of the gateway's own only after it has been checked character by
   character. A new parser of peer input needs a test that feeds it garbage.
+- **Nothing a request costs may come before the limits.** A handler calls
+  `admit` in `proxy.zig` (the key's requests in flight and the memory they
+  hold, `Gate` in `limits.zig`) and then checks the rate limit, both before
+  it reads a byte of the body. A new endpoint that takes a body does the
+  same. Otherwise a client decides how much the process reads and holds
+  before any limit has judged the request. The price is known and
+  accepted: a request later refused for its model or its JSON has used a
+  rate-limit token.
+- **Never build a JSON tree of a peer's bytes outside a capped arena.** A
+  value tree can be hundreds of times the size of its text (a megabyte of
+  `0,0,0,...` is 180 MiB of tree), and std's JSON object is a hash map
+  with a fixed seed, so keys chosen to collide cost the square of their
+  number. To read fields from a request body, use `jsonscan.scan`, which
+  allocates nothing. Where a tree cannot be avoided, check the members per
+  object first (`guard.max_tree_members`) and build it through `inTree` in
+  `proxy.zig`: it reserves `limits.treeCap` of the text against the tree
+  budget and runs the step inside a `limits.Tree`. That goes for an
+  upstream's answer as much as for a client's request.
+- **Never let std read or frame an upstream's body, and never forward a
+  peer's `content-length`.** std's body readers trust the peer: a chunk
+  size too large for its integer overflows, and std asserts when a response
+  ends with a different number of bytes than its head promised. A response
+  from an upstream or from the control plane is taken over with
+  `framing.takeBody` and read through `framing.BodyReader`; when the
+  exchange is dropped, `framing.disown` keeps std from reading what is
+  left. The client's response is framed here: a counted length for a small
+  answer, chunked for everything else. A header value copied from a peer
+  into a response of ours must have no control byte in it:
+  `framing.plainHeaderValue` checks the content type, the allowlist in
+  `headers.zig` the rest.
 - Decision logic is written as pure functions where possible so it can be
   tested exhaustively (`balance.order`, the translation functions).
 - Fields added to the config snapshot must be optional with a default, and
@@ -384,10 +494,47 @@ not to, and say the reason in the commit.
   required field or an invalid value raises, which stops a start and makes a
   reload keep the previous config; the newer checks (`models`, `strategy`,
   `weight`, `retention`) raise with a message that names the field, and new
-  ones should too.
-- JSON uses the standard library's `JSON` module; outbound HTTP goes
-  through `OmnigateControl.Http`.
-- Secrets are compared with `Plug.Crypto.secure_compare/2`.
+  ones should too. A whole-number setting is read with `int!/4`, which
+  takes a range and rejects a fraction instead of cutting it. A number the
+  data plane reads out of the config snapshot goes into a 32-bit field
+  there, and one value that does not fit makes the whole snapshot
+  unreadable for every data plane, so each has an upper bound in
+  `ConfigStore` (`limits/0`); the admin API holds managed keys to the same
+  bound.
+- JSON uses the standard library's `JSON` module.
+- **Every outbound request goes through `OmnigateControl.Http`, and every
+  response is read through a cap.** Whoever answers a webhook, a provider
+  call or a download decides how many bytes they send, so the caller
+  decides how many are read. `Http.request/5` reads at most 4 MiB unless
+  `max_body:` says otherwise; an adapter whose provider returns the media
+  inline passes `Adapter.inline_cap(ctx)`, a caller that only wants the
+  status passes a small cap with `overflow: :truncate` (webhooks: 16 KiB),
+  and `Http.download/4` takes the most bytes it may write. No other module
+  opens an outbound connection.
+- **Text from outside goes through `OmnigateControl.Text` before it is
+  logged, stored or encoded.** A provider's error body, a header value and
+  a job's input are bytes somebody else chose. `JSON.encode!/1` raises on
+  invalid UTF-8, which used to end the process that held the jobs or the
+  audit log, and a raw newline in a log line lets the sender write the next
+  line. Use `Text.line/2` for anything that goes into a log line or a
+  stored outcome, and `Text.clean/1` on a term before it is encoded.
+- **A process that holds state belongs to the guarded group** in
+  `application.ex` (`OmnigateControl.StateGuard`), not directly under the
+  root supervisor. If the group's supervisor gives up, the guard starts it
+  again with a pause and the HTTP listener is not touched. Code that calls
+  into the group has to cope with it being away for a moment: the job
+  runner waits for the store (`with_store/1` in `jobs/runner.ex`), and
+  `GET /internal/config` answers `503 not_ready` while the ledger is not
+  ready.
+- **A request body is parsed only for a caller who has authenticated**, and
+  for the sign-in form (`parse_body` and `body_policy` in `router.ex`). A
+  new route that takes a body from an anonymous caller needs its own small
+  limit there, and a reason.
+- Secrets are compared with `Plug.Crypto.secure_compare/2`. The admin token
+  as a bearer token is compared in one place, `AdminAuth.authenticate/1`,
+  which counts wrong tokens per address; a route that accepts it reads
+  `conn.assigns.auth` and never compares it itself, or it would be a place
+  to guess the token at full speed.
 - The router's guards deny by default. A route under a new first path
   segment answers 404 until that segment is added to the guard in
   `router.ex`, with a decision about which credential it needs; say which
@@ -403,7 +550,10 @@ not to, and say the reason in the commit.
   `line_length: 160`. CI runs `mix format --check-formatted` and fails on a
   file that is not formatted, so run `mix format` before committing.
 - Admin actions that change state are recorded with `Audit.record/5`, with
-  the outcome and never a secret; a new one should be too.
+  the outcome and never a secret; a new one should be too. Something a
+  caller without a credential can cause as often as they like (a failed
+  sign-in) goes through `Audit.anonymous/4` instead, which writes the first
+  one from an address in a minute and counts the rest.
 
 ### Adding a media adapter
 
@@ -414,8 +564,12 @@ The existing adapters all followed the same steps:
    and `poll/5` / `cancel/5` for async providers). `billable/1` returns the
    characters of text and the seconds of media in the request `submit/4`
    builds; it is what per-character and per-second prices are applied to.
-   Its `@moduledoc` documents the provider calls, the job `input` it
-   accepts, and what was verified.
+   Every call goes through `OmnigateControl.Http`; a call whose answer
+   carries the media inline passes `max_body: Adapter.inline_cap(ctx)`, the
+   others keep the 4 MiB default. A failed exchange is described with
+   `Adapter.describe/1`, which makes the provider's words one short line of
+   valid UTF-8. Its `@moduledoc` documents the provider calls, the job
+   `input` it accepts, and what was verified.
 2. An entry in `Adapter.for_kind/1` and `Adapter.kinds/0`.
 3. A mock of the provider in `tools/mock_media.py` and checks in
    `tools/e2e.py`.
@@ -448,11 +602,14 @@ README status and example config change in the same commit as the feature.
   leaves out, if you touched a Dockerfile, `compose.yaml`,
   `deploy/Caddyfile`, an `.env*.example` file or the mocks.
 - If you change the final stage of `dataplane/Dockerfile` (user, volume,
-  environment, entry point), make the same change in
+  environment, health check, entry point), make the same change in
   `.github/release/dataplane.Dockerfile`; the release workflow fails when
   the two differ.
 - Add an entry under "Unreleased" in [CHANGELOG.md](CHANGELOG.md).
-- Update `docs/` when behaviour, configuration or an error type changes.
+- Update `docs/` when behaviour, configuration or an error type changes,
+  and add an entry to [docs/upgrading.md](docs/upgrading.md) when the
+  change alters a default, a file format on disk, what a config file may
+  contain or what a client is answered.
 - A fix for a vulnerability gets an entry under "Security" in the
   changelog and an advisory in [SECURITY.md](SECURITY.md#past-advisories)
   that says what was wrong, who was affected and what to do.

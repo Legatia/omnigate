@@ -98,7 +98,8 @@ job error's reason from `error.type` must read `error.code` now.
 |---|---|---|---|---|
 | 400 | `invalid_json` | `invalid_request_error` | `invalid_request_error` | The body is not a JSON object, or its arrays and objects are nested deeper than 64 levels. |
 | 400 | `missing_model` | `invalid_request_error` | `invalid_request_error` | No `"model"` string in the body. |
-| 400 | `invalid_request` | `invalid_request_error` | `invalid_request_error` | The request head is malformed or ambiguous, the path is not in canonical form, the query string has characters outside the allowed set, or an `anthropic-version`, `anthropic-beta` or `Idempotency-Key` header has a value the gateway will not forward. See [Request heads, paths and queries](#request-heads-paths-and-queries). |
+| 400 | `invalid_request` | `invalid_request_error` | `invalid_request_error` | The request head is malformed or ambiguous, the path is not in canonical form, the query string has characters outside the allowed set, an `anthropic-version` or `anthropic-beta` header (or, on a job request, `Idempotency-Key`) has a value the gateway will not forward, or the JSON body has an object with more than 65,536 members, a key longer than 8 KiB, or `model`, `stream` or `stream_options` twice or spelled with escapes. See [Request heads, paths and queries](#request-heads-paths-and-queries). |
+| 400 | `request_too_complex` | `invalid_request_error` | `invalid_request_error` | The request has to be parsed into a tree (to translate it for a provider of the other protocol, or to rewrite its `stream_options`) and is too costly for that: an object with more than 1,024 members, or far more values than its size suggests. The same body is accepted on a route that needs no such step. See [Limits on what one request and one key may hold](#limits-on-what-one-request-and-one-key-may-hold). |
 | 400 | `endpoint_not_supported` | `invalid_request_error` | `invalid_request_error` | The route exists, but every one of its upstreams speaks the other protocol and this endpoint is not translated (only chat completions and messages are). Nothing was sent to a provider. |
 | 400 | `untranslatable_request` | `invalid_request_error` | `invalid_request_error` | No target could be sent the request: it would have to be translated and uses something that cannot be (audio or file parts). Nothing was sent to a provider. |
 | 401 | `missing_api_key` | `invalid_request_error` | `authentication_error` | No key was sent. |
@@ -108,22 +109,26 @@ job error's reason from `error.type` must read `error.code` now.
 | 404 | `not_found` | `invalid_request_error` | `not_found_error` | The path is not an endpoint the gateway serves. |
 | 404 | `model_not_found` | `invalid_request_error` | `not_found_error` | No route has this name; or, on `GET /v1/models/{id}`, the model does not exist or the key may not use it. |
 | 405 | `method_not_allowed` | `invalid_request_error` | `invalid_request_error` | A method other than GET or POST on `/v1/jobs*` or `/v1/files/*`. |
-| 411 | `invalid_request` | `invalid_request_error` | (always the OpenAI shape) | A `POST`, `PUT` or `PATCH` with neither `Content-Length` nor `Transfer-Encoding: chunked`. |
-| 413 | `payload_too_large` | `invalid_request_error` | `request_too_large` | The request body exceeds 8 MiB; for `POST /v1/jobs`, 8,000,000 bytes (the size the control plane's parser reads). |
+| 411 | `invalid_request` | `invalid_request_error` | (always the OpenAI shape) | A `POST`, `PUT` or `PATCH` without a `Content-Length`. A chunked request body (`Transfer-Encoding: chunked`) is not accepted and gets this answer too. |
+| 413 | `payload_too_large` | `invalid_request_error` | `request_too_large` | The request body exceeds 8 MiB; for `POST /v1/jobs`, 8,000,000 bytes (the size the control plane's parser reads). A declared length over the limit is refused without reading any of the body. |
 | 417 | `invalid_request` | `invalid_request_error` | (always the OpenAI shape) | An `Expect` header other than `100-continue`. |
+| 429 | `concurrency_limit_exceeded` | `rate_limit_error` | `rate_limit_error` | The key already has `OMNIGATE_MAX_CONCURRENT_PER_KEY` (512) requests in flight. Answered before the body is read, with `retry-after: 1`. |
+| 429 | `request_memory_exceeded` | `rate_limit_error` | `rate_limit_error` | The requests the key has in flight are too large together (its share of `OMNIGATE_REQUEST_MEMORY_MB`), or it is converting as many large requests at once as it may (its share of `OMNIGATE_PARSE_MEMORY_MB`). With `retry-after: 1`. |
 | 429 | `rate_limit_exceeded` | `rate_limit_error` | `rate_limit_error` | The key is over its `rpm`. The response has a `Retry-After` header in seconds. |
 | 429 | `upstream_rate_limited` | `rate_limit_error` | `rate_limit_error` | No target succeeded and at least one answered 429. The error has `attempts`, and the response carries the longest `retry-after` any of the rate-limited targets sent. |
 | 431 | none | | | The request head is larger than 16 KiB. The answer has no body. |
 | 502 | `all_upstreams_failed` | `server_error` | `api_error` | Every target failed and none of them answered 429. The error has `attempts`. |
 | 503 | `gateway_not_ready` | `server_error` | `api_error` | The data plane has no config yet (the control plane has never answered and there is no cached config). |
 | 503 | `control_plane_unavailable` | `server_error` | `api_error` | A jobs or files request could not reach the control plane. |
-| 503 | `overloaded` | `server_error` | `overloaded_error` | The data plane is already serving `OMNIGATE_MAX_CONNECTIONS` connections. Sent at once, without reading the request, with `retry-after: 1` and `connection: close`. Because the request was not read, this answer is always in the OpenAI shape and has no request id. |
+| 503 | `overloaded` | `server_error` | `overloaded_error` | Two cases, both with `retry-after: 1`. (1) The data plane is already serving `OMNIGATE_MAX_CONNECTIONS` connections: sent at once, without reading the request, with `connection: close`; because the request was not read, this answer is always in the OpenAI shape and has no request id. (2) The gateway as a whole is holding as many request bodies, or converting as many requests, as its memory budgets allow (`OMNIGATE_REQUEST_MEMORY_MB`, `OMNIGATE_PARSE_MEMORY_MB`): an ordinary answer for this one request, in the client's protocol, with a request id. |
 
-The mapping is `typesFor` in `dataplane/src/errors.zig`, and a unit test
-there lists every reason the data plane uses. A reason that is not in that
-function's table would get its category from the status alone: 401, 403,
-404 and 429 as in the rows above, 400 and 405 to 428
-`invalid_request_error`, anything else `server_error` / `api_error`.
+The mapping is `typesFor` in `dataplane/src/errors.zig`. A reason that is
+not in that function's table gets its category from the status alone: 401,
+403, 404 and 429 as in the rows above, 400 and 405 to 428
+`invalid_request_error`, anything else `server_error` / `api_error`. That
+is how `concurrency_limit_exceeded`, `request_memory_exceeded` and
+`request_too_complex` get theirs; the unit test there that lists the
+reasons has not been extended with these three.
 
 **The jobs API has more reasons.** The ones above are raised by the data
 plane. The control plane, which owns the jobs, adds `job_not_found`,
@@ -154,7 +159,7 @@ connection.
 | Answer | When |
 |---|---|
 | `400 invalid_request` | A header line without a colon or with an empty name; a character in a header name that is not a token character; a control character in a header value; a bare CR or LF; a NUL byte; more than 100 header lines; a request line that is not `METHOD /path HTTP/1.x`; a request target that does not start with `/`, or contains a space, a control character or a byte outside ASCII; a `Content-Length` that is not a plain decimal number; two `Content-Length` headers with different values; `Content-Length` together with `Transfer-Encoding`; a `Transfer-Encoding` other than exactly `chunked`; a body (a length above 0, or chunked) on a method that has none, such as `GET`. |
-| `411 invalid_request` | A method that carries a body (`POST`, `PUT`, `PATCH`) with neither `Content-Length` nor `Transfer-Encoding: chunked`. |
+| `411 invalid_request` | A method that carries a body (`POST`, `PUT`, `PATCH`) without a `Content-Length`, also when it says `Transfer-Encoding: chunked`: chunked request bodies are not accepted. (Until commit e4e30e4 they were.) |
 | `417 invalid_request` | An `Expect` header other than `100-continue`. |
 | `400` with no body | A head the HTTP parser itself rejects. |
 | `431` with no body | A head larger than 16 KiB. |
@@ -173,22 +178,77 @@ answers `400`. The signed file URLs the gateway hands out, and `limit=N` on
 the job list, fit.
 
 **Forwarded headers.** Three request headers are copied into requests the
-gateway makes, and each must be plain or the request answers `400`. The
-check is made whenever the header is present, on every endpoint, also
-where the header is not used (an `Idempotency-Key` holding base64 with `+`,
-`/` or `=` is refused on a chat completion as well):
+gateway makes, and each must be plain or the request answers `400`:
 
-| Header | Allowed |
+| Header | Checked | Allowed |
+|---|---|---|
+| `anthropic-version` | Whenever present, on every endpoint | Up to 32 letters, digits, `-`, `.` and `_`. |
+| `anthropic-beta` | Whenever present, on every endpoint | Up to 512 letters, digits, `-`, `.`, `_`, commas and spaces. |
+| `Idempotency-Key` | On `/v1/jobs*` and `/v1/files/*` only, where it is used | 1 to 255 visible ASCII characters (`!` to `~`), no spaces. UUIDs, base64 (`+`, `/`, `=`) and separators such as `:` `|` `#` all fit. |
+
+On every other endpoint an `Idempotency-Key` is neither forwarded nor
+looked at, so the keys the official SDKs attach to their calls pass
+whatever they contain. (Until commit e4e30e4 the header was checked on
+every endpoint, against a narrower set: letters, digits, `-`, `.`, `_` and
+`:`.)
+
+**The body** of a text request is walked once, in place, before anything
+else is done with it, and must stay inside these bounds:
+
+| Bound | Answer |
 |---|---|
-| `anthropic-version` | Up to 32 letters, digits, `-`, `.` and `_`. |
-| `anthropic-beta` | Up to 512 letters, digits, `-`, `.`, `_`, commas and spaces. |
-| `Idempotency-Key` | 1 to 255 letters, digits, `-`, `.`, `_` and `:`. |
+| Arrays and objects nested at most 64 levels deep | `400 invalid_json` |
+| At most 65,536 members in any one object | `400 invalid_request` |
+| No object key longer than 8 KiB | `400 invalid_request` |
+| `model`, `stream` and `stream_options` at most once each at the top level, spelled without escapes (`"mod\u0065l"` is refused) | `400 invalid_request` |
 
-**The body** of a text or job request may nest arrays and objects at most
-64 levels deep; deeper answers `400 invalid_json`. JSON inside a tool
-call's `arguments` string that is nested deeper than that is not refused:
-in a translated request it is handled like arguments that are not a JSON
-object, and travels on as a string instead of being parsed.
+The last rule exists because the gateway acts on those three fields and
+then, for a provider of the same protocol, forwards the client's own bytes
+with only the model name replaced: the provider parses the body again, and
+the two readings must not be able to differ. A job request body is checked
+for nesting depth only; the control plane parses it.
+
+JSON inside a tool call's `arguments` string that is nested deeper than 64
+levels is not refused: in a translated request it is handled like arguments
+that are not a JSON object, and travels on as a string instead of being
+parsed.
+
+### Limits on what one request and one key may hold
+
+Before a request body is read, the data plane checks what the key already
+has in flight. Each refusal is an ordinary answer in the client's protocol
+with `retry-after: 1`, so an SDK backs off and tries again by itself:
+
+| Limit | Default | Over it |
+|---|---|---|
+| Requests of one key in flight | `OMNIGATE_MAX_CONCURRENT_PER_KEY`, 512 | `429 concurrency_limit_exceeded` |
+| Request bodies of one key in flight, by declared length, each counted twice | a quarter of `OMNIGATE_REQUEST_MEMORY_MB` (256 MiB of 1,024) | `429 request_memory_exceeded` |
+| Request bodies of all keys in flight | `OMNIGATE_REQUEST_MEMORY_MB`, 1,024 | `503 overloaded` |
+
+They apply to every text endpoint and to every `POST` on the jobs API, and
+come before the rate limit: a request refused here has not used up a
+rate-limit token. A stream whose client has gone but whose upstream answer
+is still being read for billing ([Streaming](#streaming)) keeps its place
+until that is finished, so hanging up and coming back is not a way around
+the cap.
+
+A same-protocol request is forwarded without ever being parsed into a
+tree. A tree is built only where one is needed: translation to the other
+protocol, the response cache's key, the fixes for provider quirks, and
+rewriting a `stream_options` the client sent without `include_usage`. Those
+steps have limits of their own:
+
+| Limit | Over it |
+|---|---|
+| At most 1,024 members in any one object of a body that is parsed into a tree | `400 request_too_complex` (for the response cache: the request is served, just not cached) |
+| One tree may take 128 times its text plus 1 MiB, at most 96 MiB | `400 request_too_complex` |
+| Trees one key has reserved at once: half of `OMNIGATE_PARSE_MEMORY_MB` | `429 request_memory_exceeded` |
+| Trees reserved at once by all keys: `OMNIGATE_PARSE_MEMORY_MB`, 1,024 | `503 overloaded` |
+
+An ordinary request is nowhere near these: measured on real request shapes
+a translation needs 10 to 70 times its text. The 1,024-member bound is the
+one a legitimate request could meet (a tool schema with more than 1,024
+properties in one object, say), and only on a route that translates.
 
 When the gateway answers before it has read a request's body (a bad key on
 a `POST`, for example), the response says `connection: close`, and the
@@ -247,9 +307,17 @@ outcome only when every target has failed, as described above.
 The gateway checks a text request in this order: the request head, the
 path, the query string and the forwarded headers
 ([above](#request-heads-paths-and-queries)), config present, key present
-and known, budget, endpoint, body size, nesting depth, JSON, `model`, model
-limits, rate limit, route, and then the response cache if the route has
-one.
+and known, budget, endpoint, the key's concurrency cap and the
+request-memory budget, the rate limit, the declared body size, and only
+then is the body read: nesting depth, JSON and its bounds, `model`, model
+limits, route, and the response cache if the route has one.
+
+**The rate limit is charged before the body is read.** A request that is
+then refused for its size, its JSON, its model or the key's model list has
+used up one request of the key's `rpm`. (Until commit e4e30e4 the body was
+read first, so that a disallowed model cost nothing; the price was that a
+key could make the gateway read and parse megabytes before any limit was
+consulted.)
 
 ### What an over-budget key can still do
 
@@ -312,12 +380,13 @@ Request headers the gateway acts on:
 | `Idempotency-Key` | Jobs API only. |
 
 Other request headers are not forwarded to the provider. The values of
-these three are restricted to plain characters, on every endpoint; see
-[Request heads, paths and queries](#request-heads-paths-and-queries).
+these three are restricted to plain characters; see
+[Request heads, paths and queries](#request-heads-paths-and-queries). A
+request body needs a `Content-Length`: chunked request bodies answer `411`.
 
 ### Response
 
-The provider's response, streamed as it arrives, with these headers added:
+The provider's response, with these headers added:
 
 | Header | Meaning |
 |---|---|
@@ -340,8 +409,27 @@ A `429 upstream_rate_limited` or `502 all_upstreams_failed` carries the
 three id headers, and `retry-after` when an upstream sent one
 ([When every target fails](#when-every-target-fails) says whose).
 
-**Provider headers.** The provider's `content-type` is kept (and
-`content-length`, when the body is passed through untouched), and the
+**Framing.** The gateway reads a provider's response body with its own
+bounded reader and frames its answer to the client itself; a length the
+provider declared is never passed on.
+
+- An answer that is not an event stream and is at most 64 KiB is read to
+  its end, then sent in one piece with a `content-length` the gateway
+  counted. If the provider cuts it short, nothing has been sent yet, and
+  the request fails over like any other failed attempt.
+- An event stream, and any longer answer, is sent with
+  `transfer-encoding: chunked` as it arrives. If the provider breaks off
+  part way, or sends a body shorter than the length it declared, the
+  gateway **drops the client's connection without the closing chunk**. An
+  HTTP client reports that as an incomplete or broken response, which is
+  what it was. The call is recorded with status 499.
+- A provider response whose head is ambiguous about its length (both a
+  length and chunked encoding, two different lengths, a transfer coding
+  other than `chunked`) or whose chunk sizes do not parse is treated as a
+  failed attempt (`UpstreamUnparseable`), and the next target is tried.
+
+**Provider headers.** The provider's `content-type` is kept (a value with
+a control byte in it, or longer than 256 bytes, fails the attempt), and the
 gateway sets `cache-control: no-cache`. Beyond that, a fixed allowlist of
 provider response headers is passed to the client under their original
 names:
@@ -382,29 +470,46 @@ report token usage on a stream only when asked. If the client did not set
 removes the extra usage chunk from what the client receives.
 
 Failover happens only before the first byte of a response reaches the
-client. If a stream breaks after that, the connection is closed and the
-call is recorded with status 499 in the ledger.
+client. If a stream breaks after that, the client's connection is dropped
+(without the closing chunk, see [Framing](#response)) and the call is
+recorded with status 499 in the ledger.
 
-A stream that goes silent is cut off the same way: when the upstream sends
-nothing, or the client reads nothing, for `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`
-(five minutes by default), the gateway closes the connection and records
-the call, also with status 499.
+Two timeouts watch a response in progress:
+
+- **The upstream goes silent.** When it sends nothing for
+  `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (five minutes by default), the gateway
+  closes both sides and records the call with status 499.
+- **The client stops reading.** When a client stays connected but takes
+  none of a relayed response for `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30
+  seconds by default), the gateway gives up on it. From then on it is
+  handled like a client that hung up.
 
 **A response that ends early is still billed.** Hanging up on a stream does
 not make it free: the provider charges for what it generated.
 
-- When the client disconnects, the gateway keeps reading the upstream for
-  up to `OMNIGATE_ABORT_DRAIN_MS` (5 seconds by default, and at most 8 MiB)
-  to catch the provider's closing usage figures. If they arrive, the call
-  is billed exactly those.
-- Whenever a response on a metered endpoint ends early without those
-  closing figures (the client left and they did not arrive in time, the
-  idle timeout fired, or the upstream broke off), the call is billed an
-  **estimate**, and its usage event is marked `"estimated": true`. The
-  estimate is never below what was actually metered. Input that was not
-  reported is taken as the request body's size in bytes divided by 4;
-  output as one token per server-sent event received (or the response's
-  bytes divided by 4, when it was not an event stream).
+- When the client disconnects or stalls, the client's connection is
+  finished with, and the gateway **keeps reading the upstream in the
+  background**: until the provider's closing usage figures, or the end of
+  the answer, or for at most `OMNIGATE_ABORT_DRAIN_MS` (two minutes by
+  default) and `OMNIGATE_ABORT_DRAIN_MAX_MB` (64) more megabytes. If the
+  figures arrive, the call is billed exactly those. Only then is the
+  upstream connection closed, which is what makes a provider stop
+  generating.
+- Whenever a response on a metered endpoint ends without those closing
+  figures (they did not arrive within those bounds, the upstream went
+  silent or broke off, more than 256 such answers were already being read
+  on, or the gateway was stopped), the call is billed an **estimate**, and
+  its usage event is marked `"estimated": true`. The estimate is never
+  below what was actually metered.
+  - Input that was not reported is taken as the request body's size in
+    bytes divided by 4, plus 1,600 tokens for every image, document, file
+    or audio part the request names.
+  - Output that was not reported is, for an event stream, the larger of
+    one token per event received and the generated text received (the
+    string values of `content`, `text`, `delta`, `arguments`,
+    `partial_json`, `thinking`, `reasoning_content`, `reasoning` and
+    `refusal`) divided by 4; for anything else, the response's bytes
+    divided by 4.
 - The estimate errs on the high side for the request and is rough for the
   response. It exists so that an abandoned stream costs something close to
   what the provider charged, not so that the two agree.
@@ -644,7 +749,10 @@ Differences from the real APIs that an SDK user can still see:
 | Paging of `models.list()` | There is one page; paging parameters are ignored. |
 | The error body on Anthropic-style endpoints | `error` has one member more than `type` and `message`: `code`, the gateway's reason. |
 | Endpoints the gateway does not serve (files, batches, audio, images and so on) | `404 not_found`. Media goes through the [jobs API](#jobs-api), which the SDKs do not know. |
-| Request paths, query strings and JSON nesting | Stricter than the providers: no percent-encoding, a small character set, at most 64 levels of nesting ([above](#request-heads-paths-and-queries)). Neither SDK sends anything else in the cases the suite covers. |
+| Request paths, query strings and JSON bodies | Stricter than the providers: no percent-encoding, a small character set, at most 64 levels of nesting, bounded object sizes, no duplicate `model` ([above](#request-heads-paths-and-queries)). Neither SDK sends anything else in the cases the suite covers. |
+| Request bodies | Must carry a `Content-Length`; a chunked request body answers `411`. Both SDKs send a length for JSON bodies. |
+| A response cut short by the provider | The connection is dropped mid-body instead of ending cleanly; the SDKs raise a connection error. |
+| Load refusals | `429 concurrency_limit_exceeded`, `429 request_memory_exceeded` and `503 overloaded` carry `retry-after: 1`; the SDKs retry them like any 429 or 503. |
 
 ## Jobs API
 
@@ -659,29 +767,54 @@ GET  /v1/jobs?limit=N         this key's jobs, newest first
 POST /v1/jobs/{id}/cancel     cancel a job
 ```
 
-Only `POST /v1/jobs` counts against the key's rate limit. A key sees only its
-own jobs; another key's job id answers 404. A managed key keeps its jobs
-when its secret is rotated ([Admin](admin.md#rotate)).
+Only `POST /v1/jobs` counts against the key's rate limit (listing has an
+allowance of its own, below). A key sees only its own jobs; another key's
+job id answers 404. A managed key keeps its jobs when its secret is rotated
+([Admin](admin.md#rotate)).
 
-Creating jobs is limited in three ways:
+Creating jobs is limited in these ways:
 
+- **The data plane's limits for any request with a body.** The key's
+  concurrency cap and the request-memory budget
+  ([above](#limits-on-what-one-request-and-one-key-may-hold)) apply to
+  every `POST` on the jobs API.
 - **The key's `rpm`, twice.** The data plane charges its token bucket, as
   for a text request. The control plane then counts the creation again by
-  itself, in fixed one-minute windows, so that the limit on work that costs
-  money does not depend on the data plane recognising the request. Either
-  can answer `429 rate_limit_exceeded`.
+  itself, with the same token bucket (a burst of up to `rpm`, refilled at
+  `rpm` per minute), so that the limit on work that costs money does not
+  depend on the data plane recognising the request. Either can answer
+  `429 rate_limit_exceeded`. A request that repeats an `Idempotency-Key`
+  the key already used creates nothing and is not counted by the control
+  plane (the data plane still counts it).
 - **Unfinished jobs per key.** A key may have at most `max_open_jobs` jobs
   that are queued or running (100 unless the key or `media.max_open_jobs`
   says otherwise; `0` means no limit). One more answers
   `429 too_many_open_jobs`. Jobs made under the key's earlier secrets count
   too, and a replay by `Idempotency-Key` is never refused for this.
+- **Jobs per day per key.** A key may create at most `max_jobs_per_day`
+  jobs per UTC day (10,000 unless the key or `media.max_jobs_per_day` says
+  otherwise; `0` means no limit), whatever became of them. One more answers
+  `429 too_many_jobs_today`; the count starts again at midnight UTC. Jobs
+  made under the key's earlier secrets count too.
 - **Size.** `input` and `metadata` together may be at most
   `media.max_input_bytes` (1 MiB by default) as JSON; more answers
   `413 payload_too_large`.
+- **What the route accepts.** A route can list the `input` fields it
+  takes (`allowed_input`), the values a field may have
+  (`price_multipliers`) and a longest duration (`max_seconds`); see
+  [Create a job](#create-a-job).
+
+**Listing is rate-limited too.** `GET /v1/jobs` has a bucket of its own in
+the control plane, so listing never uses up the allowance for creating
+jobs: the key's `rpm` when it has one, 600 per minute otherwise. Over it
+the answer is `429 rate_limit_exceeded` ("this key is listing jobs too
+often"). Fetching one job by id is not limited.
 
 Every one of these 429 answers carries `Retry-After`: the data plane's own,
-and the control plane's two (the seconds left in the minute, and 10 for
-`too_many_open_jobs`), which the data plane passes on.
+and the control plane's (the seconds until the next request fits for the
+rate limits; 10 for `too_many_open_jobs` and, although that count only
+starts again at midnight UTC, for `too_many_jobs_today` as well), which the
+data plane passes on.
 
 A key over its budget cannot create a job (`402 budget_exceeded`) but can
 still fetch, list and cancel its jobs and download their files.
@@ -698,13 +831,30 @@ Request body:
 | `metadata` | object | no | Stored with the job and returned unchanged. |
 | `cache` | boolean | no | `true` allows reuse of a stored output; `false` forbids it. See [Caching](#caching). |
 
-Optional header: `Idempotency-Key` (1 to 255 characters: letters, digits,
-`-`, `.`, `_` and `:`).
+Optional header: `Idempotency-Key` (1 to 255 visible ASCII characters,
+without spaces).
 
 Some members of `input` are checked whatever the adapter, because they feed
-the price: `duration` and `seconds` must be a number of 0 or more (or a
-string that is one), and `n`, `num_outputs` and `num_images` a whole number
-of 0 or more. Anything else answers `400 invalid_request`.
+the price. Anything else than what this list allows answers
+`400 invalid_request`:
+
+- `duration` and `seconds` must be a number of seconds, 0 or more: a
+  number, a string that is one, or a number followed by `s` (`5`, `"5"`,
+  `"5s"`).
+- `n`, `num_outputs` and `num_images` must be a whole number of 0 or more.
+- **On a route priced per second**, a job must name a duration above 0
+  unless the operator configured a default for the route's targets
+  (`default_seconds`), and may not ask for more than a target's
+  `max_seconds`.
+- **On a route with `allowed_input`**, `input` may only have the listed
+  fields. The error names the fields that are not allowed and the ones
+  that are.
+- **On a route with `price_multipliers`**, a field that has factors may
+  only carry one of the listed values. The error lists them.
+
+The last three are the operator's settings
+([Configuration](configuration.md#mediaroutes)); a route that sets none of
+them accepts what it accepted before.
 
 ```bash
 curl -i http://127.0.0.1:8080/v1/jobs -H "Authorization: Bearer og-unlimited-key" -H "Idempotency-Key: order-A-17" -d '{"model":"demo-image","input":{"prompt":"a lighthouse at dusk"},"metadata":{"order":"A-17"}}'
@@ -814,6 +964,12 @@ curl "http://127.0.0.1:8080/v1/jobs?limit=5" -H "Authorization: Bearer og-unlimi
 `limit` is between 1 and 100 and defaults to 20. Jobs are ordered newest
 first.
 
+A list leaves large inputs out: a job whose `input` is over 8 KiB as JSON
+is listed with `"input": null` and `"input_omitted": true`. Fetch the job
+by its id to get the input. (One response can therefore not be made of a
+hundred megabyte-sized inputs.) Listing is rate-limited; see
+[above](#jobs-api).
+
 ### Cancel a job
 
 ```bash
@@ -871,11 +1027,13 @@ shape, with the reason in `error.code` (see [Shape](#shape)), and the same
 |---|---|---|
 | 400 | `missing_model` | `"model"` is not a string. |
 | 400 | `invalid_json` | The body is not valid JSON. |
-| 400 | `invalid_request` | `input` is missing or not an object; `metadata` is not an object; `input.duration` or `input.seconds` is negative or not numeric; `input.n`, `input.num_outputs` or `input.num_images` is not a whole number of 0 or more; the `Idempotency-Key` is empty or longer than 255 bytes; or the request path contains a percent-encoded character (job ids and file names never need one). The data plane refuses most odd paths and idempotency keys before the control plane sees them. |
+| 400 | `invalid_request` | `input` is missing or not an object; `metadata` is not an object; `input.duration` or `input.seconds` is negative or not a duration; `input.n`, `input.num_outputs` or `input.num_images` is not a whole number of 0 or more; the route is priced per second and the job names no duration (and the route has no default), or more than the route's `max_seconds`; `input` has a field the route's `allowed_input` does not list, or a value the route's `price_multipliers` do not list; the `Idempotency-Key` is empty, longer than 255 bytes or not printable text; or the request path contains a percent-encoded character (job ids and file names never need one). The data plane refuses most odd paths and idempotency keys before the control plane sees them. |
 | 401 | `invalid_api_key` | The control plane no longer knows the key the data plane accepted: it was deleted, disabled or rotated within the last poll interval. |
 | 413 | `payload_too_large` | `input` and `metadata` together are larger than `media.max_input_bytes` (1 MiB by default); or the whole body is larger than 8,000,000 bytes, the limit of the control plane's JSON parser, which the data plane applies to job requests itself so that both give the same answer. |
-| 429 | `rate_limit_exceeded` | Create only: the control plane's own count of the key's `rpm` (fixed one-minute windows) is used up. |
+| 429 | `rate_limit_exceeded` | Create: the control plane's own count of the key's `rpm` (a token bucket, like the data plane's) is used up. List: the key is listing jobs too often (its `rpm`, or 600 per minute when it has none). |
 | 429 | `too_many_open_jobs` | Create only: the key already has its limit of unfinished jobs. Wait for some to finish, or cancel some. |
+| 429 | `too_many_jobs_today` | Create only: the key already created its limit of jobs this UTC day (`max_jobs_per_day`). The count starts again at midnight UTC. |
+| 503 | `storage_unavailable` | Create only: the job could not be written to the job store (its disk, most likely). Nothing was created; try again shortly. |
 | 500 | `internal_error` | The control plane failed while handling the request. The error carries a `request_id` that is also in the control plane's log, and is the id in the response's `x-omnigate-request-id`; nothing else about the failure is disclosed. |
 | 400 | `webhook_not_configured` | `webhook_url` was given but no signing secret is configured for this key. |
 | 400 | `invalid_webhook_url` | The URL is not http(s), has no host, contains credentials, does not resolve, or resolves to a private or loopback address. |
@@ -924,10 +1082,18 @@ a browser would render as a page on the gateway's origin.
   `content-security-policy: sandbox; default-src 'none'` and
   `cache-control: private, max-age=3600`.
 - **What reaches the client.** The data plane passes these four headers
-  on, with the status, content type, length and body, so a client gets
-  them from the gateway itself, with or without a proxy in front. (For a
-  short while, between commits 3a0b147 and 10bc009, it did not, and the
-  included proxy added them; that rule is gone from `deploy/Caddyfile`.)
+  on, with the status, content type and body, so a client gets them from
+  the gateway itself, with or without a proxy in front. (For a short
+  while, between commits 3a0b147 and 10bc009, it did not, and the included
+  proxy added them; that rule is gone from `deploy/Caddyfile`.)
+- **Framing.** A file of at most 64 KiB is sent with a `content-length`.
+  A larger one is sent with `transfer-encoding: chunked` and **no
+  `content-length`**, so a client cannot show a percentage while it
+  downloads; the size is in the job (`outputs[].bytes`), and so is the
+  SHA-256 to check the result against. If the download breaks off inside
+  the gateway, the connection is dropped without the closing chunk. A
+  client that stops reading for `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30
+  seconds) is disconnected.
 
 To show an output in a web page, fetch it and use it from your own origin
 (or use bucket storage); do not point a page at the gateway URL and expect
@@ -984,6 +1150,16 @@ webhook-signature: v1,<base64 HMAC-SHA256>
 
 - Any 2xx answer counts as delivered. Anything else, a redirect included, is
   a failed attempt.
+- **Only the status of the receiver's answer is used.** At most 16 KiB of
+  its body are read, then the connection is closed; a receiver cannot make
+  the control plane hold a large answer.
+- **An attempt is recorded before its request is sent.** A delivery that a
+  crash or a restart cuts short has therefore used up its attempt, and a
+  receiver gets at most `max_attempts` requests per job whatever happens.
+- **Deliveries are capped.** At most `media.webhooks.max_concurrent` (16)
+  run at once, and at most `max_concurrent_per_key` (4) for the jobs of one
+  gateway key. The rest wait their turn, fairly across keys, so a delivery
+  can start later than its schedule says when many are due at once.
 - The host name is resolved once per attempt. Every address it resolves to
   is checked against the private-address rule, and the connection is then
   made to the address that was checked (with the host name still used for
@@ -1067,6 +1243,16 @@ Neither needs authentication. While the control plane is starting, the port
 is not open yet (the ledger is loaded before the listener starts), so a
 probe gets a refused connection rather than a 503.
 
+Once it is up, the listener stays up even if the ledger, the job store,
+the keys or the audit log have to restart: those run as a group of their
+own, which is restarted (with a pause that grows from half a second to
+thirty) without touching the listener. During such a restart `/healthz`
+still answers `200`, `/readyz` answers `503` with the reason, and
+`GET /internal/config` answers `503 not_ready`, so data planes keep the
+config they have and no key is unblocked by a ledger that has not loaded
+its totals yet. Other requests that need the missing piece fail instead of
+being answered from half-loaded state.
+
 ### Errors and request paths
 
 Control-plane errors have the same shape as the gateway's OpenAI-style
@@ -1089,8 +1275,9 @@ otherwise. Besides the errors of each endpoint, any request can get:
 | 400 | `invalid_json` | A body that is not valid JSON. |
 | 401 | `unauthorized` | `/admin/*` or `/metrics` without the admin token or a session; `/internal/*` without the internal token. |
 | 404 | `not_found` | No such endpoint. |
-| 413 | `payload_too_large` | A body larger than 8,000,000 bytes. On `POST /login` and `POST /logout`, the only endpoints that take a body without a credential: a body declared larger than 4,096 bytes, or sent with chunked encoding instead of a declared length. |
-| 429 | `too_many_attempts` | `/admin/*` or `/metrics`: this address has sent 20 wrong admin tokens within a minute. Every bearer token from it is refused until that minute is over, the right one included; the answer has `retry-after: 60`. See [Admin](admin.md#two-ways-in). |
+| 413 | `payload_too_large` | A body larger than 8,000,000 bytes. On `POST /login`, the only endpoint that takes a body without a credential, and on `POST /logout` from a signed-in browser: a body declared larger than 4,096 bytes, or sent with chunked encoding instead of a declared length. |
+| 429 | `too_many_attempts` | `/admin/*`, `/metrics` and the dashboard page (`/`): this address has sent 20 wrong admin tokens within a minute. Every bearer token from it is refused until that minute is over, the right one included; the answer has `retry-after: 60`. See [Admin](admin.md#two-ways-in). |
+| 503 | `not_ready` | `GET /internal/config` while the ledger is starting or restarting, with `retry-after: 1`. |
 | 500 | `internal_error` | An unexpected failure. The error has a `request_id` (the same value as the `x-request-id` header) that is also in the control plane's log line for it; the cause is only in the log. |
 
 A request is handled in this order: the path check above, then the
@@ -1101,16 +1288,24 @@ check, then the endpoint.
   control plane does not serve is answered `404` at the guard. Under
   `/admin` and `/internal` an unknown path answers `401` without the right
   credential and `404` with it.
-- **Authentication comes before body parsing**, so a caller without
-  credentials cannot make the control plane read and parse a large body on
-  `/admin/*` or `/internal/*`. The sign-in form (`POST /login`) is the one
-  public endpoint that takes a body, and that body is limited to 4,096
-  bytes by its declared length.
-- **Wrong credentials are counted.** Five failed logins, or 20 wrong bearer
-  tokens, from one address within a minute lock that address out of that
-  way in until the minute is over. A request with no `Authorization` header
-  at all is not a guess and is not counted, and a signed-in browser session
-  is not affected by a bearer lockout.
+- **A body is read only for a caller who has authenticated, and for the
+  sign-in form.** `/admin/*` and `/internal/*` bodies are parsed after the
+  credential check. `POST /login` (and `POST /logout` from a signed-in
+  browser) may carry at most 4,096 bytes, by declared length. Nobody
+  else's body is read at all: a body on `POST /healthz`, on a `GET`, on
+  `DELETE /login` or on an unknown path is left unread, the request gets
+  the answer its path deserves, and the response says `connection: close`
+  so that the unread bytes are never taken for a next request.
+- **Wrong credentials are counted, wherever the token is accepted.** Five
+  failed logins, or 20 wrong bearer tokens, from one address within a
+  minute lock that address out of that way in until the minute is over.
+  The bearer count covers `/admin/*`, `/metrics`, the dashboard page (`/`)
+  and `/login`, which also accept the token; until commit d79406b the last
+  two compared it outside the throttle. A locked-out address gets
+  `429 too_many_attempts` on the first three; the sign-in page ignores its
+  token and shows the form. A request with no `Authorization`
+  header at all is not a guess and is not counted, and a signed-in browser
+  session is not affected by a bearer lockout.
 - **HTTP/1.1 only.** The control plane's listener has HTTP/2 and WebSocket
   upgrades switched off; nothing it serves needs them.
 - The path check is the fix for an authentication bypass in earlier
@@ -1123,7 +1318,7 @@ check, then the endpoint.
 |---|---|
 | `GET /admin/keys` | Every gateway key, from the config file and managed, with its usage. |
 | `POST /admin/keys` | Create a managed key. The answer is the only one that contains the key itself. |
-| `PATCH /admin/keys/{name}` | Change a managed key's budget, period, rate limit, models, open-job limit, webhook secret or disabled flag. |
+| `PATCH /admin/keys/{name}` | Change a managed key's budget, period, rate limit, models, open-job limit, jobs-per-day limit, webhook secret or disabled flag. |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
@@ -1151,6 +1346,7 @@ curl http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-
       "rpm": 0,
       "models": null,
       "max_open_jobs": 100,
+      "max_jobs_per_day": 10000,
       "disabled": false,
       "blocked": true,
       "state": "blocked",
@@ -1179,6 +1375,7 @@ curl http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-
 | `shadowed` | `true` for a managed key that is out of use because the config file defines a key with the same name. Such a key is listed after all the others, here, in `GET /admin/overview` and in the dashboard; its secret answers `401` until one of the two is removed. See [Admin](admin.md#gateway-keys-two-sources). |
 | `budget_period`, `period_spend_usd`, `period_resets_at` | What the budget covers, the spend that counts against it, and when that starts over (`null` for a total budget). |
 | `max_open_jobs` | The limit on unfinished media jobs in force for the key: its own setting, or `media.max_open_jobs` when it has none. `0` means no limit. |
+| `max_jobs_per_day` | The limit on media jobs created per UTC day in force for the key: its own setting, or `media.max_jobs_per_day` when it has none. `0` means no limit. |
 | `requests` | Text calls and media jobs recorded in the ledger. `jobs` counts the media jobs among them. |
 | `errors` | Ledger events with a status of 400 or above, which includes failed and canceled jobs. |
 | `input_tokens` | Input tokens that were not served from a provider's prompt cache. |
@@ -1235,7 +1432,9 @@ curl http://127.0.0.1:4000/metrics -H "Authorization: Bearer dev-admin-token-cha
 | `omnigate_jobs` | gauge | `status` | Media jobs currently in the job store, by status. |
 | `omnigate_webhooks` | gauge | `state` | Webhook deliveries of the jobs currently in the job store, by state. |
 | `omnigate_ledger_events_total` | counter | | Usage events in the ledger. |
-| `omnigate_ledger_dedup_ids` | gauge | | Event ids held in memory to reject resent events. |
+| `omnigate_ledger_dedup_ids` | gauge | | Event ids held in memory to reject resent events (about 61 MiB per million). |
+| `omnigate_ledger_invalid_events_total` | counter | | Usage events dropped because they were malformed, since this control plane started. |
+| `omnigate_ledger_unpriced_events_total` | counter | | Usage events recorded at $0 because the config has no such route or target, and media jobs that succeeded on a target with no price, since this control plane started. |
 
 The `key` label is the key's `name`, never its hash, and covers both file
 and managed keys. See [Operations](operations.md#metrics) for a scrape
@@ -1247,7 +1446,7 @@ config and caveats.
 |---|---|
 | `GET /` | The dashboard: totals, keys (with create, disable, rotate and delete for managed keys), recent requests and media jobs, refused requests, admin activity, and a read-only view of the configuration. Redirects to `/login` without a session. See [Admin](admin.md#the-dashboard). |
 | `GET /login` | The sign-in form. |
-| `POST /login` | Form field `password` = the admin token. Sets the `omnigate_session` cookie (12 hours, `HttpOnly`, `SameSite=Strict`) and redirects to `/`. A wrong token answers 401; after five failures from one address, 429 for a minute. The body may be at most 4,096 bytes, declared in `Content-Length` (413 otherwise). |
+| `POST /login` | Form field `password` = the admin token. Sets the `omnigate_session` cookie (12 hours, `HttpOnly`, `SameSite=Strict`) and redirects to `/`. A wrong token answers 401; after five failures from one address, 429 for a minute. The body may be at most 4,096 bytes, declared in `Content-Length` (413 otherwise). Failed and throttled attempts are aggregated in the audit log: at most two lines per address, outcome and minute ([Admin](admin.md#the-audit-log)). |
 | `POST /logout` | Clears the cookie. From a session it needs the CSRF token, which the dashboard's sign-out button sends. |
 
 A valid session cookie is accepted wherever the admin token is, so
@@ -1261,8 +1460,11 @@ that allows nothing from other origins, `X-Frame-Options: DENY`,
 ### `/internal/*`
 
 Used by data planes only, with the internal token in the
-`x-omnigate-internal` header: `GET /internal/config`,
-`POST /internal/usage/batch`, `POST /internal/counters` (counts of refused
+`x-omnigate-internal` header: `GET /internal/config` (which answers
+`503 not_ready` while the ledger is starting),
+`POST /internal/usage/batch` (answered with how many events were
+`accepted`, were `duplicates` or were `invalid`),
+`POST /internal/counters` (counts of refused
 requests), and the jobs and files API under `/internal/v1/`. It is not a
 public interface. The Compose proxy answers 404 for these paths from
 outside, and the control plane itself refuses any percent-encoded spelling

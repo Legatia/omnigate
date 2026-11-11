@@ -19,16 +19,21 @@ only met a mock, is tracked in the README's
 
 ### Security
 
-Three commits (97cf396, fde530c, 3a0b147) fix what an independent review
-of the code found in November 2026. Everything was found by reading the
-code and small proofs of concept; **nothing is known to have been
-exploited.** The full advisories, one per class, are in
-[SECURITY.md](SECURITY.md#past-advisories).
+Five commits fix what two independent reviews of the code found in
+November 2026: 97cf396, fde530c and 3a0b147 after the first review,
+e4e30e4 (data plane) and d79406b (control plane) after the second.
+Everything was found by reading the code and small proofs of concept;
+**nothing is known to have been exploited.** The full advisories, one per
+class, are in [SECURITY.md](SECURITY.md#past-advisories).
 
 **What to do, for everyone who ran an earlier commit:**
 
-1. Update **both** processes to 3a0b147 or later. The fixes are on both
-   sides.
+1. Update **both** processes to d79406b or later. The fixes are on both
+   sides. Read [docs/upgrading.md](docs/upgrading.md) first: it lists what
+   changes on disk, which defaults changed, what clients will notice and
+   the order to upgrade in. In short: back up the control plane's data
+   directory, check the config file against the stricter validation,
+   upgrade the control plane, then the data planes.
 2. If the control plane's port, or the dashboard's host name behind the
    Compose proxy, could be reached by anyone you do not trust: set a new
    admin token, delete managed gateway keys you did not create, rotate the
@@ -41,6 +46,14 @@ exploited.** The full advisories, one per class, are in
 4. If you bill or budget from the ledger and hand gateway keys to parties
    you do not fully trust, compare the period before the update with your
    providers' invoices.
+5. After the second pair of commits there is nothing to rotate, but there
+   are settings to look at: `default_seconds` on media targets priced per
+   second (a job without a duration is now refused otherwise);
+   `retention.ledger_ids_days` if a data plane can hold undelivered usage
+   for more than three days; the memory limits of the Compose file against
+   the data plane's memory budgets; `OMNIGATE_MAX_CONCURRENT_PER_KEY` if
+   your keys are held by strangers; and any proxy in front of the data
+   plane that sends request bodies chunked (they now answer 411).
 
 **What was wrong:**
 
@@ -119,7 +132,126 @@ exploited.** The full advisories, one per class, are in
   development config; learned provider quirks are per gateway key; log
   lines escape control bytes; the control plane speaks HTTP/1.1 only.
 
+- **Resource exhaustion of the data plane by a valid key (e4e30e4).** A
+  request body was read and parsed into a JSON tree before the key's rate
+  limit was consulted, and nothing bounded what the tree cost or how many
+  requests a key had in flight. One 8 MiB body of tiny values took 1,096
+  MiB at its peak; one body of colliding keys took 4 seconds of CPU; a
+  chunked request body with an oversized chunk size reached a decoder that
+  overflows.
+  - *Who was affected:* deployments that give gateway keys to parties they
+    do not fully trust, or whose keys can leak. Any valid key was enough,
+    whatever its `rpm` or model list, to exhaust the gateway's memory or
+    CPU and end the process for everyone. Without a key there was no
+    exposure, and nothing was disclosed.
+  - *The fix:* the key's requests in flight, the memory its requests hold
+    and its rate limit are checked before the body is read; a
+    same-protocol request is forwarded without building a tree; trees that
+    are needed are built in capped, budgeted arenas with bounded objects;
+    chunked request bodies answer 411. The same attack body now peaks at
+    30 MiB and the collision body costs nothing measurable.
+  - *What to do:* update the data plane; then size the new limits
+    (`OMNIGATE_MAX_CONCURRENT_PER_KEY`, `OMNIGATE_REQUEST_MEMORY_MB`,
+    `OMNIGATE_PARSE_MEMORY_MB`). Clients must send a `Content-Length`.
+- **Crashes of the data plane from malformed upstream responses
+  (e4e30e4).** Three responses from an upstream ended the gateway process:
+  a chunk size too large for its integer, a body shorter than its declared
+  length (the length had been promised to the client), and a head with
+  both a length and chunked encoding. A content type with a bare line feed
+  could add a header line to the gateway's answer.
+  - *Who was affected:* every deployment, to the degree that someone else
+    can decide what an upstream answers: the provider itself, anything on
+    the path to an upstream reached over plain HTTP, or whatever answers
+    on the control plane's address. A buggy upstream that truncated a
+    response could do it by accident.
+  - *The fix:* the gateway frames and reads upstream (and control-plane)
+    response bodies itself, with every size bounded, and frames its own
+    answers; an upstream's length is never forwarded.
+  - *What to do:* update the data plane. Note that file downloads over 64
+    KiB are now sent chunked, without a `content-length`, and that a
+    response an upstream cuts short ends with a dropped connection.
+- **Memory exhaustion of the control plane through webhook receivers
+  (d79406b).** Outbound responses were buffered whole. A client-chosen
+  webhook receiver that answered with an endless body ran the control
+  plane out of memory, and the delivery that did it had not used up an
+  attempt, so it was repeated after the restart.
+  - *Who was affected:* deployments with media routes where a key that can
+    request webhooks is held by a party they do not fully trust, or where
+    a media provider is not fully trusted. While the control plane is
+    down, the jobs API, the dashboard and usage intake stop; text traffic
+    goes on. Nothing was disclosed.
+  - *The fix:* every outbound response is read through a cap (16 KiB for
+    a webhook receiver, 4 MiB for provider and bucket API answers, the
+    output limit for downloads and inline media); a webhook attempt is
+    recorded before it is sent; deliveries are capped at 16 overall and 4
+    per key; jobs per key per day are capped; Compose sets memory limits.
+  - *What to do:* update the control plane.
+- **Crash of the control plane by text that is not valid UTF-8
+  (d79406b).** A provider's error body or an `X-Forwarded-For` header with
+  such bytes made the JSON encoder raise inside the job store or the audit
+  log; four such crashes within five seconds stopped the whole control
+  plane, listener included. While the ledger restarted, keys over their
+  budget could be handed to data planes as unblocked.
+  - *Who was affected:* deployments with media routes whose provider can
+    return such bytes in an error; and deployments whose control-plane
+    port could be reached directly (or through a proxy that forwards the
+    client's `X-Forwarded-For`) by someone they do not trust, without any
+    credential. Nothing was disclosed.
+  - *The fix:* outside text is made valid UTF-8 before it is logged,
+    stored or encoded; the stores answer errors instead of dying and
+    restart as a group without touching the listener; the config snapshot
+    is refused (503 `not_ready`) until the ledger's totals are loaded.
+  - *What to do:* update the control plane.
+- **Other hardening from the second review (e4e30e4, d79406b).** A
+  per-second media price is no longer skipped when the client leaves the
+  duration out, and routes can restrict and price input options; an
+  abandoned stream is read to its end in the background and billed the
+  provider's figures; a client that stops reading is given up on after 30
+  seconds; the admin token cannot be probed outside the throttle; request
+  bodies are parsed only for authenticated callers and the sign-in form;
+  failed sign-ins are aggregated in the audit log; whole-number settings
+  are validated strictly; the usage spool never blocks a start; the
+  included proxy sets `X-Forwarded-For` itself.
+
 ### Added
+
+**Since the second security review (commits e4e30e4 and d79406b)**
+
+- Data plane: `OMNIGATE_MAX_CONCURRENT_PER_KEY` (512),
+  `OMNIGATE_REQUEST_MEMORY_MB` (1024) and `OMNIGATE_PARSE_MEMORY_MB`
+  (1024), checked before a request body is read, with the answers 429
+  `concurrency_limit_exceeded`, 429 `request_memory_exceeded`, 503
+  `overloaded` (all with `retry-after: 1`) and 400 `request_too_complex`.
+- Data plane: `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 s) for a client that
+  stays connected but reads nothing, and `OMNIGATE_ABORT_DRAIN_MAX_MB`
+  (64) next to `OMNIGATE_ABORT_DRAIN_MS`.
+- Data plane: `omnigate-dp healthcheck`, and a `HEALTHCHECK` in
+  `dataplane/Dockerfile` that runs it.
+- Data plane: the JSON access log marks estimated usage
+  (`"estimated": true`).
+- Control plane: `media.max_jobs_per_day` (10,000) and a per-key
+  `max_jobs_per_day`, in the config file and through `/admin/keys`; one
+  job more answers 429 `too_many_jobs_today`.
+- Control plane: `GET /v1/jobs` is rate-limited per key (its `rpm`, or
+  600 per minute), and leaves inputs over 8 KiB out of the list
+  (`"input_omitted": true`).
+- Control plane: media targets take `default_seconds`, `min_seconds` and
+  `max_seconds`; media routes take `allowed_input` and
+  `price_multipliers`. `input.duration` may be written `"5s"`.
+- Control plane: `media.webhooks.max_concurrent` (16) and
+  `max_concurrent_per_key` (4).
+- Control plane: 503 `storage_unavailable` when a job cannot be written,
+  and 503 `not_ready` on `GET /internal/config` while the ledger loads.
+- Metrics: `omnigate_ledger_invalid_events_total` and
+  `omnigate_ledger_unpriced_events_total`.
+- Compose: memory limits for both containers (`OMNIGATE_CONTROL_MEMORY`,
+  `OMNIGATE_DATAPLANE_MEMORY`, 1 GiB each by default).
+- `tools/malformed_test.py` also plays a hostile upstream and a hostile
+  control plane, and checks the limits that apply before a body is read,
+  expensive bodies, the `healthcheck` subcommand and the billing of
+  clients that stop reading. `tools/container_test.py` checks the memory
+  limits and that a client cannot choose its `X-Forwarded-For`.
+- `docs/upgrading.md`.
 
 **Text gateway (data plane)**
 
@@ -158,6 +290,7 @@ exploited.** The full advisories, one per class, are in
   is disconnected.
 - Stream idle timeout (`OMNIGATE_STREAM_IDLE_TIMEOUT_MS`, 5 min): a response
   that stops moving is cut off, and what was metered up to then is billed.
+  (Since e4e30e4 it covers a silent upstream only; see "Changed".)
 - Connection cap (`OMNIGATE_MAX_CONNECTIONS`, 4096): further connections get
   an immediate 503 `overloaded` with `retry-after`.
 - Graceful shutdown on SIGINT and SIGTERM (Ctrl-C and Ctrl-Break on
@@ -195,7 +328,9 @@ exploited.** The full advisories, one per class, are in
   verified against the live API.
 - `OMNIGATE_ABORT_DRAIN_MS` (5 s): after a client disconnects mid-response
   the data plane keeps reading the upstream this long, and at most 8 MiB,
-  for the provider's final usage. `0` bills an estimate at once.
+  for the provider's final usage. `0` bills an estimate at once. (Since
+  e4e30e4: 120 s, in the background, with `OMNIGATE_ABORT_DRAIN_MAX_MB`;
+  see "Changed".)
 - Usage events carry `"estimated": true` when their token counts are an
   estimate, and the text access log marks such a line `usage=estimated`.
 - Exit status 70 after a panic, with one log line (`error(panic): ...`), so
@@ -280,6 +415,7 @@ exploited.** The full advisories, one per class, are in
   job together; more answers 413.
 - Job creation is rate-limited in the control plane as well, with the
   key's `rpm` in fixed one-minute windows (429 `rate_limit_exceeded`).
+  (Since d79406b: a token bucket; see "Changed".)
 - `OMNIGATE_TRUST_FORWARDED`: count failed logins and wrong admin tokens
   per address in `X-Forwarded-For` instead of per connection, for a control
   plane that is only reachable through a proxy.
@@ -359,12 +495,79 @@ exploited.** The full advisories, one per class, are in
 
 ### Changed
 
+**Since the second security review (commits e4e30e4 and d79406b).** The
+full list, with old and new values, is in
+[docs/upgrading.md](docs/upgrading.md).
+
+- **The rate limit is checked before the request body is read**, after
+  the key's concurrency cap and the request-memory budget and before the
+  size limit. A request that is then refused for its model or its JSON has
+  used up one request of the key's `rpm`. This reverses the earlier
+  change further down this list ("the request body is now read before the
+  rate-limit check").
+- **Chunked request bodies are refused with 411.** Every request with a
+  body needs a `Content-Length`.
+- **The gateway frames its own responses.** An answer that is not a
+  stream and is at most 64 KiB is buffered and sent with a counted
+  `content-length`; everything else is sent chunked, file downloads over
+  64 KiB included, and an upstream's length is never forwarded. A response
+  an upstream cuts short after the client's response has started drops the
+  client's connection.
+- **Abandoned streams are read to their end in the background.**
+  `OMNIGATE_ABORT_DRAIN_MS` defaults to 120000 instead of 5000 and no
+  longer holds the client's connection; the byte cap is
+  `OMNIGATE_ABORT_DRAIN_MAX_MB` (64) instead of a fixed 8 MiB. The
+  estimate billed when the provider's figures do not come is floored by
+  the generated text received and allows 1,600 tokens per image, document,
+  file or audio part of the request.
+- `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` covers only a silent upstream; a
+  client that reads nothing is cut off after
+  `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 s, where it used to get 5
+  minutes).
+- `Idempotency-Key` is validated only on job requests, as 1 to 255
+  visible ASCII characters; on other endpoints it is ignored.
+- The body of a text request may have at most 65,536 members per object
+  and keys of at most 8 KiB, and `model`, `stream` and `stream_options`
+  may each appear once, spelled without escapes (400 `invalid_request`).
+- The usage spool keeps the oldest events when it overflows (100,000
+  events or 128 MiB), compacts its file as events are acknowledged, and
+  never stops a start whatever its size.
+- `retention.ledger_ids_days` defaults to 3 instead of 14. Ids are kept
+  per UTC day in files of their own (`ledger.ids.YYYY-MM-DD`) and are no
+  longer part of the ledger snapshot, which is now version 2 (snapshot
+  pause at a million ids: 1.6 s before, 12 ms after). A version 1 snapshot
+  is converted at the first start; older code does not read version 2.
+- A job input over 8 KiB is kept in a file of its own
+  (`<jobs log>.inputs/<job id>.json`) instead of in the job record.
+- Whole-number settings in the config file are validated strictly, with
+  bounds (`rpm` at most 1,000,000 and so on); a fraction is rejected where
+  it used to be cut. The admin API applies the same bounds.
+- A media job on a route priced per second must name a duration unless
+  the target has `default_seconds`; it used to be accepted and billed no
+  seconds.
+- The control plane counts job creations with a token bucket like the
+  data plane's, per key hash, instead of fixed one-minute windows.
+- The control plane reads every outbound response through a cap, with an
+  HTTP client of its own in place of OTP's `httpc`; a webhook attempt is
+  recorded before it is sent.
+- The control plane parses a request body only for authenticated callers
+  and the sign-in form; wrong bearer tokens are counted on the dashboard
+  page and the sign-in page too; failed sign-ins are aggregated in the
+  audit log (summary lines carry `repeats`).
+- The control plane's stores restart as a group without stopping the
+  listener; `/readyz` reports it.
+- `deploy/Caddyfile` sets `X-Forwarded-For` from the connection's address
+  for both hosts.
+
+**Earlier**
+
 - The dashboard and the `/admin` API now require the admin token. They were
   previously open to anyone who could reach the control plane's port.
 - `GET /v1/models` lists only the routes the calling key may use.
 - For text endpoints the request body is now read before the rate-limit
   check, so that a disallowed model is a 403 rather than a 429. A key over
-  its limit therefore still costs one body read.
+  its limit therefore still costs one body read. (Reversed in e4e30e4; see
+  the top of this list.)
 - The placeholder webhook secret in the dev config is written without the
   `whsec_` prefix (same key bytes), and test placeholders are assembled at
   compile time, so secret scanners no longer flag them.
@@ -474,7 +677,7 @@ exploited.** The full advisories, one per class, are in
   negative media price stops the config from loading.
 - `retention.ledger_ids_days` defaults to 14 instead of keeping
   duplicate-detection ids for ever; an explicit `0` keeps the old
-  behaviour.
+  behaviour. (The default is 3 since d79406b.)
 - Stored outputs are served as attachments, with
   `x-content-type-options: nosniff` and a sandboxing
   `content-security-policy`, and with their stored content type only when

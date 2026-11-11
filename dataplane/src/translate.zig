@@ -113,6 +113,16 @@ fn parseObject(a: Allocator, body: []const u8) error{ OutOfMemory, InvalidJson }
     return v.object;
 }
 
+/// Any JSON value, under the same two bounds as `parseObject`.
+fn parseValue(a: Allocator, body: []const u8) error{ OutOfMemory, InvalidJson }!Value {
+    if (!guard.jsonDepthOk(body, guard.max_upstream_json_depth)) return error.InvalidJson;
+    if (!guard.jsonMembersOk(body, guard.max_tree_members)) return error.InvalidJson;
+    return json.parseFromSliceLeaky(Value, a, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
+}
+
 fn textBlock(a: Allocator, text: []const u8) !Value {
     var o: ObjectMap = .empty;
     try o.put(a, "type", S("text"));
@@ -854,47 +864,96 @@ fn anthropicErrorType(status: u16) []const u8 {
     };
 }
 
-/// Upstream error body -> error envelope in the client's protocol. Bodies that
-/// are not a recognisable envelope are used verbatim as the message.
-pub fn translateError(arena: Allocator, dir: Direction, status: u16, upstream_body: []const u8) ![]u8 {
-    var message: []const u8 = std.mem.trim(u8, upstream_body, " \t\r\n");
-    var upstream_type: ?[]const u8 = null;
+/// What an error body says, in whichever shape the provider chose.
+const ErrorParts = struct {
+    message: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+    code: ?[]const u8 = null,
 
-    if (parseObject(arena, upstream_body)) |o| {
-        if (o.get("error")) |e| {
-            switch (e) {
-                .object => |eo| {
-                    if (getStr(eo, "message")) |m| message = m;
-                    upstream_type = getStr(eo, "type");
-                },
-                .string => |s| message = s,
-                else => {},
-            }
-        } else if (getStr(o, "message")) |m| {
-            message = m;
+    /// Nothing that is not text may reach a JSON string: the serialiser
+    /// would write it as an array of numbers.
+    fn textOnly(p: *ErrorParts) void {
+        inline for (.{ "message", "type", "code" }) |field| {
+            if (@field(p, field)) |s| if (!std.unicode.utf8ValidateSlice(s)) {
+                @field(p, field) = null;
+            };
         }
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidJson => {},
     }
-    if (message.len == 0) message = try std.fmt.allocPrint(arena, "upstream returned HTTP {d}", .{status});
+};
+
+/// The provider's own name for the error: a string `code`, else a string
+/// `status` (Google: `"INVALID_ARGUMENT"` next to a numeric `code`), else
+/// the numeric `code` in digits.
+fn errorCode(a: Allocator, o: ObjectMap) Allocator.Error!?[]const u8 {
+    if (getStr(o, "code")) |s| if (s.len > 0) return s;
+    if (getStr(o, "status")) |s| if (s.len > 0) return s;
+    if (o.get("code")) |c| if (c == .integer) return try std.fmt.allocPrint(a, "{d}", .{c.integer});
+    return null;
+}
+
+/// Message, type and code of an error body. The shapes seen from real
+/// providers, on endpoints that all claim one protocol:
+///
+///   {"error":{"message":..,"type":..,"code":..}}    OpenAI, Anthropic
+///   {"code":"..","error":"text"}                    xAI
+///   [{"error":{"code":400,"message":..,"status":..}}]   Google (an array)
+///   {"message":..} and {"detail":..}                proxies and frameworks
+fn errorParts(a: Allocator, v: Value, depth: u8) Allocator.Error!ErrorParts {
+    switch (v) {
+        .array => |list| return if (list.items.len > 0 and depth < 2) errorParts(a, list.items[0], depth + 1) else .{},
+        .string => |s| return .{ .message = s },
+        .object => |o| {
+            var parts: ErrorParts = .{ .code = try errorCode(a, o) };
+            if (o.get("error")) |e| switch (e) {
+                .object => |eo| {
+                    parts.message = getStr(eo, "message");
+                    parts.type = getStr(eo, "type");
+                    if (try errorCode(a, eo)) |c| parts.code = c;
+                },
+                .string => |s| parts.message = s,
+                else => {},
+            };
+            if (parts.message == null) parts.message = getStr(o, "message") orelse getStr(o, "detail");
+            return parts;
+        },
+        else => return .{},
+    }
+}
+
+/// The message to give a client for an error body: what the provider said,
+/// else the body as text, else a sentence of our own.
+fn errorMessage(a: Allocator, parts: ErrorParts, status: u16, body: []const u8) Allocator.Error![]const u8 {
+    const message = parts.message orelse std.mem.trim(u8, body, " \t\r\n");
+    if (message.len == 0) return std.fmt.allocPrint(a, "upstream returned HTTP {d}", .{status});
     // A body that is not text (compressed, binary, another encoding) cannot
     // be a JSON string; the serialiser would write it as an array of
     // numbers, which no client reads as a message.
     if (!std.unicode.utf8ValidateSlice(message)) {
-        message = try std.fmt.allocPrint(arena, "upstream returned HTTP {d} with a body that is not valid text", .{status});
+        return std.fmt.allocPrint(a, "upstream returned HTTP {d} with a body that is not valid text", .{status});
     }
-    if (upstream_type) |t| if (!std.unicode.utf8ValidateSlice(t)) {
-        upstream_type = null;
-    };
+    return message;
+}
+
+/// Upstream error body -> error envelope in the client's protocol. Bodies that
+/// are not a recognisable envelope are used verbatim as the message.
+pub fn translateError(arena: Allocator, dir: Direction, status: u16, upstream_body: []const u8) ![]u8 {
+    var parts: ErrorParts = .{};
+    if (parseValue(arena, upstream_body)) |v| {
+        parts = try errorParts(arena, v, 0);
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidJson => {},
+    }
+    parts.textOnly();
+    const message = try errorMessage(arena, parts, status, upstream_body);
 
     return switch (dir) {
         .openai_to_anthropic => json.Stringify.valueAlloc(arena, .{
             .@"error" = .{
                 .message = message,
-                .type = upstream_type orelse openAiErrorType(status),
+                .type = parts.type orelse openAiErrorType(status),
                 .param = @as(?[]const u8, null),
-                .code = upstream_type,
+                .code = parts.code orelse parts.type,
             },
         }, .{}),
         .anthropic_to_openai => json.Stringify.valueAlloc(arena, .{
@@ -902,6 +961,133 @@ pub fn translateError(arena: Allocator, dir: Direction, status: u16, upstream_bo
             .@"error" = .{ .type = anthropicErrorType(status), .message = message },
         }, .{}),
     };
+}
+
+/// The protocol an error envelope is written for.
+pub const ErrorShape = enum { openai, anthropic };
+
+/// Is `v` the error envelope `shape` promises? Only what an SDK reads is
+/// asked for: an `error` object with a `message` (and for Anthropic the
+/// outer `"type":"error"` and the inner `type`).
+fn isErrorEnvelope(shape: ErrorShape, v: Value) bool {
+    if (v != .object) return false;
+    const e = getObj(v.object, "error") orelse return false;
+    if (getStr(e, "message") == null) return false;
+    return switch (shape) {
+        .openai => true,
+        .anthropic => getStr(e, "type") != null and std.mem.eql(u8, getStr(v.object, "type") orelse "", "error"),
+    };
+}
+
+/// An upstream's error body for a client that speaks the upstream's own
+/// protocol (nothing is being translated). Null when the body is already
+/// that protocol's error envelope, which is then relayed byte for byte, or
+/// when it is not something to parse (nested too deeply, an object with too
+/// many members). Anything else is not what the protocol promises, and an
+/// SDK either cannot read it or shows the raw text: the answer is then the
+/// promised envelope, built around what the provider said. The message is
+/// the provider's, `code` is the provider's when it gave one, `type` follows
+/// the status. (The HTTP status is the caller's to keep.)
+pub fn wrapError(arena: Allocator, shape: ErrorShape, status: u16, body: []const u8) error{ OutOfMemory, InvalidJson }!?[]u8 {
+    if (!guard.jsonDepthOk(body, guard.max_upstream_json_depth)) return null;
+    if (!guard.jsonMembersOk(body, guard.max_tree_members)) return null;
+    var parts: ErrorParts = .{};
+    if (json.parseFromSliceLeaky(Value, arena, body, .{})) |v| {
+        if (isErrorEnvelope(shape, v)) return null;
+        parts = try errorParts(arena, v, 0);
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Not JSON at all (a proxy's HTML page, plain text, nothing).
+        else => {},
+    }
+    parts.textOnly();
+    const message = try errorMessage(arena, parts, status, body);
+    const Out = error{OutOfMemory}![]u8;
+    const out: Out = switch (shape) {
+        .openai => json.Stringify.valueAlloc(arena, .{
+            .@"error" = .{
+                .message = message,
+                .type = parts.type orelse openAiErrorType(status),
+                .param = @as(?[]const u8, null),
+                .code = parts.code,
+            },
+        }, .{}),
+        .anthropic => if (parts.code) |code| json.Stringify.valueAlloc(arena, .{
+            .type = "error",
+            .@"error" = .{ .type = anthropicErrorType(status), .message = message, .code = code },
+        }, .{}) else json.Stringify.valueAlloc(arena, .{
+            .type = "error",
+            .@"error" = .{ .type = anthropicErrorType(status), .message = message },
+        }, .{}),
+    };
+    return try out;
+}
+
+test "wrapError leaves a protocol's own envelope alone and wraps the shapes providers really send" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Well-formed: untouched (null means "relay the bytes as they are").
+    try std.testing.expect(try wrapError(a, .openai, 401, "{\"error\":{\"message\":\"Incorrect API key\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_api_key\"}}") == null);
+    try std.testing.expect(try wrapError(a, .openai, 400, " {\"error\": {\"message\": \"m\"}}\n") == null);
+    try std.testing.expect(try wrapError(a, .anthropic, 401, "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}") == null);
+
+    // Google's OpenAI-compatible endpoint answers a bad key with an array.
+    const google = "[{\"error\":{\"code\":400,\"message\":\"API key not valid. Please pass a valid API key.\",\"status\":\"INVALID_ARGUMENT\"}}]";
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"message\":\"API key not valid. Please pass a valid API key.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"INVALID_ARGUMENT\"}}",
+        (try wrapError(a, .openai, 400, google)).?,
+    );
+    // xAI: `error` is the text itself.
+    const xai = "{\"code\":\"Client specified an invalid argument\",\"error\":\"Incorrect API key provided: xa***zz.\"}";
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"message\":\"Incorrect API key provided: xa***zz.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"Client specified an invalid argument\"}}",
+        (try wrapError(a, .openai, 400, xai)).?,
+    );
+    // An OpenAI-shaped body is not what an Anthropic client was promised.
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"no such model\",\"code\":\"model_not_found\"}}",
+        (try wrapError(a, .anthropic, 404, "{\"error\":{\"message\":\"no such model\",\"code\":\"model_not_found\"}}")).?,
+    );
+    // Not JSON, nothing at all, not text.
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"message\":\"<html>Bad Request</html>\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+        (try wrapError(a, .openai, 400, "<html>Bad Request</html>\r\n")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"upstream returned HTTP 403\"}}",
+        (try wrapError(a, .anthropic, 403, "")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"message\":\"upstream returned HTTP 404 with a body that is not valid text\",\"type\":\"not_found_error\",\"param\":null,\"code\":null}}",
+        (try wrapError(a, .openai, 404, "\x1f\x8b\x08\x00\xff\xfe")).?,
+    );
+    // An envelope without a message is not one; one member that is not text is dropped.
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"message\":\"{\\\"error\\\":{\\\"type\\\":\\\"overloaded\\\"}}\",\"type\":\"overloaded\",\"param\":null,\"code\":null}}",
+        (try wrapError(a, .openai, 400, "{\"error\":{\"type\":\"overloaded\"}}")).?,
+    );
+}
+
+test "translateError reads the array and the string shapes too" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Google behind an Anthropic client, xAI behind an Anthropic client.
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"API key not valid.\"}}",
+        try translateError(a, .anthropic_to_openai, 400, "[{\"error\":{\"code\":400,\"message\":\"API key not valid.\",\"status\":\"INVALID_ARGUMENT\"}}]"),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Incorrect API key\"}}",
+        try translateError(a, .anthropic_to_openai, 400, "{\"code\":\"bad\",\"error\":\"Incorrect API key\"}"),
+    );
+    // An Anthropic error for an OpenAI client keeps its type as the code.
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"message\":\"max_tokens: too large\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}",
+        try translateError(a, .openai_to_anthropic, 400, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"max_tokens: too large\"}}"),
+    );
 }
 
 // ---------------------------------------------------------------------------

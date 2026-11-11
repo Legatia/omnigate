@@ -172,6 +172,12 @@ def sdk_config():
         {"model": "rid", "targets": [dict(upstream="mock-ok", model="rid-1", **price)]},
         {"model": "rid-claude", "targets": [dict(upstream="mock-anthropic", model="rid-1", **price)]},
         {"model": "down", "targets": [dict(upstream="mock-flaky", model="f", **price)]},
+        # Provider errors that are not their protocol's envelope (and one that is).
+        {"model": "err-array", "targets": [dict(upstream="mock-ok", model="err-array-1", **price)]},
+        {"model": "err-string", "targets": [dict(upstream="mock-ok", model="err-string-1", **price)]},
+        {"model": "err-exact", "targets": [dict(upstream="mock-ok", model="err-exact-1", **price)]},
+        {"model": "err-openai-claude", "targets": [dict(upstream="mock-anthropic", model="err-openai-1", **price)]},
+        {"model": "err-text-claude", "targets": [dict(upstream="mock-anthropic", model="err-text-1", **price)]},
     ]
     return config
 
@@ -731,6 +737,51 @@ def fidelity_cases(openai, anthropic):
     case("Anthropic SDK: the same, as anthropic.InternalServerError with type api_error",
          raises(anthropic.InternalServerError, 502, lambda: an.messages.create(model="down", max_tokens=64, messages=MSG),
                 lambda exc: differ(error_type=(exc.type, "api_error"))))
+
+    group("provider errors", "a provider's error that is not in its protocol's shape still raises the right class, with the provider's words")
+    import mock_upstream as mock  # the bodies the mocks send
+    array_text, string_text = mock.ERR_ARRAY[0]["error"]["message"], mock.ERR_STRING["error"]
+
+    def openai_provider_error(message, code):
+        def look(exc):
+            body = exc.body if isinstance(exc.body, dict) else {}
+            return differ(message=(body.get("message"), message), code=(exc.code, code), type=(exc.type, "invalid_request_error"),
+                          shown=(message in str(exc), True))
+        return look
+
+    def anthropic_provider_error(message, error_type):
+        def look(exc):
+            body = exc.body if isinstance(exc.body, dict) else {}
+            return differ(envelope_type=(body.get("type"), "error"), message=((body.get("error") or {}).get("message"), message),
+                          error_type=(exc.type, error_type), shown=(message in str(exc), True))
+        return look
+    case("OpenAI SDK: an error sent as a JSON array (Google's shape) -> openai.BadRequestError with the provider's message and code",
+         raises(openai.BadRequestError, 400, lambda: oa.chat.completions.create(model="err-array", messages=MSG),
+                openai_provider_error(array_text, "INVALID_ARGUMENT")))
+    case("OpenAI SDK: the same on a streaming call, raised before any chunk",
+         raises(openai.BadRequestError, 400, lambda: list(oa.chat.completions.create(model="err-array", messages=MSG, stream=True)),
+                openai_provider_error(array_text, "INVALID_ARGUMENT")))
+    case("OpenAI SDK: `error` as a string (xAI's shape) -> openai.BadRequestError with the provider's message and code",
+         raises(openai.BadRequestError, 400, lambda: oa.chat.completions.create(model="err-string", messages=MSG),
+                openai_provider_error(string_text, mock.ERR_STRING["code"])))
+    case("OpenAI SDK: a well-formed provider error arrives byte for byte",
+         raises(openai.BadRequestError, 400, lambda: oa.chat.completions.create(model="err-exact", messages=MSG),
+                lambda exc: differ(body=(exc.response.content, mock.ERR_EXACT), code=(exc.code, "context_length_exceeded"), param=(exc.param, "messages"))))
+    case("Anthropic SDK -> OpenAI-style upstream (translated): the array shape -> anthropic.BadRequestError with the provider's message",
+         raises(anthropic.BadRequestError, 400, lambda: an.messages.create(model="err-array", max_tokens=64, messages=MSG),
+                anthropic_provider_error(array_text, "invalid_request_error")))
+    case("Anthropic SDK -> OpenAI-style upstream (translated): the string shape",
+         raises(anthropic.BadRequestError, 400, lambda: an.messages.create(model="err-string", max_tokens=64, messages=MSG),
+                anthropic_provider_error(string_text, "invalid_request_error")))
+    case("Anthropic SDK -> Anthropic-style upstream: an OpenAI-shaped 404 -> anthropic.NotFoundError in Anthropic's envelope",
+         raises(anthropic.NotFoundError, 404, lambda: an.messages.create(model="err-openai-claude", max_tokens=64, messages=MSG),
+                anthropic_provider_error("no such model here", "not_found_error")))
+    case("Anthropic SDK -> Anthropic-style upstream: a plain-text 400 -> anthropic.BadRequestError with the text as the message",
+         raises(anthropic.BadRequestError, 400, lambda: an.messages.create(model="err-text-claude", max_tokens=64, messages=MSG),
+                anthropic_provider_error("Bad Request: the proxy in front of the provider did not like this", "invalid_request_error")))
+    case("OpenAI SDK -> Anthropic-style upstream (translated): the plain-text 400 -> openai.BadRequestError with the text as the message",
+         raises(openai.BadRequestError, 400, lambda: oa.chat.completions.create(model="err-text-claude", messages=MSG),
+                lambda exc: differ(message=((exc.body or {}).get("message"), "Bad Request: the proxy in front of the provider did not like this"))))
 
     group("unsupported", "an endpoint that cannot be served for a model is the caller's error (400), not an outage")
     case("OpenAI SDK: embeddings on a route served only by an Anthropic-style upstream -> openai.BadRequestError",

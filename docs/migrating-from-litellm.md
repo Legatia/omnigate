@@ -40,7 +40,7 @@ Then start omnigate with `OMNIGATE_CONFIG` pointing at the result; see the
 | `litellm_params.api_key: os.environ/NAME` | `api_key_env: NAME`. |
 | `litellm_params.api_base` (or `base_url`) | The upstream's `base_url`, with a trailing `/v1` removed. |
 | `input_cost_per_token`, `output_cost_per_token` (in `model_info` or `litellm_params`) | `price_in_per_mtok`, `price_out_per_mtok` (multiplied by one million). |
-| `litellm_params.timeout` / `request_timeout` (seconds) | The upstream's `timeout_ms`, a whole number of milliseconds. The importer does not check its size: omnigate accepts at most 3,600,000 (one hour), so a LiteLLM timeout above 3,600 seconds gives a file the control plane refuses to load, with a message naming the upstream. Lower the value by hand. |
+| `litellm_params.timeout` / `request_timeout` (seconds) | The upstream's `timeout_ms`, a whole number of milliseconds. omnigate accepts at most 3,600,000 (one hour): a LiteLLM timeout above 3,600 seconds is written as `3600000`, and the importer's report says so. (Until the close-out commit it was written as it was, and the control plane refused to load the file.) |
 
 Imported routes have no `strategy`, so they use omnigate's default:
 `failover`, in order. LiteLLM load-balances entries that share a

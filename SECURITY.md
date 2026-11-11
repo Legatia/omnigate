@@ -280,8 +280,10 @@ On the public port:
 - A client that stays connected but takes none of a response is
   disconnected after `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 seconds); a
   response whose upstream goes silent is cut off after
-  `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (5 minutes). That includes the
-  gateway's own answers and file downloads.
+  `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (5 minutes). That includes file
+  downloads and, since the close-out commit (the one after 55a294d), the
+  gateway's own answers once the request has been read: until then they
+  were written under the five-minute timeout, not the thirty-second one.
 - At most 256 upstream answers are read on after their client left, each
   for at most `OMNIGATE_ABORT_DRAIN_MS` and `OMNIGATE_ABORT_DRAIN_MAX_MB`,
   and each still counts against its key's concurrency cap.
@@ -402,12 +404,14 @@ vulnerabilities to report.
 - **The rate limit is charged before a request is judged.** A request
   refused for its body or its model has used up one request of the key's
   `rpm`. That is deliberate: nothing a request costs comes before a limit.
-- **The per-key concurrency cap is one number for all keys**
-  (`OMNIGATE_MAX_CONCURRENT_PER_KEY`); there is no per-key setting.
+- **The per-key concurrency cap is one number for every key that has no
+  `max_concurrent` of its own** (`OMNIGATE_MAX_CONCURRENT_PER_KEY`). The
+  per-key field exists since the close-out commit.
 - **The memory budgets are not the process's memory.** They bound request
   bodies and parse trees; the response cache, the usage queue and
-  per-connection buffers come on top. With the defaults they admit more
-  than the Compose file's 1 GiB container limit.
+  per-connection buffers come on top. The binary's defaults admit 2 GiB;
+  the Compose file sets them to 256 MiB each, under its 1 GiB container
+  limit (since the close-out commit; before, it left the defaults).
 - **An upstream that frames its answer by closing the connection** (no
   length, no chunking) cannot be told from one that was cut off: such an
   answer is taken as complete wherever it ends.
@@ -902,7 +906,9 @@ coding are refused), and reads the body with its own reader, in which
 every size is bounded and a body that ends early is an error. It frames
 its own answer: a short answer that is not a stream is buffered and sent
 with a length the gateway counted, everything else is sent chunked, and an
-upstream's length is never forwarded. When an upstream breaks off after
+upstream's length is never forwarded. (The control plane's declared length
+for a file is forwarded again since the close-out commit; the reader holds
+the body to it byte for byte.) When an upstream breaks off after
 the client's response has started, the client's connection is dropped
 without the closing chunk. A relayed content type may hold no control
 byte. The control plane's answers go through the same reader.

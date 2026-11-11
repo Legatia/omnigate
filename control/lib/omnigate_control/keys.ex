@@ -24,7 +24,7 @@ defmodule OmnigateControl.Keys do
   alias OmnigateControl.{ConfigStore, Ledger}
 
   @name_format ~r/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
-  @fields [:budget_usd, :budget_period, :rpm, :models, :max_open_jobs, :max_jobs_per_day, :webhook_secret, :disabled]
+  @fields [:budget_usd, :budget_period, :rpm, :max_concurrent, :models, :max_open_jobs, :max_jobs_per_day, :webhook_secret, :disabled]
   @max_old_hashes 50
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -152,6 +152,7 @@ defmodule OmnigateControl.Keys do
             budget_usd: nil,
             budget_period: "total",
             rpm: 0,
+            max_concurrent: 0,
             models: nil,
             max_open_jobs: nil,
             max_jobs_per_day: nil,
@@ -290,6 +291,16 @@ defmodule OmnigateControl.Keys do
 
   defp validate(:rpm, _), do: invalid("rpm must be a whole number of requests per minute, or 0 for no limit")
 
+  defp validate(:max_concurrent, nil), do: {:ok, 0}
+
+  # Read by the data plane into a 32-bit field, like `rpm`.
+  defp validate(:max_concurrent, n) when is_integer(n) and n >= 0 do
+    max = ConfigStore.limits().max_concurrent
+    if n <= max, do: {:ok, n}, else: invalid("max_concurrent must be at most #{max} (0 for the gateway default)")
+  end
+
+  defp validate(:max_concurrent, _), do: invalid("max_concurrent must be a whole number of requests in flight at once, or 0 for the gateway default")
+
   defp validate(:models, nil), do: {:ok, nil}
 
   defp validate(:models, list) when is_list(list) do
@@ -337,6 +348,7 @@ defmodule OmnigateControl.Keys do
           budget_period: if(k["budget_period"] in ConfigStore.budget_periods(), do: k["budget_period"], else: "total"),
           # A file written before `rpm` was bounded may hold anything.
           rpm: if(is_integer(k["rpm"]), do: k["rpm"] |> max(0) |> min(ConfigStore.limits().rpm), else: 0),
+          max_concurrent: if(is_integer(k["max_concurrent"]), do: k["max_concurrent"] |> max(0) |> min(ConfigStore.limits().max_concurrent), else: 0),
           models: if(is_list(k["models"]), do: k["models"]),
           max_open_jobs: if(is_integer(k["max_open_jobs"]) and k["max_open_jobs"] >= 0, do: k["max_open_jobs"]),
           max_jobs_per_day: if(is_integer(k["max_jobs_per_day"]) and k["max_jobs_per_day"] >= 0, do: k["max_jobs_per_day"]),

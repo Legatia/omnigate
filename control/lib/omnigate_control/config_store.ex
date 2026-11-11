@@ -18,6 +18,7 @@ defmodule OmnigateControl.ConfigStore do
   # good. So each is bounded here, well inside 32 bits, where a bad value
   # only costs the reload that carried it.
   @max_rpm 1_000_000
+  @max_concurrent 1_000_000
   @max_weight 1_000_000
   @max_cache_ttl_s 31_536_000
   @max_timeout_ms 3_600_000
@@ -188,6 +189,9 @@ defmodule OmnigateControl.ConfigStore do
             rpm: int!(k["rpm"], 0, 0..@max_rpm, "key #{inspect(k["name"])}: \"rpm\""),
             # Route model names (text or media) this key may use; nil = all.
             models: models(k["models"]),
+            # Requests the data plane lets this key have in flight at once;
+            # 0 = the data plane's own default (OMNIGATE_MAX_CONCURRENT_PER_KEY).
+            max_concurrent: int!(k["max_concurrent"], 0, 0..@max_concurrent, "key #{inspect(k["name"])}: \"max_concurrent\""),
             # Jobs this key may have unfinished at once; nil = the media default.
             max_open_jobs: open_jobs!(k["max_open_jobs"], "key #{inspect(k["name"])}"),
             # Jobs this key may create per UTC day; nil = the media default.
@@ -250,7 +254,7 @@ defmodule OmnigateControl.ConfigStore do
   end
 
   @doc false
-  def limits, do: %{rpm: @max_rpm, weight: @max_weight, cache_ttl_s: @max_cache_ttl_s, timeout_ms: @max_timeout_ms}
+  def limits, do: %{rpm: @max_rpm, max_concurrent: @max_concurrent, weight: @max_weight, cache_ttl_s: @max_cache_ttl_s, timeout_ms: @max_timeout_ms}
 
   # A whole number within `range`, or `default` when the setting is left out.
   defp int!(nil, default, _range, _what), do: default
@@ -388,6 +392,34 @@ defmodule OmnigateControl.ConfigStore do
 
   # Media (async job) config. Never sent to data planes.
   defp normalize_media(m) do
+    m |> build_media() |> check_per_second_prices!()
+  end
+
+  # A per-second price needs seconds to multiply. Video providers take them
+  # from the request; image and speech providers are never sent a duration,
+  # so there the price can only apply to the target's `default_seconds`.
+  # Without one the job would be billed nothing per second (or only
+  # `min_seconds`), whatever the request says. Refuse that at load.
+  defp check_per_second_prices!(media) do
+    kinds = Map.new(media.upstreams, &{&1.name, &1.kind})
+
+    for route <- media.routes, target <- route.targets do
+      kind = kinds[target.upstream]
+      per_second = target.price.per_second_usd
+
+      if is_number(per_second) and per_second > 0 and is_binary(kind) and
+           not OmnigateControl.Jobs.Adapter.takes_duration?(kind) and is_nil(target.default_seconds) do
+        raise ArgumentError,
+              "media route #{inspect(route.model)}: the target on #{inspect(target.upstream)} has \"per_second_usd\", " <>
+                "but a #{kind} provider is never sent a duration. Set \"default_seconds\" on the target " <>
+                "(the seconds every job is billed for), or price it with \"per_job_usd\" or \"per_output_usd\""
+      end
+    end
+
+    media
+  end
+
+  defp build_media(m) do
     webhooks = m["webhooks"] || %{}
     schedule = retry_schedule!(webhooks["retry_schedule_ms"])
 

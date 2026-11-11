@@ -152,6 +152,10 @@ test "every reason the gateway uses has the right category in both protocols" {
         .{ "untranslatable_request", 400, "invalid_request_error", "invalid_request_error" },
         .{ "rate_limit_exceeded", 429, "rate_limit_error", "rate_limit_error" },
         .{ "upstream_rate_limited", 429, "rate_limit_error", "rate_limit_error" },
+        // Refusals from the per-key gates (limits.zig) and the parse budget.
+        .{ "concurrency_limit_exceeded", 429, "rate_limit_error", "rate_limit_error" },
+        .{ "request_memory_exceeded", 429, "rate_limit_error", "rate_limit_error" },
+        .{ "request_too_complex", 400, "invalid_request_error", "invalid_request_error" },
         .{ "all_upstreams_failed", 502, "server_error", "api_error" },
         .{ "gateway_not_ready", 503, "server_error", "api_error" },
         .{ "control_plane_unavailable", 503, "server_error", "api_error" },

@@ -105,7 +105,7 @@ defmodule OmnigateControl.Audit do
 
     if :ets.update_counter(@anon, row, 1, {row, 0}) == 1 do
       entry = entry(conn, action, nil, outcome, extra)
-      entry = if elem(row, 0) == "(others)", do: entry |> Map.put("address", "(others)") |> Map.delete("forwarded_for"), else: entry
+      entry = if elem(row, 0) == "(others)", do: entry |> Map.put("address", "(others)") |> Map.drop(["peer", "forwarded_for"]), else: entry
       GenServer.cast(__MODULE__, {:record, entry})
     end
 
@@ -122,15 +122,23 @@ defmodule OmnigateControl.Audit do
   @doc "The newest entries, newest first."
   def recent(limit \\ 50) when is_integer(limit), do: GenServer.call(__MODULE__, {:recent, limit})
 
+  # `address` means the same on every line, summary lines included: the
+  # address the caller is counted under (`AdminAuth.client_address/1`: the
+  # peer, or behind a trusted proxy the hop it reported; IPv6 by its /64).
+  # `peer` is the other end of the connection, written only when it differs.
   defp entry(conn, action, target, outcome, extra) do
+    peer = address(conn.remote_ip)
+    counted = address(OmnigateControl.AdminAuth.client_address(conn)) || peer
+
     %{
       "ts" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
       "action" => action,
       "target" => target,
       "auth" => extra[:auth] || auth(conn),
-      "address" => address(conn.remote_ip),
+      "address" => counted,
       "outcome" => to_string(outcome)
     }
+    |> put_if("peer", if(peer != counted, do: peer))
     |> put_if("forwarded_for", forwarded_for(conn))
     |> put_if("fields", extra[:fields])
   end
@@ -142,6 +150,9 @@ defmodule OmnigateControl.Audit do
     path = Keyword.fetch!(opts, :path)
     File.mkdir_p!(Path.dirname(path))
     recent = tail(path)
+    # So that a clean stop reaches `terminate/2`, which writes the counts
+    # that have no summary line yet.
+    Process.flag(:trap_exit, true)
     Process.send_after(self(), :flush, @flush_ms)
     {:ok, %{path: path, recent: recent, max_bytes: max_bytes()}}
   end
@@ -192,10 +203,22 @@ defmodule OmnigateControl.Audit do
 
   def handle_info(_other, state), do: {:noreply, state}
 
+  # A clean stop (the supervisor shutting down, `docker stop`): write the
+  # summary lines of every minute counted so far, the running one included,
+  # so the counts are not lost with the process. A kill or a crash of the
+  # node still loses them.
+  @impl true
+  def terminate(_reason, state) do
+    flush_anonymous(state, :all)
+    :ok
+  end
+
   # One summary line per row of a finished minute that saw more than the one
-  # attempt already written.
-  defp flush_anonymous(state, now_s) do
-    minute = div(now_s, 60)
+  # attempt already written. `:all` takes the running minute too (its line
+  # is then stamped with the time of writing, not the minute's end).
+  defp flush_anonymous(state, upto) do
+    now_s = System.os_time(:second)
+    minute = if upto == :all, do: div(now_s, 60) + 1, else: div(upto, 60)
 
     finished =
       try do
@@ -210,7 +233,7 @@ defmodule OmnigateControl.Audit do
 
         if count > 1 do
           %{
-            "ts" => DateTime.from_unix!((at + 1) * 60) |> DateTime.to_iso8601(),
+            "ts" => DateTime.from_unix!(min((at + 1) * 60, max(now_s, at * 60))) |> DateTime.to_iso8601(),
             "action" => action,
             "target" => nil,
             "auth" => "password",

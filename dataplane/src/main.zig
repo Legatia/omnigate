@@ -27,14 +27,23 @@
 //!   OMNIGATE_CLIENT_TIMEOUT_MS  how long a client may take to send a request
 //!                            (head and body), and how long an idle keep-alive
 //!                            connection is kept (default 30000; 0 = no limit)
-//!   OMNIGATE_STREAM_IDLE_TIMEOUT_MS  abort a response that is being streamed
-//!                            when the upstream sends nothing for this long
+//!   OMNIGATE_STREAM_IDLE_TIMEOUT_MS  give up on an upstream that has sent
+//!                            its response head and then sends nothing for
+//!                            this long: a response being streamed is cut
+//!                            off; one of which nothing has reached the
+//!                            client yet goes to the next upstream instead
 //!                            (default 300000; 0 = no limit)
 //!   OMNIGATE_CLIENT_STALL_TIMEOUT_MS  give up on a client that takes none of
 //!                            a response for this long while staying
-//!                            connected; the upstream is then read to its end
-//!                            without it, as for a client that left (default
-//!                            30000; 0 = use the stream idle timeout)
+//!                            connected. That is every response written
+//!                            after the request was read: a relayed answer
+//!                            (the upstream is then read to its end without
+//!                            the client, as for one that left), a file, and
+//!                            the gateway's own answers (errors, the model
+//!                            list, cache hits). A refusal sent before the
+//!                            request body was read is under the client
+//!                            timeout (default 30000; 0 = use the stream
+//!                            idle timeout)
 //!   OMNIGATE_MAX_CONNECTIONS  client connections served at once; further ones
 //!                            get an immediate 503 (default 4096)
 //!   OMNIGATE_MAX_CONCURRENT_PER_KEY  requests one gateway key may have in

@@ -21,6 +21,8 @@ defmodule OmnigateControl.Admin do
       period_spend_usd: Keys.period_spend(key),
       period_resets_at: Keys.period_resets_at(key),
       rpm: Map.get(key, :rpm, 0),
+      # Requests in flight at once on the data plane; 0 = its default.
+      max_concurrent: Map.get(key, :max_concurrent, 0),
       models: Map.get(key, :models),
       max_open_jobs: Keys.max_open_jobs(key),
       max_jobs_per_day: Keys.max_jobs_per_day(key),

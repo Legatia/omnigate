@@ -356,8 +356,10 @@ per UTC day: the key's own setting, else `media.max_jobs_per_day`, 10,000
 by default, `0` for no limit.
 
 - One job more is refused with 429 `too_many_jobs_today`. The count starts
-  again at midnight UTC. (The answer's `Retry-After` is 10 seconds like
-  that of `too_many_open_jobs`, which is not when the limit lifts.)
+  again at midnight UTC, and the answer's `Retry-After` says how far away
+  that is, in seconds, but never more than 3,600: a client that honours it
+  comes back at most once an hour, and finds out if the limit was raised
+  in the meantime. (Until the close-out commit it was a fixed 10 seconds.)
 - Every created job counts, whatever became of it. That is the point: the
   open-jobs limit does not bound jobs that end at once (a refused input, a
   provider that is down), and each of those still costs a log line, a
@@ -374,8 +376,8 @@ Four timeouts, all on the data plane:
 |---|---|---|---|
 | Upstream | `OMNIGATE_UPSTREAM_TIMEOUT_MS` (10 minutes), or the upstream's `timeout_ms` | Waiting for a provider's response headers | The target is abandoned (`UpstreamTimeout`) and the next one is tried. |
 | Client | `OMNIGATE_CLIENT_TIMEOUT_MS` (30 seconds) | A client sending its request head and body, and an idle keep-alive connection between requests | The connection is closed. No response is sent (there is no 408). |
-| Stream idle | `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (5 minutes) | A response in progress: the **upstream** sending nothing. | Both sides are closed, and the call is billed with status 499: the provider's figures if they had arrived, otherwise an estimate ([below](#streams-that-end-early)). |
-| Client stall | `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 seconds) | A client that is connected but takes none of a relayed response: a provider's answer, a file download, a jobs API answer. (The gateway's own short answers, such as errors and the model list, are written under the stream idle timeout.) | The client's connection is closed. For a metered stream the upstream is then read to its end in the background and the call billed with status 499 ([below](#streams-that-end-early)). |
+| Stream idle | `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (5 minutes) | The **upstream** sending nothing after its response head. | A response already being relayed: both sides are closed, and the call is billed with status 499: the provider's figures if they had arrived, otherwise an estimate ([below](#streams-that-end-early)). An answer of which nothing has been sent on yet: a failed attempt (`StreamIdleTimeout`), and the next target is tried. |
+| Client stall | `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 seconds) | A client that is connected but takes none of a response: a provider's answer, a file download, a jobs API answer, or one of the gateway's own answers (an error, the model list, a cache hit) once the request has been read. | The client's connection is closed. For a metered stream the upstream is then read to its end in the background and the call billed with status 499 ([below](#streams-that-end-early)). |
 
 The first three can be turned off with `0`; a client stall timeout of `0`
 means "the same as the stream idle timeout". Until commit e4e30e4 the
@@ -387,7 +389,19 @@ reading was given five minutes; it now gets thirty seconds. Notes:
   provider.
 - The stream idle timeout restarts whenever bytes move, so a long but
   steadily streaming answer is never cut. It also covers a non-streaming
-  answer whose body stalls after the headers.
+  answer whose body stalls after the headers. Such an answer is buffered
+  before any of it is sent (up to 64 KiB, or all of it when it is being
+  translated), so nothing has reached the client when the timeout passes:
+  the attempt fails with `StreamIdleTimeout` and the request goes to the
+  route's next target, or ends in `502 all_upstreams_failed` with that
+  outcome among the `attempts`. In that phase the silence is noticed after
+  between one and two times the timeout. Until the close-out commit the
+  watchdog ended such a request's task instead, which could leave the
+  following attempts and the connection without any deadline.
+- Until the close-out commit the gateway's own answers (errors, the model
+  list, cache hits) were written under the stream idle timeout; they are
+  under the client stall timeout now. A refusal sent before the request
+  body was read is under the client timeout.
 - A client that stalls while sending its body shows in the access log with
   status 408 and `aborted=ClientTimeout` (the 408 is for the log only), and
   is counted as `client_timeout` among the
@@ -520,10 +534,12 @@ among the [refused requests](#refused-requests).
   is more than most applications ever have). Lower
   `OMNIGATE_MAX_CONCURRENT_PER_KEY` if you hand keys to parties you do not
   trust, and size the two memory budgets to the memory the process may
-  use: with the defaults they add up to 2 GiB, more than the 1 GiB that
-  `compose.yaml` gives the container
+  use: the binary's defaults add up to 2 GiB, which is why `compose.yaml`
+  sets them to 256 MiB each for its 1 GiB container
   ([Deployment](deployment.md#memory-limits)).
-- There is no per-key setting; the cap is the same for every key.
+- A key can have a cap of its own, `max_concurrent`, in the config file or
+  through the admin API (since the close-out commit); the variable is the
+  cap of every key without one.
 - The measurements behind this, from the commit that added it: an 8 MiB
   body built to be expensive took 1,096 MiB at its peak before and 30 MiB
   after; a body of keys chosen to collide in the parser's hash map took 4
@@ -810,6 +826,7 @@ Control plane:
 | `ledger: sealed segment N (N bytes)` | The active segment was closed under its number and a new one started. |
 | `ledger: ignoring ledger.snapshot (<reason>)` | A snapshot failed a check (checksum, contents, or the segment bytes it covers) and was not used. The spare, or a full replay, takes its place. |
 | `ledger: using the previous snapshot; the newest one was unusable` | Startup went on from the spare. |
+| `ledger: the id file for <day> (<path>) is missing; the snapshot recorded N ids in it. ...` | Warning, at startup. A `ledger.ids.<day>` file that the snapshot counted ids for is gone (deleted, or left out of a restore). The totals are unaffected, but a usage event of that day that a data plane delivers again would be counted a second time. Restore the file from the backup that holds the snapshot, if you have it. |
 | `ledger: no usable snapshot, and segments before N were deleted by retention. ...` | Error. Totals were rebuilt from the remaining segments only; spend recorded before them is lost. Restore the data directory from a backup. |
 | `ledger: snapshot failed: ...` | A snapshot could not be written. Usage is still recorded; the next start replays more. |
 | `ledger: sealing segment N failed, will try again: ...` | Error (a full disk, a permission). The batch is recorded; the segment stays active and is sealed after a later batch. |
@@ -951,10 +968,10 @@ python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key -
 
 `--rpm-key` adds the check that the trailing-slash spelling cannot be used
 to create jobs past a rate limit, and that the limit is applied before the
-body is read. It takes a key limited to **3 requests per minute**: the
-second check sends three requests and expects the fourth to be refused.
-The dev config's `og-ratelimited-key` allows 5, so it does not fit that
-check as it stands. `--other-key`, `--concurrency-cap`, `--translated-model`,
+body is read. The second check sends as many requests as the key allows
+per minute and expects the next one to be refused, so the tool has to know
+that number: `--rpm`, 3 unless given. The dev config's `og-ratelimited-key`
+allows 5: `--rpm-key og-ratelimited-key --rpm 5`. `--other-key`, `--concurrency-cap`, `--translated-model`,
 `--late-model` and `--flood-model` switch on further checks against your
 own instance; `--help` says what each needs. The hostile-upstream and
 hostile-control-plane cases only run when the script started the stack
@@ -987,7 +1004,7 @@ line in the data plane's access log.
 | `budget_exceeded` (402) | Recorded spend in the key's budget period reached `budget_usd`. | Raise or remove the budget, or wait for the period to turn if it is monthly or daily; a `total` budget never resets by itself. See [Budgets](#budgets). The key can still read its jobs and files. |
 | `overloaded` (503) with no request id | The data plane is at `OMNIGATE_MAX_CONNECTIONS`. | Retry after a second. If it persists: look for clients that open connections without reusing or closing them, lower `OMNIGATE_CLIENT_TIMEOUT_MS` so idle ones are dropped sooner, or raise the cap. |
 | `overloaded` (503) with a request id | The request bodies in flight, or the requests being converted, have used up `OMNIGATE_REQUEST_MEMORY_MB` or `OMNIGATE_PARSE_MEMORY_MB`. | Retry after a second (the SDKs do). If it persists under honest load, raise the budget, and the container's memory limit with it. |
-| `concurrency_limit_exceeded` (429) | The key has `OMNIGATE_MAX_CONCURRENT_PER_KEY` requests in flight. Streams whose client hung up count until the provider's answer has been read to its end. | Retry after a second. Raise the cap if one key legitimately runs that many requests at once. |
+| `concurrency_limit_exceeded` (429) | The key has its `max_concurrent` (or, without one, `OMNIGATE_MAX_CONCURRENT_PER_KEY`) requests in flight. Streams whose client hung up count until the provider's answer has been read to its end. | Retry after a second. Raise the cap if one key legitimately runs that many requests at once. |
 | `request_memory_exceeded` (429) | The key's requests in flight are too large together (a quarter of `OMNIGATE_REQUEST_MEMORY_MB`), or it is having as many large requests converted at once as it may (half of `OMNIGATE_PARSE_MEMORY_MB`). | Retry after a second; send fewer large requests at once, or raise the budget. |
 | `request_too_complex` (400) | The request must be translated for a provider of the other protocol (or its `stream_options` rewritten) and has an object with more than 1,024 members, or far more values than its size suggests. | Use a route with an upstream of the client's own protocol, which forwards the body without parsing it, or split the object. |
 | `model_not_allowed` (403) | The key has a `models` list without this route. | Add the route name to the list. |
@@ -1002,7 +1019,7 @@ line in the data plane's access log.
 | `payload_too_large` (413) | Body over 8 MiB. | Send less; the limit is not configurable. |
 | `rate_limit_exceeded` (429) | Over the key's `rpm`. For `POST /v1/jobs` the control plane counts as well, and can be the one that answers. On `GET /v1/jobs`: the key is listing too often (its `rpm`, or 600 per minute). Remember that requests refused for their body or model count against the limit too. | Wait `Retry-After` seconds, or raise `rpm`. |
 | `too_many_open_jobs` (429) | The key already has `max_open_jobs` jobs queued or running. | Wait for jobs to finish (the answer suggests 10 seconds in `Retry-After`), cancel some, or raise the key's `max_open_jobs` (or `media.max_open_jobs`). |
-| `too_many_jobs_today` (429) | The key already created `max_jobs_per_day` jobs this UTC day, failed and canceled ones included. | Wait for midnight UTC (the `Retry-After` of 10 seconds is not when the limit lifts), or raise the key's `max_jobs_per_day` (or `media.max_jobs_per_day`). |
+| `too_many_jobs_today` (429) | The key already created `max_jobs_per_day` jobs this UTC day, failed and canceled ones included. | Wait for midnight UTC (`Retry-After` counts down to it, an hour at a time at most), or raise the key's `max_jobs_per_day` (or `media.max_jobs_per_day`). |
 | `storage_unavailable` (503) on `POST /v1/jobs` | The control plane could not write the job to its job store. | Check the disk and permissions of the control plane's data directory; its log has `job <id> could not be stored`. |
 | `payload_too_large` (413) on `POST /v1/jobs`, from the control plane | `input` and `metadata` together exceed `media.max_input_bytes`. | Send less, pass large inputs by URL, or raise the setting. |
 | `invalid_request` (400) on `POST /v1/jobs`: `"input.duration" must be a number of seconds, 0 or more` (or the same for `seconds`, `n`, `num_outputs`, `num_images`) | A field that feeds the price is negative or not a number. | Fix the request. |
@@ -1074,8 +1091,8 @@ Other symptoms:
 | A connection the client kept open was closed by the gateway | It was idle for `OMNIGATE_CLIENT_TIMEOUT_MS` (30 seconds by default). Most HTTP clients retry on a fresh connection by themselves. |
 | A long streamed answer was cut off | The upstream sent nothing for `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`, or the client read nothing for `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 seconds by default; a client that pauses reading for longer than that, to do slow work per chunk, needs it raised). The ledger has the request with status 499, with estimated token counts if the provider's own did not arrive. |
 | A response or a file download ends with a broken connection instead of an error | The provider (or, for a file, the control plane) cut its answer short after the gateway had started sending. A chunked response without its closing chunk is how that is signalled. | Retry. The access log has `aborted=UpstreamTruncated` (or the I/O error). |
-| A file download shows no size or progress | Files over 64 KiB are sent chunked, without a `content-length`. | Take the size from the job (`outputs[].bytes`). |
-| The data-plane container is killed and restarted under load (`OOMKilled`) | Its memory limit (`OMNIGATE_DATAPLANE_MEMORY`, 1 GiB) is below what its budgets admit (2 GiB with the defaults, plus the cache). | Raise the limit or lower `OMNIGATE_REQUEST_MEMORY_MB` and `OMNIGATE_PARSE_MEMORY_MB`; see [Deployment](deployment.md#memory-limits). |
+| A file download shows no size or progress | Between commit e4e30e4 and the close-out commit, files over 64 KiB were sent chunked, without a `content-length`. | Update the data plane: downloads carry their length again. The size is also in the job (`outputs[].bytes`). |
+| The data-plane container is killed and restarted under load (`OOMKilled`) | Its memory limit (`OMNIGATE_DATAPLANE_MEMORY`, 1 GiB) is below what its budgets admit. With the current `compose.yaml` they are 256 + 256 + 64 MiB; a Compose file from before the close-out commit, or budgets you raised in `.env`, admit more. | Raise the limit or lower `OMNIGATE_REQUEST_MEMORY_MB` and `OMNIGATE_PARSE_MEMORY_MB` (in `.env` under Compose); see [Deployment](deployment.md#memory-limits). |
 | The control-plane container is killed and restarted (`OOMKilled`) | Its memory limit (`OMNIGATE_CONTROL_MEMORY`, 1 GiB) is too small for the duplicate-detection ids of your traffic, or for a media output a provider returned inline. | Look at `omnigate_ledger_dedup_ids` (61 MiB per million); raise the limit, or shorten `retention.ledger_ids_days` if your data planes are never cut off that long. |
 | The data-plane container is `unhealthy` | `omnigate-dp healthcheck` gets no `200` from `/healthz` on `OMNIGATE_LISTEN` within three seconds. | The process is not listening or is not answering; read its log. |
 | The control plane does not start after an upgrade, naming a setting | Whole-number settings are read strictly since commit d79406b: `"rpm": 600.0`, a negative budget, a `timeout_s` of 0 or a `media.max_input_bytes` over 8,000,000 used to load. | Fix the value the message names; see [Upgrading](upgrading.md). |

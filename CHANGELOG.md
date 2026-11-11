@@ -215,6 +215,28 @@ class, are in [SECURITY.md](SECURITY.md#past-advisories).
 
 ### Added
 
+**Close-out (the commit after 55a294d).** What an installation has to do
+is in [docs/upgrading.md](docs/upgrading.md#the-close-out-commit).
+
+- A gateway key can have its own concurrency cap, `max_concurrent` (0 to
+  1,000,000; `0` leaves it on `OMNIGATE_MAX_CONCURRENT_PER_KEY`): in the
+  config file, through the admin API, in the config snapshot, in
+  `GET /admin/keys` and on the dashboard.
+- Audit log: a `peer` member (the connection's address, when it differs
+  from `address`); the dashboard shows a summary line's `repeats`.
+- Control plane: a warning at start when an id file that the ledger
+  snapshot counted ids for is missing.
+- `tools/malformed_test.py --rpm`, the per-minute limit of `--rpm-key`
+  (default 3; 5 for the dev config's key). The tool gained cases for an
+  upstream and a control plane that send a head and no body, for a client
+  that takes none of the gateway's own answers, and for the length of
+  file downloads.
+- `tools/mock_upstream.py`: the error bodies two providers really send
+  (`err-array-1`, `err-string-1`), a well-formed one in an unusual
+  spelling (`err-exact-1`), two on the Anthropic mock, and `stall-body`
+  (a 200 head, then nothing). `tools/sdk_compat.py` checks that both SDKs
+  raise the right class with the provider's message for them.
+
 **Since the second security review (commits e4e30e4 and d79406b)**
 
 - Data plane: `OMNIGATE_MAX_CONCURRENT_PER_KEY` (512),
@@ -495,6 +517,41 @@ class, are in [SECURITY.md](SECURITY.md#past-advisories).
 
 ### Changed
 
+**Close-out (the commit after 55a294d)**
+
+- **A provider's error body that is not its protocol's error envelope is
+  put into one**, with the provider's message, its code when it gave one,
+  and the provider's status: Google's OpenAI-compatible endpoint answers a
+  bad key with a JSON array, xAI with `error` as a string, and an SDK
+  could not read either. A well-formed provider error is still relayed
+  byte for byte. Translated errors read the same shapes.
+- **A media target priced per second on a provider that is never sent a
+  duration** (`openai_images`, `elevenlabs`, `gemini`,
+  `gemini_interactions`) **must set `default_seconds`**, or the config is
+  rejected at load. Such a job is billed the default whatever the request
+  names, and the request-time check no longer refuses it for a duration
+  the provider never sees.
+- **Compose sets the data plane's memory budgets**
+  (`OMNIGATE_REQUEST_MEMORY_MB` 256, `OMNIGATE_PARSE_MEMORY_MB` 256,
+  `OMNIGATE_CACHE_MAX_MB` 64, from `.env`), so that they fit the 1 GiB
+  container limit. A value for them in `.env.dataplane` is now
+  overridden. The binary's own defaults are unchanged.
+- `429 too_many_jobs_today` carries a `Retry-After` of the seconds until
+  midnight UTC, at most 3,600 (it was 10).
+- The gateway's own answers (errors, the model list, cache hits) are
+  written under `OMNIGATE_CLIENT_STALL_TIMEOUT_MS`, not the stream idle
+  timeout.
+- `GET /login` with a bearer token from an address locked out for wrong
+  tokens answers `429 too_many_attempts` (it showed the sign-in page).
+- Audit log: `address` is the address the caller was counted under on
+  every line, so a failed sign-in's first line and its summary line name
+  the same address behind a proxy.
+- The control-plane image's health check asks the port in
+  `OMNIGATE_CONTROL_PORT`.
+- `tools/import_litellm.py` cuts a timeout above one hour to `3600000` ms
+  and reports it.
+- `:inets` is no longer started with the control plane (nothing used it).
+
 **Since the second security review (commits e4e30e4 and d79406b).** The
 full list, with old and new values, is in
 [docs/upgrading.md](docs/upgrading.md).
@@ -731,6 +788,23 @@ full list, with old and new values, is in
 
 ### Fixed
 
+- **An upstream that sent a 200 head and then no body, on an answer that
+  is not a stream, ended the request and could disarm the gateway's
+  deadlines.** The silence was timed by the watchdog, which cancels the
+  connection's task and waits for it; the task then went on to the next
+  upstream without any deadline, and the watchdog served no other
+  connection until it finished. Such a wait is now timed next to the read,
+  the attempt fails with `StreamIdleTimeout`, and the request fails over
+  cleanly (or ends in a 502). The same applied to a control plane that
+  stalled inside a jobs answer. A task the watchdog did cancel now ends
+  without starting anything else. Found by reading the code and
+  reproduced with `tools/malformed_test.py` against the previous binary
+  (a client that sent half a request head was never dropped while such a
+  connection stayed open); not seen in use. (Close-out commit.)
+- File downloads over 64 KiB carry their `Content-Length` again; since
+  e4e30e4 they were sent chunked. (Close-out commit.)
+- Sign-in counts that had no summary line yet were lost whenever the
+  control plane stopped; a clean stop now writes them. (Close-out commit.)
 - Streamed responses were not flushed per chunk, so streams arrived in one
   burst.
 - An error after the response had started no longer triggers failover.

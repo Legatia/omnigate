@@ -17,6 +17,12 @@ defmodule OmnigateControl.Jobs.Adapters.GeminiInteractions do
   Checked against the real service with `gemini-omni-1.2-flash` generating a
   short video in the foreground (November 2026). Background polling follows
   the documented outline and has only met the mock.
+
+  Those calls were made with the HTTP client this adapter used at the time
+  (OTP's `:httpc`). They have not been repeated on the client that replaced
+  it (`OmnigateControl.Http`): against the real service that one has only
+  sent a request with an invalid key, which shows that the service is
+  reached and its error is read, not that a job completes.
   """
   @behaviour OmnigateControl.Jobs.Adapter
 

@@ -53,8 +53,8 @@ holds the admin token, a media provider key, a webhook secret or a bucket
 credential. (Earlier commits gave one `.env` to both containers; see
 [Upgrades](#upgrades) if you have one.)
 
-**`.env`** is read by Compose itself, for the proxy and for the two memory
-limits. Nothing in it is a secret.
+**`.env`** is read by Compose itself, for the proxy, the two memory
+limits and the data plane's memory budgets. Nothing in it is a secret.
 
 | Variable | Value |
 |---|---|
@@ -62,7 +62,8 @@ limits. Nothing in it is a secret.
 | `OMNIGATE_ADMIN_HOST` | Host name for the dashboard, for example `admin.gateway.example.com`. |
 | `OMNIGATE_ADMIN_ALLOW` | Who may reach the dashboard host at all: CIDR ranges separated by spaces, for example `203.0.113.0/24 2001:db8::/32`. The default, `0.0.0.0/0 ::/0`, is everyone; narrow it to your office or VPN. See [The admin allow-list](#the-admin-allow-list). |
 | `OMNIGATE_CONTROL_MEMORY` | Optional. Memory limit of the control-plane container, as a Docker size (`512m`, `1g`, `2g`). `1g` when it is not set. |
-| `OMNIGATE_DATAPLANE_MEMORY` | Optional. The same for the data-plane container. `1g` when it is not set, which is less than the data plane's default memory budgets admit: read [Memory limits](#memory-limits) before you go live. |
+| `OMNIGATE_DATAPLANE_MEMORY` | Optional. The same for the data-plane container. `1g` when it is not set. |
+| `OMNIGATE_REQUEST_MEMORY_MB`, `OMNIGATE_PARSE_MEMORY_MB`, `OMNIGATE_CACHE_MAX_MB` | Optional. The data plane's three memory budgets, in megabytes; `256`, `256` and `64` when not set, which fits the 1 GiB limit. `compose.yaml` passes them to the data-plane container, and a value in `.env.dataplane` does not override them. If you raise one, raise `OMNIGATE_DATAPLANE_MEMORY` with it: read [Memory limits](#memory-limits). |
 
 **`.env.control`** is the control plane's environment.
 
@@ -231,7 +232,10 @@ intervals, and what Compose does with the result (nothing), are under
   itself sits behind another proxy or a load balancer, see
   [The admin allow-list](#the-admin-allow-list).
 - `mem_limit` for both omnigate services, from `OMNIGATE_CONTROL_MEMORY`
-  and `OMNIGATE_DATAPLANE_MEMORY` in `.env` (`1g` each by default). See
+  and `OMNIGATE_DATAPLANE_MEMORY` in `.env` (`1g` each by default), and
+  the data plane's memory budgets in its `environment`, from
+  `OMNIGATE_REQUEST_MEMORY_MB`, `OMNIGATE_PARSE_MEMORY_MB` and
+  `OMNIGATE_CACHE_MAX_MB` in `.env` (256, 256 and 64). See
   [Memory limits](#memory-limits).
 - `stop_grace_period`: 30 seconds for the control plane, 20 for the data
   plane.
@@ -353,7 +357,9 @@ domain, and Kubernetes.**
 | Control plane | `GET /readyz`, no credentials | It can do its job: the config is loaded, the job store is running, the ledger is loaded and its file is writable. `200 {"status":"ready"}`, or `503 {"status":"not_ready","reason":"..."}` naming the first thing that is not. |
 
 - **The control image's health check calls `/readyz`** every 10 seconds
-  (3 second timeout, 120 second start period, 3 retries);
+  (3 second timeout, 120 second start period, 3 retries), on the port in
+  `OMNIGATE_CONTROL_PORT` (4000 unless set; until the close-out commit it
+  asked 4000 whatever the setting);
   `docker compose ps` shows the result. While the control plane is still
   loading its ledger the port is not open at all, so the probe fails with a
   refused connection rather than a 503. With snapshots that phase is under
@@ -453,38 +459,46 @@ foreseen.
 ### What the data plane needs memory for
 
 - **The response cache**: up to `OMNIGATE_CACHE_MAX_MB` (64).
-- **Request bodies in flight**: up to `OMNIGATE_REQUEST_MEMORY_MB` (1024),
-  by declared length, each counted twice.
+- **Request bodies in flight**: up to `OMNIGATE_REQUEST_MEMORY_MB` (256
+  under `compose.yaml`; the binary's own default is 1024), by declared
+  length, each counted twice.
 - **JSON trees being built** for translation, the response cache and
-  provider quirks: up to `OMNIGATE_PARSE_MEMORY_MB` (1024) reserved at
-  once.
+  provider quirks: up to `OMNIGATE_PARSE_MEMORY_MB` (256 under
+  `compose.yaml`; 1024 by itself) reserved at once.
 - On top, with no setting: the usage queue (at most 128 MiB; it fills
   only while usage cannot be delivered to the control plane), an upstream
   answer that is buffered to be translated (at most 16 MiB each), and the
   buffers of each connection.
 
-**With the defaults, the data plane's budgets do not fit its limit.**
-1024 + 1024 + 64 MiB is 2,112 MiB, about twice the 1 GiB the container
-gets. The comment at the top of `compose.yaml` says the data plane's limits
-add up to "well under" the container limit; that is not what the defaults
-are. The two budgets are ceilings on what the data plane admits at once,
-not memory it takes at start, so the mismatch does not show in ordinary
-traffic. Under heavy or hostile load (many large bodies at once, from
-several keys) the container would be killed before either budget refuses
-anything, and a kill ends every connection where a refusal would have
-cost one client a `429` or `503`. Do one of two things:
+**The budgets have to fit the limit, and under Compose they do.** The
+binary's own defaults, 1024 + 1024 + 64 MiB, are 2,112 MiB: sized for a
+host without a memory limit, and about twice the 1 GiB the container
+gets. So `compose.yaml` sets the three itself, from `.env`:
 
-- **Raise the limit**: set `OMNIGATE_DATAPLANE_MEMORY` in `.env` to at
-  least the sum of the two budgets and the cache, plus headroom for the
-  items without a setting. With the defaults that means more than `2g`.
-- **Lower the budgets**: set `OMNIGATE_REQUEST_MEMORY_MB` and
-  `OMNIGATE_PARSE_MEMORY_MB` in `.env.dataplane` so that the two, the
-  cache and the headroom fit inside `OMNIGATE_DATAPLANE_MEMORY`. Two
-  things follow from how the budgets are divided: one key may hold a
-  quarter of the request budget, and a request counts twice its length, so
-  below 64 a single 8 MiB request no longer fits; one key may reserve half
-  the parse budget, and one tree may take up to 96 MiB, so below 192 the
-  largest translated requests are refused.
+| Variable in `.env` | Default under Compose | Budget |
+|---|---|---|
+| `OMNIGATE_REQUEST_MEMORY_MB` | `256` | request bodies in flight |
+| `OMNIGATE_PARSE_MEMORY_MB` | `256` | JSON trees |
+| `OMNIGATE_CACHE_MAX_MB` | `64` | the response cache |
+
+That is 576 MiB of the 1,024, which leaves more than 400 MiB for the items
+without a setting. Under heavy or hostile load (many large bodies at once,
+from several keys) a budget then refuses a request, which costs one client
+a `429` or `503`, before the container is killed, which would end every
+connection. (Until the close-out commit, the one after 55a294d, the
+Compose file left the budgets at the binary's defaults, and the container
+could be killed first.)
+
+- **Set them in `.env`, not in `.env.dataplane`.** `compose.yaml` puts the
+  three into the container's `environment`, which wins over the
+  `env_file`. If you had them in `.env.dataplane`, move them.
+- **To admit more, raise both sides**: a budget and
+  `OMNIGATE_DATAPLANE_MEMORY`, by at least the same amount.
+- **How low a budget can go.** One key may hold a quarter of the request
+  budget, and a request counts twice its length, so below 64 a single
+  8 MiB request no longer fits; with 256, one key can have four of them in
+  flight. One key may reserve half the parse budget, and one tree may take
+  up to 96 MiB, so below 192 the largest translated requests are refused.
 
 How much headroom is enough has not been measured: the repository records
 no figure for the data plane's memory under load beyond the per-request
@@ -563,9 +577,9 @@ keys to the data plane only.
 - terminate TLS for the gateway and for the dashboard;
 - pass responses through without buffering (Caddy: `flush_interval -1`).
   That concerns more than token streams: the gateway frames its own
-  answers, and everything that is a stream or longer than 64 KiB,
-  file downloads included, goes out with `transfer-encoding: chunked` and
-  no `content-length`;
+  answers, and a provider's answer that is a stream or longer than 64 KiB
+  goes out with `transfer-encoding: chunked` and no `content-length` (a
+  file download carries its length);
 - hand request bodies on to the data plane with a `Content-Length`. The
   data plane does not accept chunked request bodies: a `POST` that
   arrives with `Transfer-Encoding: chunked` is answered `411`. A proxy or
@@ -597,7 +611,7 @@ client, so the data plane's client timeouts apply to it:
 
 | The data plane | After | Consequence for the proxy |
 |---|---|---|
-| gives up on a client that stays connected but takes none of a response | `OMNIGATE_CLIENT_STALL_TIMEOUT_MS`, 30 seconds | A proxy that buffers a response, or stops reading because its own client is slow, is cut off after 30 seconds; the upstream is then read to its end without it and the call is billed. Raise the variable if your clients pause that long on purpose. |
+| gives up on a client that stays connected but takes none of a response, the gateway's own answers included | `OMNIGATE_CLIENT_STALL_TIMEOUT_MS`, 30 seconds | A proxy that buffers a response, or stops reading because its own client is slow, is cut off after 30 seconds; the upstream is then read to its end without it and the call is billed. Raise the variable if your clients pause that long on purpose. |
 | cuts off a response whose **upstream** sends nothing | `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`, 5 minutes | This one no longer covers a client that stops reading. A proxy read timeout shorter than this ends streams the gateway would have waited for. |
 | waits for an upstream's response headers | `OMNIGATE_UPSTREAM_TIMEOUT_MS`, 10 minutes, or the upstream's `timeout_ms` | A proxy response-header timeout shorter than this turns slow answers that are not streamed into the proxy's own error. |
 | drops a client that is slow to send a request, and closes an idle keep-alive connection | `OMNIGATE_CLIENT_TIMEOUT_MS`, 30 seconds | A proxy that keeps idle connections to the gateway for longer will find them closed. |
@@ -788,9 +802,9 @@ and how to go back. In short:
 - **Back up `control-data` before.** The first start of the new control
   plane rewrites the ledger snapshot in a format the older code does not
   read.
-- **Look at memory.** Both containers now have a 1 GiB limit, and the
-  data plane's default budgets admit more than that
-  ([Memory limits](#memory-limits)).
+- **Look at memory.** Both containers now have a 1 GiB limit. The current
+  `compose.yaml` sets the data plane's budgets to fit it; the one from
+  d79406b did not ([Memory limits](#memory-limits)).
 - **A proxy of your own in front of the data plane** must hand request
   bodies on with a `Content-Length` and, if the control plane trusts
   `X-Forwarded-For`, write that header itself
@@ -907,8 +921,9 @@ What the code does during a restart:
   (`ledger.ids.YYYY-MM-DD`) and the directory `jobs.jsonl.inputs/`. Ledger
   events gained fields (`cached_input_tokens`, `cache_write_input_tokens`,
   `cached`, `estimated`); events written before they existed are read as
-  before. A key in `keys.json` may have `max_jobs_per_day`, and failed
-  sign-ins in `audit.jsonl` are summarised in lines with a `repeats`
+  before. A key in `keys.json` may have `max_jobs_per_day` and
+  `max_concurrent`, failed sign-ins in `audit.jsonl` are summarised in
+  lines with a `repeats` member, and an audit line may have a `peer`
   member; both files are still read by older code.
 - **The job file's lines changed.** A job's later changes are now appended
   to `jobs.jsonl` as short patch lines instead of full copies of the job. A

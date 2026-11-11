@@ -205,7 +205,7 @@ To test a gateway you started yourself instead (as in the
 [Quickstart](docs/quickstart.md#3-run-the-pieces-by-hand)):
 
 ```bash
-python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key --model demo-direct --rpm-key og-ratelimited-key
+python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key --model demo-direct --rpm-key og-ratelimited-key --rpm 5
 ```
 
 Against your own gateway the hostile-upstream, hostile-control-plane and

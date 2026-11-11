@@ -180,11 +180,22 @@ defmodule OmnigateControl.Router do
       caps = [open_cap: {Keys.max_open_jobs(key), hashes}, day_cap: {Keys.max_jobs_per_day(key), hashes}]
 
       case Jobs.create(key.key_sha256, conn.body_params, idempotency_key, caps) do
-        {:ok, job} -> send_json(conn, 202, Jobs.view(job))
-        {:existing, job} -> send_json(conn, 200, Jobs.view(job))
+        {:ok, job} ->
+          send_json(conn, 202, Jobs.view(job))
+
+        {:existing, job} ->
+          send_json(conn, 200, Jobs.view(job))
+
         # Too many unfinished jobs: worth trying again once some have finished.
-        {:error, 429, type, message} -> conn |> put_resp_header("retry-after", "10") |> send_error(429, type, message)
-        {:error, status, type, message} -> send_error(conn, status, type, message)
+        {:error, 429, type, message} ->
+          conn |> put_resp_header("retry-after", "10") |> send_error(429, type, message)
+
+        # A limit that lifts at a known time says when.
+        {:error, 429, type, message, retry_after_s} ->
+          conn |> put_resp_header("retry-after", Integer.to_string(retry_after_s)) |> send_error(429, type, message)
+
+        {:error, status, type, message} ->
+          send_error(conn, status, type, message)
       end
     else
       {:error, 429, type, message, retry_after_s} -> conn |> put_resp_header("retry-after", Integer.to_string(retry_after_s)) |> send_error(429, type, message)
@@ -340,7 +351,13 @@ defmodule OmnigateControl.Router do
   end
 
   get "/login" do
-    if conn.assigns[:auth] in [:session, :token], do: redirect(conn, "/"), else: send_html(conn, 200, login_page(nil))
+    case conn.assigns[:auth] do
+      ok when ok in [:session, :token] -> redirect(conn, "/")
+      # A bearer token from an address that sent too many wrong ones gets
+      # the same answer here as on `/` and `/admin/*`, not a page with 200.
+      :throttled -> too_many_tokens(conn)
+      _ -> send_html(conn, 200, login_page(nil))
+    end
   end
 
   # Failed and throttled attempts are anyone's to cause: they go to the
@@ -420,7 +437,15 @@ defmodule OmnigateControl.Router do
       # an unknown key (401) rather than as one that is out of budget.
       keys:
         for k <- config.keys, not Keys.disabled?(k) do
-          %{key_sha256: k.key_sha256, name: k.name, blocked: Keys.over_budget?(k), rpm: k.rpm, models: k.models}
+          %{
+            key_sha256: k.key_sha256,
+            name: k.name,
+            blocked: Keys.over_budget?(k),
+            rpm: k.rpm,
+            # Requests in flight at once; 0 = the data plane's own default.
+            max_concurrent: Map.get(k, :max_concurrent, 0),
+            models: k.models
+          }
         end,
       upstreams: config.upstreams,
       routes:

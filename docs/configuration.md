@@ -78,6 +78,7 @@ listed before the managed keys created through it
 | `budget_usd` | number, 0 or more | none (no budget) | The key is blocked once its recorded spend in the current budget period reaches this amount. A negative value, or one that is not a number, is rejected when the file is loaded. See [Operations](operations.md#budgets). |
 | `budget_period` | string | `total` | What the budget covers: `total` (everything, never resets), `monthly` (the current UTC calendar month) or `daily` (the current UTC day). Any other value is rejected when the file is loaded. |
 | `rpm` | whole number, 0 to 1,000,000 | `0` (unlimited) | Requests per minute, enforced by each data-plane process. Job creation is counted a second time by the control plane; see [Operations](operations.md#rate-limits). A value that is not a whole number in that range (`600.0` and `"600"` included) is rejected when the file is loaded. |
+| `max_concurrent` | whole number, 0 to 1,000,000 | `0` (the data plane's `OMNIGATE_MAX_CONCURRENT_PER_KEY`) | Requests the key may have in flight at once on one data-plane process, in place of that process's `OMNIGATE_MAX_CONCURRENT_PER_KEY` (512). One more gets `429 concurrency_limit_exceeded`. `0` means the key has no cap of its own; it cannot switch the cap off. A value that is not a whole number in that range is rejected when the file is loaded. |
 | `models` | list of strings | absent (all models) | Route names, text or media, the key may use. An empty list allows none. Anything other than a list of strings is rejected when the file is loaded. |
 | `max_open_jobs` | whole number, 0 or more | absent (the value of `media.max_open_jobs`) | Media jobs the key may have unfinished (queued or running) at one time. `0` means no limit. Anything else is rejected when the file is loaded. See [Operations](operations.md#rate-limits). |
 | `max_jobs_per_day` | whole number, 0 or more | absent (the value of `media.max_jobs_per_day`) | Media jobs the key may create per UTC day, whatever became of them. `0` means no limit. Anything else is rejected when the file is loaded. See [Operations](operations.md#rate-limits). |
@@ -85,9 +86,10 @@ listed before the managed keys created through it
 | `webhook_secret` | string | none | Signing secret for this key's job webhooks. |
 | `webhook_secret_env` | string | none | Name of an environment variable (read by the control plane) holding that secret. Used when `webhook_secret` is absent. |
 
-There is no per-key setting for the data plane's concurrency cap: every
-key gets `OMNIGATE_MAX_CONCURRENT_PER_KEY` (see
-[Environment variables](#data-plane)).
+`max_concurrent` is new with the close-out commit (the one after
+55a294d). Until then every key had the data plane's
+`OMNIGATE_MAX_CONCURRENT_PER_KEY` (see [Environment variables](#data-plane))
+and nothing else; a key without the field still does.
 
 A key is any string; it is only ever compared by its SHA-256. The LiteLLM
 importer generates keys as `og-` followed by random characters, which is a
@@ -114,6 +116,7 @@ Example:
   "budget_usd": 25.0,
   "budget_period": "monthly",
   "rpm": 600,
+  "max_concurrent": 64,
   "max_open_jobs": 20,
   "max_jobs_per_day": 2000,
   "models": ["claude", "gpt", "gemini", "image"],
@@ -339,12 +342,26 @@ Each target has `upstream`, `model` (the provider's model id), an optional
 
 | Target field | Type | Default | Meaning |
 |---|---|---|---|
-| `default_seconds` | number above 0 | absent | The duration billed when the request names none. Without it, a job on a route with a `per_second_usd` price must send `input.duration` (or `input.seconds`) above 0, or it is refused with `400 invalid_request`. |
+| `default_seconds` | number above 0 | absent | The duration billed when the request names none. Without it, a job on a route with a `per_second_usd` price must send `input.duration` (or `input.seconds`) above 0, or it is refused with `400 invalid_request`. **Required** on a per-second target whose upstream is never sent a duration (see below). |
 | `min_seconds` | number, 0 or more | absent | The least duration billed, whatever the request says. |
 | `max_seconds` | number, 0 or more | absent | A request for more than this is refused with `400 invalid_request`. |
 
 `min_seconds` above `max_seconds`, `default_seconds` above `max_seconds`
-and a `default_seconds` of 0 are rejected when the file is loaded. The
+and a `default_seconds` of 0 are rejected when the file is loaded.
+
+**Per-second prices and providers that take no duration.** Only the video
+kinds (`replicate`, `fal`, `xai_video`) are sent a duration from the
+request. An upstream of kind `openai_images`, `elevenlabs`, `gemini` or
+`gemini_interactions` never is, so there a `per_second_usd` price has
+nothing from the request to multiply: the job is billed
+`default_seconds` (raised to `min_seconds`), whatever `input.duration`
+says, and `max_seconds` refuses nothing. A per-second price on such a
+target **without** `default_seconds` is rejected when the file is loaded
+(since the close-out commit; before, such a job was refused or billed
+nothing per second depending on the request). Set `default_seconds`, or
+price the target with `per_job_usd` or `per_output_usd`.
+
+The
 three only matter on a target whose `per_second_usd` is above 0. They
 change what is billed and what is accepted, not what is sent to the
 provider, and a job is checked against every per-second target of its route
@@ -479,12 +496,12 @@ that asks for a webhook when none of these is set is refused
 | `OMNIGATE_FLUSH_MS` | `500` | How often queued usage, and the counts of refused requests, are sent. |
 | `OMNIGATE_UPSTREAM_TIMEOUT_MS` | `600000` | Maximum wait for upstream response headers. `0` means no limit. An upstream's `timeout_ms` overrides it. |
 | `OMNIGATE_CLIENT_TIMEOUT_MS` | `30000` | How long a client may take to send a request (head and body), and how long an idle keep-alive connection is kept open. `0` means no limit. |
-| `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` | `300000` | A response in progress is cut off when the **upstream** sends nothing for this long. The call is still billed: the provider's figures if they had arrived, otherwise an estimate. `0` means no limit. Until commit e4e30e4 this also covered a client that read nothing; that is `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` now. |
-| `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` | `30000` | A client that stays connected but takes none of a relayed response for this long is given up on: a provider's answer, a file download, a jobs API answer. For a provider's answer the upstream is then read to its end without the client, as for one that disconnected. `0` uses the value of `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`. (The gateway's own short answers, such as errors, the model list and cache hits, are written under the stream idle timeout.) |
+| `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` | `300000` | How long an **upstream** (or the control plane, for the jobs API and files) may send nothing after its response head. A response already being relayed is cut off, and the call is still billed: the provider's figures if they had arrived, otherwise an estimate. An answer of which nothing has reached the client yet (a non-streaming answer whose body does not come) counts as a failed attempt, `StreamIdleTimeout`, and the next target is tried; there the silence is noticed after between one and two times this value. `0` means no limit. Until commit e4e30e4 this also covered a client that read nothing; that is `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` now. |
+| `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` | `30000` | A client that stays connected but takes none of a response for this long is given up on. That is every response written once the request has been read: a provider's answer, a file download, a jobs API answer, and (since the close-out commit) the gateway's own answers, such as errors, the model list and cache hits, which used to be written under the stream idle timeout. For a provider's answer the upstream is then read to its end without the client, as for one that disconnected. A refusal sent before the request body was read is under `OMNIGATE_CLIENT_TIMEOUT_MS`. `0` uses the value of `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`. |
 | `OMNIGATE_MAX_CONNECTIONS` | `4096` | Client connections served at once. Further connections get an immediate `503` (`overloaded`) and are closed. |
-| `OMNIGATE_MAX_CONCURRENT_PER_KEY` | `512` | Requests one gateway key may have in flight at once, checked before a request body is read. One more gets `429 concurrency_limit_exceeded` with `retry-after: 1`. An upstream answer still being read after its client left counts until it is finished. `0` means no cap. |
-| `OMNIGATE_REQUEST_MEMORY_MB` | `1024` | Memory all request bodies in flight may take together, by their declared length, each counted twice (as received and as sent on). One key may hold a quarter of it. Beyond the key's share a request gets `429 request_memory_exceeded`, beyond the whole budget `503 overloaded`, both with `retry-after: 1` and before the body is read. `0` means no cap. |
-| `OMNIGATE_PARSE_MEMORY_MB` | `1024` | Memory that may be reserved at once for parsing JSON into trees, which only translation between protocols, the response cache, the fixes for provider quirks and rewriting an existing `stream_options` need. One tree may take 128 times its text plus 1 MiB, at most 96 MiB; a request that needs more gets `400 request_too_complex`. One key may reserve half the budget: beyond that `429 request_memory_exceeded`, beyond the whole budget `503 overloaded`. `0` means no budget (the per-tree cap still applies). |
+| `OMNIGATE_MAX_CONCURRENT_PER_KEY` | `512` | Requests one gateway key may have in flight at once, checked before a request body is read. One more gets `429 concurrency_limit_exceeded` with `retry-after: 1`. An upstream answer still being read after its client left counts until it is finished. `0` means no cap. A key's own [`max_concurrent`](#gateway-keys) takes its place for that key. |
+| `OMNIGATE_REQUEST_MEMORY_MB` | `1024` (`256` under `compose.yaml`) | Memory all request bodies in flight may take together, by their declared length, each counted twice (as received and as sent on). One key may hold a quarter of it. Beyond the key's share a request gets `429 request_memory_exceeded`, beyond the whole budget `503 overloaded`, both with `retry-after: 1` and before the body is read. `0` means no cap. |
+| `OMNIGATE_PARSE_MEMORY_MB` | `1024` (`256` under `compose.yaml`) | Memory that may be reserved at once for parsing JSON into trees, which only translation between protocols, the response cache, the fixes for provider quirks and rewriting an existing `stream_options` need. One tree may take 128 times its text plus 1 MiB, at most 96 MiB; a request that needs more gets `400 request_too_complex`. One key may reserve half the budget: beyond that `429 request_memory_exceeded`, beyond the whole budget `503 overloaded`. `0` means no budget (the per-tree cap still applies). |
 | `OMNIGATE_ABORT_DRAIN_MS` | `120000` | When a client leaves or stalls in the middle of a response: how long the data plane keeps reading the upstream in the background to learn the provider's final token usage. If it arrives the call is billed those figures, otherwise an estimate. `0` bills the estimate at once. The default was `5000` until commit e4e30e4. See [Operations](operations.md#streams-that-end-early). |
 | `OMNIGATE_ABORT_DRAIN_MAX_MB` | `64` | ... or until this many more megabytes of the answer have been read, whichever comes first. Until commit e4e30e4 this was a fixed 8 MiB. |
 | `OMNIGATE_SHUTDOWN_GRACE_MS` | `10000` | After SIGINT or SIGTERM (Ctrl-C or Ctrl-Break on Windows): how long requests in flight may take to finish before they are cut off and the process exits. |
@@ -505,9 +522,10 @@ The three limits `OMNIGATE_MAX_CONCURRENT_PER_KEY`,
 before a request body is read. The two memory settings are ceilings on what
 the data plane admits, not on what the process uses in total: add the
 response cache (`OMNIGATE_CACHE_MAX_MB`) and a few tens of megabytes of its
-own. Their defaults add up to more than the 1 GiB that `compose.yaml` gives
-the data-plane container; see
-[Deployment](deployment.md#memory-limits).
+own. The binary's defaults (1024 + 1024 + 64) are meant for a host without
+a memory limit. `compose.yaml` limits the data-plane container to 1 GiB
+and therefore sets the three itself, to 256 + 256 + 64, from `.env`
+([below](#compose-only)); see [Deployment](deployment.md#memory-limits).
 
 `omnigate-dp healthcheck` is the binary's one subcommand: it asks the
 address in `OMNIGATE_LISTEN` for `/healthz` and exits 0 if that answers 200
@@ -568,8 +586,9 @@ The container images set some of these differently; see
 
 ### Compose only
 
-Read by Compose from `.env` for `compose.yaml` itself (the proxy's
-environment and the two memory limits); neither process reads them.
+Read by Compose from `.env` for `compose.yaml` itself: the proxy's
+environment, the two memory limits, and the data plane's three memory
+budgets, which `compose.yaml` passes to the data-plane container.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -578,6 +597,12 @@ environment and the two memory limits); neither process reads them.
 | `OMNIGATE_ADMIN_ALLOW` | `0.0.0.0/0 ::/0` (everyone) | Source ranges that may reach the dashboard host at all, as CIDR ranges separated by spaces. Everyone else gets `403` from the proxy before the control plane sees the request. See [Security hardening](security.md#limit-who-can-reach-the-admin-host). |
 | `OMNIGATE_CONTROL_MEMORY` | `1g` | Memory limit (`mem_limit`) of the control-plane container, as a Docker size (`512m`, `1g`, `2g`). A container that grows past its limit is killed and restarted. See [Deployment](deployment.md#memory-limits). |
 | `OMNIGATE_DATAPLANE_MEMORY` | `1g` | The same for the data-plane container. |
+| `OMNIGATE_REQUEST_MEMORY_MB` | `256` | The data plane's budget for request bodies in flight ([above](#data-plane)), set by `compose.yaml` in the container's environment so that the budgets fit the limit. Under Compose set it **here**: the same name in `.env.dataplane` is overridden by this one. |
+| `OMNIGATE_PARSE_MEMORY_MB` | `256` | The same for its budget for JSON trees. |
+| `OMNIGATE_CACHE_MAX_MB` | `64` | The same for its response cache. |
+
+With these defaults the three add up to 576 MiB of the container's 1,024.
+If you raise one, raise `OMNIGATE_DATAPLANE_MEMORY` by at least as much.
 
 ### Which file a variable goes in (Compose)
 
@@ -586,9 +611,9 @@ process that faces the internet holds as little as possible:
 
 | File | Read by | Holds |
 |---|---|---|
-| `.env` | Compose itself | `OMNIGATE_API_HOST`, `OMNIGATE_ADMIN_HOST`, `OMNIGATE_ADMIN_ALLOW`, `OMNIGATE_CONTROL_MEMORY`, `OMNIGATE_DATAPLANE_MEMORY`. No secrets. |
+| `.env` | Compose itself | `OMNIGATE_API_HOST`, `OMNIGATE_ADMIN_HOST`, `OMNIGATE_ADMIN_ALLOW`, `OMNIGATE_CONTROL_MEMORY`, `OMNIGATE_DATAPLANE_MEMORY`, and the data plane's `OMNIGATE_REQUEST_MEMORY_MB`, `OMNIGATE_PARSE_MEMORY_MB` and `OMNIGATE_CACHE_MAX_MB`. No secrets. |
 | `.env.control` | the control plane | `OMNIGATE_INTERNAL_TOKEN`, `OMNIGATE_ADMIN_TOKEN`, media provider keys, webhook secrets, bucket credentials, and any other control-plane variable from the table above. |
-| `.env.dataplane` | the data plane | `OMNIGATE_INTERNAL_TOKEN` (the same value), the text provider keys, and any data-plane variable from the table above (timeouts, the connection cap, the per-key and memory limits, logging). Never the admin token, media keys, webhook secrets or bucket credentials. |
+| `.env.dataplane` | the data plane | `OMNIGATE_INTERNAL_TOKEN` (the same value), the text provider keys, and any other data-plane variable from the table above (timeouts, the connection cap, the per-key concurrency cap, logging), except the three memory settings, which Compose takes from `.env`. Never the admin token, media keys, webhook secrets or bucket credentials. |
 
 Each has an `.example` file next to it. `compose.yaml` itself sets
 `OMNIGATE_TRUST_FORWARDED=1` for the control plane. The steps are in
@@ -602,9 +627,8 @@ control plane (`GET /internal/config`) that contains:
 - for each key that is not disabled, from the config file or created
   through the admin API: its SHA-256, name, `rpm`, `models`, and whether it
   is currently blocked by its budget (a disabled key is left out, so the
-  data plane treats it as unknown). The data plane would also read a
-  per-key `max_concurrent` from the snapshot, but the control plane has no
-  such key setting and never sends one;
+  data plane treats it as unknown), and its `max_concurrent` (`0` when the
+  key has none of its own);
 - the text upstreams as configured (the `api_key_env` name, never a secret);
 - for each text route: `model`, `strategy`, `cache_ttl_s`, and each target's
   `upstream`, `model` and `weight`;

@@ -265,6 +265,10 @@ def replicate_handler(always_fail: bool):
                 self.bump("downloads")
                 name = path[len("/files/"):]
                 seed = int(hashlib.sha256(name.encode()).hexdigest()[:6], 16)
+                if name.startswith("big-"):
+                    # Not an image anyone could open: 300 kB, more than the
+                    # gateway sends in one piece.
+                    return self.send(200, png(seed) + hashlib.sha256(name.encode()).digest() * 9375, "image/png")
                 return self.send(200, png(seed), "image/png")
             if not self.bearer():
                 return

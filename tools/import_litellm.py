@@ -13,7 +13,9 @@ What is carried over
     copied: an env var name is invented and printed for you to set.
   * model_info / litellm_params input_cost_per_token and output_cost_per_token
     -> prices per million tokens.
-  * litellm_params.timeout / request_timeout (seconds) -> upstream timeout_ms.
+  * litellm_params.timeout / request_timeout (seconds) -> upstream timeout_ms,
+    at most 3,600,000 (one hour, the most omnigate accepts); a longer one is
+    cut to that and reported.
 
 What is not
   * Providers that are neither OpenAI- nor Anthropic-shaped at a /v1 path
@@ -244,6 +246,11 @@ def _env_name(text):
     return re.sub(r"[^A-Z0-9]+", "_", text.upper()).strip("_") + "_API_KEY"
 
 
+# The largest `timeout_ms` the control plane accepts on an upstream
+# (config_store.ex); a config with more does not load.
+MAX_TIMEOUT_MS = 3_600_000
+
+
 def convert(doc):
     """Return (omnigate_config, report). `report` lists skipped models, env vars and notes."""
     doc = doc or {}
@@ -292,6 +299,12 @@ def convert(doc):
 
         timeout = params.get("timeout") or params.get("request_timeout")
         timeout_ms = int(float(timeout) * 1000) if isinstance(timeout, (int, float)) and timeout > 0 else 0
+        if timeout_ms > MAX_TIMEOUT_MS:
+            note = (f"a timeout of {timeout:g} s (model '{name}') is more than omnigate accepts; "
+                    f"written as {MAX_TIMEOUT_MS} ms (one hour)")
+            if note not in report["notes"]:
+                report["notes"].append(note)
+            timeout_ms = MAX_TIMEOUT_MS
 
         ident = (kind, base_url, key_env, timeout_ms)
         if ident not in upstreams:

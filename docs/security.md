@@ -42,8 +42,9 @@ test and has never run under production load.
 4. Leave `media.webhooks.allow_private` off outside local development.
 5. Give every gateway key a model list, a rate limit and a budget.
 6. Size the data plane's limits to the memory it may use: the per-key
-   concurrency cap and the two memory budgets. With the defaults the
-   budgets admit more than the 1 GiB the Compose file gives the container.
+   concurrency cap and the two memory budgets. `compose.yaml` sets the
+   budgets to fit its 1 GiB container limit; the binary's own defaults
+   admit 2 GiB and are meant for a host without a limit.
 7. Price every media target, and close the options a client could use to
    make a job cost more than its price says (`default_seconds`,
    `allowed_input`, `price_multipliers`).
@@ -111,8 +112,9 @@ accepted as one: `/admin/*`, `/metrics`, and since commit d79406b also the
 dashboard page (`/`) and `/login`, which used to compare the token on
 their own. Once an address is locked out, its token is not compared at
 all, so the answer says nothing about whether it was right: `/admin/*`,
-`/metrics` and `/` answer `429 too_many_attempts`, and `/login` shows the
-sign-in form as it does to anyone without a session. The two counts are
+`/metrics`, `/` and `GET /login` answer `429 too_many_attempts` (`GET
+/login` showed the sign-in form with `200` until the close-out commit, the
+one after 55a294d). The two counts are
 separate: wrong bearer tokens do not lock the sign-in form, and failed
 sign-ins do not lock bearer access.
 
@@ -289,13 +291,13 @@ one:
 | Which models | `models` | 403 for any other route, text or media. |
 | How fast | `rpm` | 429 beyond it. Per data-plane process for text; job creation is counted again in the control plane, with the same kind of token bucket. The limit is charged before the body is read, so a request that is then refused for its JSON or its model has used one. |
 | How much | `budget_usd` with `budget_period` | 402 once spent. Enforced after the fact: the call that crosses the line completes. |
+| How many requests at once | `max_concurrent` (default: the data plane's `OMNIGATE_MAX_CONCURRENT_PER_KEY`, 512) | 429 `concurrency_limit_exceeded` beyond it, per data-plane process, before the body is read. |
 | How many media jobs at once | `max_open_jobs` (default 100, from `media.max_open_jobs`) | 429 `too_many_open_jobs` beyond it. |
 | How many media jobs per day | `max_jobs_per_day` (default 10,000, from `media.max_jobs_per_day`) | 429 `too_many_jobs_today` beyond it, until the UTC day turns. It bounds what the open-jobs limit does not: jobs that end at once (a refused input, a provider that is down) and still cost a log line, a ledger event and a webhook call each. |
 
-Two limits apply to every key alike and have no per-key setting: the
-requests one key may have in flight (`OMNIGATE_MAX_CONCURRENT_PER_KEY`,
-512) and `GET /v1/jobs`, which is limited to the key's `rpm`, or to 600 a
-minute for a key without one. See [Limits to size](#limits-to-size).
+One limit applies to every key alike and has no per-key setting:
+`GET /v1/jobs` is limited to the key's `rpm`, or to 600 a minute for a key
+without one. See [Limits to size](#limits-to-size).
 
 - Write file keys as `key_sha256`, never as `key`, outside local trials.
 - One key per application, so that one can be revoked without the others,
@@ -326,18 +328,21 @@ generous on purpose. Decide each one for your deployment.
 | `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` | `30000` | How long a client may stay connected without taking any of a response. | The client is cut off; the call is still billed. |
 | `OMNIGATE_ABORT_DRAIN_MS`, `OMNIGATE_ABORT_DRAIN_MAX_MB` | `120000`, `64` | How long, and how much, an upstream answer is read on after its client left, to bill the provider's real figures. At most 256 answers are read on at once. | An estimate is billed. |
 
-- **The concurrency cap is one number for all keys.** There is no per-key
-  setting: the data plane would read a per-key `max_concurrent` from the
-  config snapshot, but the control plane has no such key field and never
-  sends one. Lower `OMNIGATE_MAX_CONCURRENT_PER_KEY` if you hand keys to
-  parties you do not trust, and keep it above what your busiest
-  legitimate key has in flight.
-- **Size the two memory budgets to the memory the process may use.** With
-  the defaults they add up to 2 GiB, and `compose.yaml` gives the
-  data-plane container 1 GiB (`OMNIGATE_DATAPLANE_MEMORY`). Under heavy
-  hostile load the container would be killed, which ends every connection,
-  before a budget refuses anything, which costs one client a retry. Raise
-  the container's limit or lower the budgets:
+- **The concurrency cap has a default and a per-key setting.**
+  `OMNIGATE_MAX_CONCURRENT_PER_KEY` applies to every key that has no
+  `max_concurrent` of its own (a key field since the close-out commit; in
+  the config file or through the admin API). Lower the default if you hand
+  keys to parties you do not trust, and give your busiest legitimate key a
+  cap of its own above what it has in flight.
+- **Size the two memory budgets to the memory the process may use.** The
+  binary's defaults add up to 2 GiB, for a host without a limit.
+  `compose.yaml` gives the data-plane container 1 GiB
+  (`OMNIGATE_DATAPLANE_MEMORY`) and, since the close-out commit, sets the
+  budgets to 256 MiB each from `.env`, so that under heavy hostile load a
+  budget refuses a request, which costs one client a retry, before the
+  container is killed, which ends every connection. If you raise a budget,
+  raise the container's limit with it; if you run the binary under a
+  limit of your own, do the same sum:
   [Deployment](deployment.md#memory-limits). The budgets bound request
   bodies and parse trees only; the response cache
   (`OMNIGATE_CACHE_MAX_MB`, 64), the usage queue and per-connection
@@ -566,11 +571,13 @@ point of view:
   minute are `repeats` plus the one that got its own line. The control
   plane follows at most 2,000 such counts (address, outcome and minute) at
   once; beyond that, further addresses are counted together under the
-  address `(others)`. Mind one difference when you read them: an ordinary
-  line's `address` is the address of the connection (the proxy, behind
-  one) with the proxy's report in `forwarded_for`, while a summary line's
-  `address` is the address the attempts were counted under, which with
-  `OMNIGATE_TRUST_FORWARDED` is the one the proxy reported.
+  address `(others)`. `address` means the same on every line: the address
+  the caller was counted under, which with `OMNIGATE_TRUST_FORWARDED` is
+  the one the proxy reported; the connection's own address is in `peer`
+  when it differs. (Until the close-out commit ordinary lines had the
+  connection's address in `address`, which behind the Compose proxy was
+  the proxy.) A clean stop writes the counts that have no summary line
+  yet; a kill loses them.
 - Wrong bearer tokens are counted and throttled but not written to the
   audit log.
 - Ship logs somewhere the containers cannot rewrite them if you rely on
@@ -598,9 +605,10 @@ Coming from a commit before e4e30e4 or d79406b (November 2026), in short
 - Nothing has to be rotated for these two.
 - Check your config file against the stricter rules before the restart: a
   value the old control plane loaded can stop the new one at startup.
-- Decide on memory: the Compose file now limits both containers to 1 GiB,
-  and the data plane's default budgets admit more
-  ([Limits to size](#limits-to-size)).
+- Decide on memory: the Compose file now limits both containers to 1 GiB.
+  Its budgets for the data plane fit that limit since the close-out
+  commit; with an earlier `compose.yaml`, or the binary's own defaults,
+  they admit more ([Limits to size](#limits-to-size)).
 - If you price media routes per second, set `default_seconds`
   ([Media prices](#media-prices)).
 - If a data plane can be cut off from the control plane for more than

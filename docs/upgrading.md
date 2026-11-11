@@ -2,7 +2,9 @@
 
 For someone who runs an earlier commit and wants to run the current one.
 No release has been tagged, so versions are named by commit. This page
-covers the two security commits of 11 November 2026 in detail:
+covers the two security commits of 11 November 2026 in detail, and the
+close-out commit that followed them
+([The close-out commit](#the-close-out-commit)):
 
 | Commit | Process | What it is |
 |---|---|---|
@@ -23,6 +25,7 @@ Contents:
 - [Configuration that used to load and no longer does](#configuration-that-used-to-load-and-no-longer-does)
 - [What changes for clients](#what-changes-for-clients)
 - [What changes for operators](#what-changes-for-operators)
+- [The close-out commit](#the-close-out-commit)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
 
@@ -45,11 +48,13 @@ Contents:
    `"retention": {"ledger_ids_days": 14}` (the old default) or more before
    you start the new control plane ([Defaults that changed](#defaults-that-changed)).
 5. **Compose users: look at memory.** Both containers now have a 1 GiB
-   limit, and the data plane's own default budgets admit more than that.
-   See [Deployment](deployment.md#memory-limits) and set
+   limit. With the `compose.yaml` of d79406b the data plane's budgets were
+   the binary's defaults, which admit more than that; the current one sets
+   them to fit ([The close-out commit](#the-close-out-commit)). See
+   [Deployment](deployment.md#memory-limits) and set
    `OMNIGATE_CONTROL_MEMORY`, `OMNIGATE_DATAPLANE_MEMORY` or the data
    plane's `OMNIGATE_REQUEST_MEMORY_MB` and `OMNIGATE_PARSE_MEMORY_MB`
-   accordingly.
+   (in `.env`) accordingly.
 6. **If a proxy or load balancer in front of the data plane sends request
    bodies with chunked encoding**, make it send a `Content-Length`: chunked
    request bodies now answer `411`.
@@ -108,8 +113,8 @@ control plane's rate-limit buckets, lockouts and refusal counts.
 | `ledger.jsonl`, `ledger.NNNNNN.jsonl` | Unchanged. | Reads them. |
 | `jobs.jsonl` | A job whose `input` is over 8 KiB as JSON is written with `"input": null` and `"input_file": true`. Jobs created before the upgrade keep their input inline. | Reads the file, but sees such a job without its input. |
 | `jobs.jsonl.inputs/` (new directory; `<OMNIGATE_JOBS>.inputs/`) | One file `<job id>.json` per large input, written before the job that points at it, deleted with the job. At a start, an input file without a job is removed. | Not looked at. |
-| `keys.json` | A key may have `max_jobs_per_day`. An `rpm` above 1,000,000 that an older commit wrote is read as 1,000,000. | Ignores the new field. |
-| `audit.jsonl` | Failed and throttled sign-ins are no longer one line each: the first from an address in a minute is a line, the rest are counted and written as one summary line with a `repeats` member. Every text field is made valid UTF-8 before it is written. | Still JSON lines. |
+| `keys.json` | A key may have `max_jobs_per_day` and, since the close-out commit, `max_concurrent`. An `rpm` above 1,000,000 that an older commit wrote is read as 1,000,000. | Ignores the new fields. |
+| `audit.jsonl` | Failed and throttled sign-ins are no longer one line each: the first from an address in a minute is a line, the rest are counted and written as one summary line with a `repeats` member. Every text field is made valid UTF-8 before it is written. Since the close-out commit a line can have a `peer` member, and `address` is the address the caller was counted under. | Still JSON lines. |
 
 **Back up the new files with the old ones.** `ledger.ids.*` belongs to the
 snapshot that names it, and `jobs.jsonl.inputs/` to `jobs.jsonl`:
@@ -135,8 +140,8 @@ directory, not single files ([Deployment](deployment.md#backups)).
 
 | File | Change |
 |---|---|
-| `compose.yaml` | `mem_limit` on both omnigate services (1 GiB each unless `.env` says otherwise). |
-| `.env` | Two new optional variables, `OMNIGATE_CONTROL_MEMORY` and `OMNIGATE_DATAPLANE_MEMORY`. An existing `.env` without them gets the 1 GiB defaults. |
+| `compose.yaml` | `mem_limit` on both omnigate services (1 GiB each unless `.env` says otherwise). Since the close-out commit also the data plane's three memory budgets, in its `environment`. |
+| `.env` | Two new optional variables, `OMNIGATE_CONTROL_MEMORY` and `OMNIGATE_DATAPLANE_MEMORY`. An existing `.env` without them gets the 1 GiB defaults. Since the close-out commit also `OMNIGATE_REQUEST_MEMORY_MB`, `OMNIGATE_PARSE_MEMORY_MB` and `OMNIGATE_CACHE_MAX_MB` (256, 256 and 64 when absent). |
 | `deploy/Caddyfile` | The proxy sets `X-Forwarded-For` itself, from the address of the connection, for both hosts. If you run your own proxy configuration with `OMNIGATE_TRUST_FORWARDED=1`, make yours do the same. |
 | `dataplane/Dockerfile` | A `HEALTHCHECK` that runs `/omnigate-dp healthcheck`. `docker ps` now shows a health status for the data-plane container; Compose itself does nothing with it. |
 | `config/omnigate.example.json` | Shows the new settings. Your own `config/omnigate.json` is not touched and needs none of them. |
@@ -163,6 +168,9 @@ directory, not single files ([Deployment](deployment.md#backups)).
 | A provider's or the bucket's answer to an API call | read whole | at most 4 MiB; an answer that carries media inline up to four thirds of `media.max_output_bytes` plus 64 KiB, at most 256 MiB | d79406b |
 | The control plane's count of job creations | fixed one-minute windows | a token bucket like the data plane's (burst of `rpm`, refilled at `rpm` per minute) | d79406b |
 | Memory limit of each omnigate container under Compose | none | `1g` (`OMNIGATE_CONTROL_MEMORY`, `OMNIGATE_DATAPLANE_MEMORY`) | d79406b |
+| The data plane's memory budgets under Compose | the binary's `1024`, `1024` and `64` | `256`, `256` and `64`, set by `compose.yaml` from `.env` | close-out |
+| `Retry-After` on `429 too_many_jobs_today` | `10` | seconds until midnight UTC, at most `3600` | close-out |
+| The deadline on the gateway's own answers | `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` | `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` | close-out |
 
 What each means in practice:
 
@@ -193,7 +201,9 @@ What each means in practice:
   (`OMNIGATE_REQUEST_MEMORY_MB` 1,024 plus `OMNIGATE_PARSE_MEMORY_MB`
   1,024 plus the 64 MiB cache) are above the 1 GiB limit, so under heavy
   hostile load the container would be killed before the budgets refuse
-  anything. Raise the limit or lower the budgets.
+  anything. The close-out commit's `compose.yaml` sets the budgets to 256
+  MiB each for that reason; with an older Compose file, raise the limit or
+  lower the budgets yourself.
 
 ## Configuration that used to load and no longer does
 
@@ -216,6 +226,7 @@ previous config stays in force.
 | `media.webhooks.max_attempts` | Any number | A whole number, 1 to 100 |
 | `media.webhooks.timeout_ms` | Any number | A whole number, 1 to 600,000 |
 | `media.webhooks.retry_schedule_ms` | Any list | At most 50 whole numbers, each 0 to 2,592,000,000 |
+| A media target with `per_second_usd` on an upstream of kind `openai_images`, `elevenlabs`, `gemini` or `gemini_interactions` | Loaded | Needs `default_seconds` (close-out commit) |
 
 In each "any number" row, a fraction used to be cut to a whole number and
 is now rejected, as is zero where the range starts at 1. Through the admin
@@ -224,7 +235,8 @@ API, `PATCH /admin/keys/{name}` refuses an `rpm` above 1,000,000, a
 `models` list with more than 1,000 names or a name over 256 bytes
 (`400 invalid_request`).
 
-New settings, all optional: a key's `max_jobs_per_day`,
+New settings, all optional: a key's `max_jobs_per_day` and (close-out
+commit) `max_concurrent`,
 `media.max_jobs_per_day`, a media route's `allowed_input` and
 `price_multipliers`, a media target's `default_seconds`, `min_seconds` and
 `max_seconds`, `media.webhooks.max_concurrent` and
@@ -278,9 +290,10 @@ carry `retry-after` by themselves.
   work.
 - **Responses are framed by the gateway.** An answer that is not a stream
   and is at most 64 KiB carries a `content-length`; everything else is
-  `transfer-encoding: chunked`, **including file downloads over 64 KiB**,
-  which used to carry the file's length. A client that needs the size
-  takes it from the job (`outputs[].bytes`).
+  `transfer-encoding: chunked`. Between e4e30e4 and the close-out commit
+  that **included file downloads over 64 KiB**, which used to carry the
+  file's length and do so again; the size is also in the job
+  (`outputs[].bytes`).
 - **A response the provider cuts short drops the connection.** When an
   upstream breaks off after the gateway has started sending, or sends less
   than it declared, the client's connection is closed without the closing
@@ -316,8 +329,8 @@ carry `retry-after` by themselves.
 - A wrong bearer token is counted on `/` and `/login` as well as on
   `/admin/*` and `/metrics`; 20 from one address in a minute lock that
   address out of bearer access. `/admin/*`, `/metrics` and `/` then answer
-  `429 too_many_attempts`; the sign-in page ignores the token and shows the
-  form.
+  `429 too_many_attempts`, and since the close-out commit so does `GET
+  /login` (it ignored the token and showed the form).
 - A request that carries both a valid session cookie and the bearer token
   is treated as a session, so a change made that way needs the CSRF token.
 - A request body is not read at all for a caller without credentials,
@@ -349,6 +362,78 @@ carry `retry-after` by themselves.
   `omnigate_rejected_requests_total`.
 - **Keys admin**: `max_jobs_per_day` can be set on a managed key and is
   shown in `GET /admin/keys`.
+
+## The close-out commit
+
+The commit that follows 55a294d closes loose ends the two security commits
+left. Nothing changes on disk except two optional members (a key's
+`max_concurrent` in `keys.json`, `peer` on audit lines), both ignored by
+older code, and either process can be upgraded first. What an installation
+can notice:
+
+**Before you start**
+
+- **A per-second price on an image or speech target needs
+  `default_seconds`.** A media target with `per_second_usd` above 0 on an
+  upstream of kind `openai_images`, `elevenlabs`, `gemini` or
+  `gemini_interactions` is rejected when the config is loaded unless it
+  sets `default_seconds`: those providers are never sent a duration, so
+  the price had nothing to multiply. A config that loaded before can stop
+  the control plane at startup (or be refused on a reload). Set
+  `default_seconds`, or use `per_job_usd` or `per_output_usd`. Such a job
+  is billed `default_seconds` whatever `input.duration` says.
+- **Compose: the data plane's memory budgets moved to `.env`.**
+  `compose.yaml` now sets `OMNIGATE_REQUEST_MEMORY_MB`,
+  `OMNIGATE_PARSE_MEMORY_MB` and `OMNIGATE_CACHE_MAX_MB` in the data-plane
+  container's environment, from `.env`, with defaults of 256, 256 and 64
+  (they were the binary's 1024, 1024 and 64, which did not fit the 1 GiB
+  limit). If you had set any of the three in `.env.dataplane`, move it to
+  `.env`: the value there is now overridden. If your traffic needs more
+  than 256 MiB of request bodies or parse trees at once, raise the budget
+  and `OMNIGATE_DATAPLANE_MEMORY` together
+  ([Deployment](deployment.md#memory-limits)). Outside Compose nothing
+  changes: the binary's defaults are as they were.
+
+**What clients can notice**
+
+| Change | Before | Now |
+|---|---|---|
+| A provider's error that is not in its protocol's shape (an array, `error` as a string, plain text) | Passed on as it came | Put into the protocol's error envelope with the provider's message and code; a well-formed one is still passed on byte for byte ([API](api.md#provider-errors)) |
+| File downloads over 64 KiB | `transfer-encoding: chunked`, no length | `content-length`, as before e4e30e4 |
+| `429 too_many_jobs_today` | `Retry-After: 10` | `Retry-After`: the seconds until midnight UTC, at most 3,600 |
+| A non-streaming answer whose provider sends the head and then nothing | The request ended there (after the stream idle timeout), and the connection's later deadlines could be lost | A failed attempt, `StreamIdleTimeout`: the next target is tried, or `502 all_upstreams_failed` |
+| A client that takes none of one of the gateway's own answers (an error, the model list, a cache hit) | Cut off after `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (5 minutes) | Cut off after `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 seconds) |
+| `GET /login` with a bearer token from an address locked out for wrong tokens | The sign-in page, `200` | `429 too_many_attempts`, as on `/` |
+
+**What operators can notice**
+
+- **A key can have its own concurrency cap**: `max_concurrent`, in the
+  config file and through the admin API, shown in `GET /admin/keys` and on
+  the dashboard. `0` (the default) leaves the key on the data plane's
+  `OMNIGATE_MAX_CONCURRENT_PER_KEY`. Every key in the config snapshot now
+  carries the field; data planes from e4e30e4 on read it, older ones
+  ignore it.
+- **Audit log.** `address` is, on every line, the address the caller was
+  counted under (with `OMNIGATE_TRUST_FORWARDED`, the client the proxy
+  reported; before, ordinary lines had the proxy there). The connection's
+  own address is in the new member `peer` when it differs. A clean stop
+  writes the sign-in counts that have no summary line yet. The dashboard
+  shows a summary line's `repeats`.
+- **The control plane warns at start when an id file is missing** that its
+  ledger snapshot counted ids for (`ledger: the id file for <day> ... is
+  missing`): events of that day that are delivered again would be counted
+  twice.
+- **The control-plane image's health check** asks the port in
+  `OMNIGATE_CONTROL_PORT` (it asked 4000 whatever the setting).
+- **`tools/malformed_test.py --rpm N`** tells the tool how many requests
+  per minute `--rpm-key` allows (it assumed 3), and
+  **`tools/import_litellm.py`** writes a LiteLLM timeout of more than an
+  hour as `3600000` and says so, instead of writing a config that does not
+  load.
+
+**Going back** from this commit to 55a294d needs nothing: remove
+`max_concurrent` from file keys only if you want to (older control planes
+ignore it).
 
 ## Going back
 

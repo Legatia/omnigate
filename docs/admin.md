@@ -44,7 +44,7 @@ checked; see [API](api.md#errors-and-request-paths).
 | | Limit | Then |
 |---|---|---|
 | Sign-in form | 5 wrong passwords within a minute | `429` on `POST /login` until the minute is over, for the right password too. A correct sign-in before that clears the count. |
-| Bearer token | 20 wrong tokens within a minute, counted wherever the token is accepted: `/admin/*`, `/metrics`, the dashboard page (`/`), `/login` and `/logout` | `429 too_many_attempts` with `retry-after: 60` on `/admin/*`, `/metrics` and `/` for **every** bearer token from that address, the right one included, until the minute is over. On `/login` and `/logout` a bearer token from that address is ignored for that time, as if none had been sent. |
+| Bearer token | 20 wrong tokens within a minute, counted wherever the token is accepted: `/admin/*`, `/metrics`, the dashboard page (`/`), `/login` and `/logout` | `429 too_many_attempts` with `retry-after: 60` on `/admin/*`, `/metrics`, `/` and `GET /login` for **every** bearer token from that address, the right one included, until the minute is over. (Until the close-out commit, the one after 55a294d, `GET /login` answered such a request with the sign-in page and `200`.) On `POST /login` and `/logout` a bearer token from that address is ignored for that time, as if none had been sent: the form's password, or the session, decides there. |
 
 - The minute starts with the first failure. A request with no
   `Authorization` header at all is not a guess and is not counted
@@ -132,8 +132,7 @@ control plane restarts; see [Operations](operations.md#refused-requests).
 **Admin activity.** The ten newest entries of the [audit log](#the-audit-log):
 time, action, target, outcome, how the caller was authenticated, and the
 address. A summary line for repeated failed sign-ins is listed like any
-other entry; its `repeats` count is not shown here, only in the file and
-in `GET /admin/audit`.
+other entry, with its `repeats` count under the outcome ("418 more").
 
 **Configuration.** A read-only view of what the config file says: text
 upstreams (name, protocol, host), text routes (strategy, cache time,
@@ -256,6 +255,7 @@ Save `key` now: no later call returns it. Only `name` is required.
 | `budget_usd` | number, 0 to 1,000,000,000,000, or `null` | `null` (no budget) | See [Budgets and periods](#budgets-and-periods). |
 | `budget_period` | `"total"`, `"monthly"` or `"daily"` | `"total"` | What the budget covers. `null` also means `"total"`. |
 | `rpm` | whole number, 0 to 1,000,000 | `0` (no limit) | Requests per minute, per data-plane process. `null` also means `0`. |
+| `max_concurrent` | whole number, 0 to 1,000,000 | `0` (the data plane's `OMNIGATE_MAX_CONCURRENT_PER_KEY`) | Requests the key may have in flight at once on one data-plane process, in place of `OMNIGATE_MAX_CONCURRENT_PER_KEY`; one more answers `429 concurrency_limit_exceeded`. `0` and `null` mean the key has no cap of its own. The dashboard shows a cap under the key's rate limit ("12 at once"). |
 | `models` | list of at most 1,000 route names, each 1 to 256 bytes, or `null` | `null` (all) | Text and media routes the key may use. A name given twice is kept once; an empty list allows none. |
 | `max_open_jobs` | whole number, 0 to 1,000,000,000, or `null` | `null` (the config's `media.max_open_jobs`, 100 unless set) | Media jobs the key may have unfinished at one time; `0` for no limit. Listings show the limit in force, so a key without its own shows the default. |
 | `max_jobs_per_day` | whole number, 0 to 1,000,000,000, or `null` | `null` (the config's `media.max_jobs_per_day`, 10,000 unless set) | Media jobs the key may create per UTC day, whatever became of them; `0` for no limit. One job more answers `429 too_many_jobs_today`. Listings show the limit in force, as for `max_open_jobs`. |
@@ -265,8 +265,9 @@ Save `key` now: no later call returns it. Only `name` is required.
 Unknown fields are ignored. A bad value answers `400 invalid_request` with a
 message naming the field. The whole numbers are read strictly: a fraction
 (`600.0`), a string (`"600"`) or a value above the range is a bad value.
-The upper bound on `rpm` is there because data planes hold it in a 32-bit
-field; the same bounds on the numbers apply to keys in the config file
+The upper bounds on `rpm` and `max_concurrent` are there because data
+planes hold them in 32-bit fields; the same bounds on the numbers apply to
+keys in the config file
 ([Configuration](configuration.md#gateway-keys)).
 
 ### List
@@ -409,7 +410,8 @@ summed up, as described [below](#failed-and-throttled-sign-ins).
 | `action` | `key.create`, `key.update`, `key.rotate`, `key.delete`, `login`, `logout`. |
 | `target` | The key name as it was sent, cut to 64 characters, or `null`. |
 | `auth` | How the caller was authenticated: `token` (bearer), `session` (dashboard), `password` (a login attempt) or `none`. A key action can no longer be recorded with `none`: the admin API is not reachable without a credential. An older entry that says so was made through the bypass described in [SECURITY.md](../SECURITY.md#past-advisories). |
-| `address` | The peer address of the connection. Behind a reverse proxy that is the proxy, also when `OMNIGATE_TRUST_FORWARDED` is set: that setting changes which address the lockouts count, not what is recorded here. A summary line is different; see [below](#failed-and-throttled-sign-ins). |
+| `address` | The address the caller is counted under, the same one the lockouts use, on every line, summary lines included: the peer of the connection, or with `OMNIGATE_TRUST_FORWARDED` (which `compose.yaml` sets) the last hop of `X-Forwarded-For`; an IPv6 address by its /64 (`2001:db8:1:2::`). Until the close-out commit an ordinary line had the peer here, which behind the Compose proxy was always the proxy. |
+| `peer` | The address at the other end of the connection, written only when it differs from `address`: the proxy, behind a trusted one, or the full IPv6 address. Never on a summary line. |
 | `forwarded_for` | Present when the request had an `X-Forwarded-For` header: the first 400 bytes of its value, made one line of valid UTF-8 and cut to 200 characters. A direct caller can fake it, so it is recorded, not trusted. |
 | `outcome` | `ok`, or the error's reason, its `error.code` (`invalid_request`, `key_exists`, `read_only_key`, `key_not_found`, ...). For logins: `ok`, `denied` or `throttled`. |
 | `fields` | For `key.update`: the names of the fields that were sent (sorted, at most 20), never their values. |
@@ -485,18 +487,22 @@ most four a minute, whatever it sends.
   minute it sums up.
 - **The address** the attempts are grouped by is the one the lockout
   counts: the peer, or with `OMNIGATE_TRUST_FORWARDED` the last hop of
-  `X-Forwarded-For`, and an IPv6 address by its /64. A summary line carries
-  that address in `address` and has no `forwarded_for`. The first line is
-  an ordinary entry: `address` is the peer and `forwarded_for` is what the
-  header said. Behind the Compose proxy the two lines for one client
-  therefore differ: the first has the proxy's address in `address` and the
-  client's in `forwarded_for`, the summary has the client's in `address`.
+  `X-Forwarded-For`, and an IPv6 address by its /64. Both lines carry it
+  in `address`, so the first line and its summary can be matched up; the
+  first line also has `peer` (when that differs) and `forwarded_for`, the
+  summary has neither. (Until the close-out commit the first line had the
+  peer in `address`, so behind the Compose proxy the two lines for one
+  client named different addresses.)
 - **A cap on what is followed.** At most 2,000 combinations of address and
   outcome are counted at a time. Attempts beyond that are counted together
   under the address `"(others)"`, which gets its own first line (without
-  `forwarded_for`) and its own summary line.
-- The counts are in memory: if the control plane stops before a summary
-  line is written, that count is lost.
+  `peer` and `forwarded_for`) and its own summary line.
+- The counts are in memory until their summary line is written. A clean
+  stop of the control plane (`docker stop`, a restart of the audit
+  process) writes the summary lines of every count it still holds, the
+  running minute included; such a line's `ts` is the time of writing, not
+  the end of the minute. A kill, or a crash of the whole runtime, still
+  loses those counts. (Until the close-out commit every stop lost them.)
 - Because repeats are only counted, a flood of failed sign-ins does not put
   a queue of synced writes in front of an operator's own action. A
   successful sign-in is an ordinary entry: one line, synced before the

@@ -14,7 +14,8 @@ defmodule OmnigateControl.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger, :crypto, :inets, :ssl, :public_key],
+      # No :inets: outbound HTTP is `OmnigateControl.Http`, on :gen_tcp and :ssl.
+      extra_applications: [:logger, :crypto, :ssl, :public_key],
       mod: {OmnigateControl.Application, []}
     ]
   end

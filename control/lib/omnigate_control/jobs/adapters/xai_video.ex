@@ -13,6 +13,12 @@ defmodule OmnigateControl.Jobs.Adapters.XaiVideo do
   Checked against the real service with `grok-imagine-video-1.5-lite`
   (November 2026): submit, poll to `done`, download. The `failed` and
   `expired` states and image inputs have only met the mock.
+
+  Those calls were made with the HTTP client this adapter used at the time
+  (OTP's `:httpc`). They have not been repeated on the client that replaced
+  it (`OmnigateControl.Http`): against the real service that one has only
+  sent a request with an invalid key, which shows that the service is
+  reached and its error is read, not that a job completes.
   """
   @behaviour OmnigateControl.Jobs.Adapter
 

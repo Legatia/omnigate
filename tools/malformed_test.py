@@ -44,6 +44,7 @@ import hashlib
 import json
 import os
 import random
+import select
 import shutil
 import socket
 import subprocess
@@ -377,14 +378,15 @@ def limits_before_body():
     record("a body declared larger than the limit is refused (413) before any of it is sent", status_of(raw) == 413, raw[:120])
 
     if ARGS.rpm_key:
-        # Three requests of a 3-per-minute key, none of which ever sends its body ...
+        # As many requests as the key may make in a minute (--rpm, 3 unless
+        # told otherwise), none of which ever sends its body ...
         waiting = []
-        for _ in range(3):
+        for _ in range(ARGS.rpm):
             s = socket.create_connection((host, port), timeout=5)
             s.sendall(head_only(ARGS.rpm_key, 8_000_000))
             waiting.append(s)
         time.sleep(0.5)
-        # ... and the fourth is told no without the gateway reading eight megabytes first.
+        # ... and the next one is told no without the gateway reading eight megabytes first.
         started = time.time()
         raw = answer_without_body(ARGS.rpm_key, 8_000_000)
         took = time.time() - started
@@ -519,6 +521,90 @@ def hostile_upstream():
         return "a short answer should carry a length"
     case("a short answer carries a length the gateway counted itself", ask(ARGS.model), expect=200, check=counted, read_timeout=5, keep_reading=8)
 
+    # A 200 head and then silence, on an answer that is not a stream: nothing
+    # has been sent to the client yet, so after the idle timeout the request
+    # goes to the next upstream (or fails with a 502), and the connection it
+    # came in on is as good as before.
+    idle = ARGS.idle_s
+
+    def timed(name, data, expect, check):
+        started = time.time()
+
+        def within(raw, status):
+            took = time.time() - started
+            if not idle - 0.5 <= took <= 2 * idle + 3:
+                return f"answered after {took:.1f} s; the idle timeout is {idle:g} s"
+            return check(raw, status)
+        case(name, data, expect=expect, check=within, read_timeout=3 * idle + 5, keep_reading=3 * idle + 6)
+
+    def second_upstream(raw, status):
+        head = raw[:raw.find(b"\r\n\r\n")].lower()
+        if b"x-omnigate-upstream: mock-ok" not in head or b"x-omnigate-attempts: 2" not in head:
+            return "not answered by the second upstream on the second attempt"
+        return None if b"Hello from the mock upstream." in raw else "not the second upstream's answer"
+    timed("a 200 head and then no body: after the idle timeout the next upstream answers", ask("stall-body"), 200, second_upstream)
+    timed("... the same when the answer would have been translated (an Anthropic client)",
+          post("/v1/messages", json.dumps({"model": "stall-body", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]})), 200,
+          lambda raw, status: None if b"Hello from the mock upstream." in raw and b'"type":"message"' in raw else "not a translated answer")
+    timed("... and with no other upstream: 502, with the timeout named among the attempts", ask("stall-body-only"), 502,
+          lambda raw, status: None if b"all_upstreams_failed" in raw and b"StreamIdleTimeout" in raw else "not the gateway's 502 for a silent upstream")
+
+    # The same connection goes on to serve the next request: the timeout did
+    # not end (or wound) the task that serves it.
+    s = socket.create_connection(host_port(), timeout=5)
+    try:
+        s.settimeout(3 * idle + 5)
+        answers = []
+        for data in (ask("stall-body-only"), ask(ARGS.model)):
+            s.sendall(data)
+            got = b""
+            while not complete(got):
+                more = s.recv(65536)
+                if not more:
+                    break
+                got += more
+            answers.append(status_of(got))
+    except OSError as e:
+        answers.append(str(e))
+    finally:
+        s.close()
+    record("after such a 502 the same keep-alive connection serves the next request", answers == [502, 200], answers)
+
+
+def own_answers_stall():
+    """A client that sends requests and never reads the answers. The answers
+    here are the gateway's own (the model list), which used to be written
+    under the long idle timeout instead of the stall timeout."""
+    section("a client that takes none of the gateway's own answers")
+    request = b"GET /v1/models HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer " + ARGS.key.encode() + b"\r\n\r\n"
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    s.settimeout(5)
+    s.connect(host_port())
+    s.settimeout(0.2)
+    batch = request * 200
+    started = time.time()
+    ended = None
+    try:
+        while time.time() - started < ARGS.idle_s + 6:
+            try:
+                s.sendall(batch)
+            except socket.timeout:
+                continue  # every buffer is full: the gateway has stopped reading, as it should
+            except OSError:
+                ended = time.time() - started
+                break
+    finally:
+        s.close()
+    # The stall timeout plus the time it takes to fill the buffers; well
+    # short of the idle timeout, which is what applied before.
+    limit = ARGS.client_stall_s + 2.0
+    record(f"the connection is dropped after the client stall timeout ({ARGS.client_stall_s:g} s), not the idle timeout ({ARGS.idle_s:g} s)",
+           ended is not None and ended < min(limit, ARGS.idle_s - 0.4), f"dropped after {ended}" if ended else "never dropped")
+    if not alive():
+        print("the gateway stopped answering")
+        sys.exit(1)
+
 
 # --------------------------------------------------------------------------
 # a hostile control plane: a stand-in here, and a second gateway that uses it
@@ -564,6 +650,15 @@ class StandIn(BaseHTTPRequestHandler):
             return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: %d\r\n\r\n" % len(data) + data)
         if mode == "longshort":
             return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 300000\r\n\r\n" + b"p" * 100_000)
+        if mode == "stall":
+            # The head of a job, and then nothing until the gateway hangs up.
+            self.wfile.write(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 30\r\n\r\n")
+            self.wfile.flush()
+            deadline = time.time() + 30
+            while time.time() < deadline and not select.select([self.connection], [], [], 0.5)[0]:
+                pass
+            self.close_connection = True
+            return
         return self.good(200, {"id": "job_1", "status": "succeeded"})
 
     def do_GET(self):
@@ -573,7 +668,9 @@ class StandIn(BaseHTTPRequestHandler):
             return self.good(200, {
                 "version": "standin-1",
                 "keys": [{"key_sha256": hashlib.sha256(STANDIN_KEY.encode()).hexdigest(), "name": "standin"}],
-                "upstreams": [], "routes": [],
+                # One route, to the mock that sends the head of an answer and then nothing (tools/mock_upstream.py).
+                "upstreams": [{"name": "silent", "kind": "openai", "base_url": "http://127.0.0.1:9005", "api_key_env": "MOCK_API_KEY"}],
+                "routes": [{"model": "stall-body", "targets": [{"upstream": "silent", "model": "stall-body-1"}]}],
             })
         if self.path.startswith("/internal/v1/jobs/"):
             return self.hostile(self.path.rsplit("/", 1)[1])
@@ -598,6 +695,9 @@ def hostile_control(stack):
         "OMNIGATE_LISTEN": f"127.0.0.1:{SECOND_GATEWAY_PORT}", "OMNIGATE_CONTROL_URL": f"http://127.0.0.1:{STANDIN_PORT}",
         "OMNIGATE_INTERNAL_TOKEN": STANDIN_TOKEN, "OMNIGATE_POLL_MS": "200", "OMNIGATE_FLUSH_MS": "200",
         "OMNIGATE_SPOOL": "off", "OMNIGATE_CONFIG_CACHE": "off",
+        # Short, for the control plane that sends a head and no body, and for
+        # the check after it that deadlines are still being enforced.
+        "OMNIGATE_STREAM_IDLE_TIMEOUT_MS": "2000", "OMNIGATE_CLIENT_TIMEOUT_MS": "3000",
     })
     TARGET = ("127.0.0.1", SECOND_GATEWAY_PORT)
     try:
@@ -623,7 +723,16 @@ def hostile_control(stack):
 
         def whole_file(raw, status):
             body = body_of(raw)
-            return None if body is not None and len(body) == 300_004 else "the file did not arrive whole"
+            if body is None or len(body) != 300_004:
+                return "the file did not arrive whole"
+            head = raw[:raw.find(b"\r\n\r\n")].lower()
+            return None if b"content-length: 300004" in head and b"transfer-encoding" not in head else "the file lost its content-length"
+
+        def cut_file(raw, status):
+            end = raw.find(b"\r\n\r\n")
+            if b"content-length: 300000" not in raw[:end].lower():
+                return "the declared length was not passed on"
+            return None if len(raw) - end - 4 < 300_000 else "more arrived than the control plane sent"
 
         case("an honest job answer is relayed, with a length the gateway counted", job("fine"), expect=200, read_timeout=5, keep_reading=8,
              check=lambda raw, status: None if b"content-length: " in raw.lower() and b'"job_1"' in raw else "not relayed as it was")
@@ -631,8 +740,59 @@ def hostile_control(stack):
         case("an answer shorter than its content-length: 502, not half an answer", job("short"), expect=502, read_timeout=5, keep_reading=8)
         case("both framings: 502", job("both"), expect=502, read_timeout=5, keep_reading=8)
         case("a content-type that smuggles a header: 502, and the header goes nowhere", job("ctype"), expect=502, check=no_injection, read_timeout=5, keep_reading=8)
-        case("a long honest answer (a file) arrives whole", job("long"), expect=200, check=whole_file, read_timeout=10, keep_reading=15)
-        case("a long answer cut short by the control plane is cut for the client too, not ended", job("longshort"), expect=200, check=cut_short, read_timeout=3, keep_reading=6)
+        case("a long honest answer (a file) arrives whole, with the control plane's content-length and not chunked",
+             job("long"), expect=200, check=whole_file, read_timeout=10, keep_reading=15)
+        case("a long answer cut short by the control plane is cut for the client too: fewer bytes than the length promised",
+             job("longshort"), expect=200, check=cut_file, read_timeout=3, keep_reading=6)
+
+        def silent_peer(what, request):
+            """`request` is answered by a peer that sends a head and then nothing. The connection it came
+            in on is kept open afterwards, and a second client checks that deadlines are still enforced:
+            before the close-out commit the watchdog cancelled the first connection's task, waited for it
+            for as long as that connection stayed open, and served nobody else in the meantime."""
+            a = socket.create_connection(TARGET, timeout=5)
+            try:
+                a.settimeout(9)
+                started = time.time()
+                a.sendall(request)
+                got = b""
+                try:
+                    while not complete(got):
+                        more = a.recv(65536)
+                        if not more:
+                            break
+                        got += more
+                except OSError:
+                    pass
+                took = time.time() - started
+                record(f"a head and then no body from {what}: 502 after the idle timeout (2 s here)",
+                       status_of(got) == 502 and 1.5 <= took <= 7, (status_of(got), round(took, 1), got[-160:]))
+                b = socket.create_connection(TARGET, timeout=5)
+                try:
+                    b.sendall(b"GET /v1/models HTTP/1.1\r\nHost: t\r\n")
+                    b.settimeout(8)
+                    started = time.time()
+                    try:
+                        b.recv(4096)
+                        dropped = time.time() - started
+                    except socket.timeout:
+                        dropped = None
+                    except OSError:
+                        dropped = time.time() - started
+                finally:
+                    b.close()
+                record("... and while that connection stays open the gateway goes on enforcing deadlines "
+                       "(a client that sends half a head is dropped at the client timeout, 3 s here)",
+                       dropped is not None and 2.0 <= dropped <= 6.5, dropped)
+            finally:
+                a.close()
+            if not alive():
+                print("the gateway stopped answering")
+                sys.exit(1)
+
+        silent_peer("the control plane", job("stall"))
+        silent_peer("an upstream", post("/v1/chat/completions", json.dumps({"model": "stall-body", "messages": [{"role": "user", "content": "hi"}]}),
+                                         key=STANDIN_KEY))
 
         # The config poll itself (every 200 ms) gets the same treatment.
         for mode in ("chunk", "short", "both"):
@@ -779,6 +939,13 @@ def start_own_stack():
     for name in ("drip", "stall", "late-usage", "flood", "hostile-chunk-json", "hostile-chunk-sse", "hostile-chunk17",
                  "hostile-short-json", "hostile-short-sse", "hostile-both", "hostile-ctype", "hostile-status", "hostile-long"):
         config["routes"].append({"model": name, "targets": [dict(upstream="mock-stall", model=name + "-1", **price)]})
+    # An upstream that sends the head of a JSON answer and then nothing: alone, and in front of one that works.
+    # (Under names of their own: the hostile answers above put "mock-stall" into its cooldown, where it would be tried last.)
+    for name in ("mock-silent-a", "mock-silent-b"):
+        config["upstreams"].append({"name": name, "kind": "openai", "base_url": "http://127.0.0.1:9005", "api_key_env": "MOCK_API_KEY"})
+    config["routes"].append({"model": "stall-body-only", "targets": [dict(upstream="mock-silent-a", model="stall-body-1", **price)]})
+    config["routes"].append({"model": "stall-body", "targets": [dict(upstream="mock-silent-b", model="stall-body-1", **price),
+                                                               dict(upstream="mock-ok", model="ok-1", **price)]})
 
     work = tempfile.mkdtemp(prefix="omnigate-malformed-")
     stack = e2e.Stack(work, config, False)
@@ -797,6 +964,7 @@ def start_own_stack():
     ARGS.key, ARGS.model, ARGS.rpm_key = e2e.KEY_MAIN, "direct", e2e.KEY_RPM
     ARGS.other_key, ARGS.translated_model, ARGS.concurrency_cap = e2e.KEY_OTHER, "claude", OWN_CONCURRENCY_CAP
     ARGS.drip_model, ARGS.stall_model, ARGS.late_model, ARGS.flood_model = "drip", "stall", "late-usage", "flood"
+    ARGS.idle_s, ARGS.client_stall_s = 4.0, 1.5  # the two timeouts set above
     OVERVIEW = (e2e.CONTROL + "/admin/overview", e2e.ADMIN_TOKEN)
     return stack, work
 
@@ -892,7 +1060,8 @@ def main():
     ap.add_argument("--gateway", help="host:port of a data plane you started; without it the script starts its own stack")
     ap.add_argument("--key", help="a valid gateway key (with --gateway)")
     ap.add_argument("--model", help="a text route that key may use (with --gateway)")
-    ap.add_argument("--rpm-key", help="a rate-limited key (3 per minute), to check the trailing-slash bypass and the limit before the body")
+    ap.add_argument("--rpm-key", help="a rate-limited key, to check the trailing-slash bypass and the limit before the body")
+    ap.add_argument("--rpm", type=int, default=3, help="the requests per minute --rpm-key allows (default 3; the dev config's og-ratelimited-key allows 5)")
     ap.add_argument("--other-key", help="a second valid key, to check that one key's concurrency cap leaves others alone")
     ap.add_argument("--concurrency-cap", type=int, default=0, help="the instance's OMNIGATE_MAX_CONCURRENT_PER_KEY, if it is small enough to reach with sockets")
     ap.add_argument("--translated-model", help="a chat route served by an Anthropic-style upstream (so the request is translated)")
@@ -954,6 +1123,7 @@ def run(stack=None):
     limits_before_body()
     if stack:
         hostile_upstream()
+        own_answers_stall()
         hostile_control(stack)
         healthcheck_command()
     if ARGS.events_url or OVERVIEW:

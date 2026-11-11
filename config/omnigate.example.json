@@ -6,6 +6,7 @@
       "budget_usd": 25.0,
       "budget_period": "monthly",
       "rpm": 600,
+      "max_concurrent": 64,
       "max_open_jobs": 20,
       "disabled": false,
       "models": [

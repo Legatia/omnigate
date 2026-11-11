@@ -56,6 +56,12 @@ defmodule OmnigateControl.Wave6Test.Stub do
     conn |> put_resp_header("content-type", "image/png") |> send_resp(200, "PNG-" <> name)
   end
 
+  # An image provider of the OpenAI kind: answers at once, with the file inline.
+  post "/v1/images/generations" do
+    bump(:submits)
+    conn |> put_resp_content_type("application/json") |> send_resp(200, JSON.encode!(%{data: [%{b64_json: Base.encode64("PNG-inline")}]}))
+  end
+
   # Answers 200 with five megabytes nobody will read.
   post "/hook/big" do
     bump(:hooks)
@@ -1173,8 +1179,12 @@ defmodule OmnigateControl.Wave6Test do
       assert AdminAuth.bearer_throttled?(ip)
 
       # Locked out: the right token gets exactly what a wrong one gets.
-      assert from("/login", ip, @admin).status == 200
-      assert from("/login", ip, "guess-4").status == 200
+      # The login page too: a bearer token there is throttled like anywhere else.
+      login = from("/login", ip, @admin)
+      assert login.status == 429 and get_resp_header(login, "retry-after") == ["60"]
+      assert from("/login", ip, "guess-4").status == 429
+      # Without a token it is still the page: a browser is not a guess.
+      assert (conn(:get, "/login") |> Map.put(:remote_ip, ip) |> call()).status == 200
       locked = from("/", ip, @admin)
       assert locked.status == 429 and get_resp_header(locked, "retry-after") == ["60"]
       assert from("/", ip, "guess-5").status == 429
@@ -1598,6 +1608,219 @@ defmodule OmnigateControl.Wave6Test do
           assert Errors.category("some_unlisted_reason", status) == expected, "status #{status}"
         end
       end
+    end
+  end
+
+  # ============================================================= close-out round
+
+  describe "close-out: a key's max_concurrent" do
+    test "the admin API takes it, bounds it and shows it, and the snapshot carries it to the data plane" do
+      name = "co-conc-#{unique()}"
+
+      send = fn method, path, body ->
+        conn(method, path, JSON.encode!(body)) |> put_req_header("content-type", "application/json") |> bearer() |> call()
+      end
+
+      for bad <- [-1, 1_000_001, 2 ** 32, 1.5, "4", true] do
+        refused = send.(:post, "/admin/keys", %{"name" => name, "max_concurrent" => bad})
+        assert refused.status == 400, "max_concurrent #{inspect(bad)} gave #{refused.status}"
+        assert json(refused)["error"]["message"] =~ "max_concurrent"
+      end
+
+      created = send.(:post, "/admin/keys", %{"name" => name, "max_concurrent" => 4})
+      on_exit(fn -> Keys.delete(name) end)
+      assert created.status == 201 and json(created)["max_concurrent"] == 4
+      in_snapshot = fn -> Router.snapshot() |> JSON.encode!() |> JSON.decode!() |> Map.fetch!("keys") |> Enum.find(&(&1["name"] == name)) end
+      assert in_snapshot.()["max_concurrent"] == 4
+
+      assert send.(:patch, "/admin/keys/#{name}", %{"max_concurrent" => 1_000_001}).status == 400
+      assert json(send.(:patch, "/admin/keys/#{name}", %{"max_concurrent" => 1_000_000}))["max_concurrent"] == 1_000_000
+      assert in_snapshot.()["max_concurrent"] == 1_000_000
+      # null, like 0, is "the gateway's default".
+      assert json(send.(:patch, "/admin/keys/#{name}", %{"max_concurrent" => nil}))["max_concurrent"] == 0
+      assert in_snapshot.()["max_concurrent"] == 0
+      # A key made without it has the default, and every key in the snapshot says so.
+      assert Enum.all?(Router.snapshot().keys, &(is_integer(&1.max_concurrent) and &1.max_concurrent >= 0))
+      assert Enum.any?(json(conn(:get, "/admin/keys") |> bearer() |> call())["keys"], &(&1["name"] == name and &1["max_concurrent"] == 0))
+    end
+
+    test "the config file is held to the same bounds, and the data plane's field is as wide" do
+      limit = ConfigStore.limits().max_concurrent
+      key = fn value -> %{"keys" => [%{"name" => "k", "key" => "x", "max_concurrent" => value}]} end
+
+      for bad <- [limit + 1, 2 ** 32, -1, 2.5, "8"],
+          do: assert_raise(ArgumentError, ~r/"max_concurrent"/, fn -> ConfigStore.normalize(key.(bad)) end)
+
+      assert hd(ConfigStore.normalize(key.(limit)).keys).max_concurrent == limit
+      assert hd(ConfigStore.normalize(key.(0)).keys).max_concurrent == 0
+      assert hd(ConfigStore.normalize(%{"keys" => [%{"name" => "k", "key" => "x"}]}).keys).max_concurrent == 0
+
+      source = Path.expand("../../dataplane/src/config.zig", __DIR__)
+      if File.exists?(source), do: assert(File.read!(source) =~ ~r/\bmax_concurrent: u32\b/)
+    end
+
+    test "the dashboard shows a key's own cap" do
+      name = "co-dash-#{unique()}"
+      {:ok, _key, _raw} = Keys.create(%{"name" => name, "rpm" => 60, "max_concurrent" => 12})
+      on_exit(fn -> Keys.delete(name) end)
+      page = conn(:get, "/") |> bearer() |> call()
+      assert page.status == 200 and page.resp_body =~ "12 at once"
+    end
+  end
+
+  describe "close-out: per-second prices on providers that are never sent a duration" do
+    test "the config is refused at load unless the target says how many seconds to bill" do
+      config = fn kind, target ->
+        %{
+          "media" => %{
+            "upstreams" => [%{"name" => "u", "kind" => kind, "base_url" => "http://x/", "api_key_env" => "K"}],
+            "routes" => [%{"model" => "m", "targets" => [Map.merge(%{"upstream" => "u", "model" => "o/m", "price" => %{"per_second_usd" => 0.1}}, target)]}]
+          }
+        }
+      end
+
+      target = fn config -> config |> ConfigStore.normalize() |> then(&hd(hd(&1.media.routes).targets)) end
+
+      for kind <- ~w(openai_images elevenlabs gemini gemini_interactions) do
+        assert_raise ArgumentError, ~r/"per_second_usd", but a #{kind} provider is never sent a duration.*"default_seconds"/s, fn ->
+          ConfigStore.normalize(config.(kind, %{}))
+        end
+
+        assert target.(config.(kind, %{"default_seconds" => 8})).default_seconds == 8
+        # A price of zero per second is no per-second price.
+        assert target.(config.(kind, %{"price" => %{"per_second_usd" => 0, "per_job_usd" => 1}})).price.per_job_usd == 1
+      end
+
+      # Providers that take the duration from the request need no default.
+      for kind <- ~w(replicate fal xai_video), do: assert(target.(config.(kind, %{})).price.per_second_usd == 0.1)
+    end
+
+    test "such a job is billed the target's default, whatever duration the request names", %{base: base} do
+      media = media(base, price: @per_second, target: %{default_seconds: 5, max_seconds: 10})
+      ConfigStore.put_media(%{media | upstreams: [%{hd(media.upstreams) | kind: "openai_images"}]})
+
+      assert %{"status" => "succeeded", "cost_usd" => 5.0} = run_job(%{"prompt" => "x"})
+      # The provider is not sent a duration, so one in the request neither
+      # changes the bill nor gets the request refused for being "too long".
+      assert %{"status" => "succeeded", "cost_usd" => 5.0} = run_job(%{"prompt" => "x", "duration" => 7})
+      assert %{"status" => "succeeded", "cost_usd" => 5.0} = run_job(%{"prompt" => "x", "duration" => 60})
+      # It still has to be a duration.
+      assert {:error, 400, "invalid_request", _} = run_job(%{"prompt" => "x", "duration" => "soon"})
+    end
+  end
+
+  describe "close-out: the daily job limit" do
+    test "says when to come back: at midnight UTC, and never more than an hour away" do
+      key = managed_key(%{"max_jobs_per_day" => 1})
+      body = %{"model" => "w6", "input" => %{"prompt" => "x"}}
+      first = json(post_job(key.key_sha256, body))
+      refused = post_job(key.key_sha256, body)
+      assert refused.status == 429 and json(refused)["error"]["code"] == "too_many_jobs_today"
+      assert [seconds] = get_resp_header(refused, "retry-after")
+      now = DateTime.utc_now()
+      to_midnight = 86_400 - (now.hour * 3_600 + now.minute * 60 + now.second)
+      assert_in_delta String.to_integer(seconds), min(to_midnight, 3_600), 3
+      assert String.to_integer(seconds) in 1..3_600
+      await(first["id"])
+    end
+  end
+
+  describe "close-out: the audit log" do
+    defp wrong_password(peer, headers \\ []) do
+      conn(:post, "/login", "password=nope")
+      |> put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> with_headers(headers)
+      |> Map.put(:remote_ip, peer)
+      |> call()
+    end
+
+    defp audit_lines(address) do
+      Application.fetch_env!(:omnigate_control, :audit_path)
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.map(&JSON.decode!/1)
+      |> Enum.filter(&(&1["address"] == address))
+    end
+
+    test "a clean stop writes the counts that have no summary line yet, and the dashboard shows them" do
+      # The counts are per minute; do not start in the last seconds of one.
+      if rem(System.os_time(:second), 60) >= 56, do: Process.sleep(5_000)
+      peer = {10, 71, 0, unique() |> rem(250)}
+      address = peer |> :inet.ntoa() |> to_string()
+      for _ <- 1..4, do: assert(wrong_password(peer).status == 401)
+
+      capture_log(fn ->
+        :ok = Supervisor.terminate_child(OmnigateControl.Supervisor, Audit)
+        {:ok, _} = Supervisor.restart_child(OmnigateControl.Supervisor, Audit)
+      end)
+
+      assert [first, %{"outcome" => "denied", "repeats" => 3, "auth" => "password"} = summary] = audit_lines(address)
+      assert first["outcome"] == "denied" and not Map.has_key?(first, "repeats")
+      # The minute was not over: the line is stamped when it was written, never in the future.
+      {:ok, at, 0} = DateTime.from_iso8601(summary["ts"])
+      assert DateTime.compare(at, DateTime.utc_now()) != :gt
+      assert %{"address" => ^address, "repeats" => 3} = hd(Audit.recent(1))
+
+      page = conn(:get, "/") |> bearer() |> call()
+      assert page.resp_body =~ ~s(<span class="muted sub">3 more</span>)
+      overview = json(conn(:get, "/admin/overview") |> bearer() |> call())
+      assert Enum.any?(overview["audit"], &(&1["address"] == address and &1["repeats"] == 3))
+
+      # Nothing is written a second time when the minute is over.
+      :ok = Audit.flush(System.os_time(:second) + 120)
+      assert length(audit_lines(address)) == 2
+    end
+
+    test "the first line and the summary name the same address, also behind a trusted proxy" do
+      if rem(System.os_time(:second), 60) >= 56, do: Process.sleep(5_000)
+      System.put_env("OMNIGATE_TRUST_FORWARDED", "1")
+      on_exit(fn -> System.delete_env("OMNIGATE_TRUST_FORWARDED") end)
+      client = "203.0.113.#{unique() |> rem(250)}"
+      peer = {10, 72, 0, 7}
+      forwarded = [{"x-forwarded-for", client}]
+
+      for _ <- 1..3, do: assert(wrong_password(peer, forwarded).status == 401)
+      :ok = Audit.flush(System.os_time(:second) + 60)
+
+      assert [first, summary] = audit_lines(client)
+      assert %{"address" => ^client, "peer" => "10.72.0.7", "forwarded_for" => ^client, "outcome" => "denied"} = first
+      assert %{"address" => ^client, "outcome" => "denied", "repeats" => 2} = summary
+      refute Map.has_key?(summary, "peer")
+      # Nothing was recorded under the proxy's address.
+      assert Enum.filter(audit_lines("10.72.0.7"), &(&1["forwarded_for"] == client)) == []
+
+      # An operator's action is recorded by the same rule ...
+      action = fn ->
+        conn(:post, "/x") |> with_headers(forwarded) |> Map.put(:remote_ip, peer) |> Audit.record("key.update", "co-probe", "ok", auth: "token")
+      end
+
+      :ok = action.()
+      assert %{"target" => "co-probe", "address" => ^client, "peer" => "10.72.0.7", "forwarded_for" => ^client} = hd(Audit.recent(1))
+      # ... and without the setting the address is the peer, with nothing to add to it.
+      System.delete_env("OMNIGATE_TRUST_FORWARDED")
+      :ok = action.()
+      assert %{"target" => "co-probe", "address" => "10.72.0.7", "forwarded_for" => ^client} = entry = hd(Audit.recent(1))
+      refute Map.has_key?(entry, "peer")
+    end
+  end
+
+  describe "close-out: small things" do
+    test "an id file the snapshot counted and that is gone is reported when the ledger is read", %{dir: dir} do
+      path = Path.join(dir, "ledger.jsonl")
+      File.write!(Ids.file(path, "2026-11-09"), :binary.copy(<<1>>, 32))
+      registry = :ets.new(:co_ids_registry, [:set, :public])
+
+      log =
+        capture_log(fn ->
+          ids = Ids.load(path, registry, %{"2026-11-09" => 32, "2026-11-08" => 160, "2026-11-07" => 0})
+          assert Map.keys(ids.days) == ["2026-11-09"]
+        end)
+
+      assert log =~ "2026-11-08" and log =~ "is missing" and log =~ "10 ids" and log =~ "counted twice"
+      refute log =~ "2026-11-09"
+      refute log =~ "2026-11-07"
+      # Nothing to say when every counted day is there.
+      refute capture_log(fn -> Ids.load(path, registry, %{"2026-11-09" => 32}) end) =~ "is missing"
     end
   end
 end

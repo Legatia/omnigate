@@ -16,8 +16,21 @@ Special model names, on the working mocks (9002 and 9003):
                    (`x-request-id` on 9002, `request-id` on 9003)
   sig-1            (9002) earlier tool calls must carry a thought signature
 
+Error bodies that are not the protocol's error envelope, as real providers
+send them (the gateway puts them into the envelope), and one that is:
+
+  err-array-1      (9002) 400 with a JSON array around the error, as Google's
+                   OpenAI-compatible endpoint answers a bad key
+  err-string-1     (9002) 400 with `error` as a string, as xAI answers one
+  err-exact-1      (9002) 400 with a well-formed OpenAI error in a spelling of
+                   its own (ERR_EXACT): must arrive byte for byte
+  err-openai-1     (9003) 404 with an OpenAI-shaped error on the Anthropic API
+  err-text-1       (9003) 400 with a plain-text body
+
 Special model names on the stalling mock (9005), by prefix:
 
+  stall-body       not a stream: the head of a JSON answer (200, with a
+                   content-length), then nothing
   drip             streams on for a minute and never reports usage
   late-usage       streams for about 2.5 s whoever is listening, then reports
                    usage (prompt 21, completion 34) and ends properly
@@ -48,6 +61,7 @@ Run:  python tools/mock_upstream.py
 
 import base64
 import json
+import select
 import sys
 import os
 import struct
@@ -56,6 +70,14 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WORDS = ["Hello", " from", " the", " mock", " upstream", "."]
+
+# What two providers really answer a bad key with on their OpenAI-compatible
+# endpoints (texts shortened), and a well-formed error in an unusual spelling.
+ERR_ARRAY = [{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key.", "status": "INVALID_ARGUMENT",
+                        "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "API_KEY_INVALID"}]}}]
+ERR_STRING = {"code": "Client specified an invalid argument",
+              "error": "Incorrect API key provided: xa***zz. You can obtain an API key from https://console.x.ai."}
+ERR_EXACT = b'{ "error" : {"code":"context_length_exceeded","param":"messages", "type":"invalid_request_error",\n  "message":"This model\'s maximum context length is 8 tokens."} }\n'
 
 
 class Base(BaseHTTPRequestHandler):
@@ -75,6 +97,13 @@ class Base(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(data)))
         for name, value in (headers or {}).items():
             self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_bytes(self, status, data, content_type="application/json"):
+        self.send_response(status)
+        self.send_header("content-type", content_type)
+        self.send_header("content-length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
@@ -154,6 +183,12 @@ class OpenAIOk(Base):
                     if not tool_call.get("extra_content", {}).get("google", {}).get("thought_signature"):
                         return self.send_json(400, {"error": {"message": "Function call is missing a thought_signature in functionCall parts.",
                                                               "type": "invalid_request_error"}})
+        if req.get("model") == "err-array-1":
+            return self.send_json(400, ERR_ARRAY)
+        if req.get("model") == "err-string-1":
+            return self.send_json(400, ERR_STRING)
+        if req.get("model") == "err-exact-1":
+            return self.send_bytes(400, ERR_EXACT)
         if req.get("model") == "rate-limited-1":
             return self.send_json(429, {"error": {"message": "Rate limit reached for mock requests.", "type": "requests",
                                                   "param": None, "code": "rate_limit_exceeded"}}, {"retry-after": "7"})
@@ -269,6 +304,10 @@ class AnthropicOk(Base):
         if not self.headers.get("x-api-key") or not self.headers.get("anthropic-version"):
             return self.send_json(401, {"type": "error", "error": {"type": "authentication_error",
                                                                   "message": "missing x-api-key or anthropic-version"}})
+        if req.get("model") == "err-openai-1":
+            return self.send_json(404, {"error": {"message": "no such model here", "type": "invalid_request_error", "code": "model_not_found"}})
+        if req.get("model") == "err-text-1":
+            return self.send_bytes(400, b"Bad Request: the proxy in front of the provider did not like this\n", "text/plain")
         if "temperature" in req or "top_p" in req:
             # Current Claude models refuse sampling parameters.
             return self.send_json(400, {"type": "error", "error": {"type": "invalid_request_error",
@@ -401,6 +440,15 @@ class Stall(Base):
         model = str(body.get("model", "")) if isinstance(body, dict) else ""
         if model.startswith("hostile-"):
             return self.hostile(model)
+        if model.startswith("stall-body"):
+            # The head of an ordinary JSON answer, and then nothing: for a
+            # minute, or until the gateway gives up and closes.
+            self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2000\r\n\r\n", close=False)
+            deadline = time.time() + 60
+            while time.time() < deadline and not select.select([self.connection], [], [], 0.5)[0]:
+                pass
+            self.close_connection = True
+            return
         if model.startswith("late-usage") or model.startswith("flood"):
             # A provider that finishes its answer whether or not anyone is
             # still reading, and reports usage at the very end.

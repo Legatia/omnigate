@@ -781,8 +781,8 @@ def get_job(job_id, key=KEY_MAIN):
     return jcall("GET", f"{GATEWAY}/v1/jobs/{job_id}", key=key)[2]
 
 
-def wait_job(job_id, timeout=30, until=TERMINAL):
-    return wait_until(lambda: (lambda j: j if j.get("status") in until else None)(get_job(job_id)), timeout, 0.2) or get_job(job_id)
+def wait_job(job_id, timeout=30, until=TERMINAL, key=KEY_MAIN):
+    return wait_until(lambda: (lambda j: j if j.get("status") in until else None)(get_job(job_id, key)), timeout, 0.2) or get_job(job_id, key)
 
 
 def stats(name):
@@ -951,6 +951,17 @@ def media_checks(stack):
     check("job list shows this key's jobs, newest first", ids[:1] == [second.get("id")] and job_id in ids, ids)
     _, _, other_list = jcall("GET", GATEWAY + "/v1/jobs", key=KEY_OTHER)
     check("another key's job list is empty", other_list.get("data") == [], other_list)
+
+    # A file larger than the gateway relays in one piece (64 KiB). Created
+    # with another key, so that the totals checked below stay as they are.
+    _, _, big = create_job({"model": "image", "input": {"prompt": "big", "mock_output_url": MOCK["replicate"] + "/files/big-1.png"}}, key=KEY_OTHER)
+    big = wait_job(big.get("id", "missing"), key=KEY_OTHER)
+    out = (big.get("outputs") or [{}])[0]
+    status, headers, data = call("GET", out.get("url", GATEWAY + "/v1/files/missing"))
+    check("a 300 kB file comes through the gateway whole, with its Content-Length and not chunked",
+          status == 200 and len(data) == out.get("bytes") and len(data) > 300_000 and hashlib.sha256(data).hexdigest() == out.get("sha256")
+          and headers.get("content-length") == str(len(data)) and "transfer-encoding" not in headers,
+          (status, len(data), out.get("bytes"), headers.get("content-length"), headers.get("transfer-encoding"), big.get("status")))
 
     expected = 0.003 + 0.5 + 0.05 + len(text) * 0.00003 + gemini_cost
     row = wait_until(lambda: (lambda r: r if close(r.get("cost_usd"), expected) else None)(usage_row("main")), 10) or usage_row("main")

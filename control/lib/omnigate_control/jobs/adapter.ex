@@ -76,6 +76,14 @@ defmodule OmnigateControl.Jobs.Adapter do
   defp text_chars_in(_), do: 0
 
   @doc """
+  Does a provider of this kind take a duration from the request? The others
+  (images, speech) never send one, so a per-second price on them can only
+  ever apply to the target's `default_seconds`; the config loader insists
+  that one is set.
+  """
+  def takes_duration?(kind), do: kind in ~w(replicate fal xai_video)
+
+  @doc """
   Seconds requested by `input`: the largest of the given fields, never below
   zero. Values are numbers, numeric strings (some providers take `"5"`) or a
   number with an `s` after it (`"5s"`, which others take).

@@ -105,6 +105,14 @@ class Convert(unittest.TestCase):
         self.assertAlmostEqual(first["price_out_per_mtok"], 10.0)
         self.assertEqual(self.upstreams["openai"]["timeout_ms"], 30000)
 
+    def test_a_timeout_above_one_hour_is_cut_and_reported(self):
+        config, report = il.convert({"model_list": [
+            {"model_name": "slow", "litellm_params": {"model": "openai/gpt-4o", "timeout": 7200}},
+            {"model_name": "edge", "litellm_params": {"model": "openai/gpt-4o-mini", "request_timeout": 3600}},
+        ]})
+        self.assertEqual(sorted(u["timeout_ms"] for u in config["upstreams"]), [3_600_000])
+        self.assertEqual(len([n for n in report["notes"] if "7200 s" in n and "3600000 ms" in n]), 1)
+
     def test_upstream_shapes(self):
         self.assertEqual(self.upstreams["anthropic"]["kind"], "anthropic")
         self.assertEqual(self.upstreams["openrouter"]["base_url"], "https://openrouter.ai/api")

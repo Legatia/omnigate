@@ -97,7 +97,11 @@ defmodule OmnigateControl.Jobs do
 
         {:error, :too_many_today} ->
           {limit, _} = Keyword.fetch!(opts, :day_cap)
-          {:error, 429, "too_many_jobs_today", "this key already created #{limit} jobs today (UTC); the count starts again at midnight UTC"}
+          # The count starts again at midnight UTC: say how far away that is,
+          # but never ask a client to stay away for more than an hour at a
+          # time (the limit may be raised, or the key replaced, before then).
+          retry_after_s = min(seconds_until_utc_midnight(), 3_600)
+          {:error, 429, "too_many_jobs_today", "this key already created #{limit} jobs today (UTC); the count starts again at midnight UTC", retry_after_s}
 
         {:error, reason} ->
           Logger.error("job #{id} could not be stored: #{Text.line(reason, 200)}")
@@ -574,10 +578,15 @@ defmodule OmnigateControl.Jobs do
   defp duration_priced(_input, []), do: :ok
 
   defp duration_priced(input, per_second) do
-    requested = Adapter.seconds(input, @durations)
+    in_request = Adapter.seconds(input, @durations)
 
     Enum.find_value(per_second, :ok, fn target ->
       max = Map.get(target, :max_seconds)
+      # Only what the provider is actually sent counts: a kind that takes no
+      # duration is billed on the target's default whatever the input says,
+      # exactly as `job_cost/5` does (its adapter reports 0 seconds).
+      upstream = ConfigStore.media_upstream(target.upstream)
+      requested = if upstream && Adapter.takes_duration?(upstream.kind), do: in_request, else: 0
 
       cond do
         requested <= 0 and is_nil(Map.get(target, :default_seconds)) ->
@@ -592,6 +601,11 @@ defmodule OmnigateControl.Jobs do
           nil
       end
     end)
+  end
+
+  defp seconds_until_utc_midnight do
+    now = DateTime.utc_now()
+    86_400 - (now.hour * 3_600 + now.minute * 60 + now.second)
   end
 
   defp webhook_url(nil, _key), do: {:ok, nil}

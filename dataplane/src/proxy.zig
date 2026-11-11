@@ -158,6 +158,10 @@ pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
         const is_probe = acc.status == 200 and std.mem.eql(u8, acc.path.get(), "/healthz");
         logging.access(&acc, if (is_probe) .debug else .info);
         outcome catch return;
+        // The watchdog cancelled this task and is waiting for it to end
+        // (`Future.cancel` returns only then, and only the first blocking
+        // call after it fails): whatever was answered, stop here.
+        if (guard.timedOut()) return;
         guard.disarm();
         // The answer said `connection: close` (the client asked for it, or the
         // request was not fully read): close now, not at the next timeout.
@@ -246,9 +250,14 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     const req_id = std.fmt.bytesToHex(raw_id, .lower);
     acc.request_id.set(&req_id);
     // A request without a body is complete. From here the deadline is on our
-    // answer reaching the client (it is lifted while waiting for an upstream,
-    // which has its own timeout).
-    if (!method.requestHasBody()) guard.arm(app.io, app.stream_idle_timeout_ms);
+    // answer reaching the client: a client that takes none of it for the
+    // stall timeout is given up on, whether the answer is a provider's or
+    // one of our own (an error, the model list, a cache hit). It is lifted
+    // while waiting for an upstream, which has its own timeout, and set
+    // again by `readBody` for a request that has a body. (A refusal sent
+    // before the body was read is under the client timeout armed with the
+    // head.)
+    if (!method.requestHasBody()) guard.arm(app.io, app.client_stall_timeout_ms);
 
     // Header strings are invalidated once the body reader is created; copy now.
     var hdrs: ClientHeaders = .{};
@@ -355,11 +364,10 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(acc, request, secs);
         }
         const job_body: ?[]u8 = if (method == .POST)
-            (try readBody(arena, request, guard, max_job_body)) orelse
+            (try readBody(app, arena, request, guard, max_job_body)) orelse
                 return respondError(acc, request, .payload_too_large, "payload_too_large", "the request body is larger than the jobs API accepts (8,000,000 bytes)")
         else
             null;
-        guard.arm(app.io, app.stream_idle_timeout_ms);
         if (job_body) |b| if (!guard_mod.jsonDepthOk(b, guard_mod.max_client_json_depth))
             return respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply");
         return forwardToControl(app, acc, arena, request, guard, method, path, query, job_body, hdrs.idempotency_key, &key_hash);
@@ -383,9 +391,8 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     }
 
     // --- body -------------------------------------------------------------
-    const body = (try readBody(arena, request, guard, max_request_body)) orelse
+    const body = (try readBody(app, arena, request, guard, max_request_body)) orelse
         return respondError(acc, request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB");
-    guard.arm(app.io, app.stream_idle_timeout_ms);
 
     // Bounded nesting, before anything parses it: the serialiser this body
     // may go through again indexes past a fixed stack beyond 256 levels.
@@ -689,6 +696,11 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     if (ep.metered) report(app, arena, event);
                     return err;
                 }
+                // The watchdog cancelled this task (shutdown; nothing else
+                // arms it while an upstream is awaited). It waits for the
+                // task to end, and no later call here could be interrupted:
+                // do not start on another upstream.
+                if (guard.timedOut()) return err;
                 // A pooled keep-alive connection may have been closed by the
                 // upstream while idle: try once more before giving up on it.
                 if (tries == 0 and worthRetrying(err)) {
@@ -967,8 +979,10 @@ fn noteFailure(app: *App, upstream: []const u8) void {
 
 /// Read the whole request body; null when it exceeds `max_request_body`.
 /// The client timeout armed on `guard` covers the read and ends with it.
-fn readBody(arena: std.mem.Allocator, request: *http.Server.Request, guard: *watchdog.Conn, limit: usize) !?[]u8 {
-    defer guard.disarm();
+/// What follows is an answer: the deadline from here on is the one for a
+/// client that does not take it (also when the answer is "too large").
+fn readBody(app: *App, arena: std.mem.Allocator, request: *http.Server.Request, guard: *watchdog.Conn, limit: usize) !?[]u8 {
+    defer guard.arm(app.io, app.client_stall_timeout_ms);
     // A length that is already too long is refused without reading any of it.
     if (request.head.content_length) |declared| if (declared > limit) return null;
     var body_buf: [8 * 1024]u8 = undefined;
@@ -1204,6 +1218,103 @@ fn sleepMs(io: Io, ms: u32) Io.Cancelable!void {
     return io.sleep(.fromMilliseconds(ms), .awake);
 }
 
+/// The start of a response body, read before any of it is passed on: up to
+/// `limit` bytes, or all of it when it is shorter.
+///
+/// A peer that sends its head and then goes silent has to be timed here
+/// too, and not by the watchdog: the watchdog cancels the connection's
+/// task, which is the end of that task (it cannot be interrupted a second
+/// time, and the watchdog waits for it), while at this point the request
+/// can still be sent to another upstream. So the read runs as a task of
+/// its own next to a timer, the way `openWithTimeout` waits for the head,
+/// and only that task is cancelled.
+const Buffered = struct {
+    body: *framing.BodyReader,
+    /// Only touched by the reading task while `read` waits for it.
+    arena: std.mem.Allocator,
+    /// Reading stops once more than this has arrived.
+    limit: usize,
+    bytes: std.ArrayList(u8) = .empty,
+    /// The body ended within `limit`.
+    ended: bool = false,
+    /// Counts the reads that returned something: how the waiting side tells
+    /// a slow body from a silent one.
+    progress: std.atomic.Value(u32) = .init(0),
+
+    const Error = framing.BodyReader.Error || error{OutOfMemory};
+
+    fn run(b: *Buffered) Error!void {
+        var chunk: [16 * 1024]u8 = undefined;
+        while (b.bytes.items.len <= b.limit) {
+            const n = try b.body.read(&chunk);
+            if (n == 0) {
+                b.ended = true;
+                return;
+            }
+            try b.bytes.appendSlice(b.arena, chunk[0..n]);
+            _ = b.progress.fetchAdd(1, .release);
+        }
+    }
+
+    /// `run`, given up on with `error.StreamIdleTimeout` when nothing
+    /// arrives for `idle_ms` (0 = wait for ever). A body that keeps
+    /// arriving is never cut off; one that stops is noticed after between
+    /// one and two times `idle_ms`.
+    fn read(b: *Buffered, io: Io, idle_ms: u32) (Error || error{StreamIdleTimeout} || Io.Cancelable)!void {
+        if (idle_ms == 0) return b.run();
+        // The usual case for a short answer: it arrived with its head and
+        // is already in the connection's buffer. Reading it cannot block,
+        // so it needs neither a task of its own nor a timer.
+        if (b.body.remaining()) |left| {
+            if (left <= b.body.in.bufferedLen()) return b.run();
+        }
+
+        const Race = union(enum) {
+            body: Error!void,
+            timer: Io.Cancelable!void,
+        };
+        var results: [2]Race = undefined;
+        var race: Io.Select(Race) = .init(io, &results);
+
+        // No spare concurrency: better an untimed read than a failed one.
+        race.concurrent(.body, run, .{b}) catch return b.run();
+        var seen: u32 = 0;
+        while (true) {
+            race.concurrent(.timer, sleepMs, .{ io, idle_ms }) catch {};
+            const first = race.await() catch |err| {
+                race.cancelDiscard();
+                return err;
+            };
+            switch (first) {
+                .body => |result| {
+                    race.cancelDiscard();
+                    return result;
+                },
+                .timer => {
+                    const now = b.progress.load(.acquire);
+                    if (now != seen) {
+                        seen = now;
+                        continue;
+                    }
+                    // Silent for a whole interval. Cancel the read; if it
+                    // finished in the meantime, use what it read.
+                    var finished = false;
+                    while (race.cancel()) |leftover| switch (leftover) {
+                        .body => |result| {
+                            if (result) |_| {
+                                finished = true;
+                            } else |_| {}
+                        },
+                        .timer => {},
+                    };
+                    if (finished) return;
+                    return error.StreamIdleTimeout;
+                },
+            }
+        }
+    }
+};
+
 const Translation = struct {
     dir: translate.Direction,
     /// The model name the client asked for and should see in the answer.
@@ -1264,9 +1375,10 @@ fn forward(
     // A fresh reader for this attempt's response.
     usage.* = .{};
     // While waiting for the upstream its own timeout applies, not the
-    // deadline on our answer; that comes back when this returns.
+    // deadline on our answer; that comes back when this returns (whatever
+    // the caller does next ends in an answer to the client).
     guard.disarm();
-    defer guard.arm(app.io, app.stream_idle_timeout_ms);
+    defer guard.arm(app.io, app.client_stall_timeout_ms);
     const base = std.mem.trimEnd(u8, up.base_url, "/");
     const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, try config.upstreamPath(arena, up.v1_path, path) });
     const uri = try std.Uri.parse(url);
@@ -1312,11 +1424,13 @@ fn forward(
     const timeout_ms = if (up.timeout_ms != 0) up.timeout_ms else app.upstream_timeout_ms;
     var response = try call.openWithTimeout(app.io, timeout_ms);
 
-    // From here on bytes have to keep moving: if the upstream goes silent for
-    // the idle timeout, or the client takes nothing for the (shorter) stall
-    // timeout, the watchdog cancels this task and the read or write below
-    // fails. The deadline is set before each of them.
-    guard.arm(app.io, app.stream_idle_timeout_ms);
+    // From here on bytes have to keep moving. As long as nothing has been
+    // passed on, an upstream that goes silent is timed by `Buffered.read`
+    // (a timer, as for the head): the request can then still go to the next
+    // upstream, which a task cancelled by the watchdog could not do. Once
+    // the answer is being relayed the watchdog's deadline is set before
+    // every read (the idle timeout) and every write (the shorter client
+    // stall timeout), and it cancels this task when one passes.
 
     const status = response.head.status;
     // A final answer is 200 or above. (std has dealt with `100 Continue`;
@@ -1367,11 +1481,10 @@ fn forward(
     // --- translated, not a stream: buffer, convert, answer in one piece -----
     if (mode == .translate and !is_sse) {
         const x = mode.translate;
-        const raw = upstream_body.readAlloc(arena, max_translated_body) catch |err| switch (err) {
-            error.ReadFailed => return if (guard.timedOut()) error.StreamIdleTimeout else error.ReadFailed,
-            error.StreamTooLong => return error.UpstreamUnparseable,
-            else => |e| return e,
-        };
+        var whole: Buffered = .{ .body = &upstream_body, .arena = arena, .limit = max_translated_body };
+        try whole.read(app.io, app.stream_idle_timeout_ms);
+        if (!whole.ended) return error.UpstreamUnparseable;
+        const raw = whole.bytes.items;
         framing.release(&call.req, &upstream_body);
         // Translation re-serialises this; refuse what the serialiser cannot take.
         if (!guard_mod.jsonDepthOk(raw, guard_mod.max_upstream_json_depth)) return error.UpstreamUnparseable;
@@ -1402,27 +1515,40 @@ fn forward(
     // is cut short there is still time to fail over: nothing has been sent.
     var head_start: []const u8 = "";
     if (!is_sse) {
-        var small: std.ArrayList(u8) = .empty;
-        const ended = while (small.items.len <= small_body_max) {
-            const n = upstream_body.read(&chunk) catch |err| return upstreamReadError(err, guard);
-            if (n == 0) break true;
-            try small.appendSlice(arena, chunk[0..n]);
-            guard.arm(app.io, app.stream_idle_timeout_ms);
-        } else false;
-        if (ended) {
+        var start: Buffered = .{ .body = &upstream_body, .arena = arena, .limit = small_body_max };
+        try start.read(app.io, app.stream_idle_timeout_ms);
+        const small = start.bytes.items;
+        if (start.ended) {
             framing.release(&call.req, &upstream_body);
-            usage.feed(small.items);
+            usage.feed(small);
             if (extras.capture) |c| {
-                c.add(arena, small.items);
+                c.add(arena, small);
                 c.content_type = content_type;
                 c.complete = !c.overflow;
             }
+            // An error that is not in the shape its protocol promises (some
+            // providers answer a bad key on an "OpenAI-compatible" endpoint
+            // with an array, or with `error` as a string) is put into that
+            // shape, with the provider's own words: a client's SDK reads
+            // nothing else. One that is well-formed is relayed as it came.
+            var answer: []const u8 = small;
+            if (@backingInt(status) >= 400) {
+                var refusal: ?TreeRefusal = null;
+                const shape: translate.ErrorShape = switch (up.kind) {
+                    .openai => .openai,
+                    .anthropic => .anthropic,
+                };
+                if (try inTree(app, arena, extras.key_hash, small.len, &refusal, translate.wrapError, .{ shape, @backingInt(status), small })) |wrapped| {
+                    answer = wrapped;
+                    out_headers.items[0].value = "application/json";
+                }
+            }
             committed.* = true;
             guard.arm(app.io, app.client_stall_timeout_ms);
-            try request.respond(small.items, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
+            try request.respond(answer, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
             return .{ .done = status };
         }
-        head_start = small.items;
+        head_start = small;
     }
 
     // --- a stream, or a long answer: chunked ----------------------------------
@@ -1781,14 +1907,13 @@ fn forwardToControl(
     // The control plane has its own timeout; our answer's deadline resumes after.
     guard.disarm();
     var response = call.openWithTimeout(app.io, control_timeout_ms) catch |err| {
-        guard.arm(app.io, app.stream_idle_timeout_ms);
+        guard.arm(app.io, app.client_stall_timeout_ms);
         // The path only: a signed URL's query is a credential.
         log.warn("control plane request {s} failed: {t}", .{ path, err });
         return respondError(acc, request, .service_unavailable, "control_plane_unavailable", "media jobs need the control plane, which is not reachable");
     };
-    // A client that asks for a large file and then stops reading must not
-    // hold this connection for ever.
-    guard.arm(app.io, app.stream_idle_timeout_ms);
+    // An answer of our own may follow at once (the checks below).
+    guard.arm(app.io, app.client_stall_timeout_ms);
 
     const status = response.head.status;
     // The control plane is ours, but what answers on its address is a
@@ -1817,46 +1942,63 @@ fn forwardToControl(
     });
     try out_headers.appendSlice(arena, relayed);
 
-    // Every JSON answer is small: buffered, counted, and sent with its real
-    // length (never the one the peer declared). A cut-short one is a 502
-    // instead of half an answer.
-    var chunk: [16 * 1024]u8 = undefined;
-    var small: std.ArrayList(u8) = .empty;
-    const ended = while (small.items.len <= small_body_max) {
-        const n = control_body.read(&chunk) catch |err| {
+    // Most answers are short (a job, an error, a small file): up to 64 KiB
+    // are buffered, counted, and sent with their real length (never the one
+    // the peer declared). A cut-short one is a 502 instead of half an
+    // answer, and so is one that stops arriving: that is timed here, not by
+    // the watchdog (see `Buffered`).
+    guard.disarm();
+    var start: Buffered = .{ .body = &control_body, .arena = arena, .limit = small_body_max };
+    const first_read = start.read(app.io, app.stream_idle_timeout_ms);
+    guard.arm(app.io, app.client_stall_timeout_ms);
+    first_read catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => |e| return e,
+        else => {
             log.warn("control plane answer to {s} could not be read: {t}", .{ path, err });
             return respondError(acc, request, .bad_gateway, "control_plane_unavailable", malformed);
-        };
-        if (n == 0) break true;
-        try small.appendSlice(arena, chunk[0..n]);
-        guard.arm(app.io, app.stream_idle_timeout_ms);
-    } else false;
+        },
+    };
+    const small = start.bytes.items;
     acc.status = @backingInt(status);
-    if (ended) {
-        guard.arm(app.io, app.client_stall_timeout_ms);
-        return request.respond(small.items, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
+    if (start.ended) {
+        return request.respond(small, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
     }
 
-    // A file: streamed, chunked. If the control plane fails part way the
-    // connection is dropped without the closing chunk.
+    // Longer (a file, a long list of jobs): streamed. With the length the
+    // control plane declared when it gave one, so that a download has a
+    // size and a client can tell a whole file from a cut one; the body
+    // reader delivers exactly that many bytes or fails, and then the
+    // connection is dropped short of them. Without a declared length:
+    // chunked, and dropped without the closing chunk on a failure.
+    var left_to_send: ?u64 = control_body.remaining();
+    var chunk: [16 * 1024]u8 = undefined;
     var resp_buf: [8 * 1024]u8 = undefined;
     var body_writer = try request.respondStreaming(&resp_buf, .{
+        .content_length = if (left_to_send) |left| small.len + left else null,
         .respond_options = .{
             .status = status,
             .extra_headers = out_headers.items,
         },
     });
-    var pending: []const u8 = small.items;
+    var pending: []const u8 = small;
+    var from_pending = true;
     while (true) {
         const data: []const u8 = if (pending.len > 0) first: {
             const d = pending;
             pending = "";
             break :first d;
         } else next: {
+            from_pending = false;
             guard.arm(app.io, app.stream_idle_timeout_ms);
             const n = control_body.read(&chunk) catch |err| return upstreamReadError(err, guard);
             if (n == 0) break;
             break :next chunk[0..n];
+        };
+        // Never more than the head of our answer promised (std asserts on
+        // that); the reader's own count makes this unreachable.
+        if (!from_pending) if (left_to_send) |*left| {
+            if (data.len > left.*) return error.UpstreamUnparseable;
+            left.* -= data.len;
         };
         // A client that asks for a large file and then stops reading must
         // not hold this connection for ever.
@@ -1865,6 +2007,9 @@ fn forwardToControl(
         try body_writer.writer.flush();
         try body_writer.flush();
     }
+    // ... and never fewer: ending short of the promised length is an assert
+    // in std, and a lie to the client.
+    if (left_to_send) |left| if (left != 0) return error.UpstreamTruncated;
     guard.arm(app.io, app.client_stall_timeout_ms);
     try body_writer.end();
 }

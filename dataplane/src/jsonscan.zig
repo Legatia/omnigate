@@ -37,11 +37,6 @@ pub const Bounds = struct {
     max_key_len: usize = 8 * 1024,
 };
 
-/// Members per object above which a body may still be forwarded as it is
-/// but is not parsed into a tree (translation, cache key). std's JSON object
-/// is a hash map with a fixed seed: N colliding keys cost N² probes.
-pub const max_members_for_tree: u32 = 1024;
-
 pub const Top = struct {
     /// The `model` value with its quotes, as it stands in the body.
     model: ?Span = null,

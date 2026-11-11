@@ -185,9 +185,9 @@ python tools/malformed_test.py --gateway 127.0.0.1:8080 --key og-unlimited-key -
 
 Run this way it leaves out the hostile upstream and the hostile control
 plane, which need a stack of its own, and the billing checks, which need
-further options. Its `--rpm-key` option adds two checks of the rate limit,
-but it expects a key limited to 3 requests per minute; the dev config's
-`og-ratelimited-key` allows 5, so it is not given here.
+further options. Its `--rpm-key` option adds two checks of the rate limit;
+`--rpm` says how many requests per minute that key allows (3 unless given).
+With the dev config that is `--rpm-key og-ratelimited-key --rpm 5`.
 
 ### Create a key without editing the config
 

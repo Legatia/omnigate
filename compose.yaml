@@ -22,14 +22,28 @@
 #
 #   OMNIGATE_CONTROL_MEMORY    The control plane holds one small record per
 #       recent request (about 61 MiB per million requests inside
-#       retention.ledger_ids_days, 3 days by default), every unfinished job,
-#       and one media output at a time for providers that answer inline.
+#       retention.ledger_ids_days, 3 days by default); a record of every job
+#       until retention removes it (inputs over 8 KiB are kept on disk, not
+#       in memory); and, for providers that return media inline, each such
+#       answer while its job is being stored (up to 256 MiB per job, with no
+#       cap across jobs running at once).
 #       1g is comfortable up to a few million requests per day; raise it, or
 #       shorten ledger_ids_days, beyond that. `GET /metrics` shows
 #       omnigate_ledger_dedup_ids.
-#   OMNIGATE_DATAPLANE_MEMORY  The data plane's own limits add up to well
-#       under this by default: its response cache (OMNIGATE_CACHE_MAX_MB, 64)
-#       and what it may hold of requests being parsed. Raise both together.
+#   OMNIGATE_DATAPLANE_MEMORY  The data plane refuses work beyond three
+#       budgets of its own, set just below in megabytes: request bodies in
+#       flight (OMNIGATE_REQUEST_MEMORY_MB), requests being parsed for
+#       translation or caching (OMNIGATE_PARSE_MEMORY_MB) and its response
+#       cache (OMNIGATE_CACHE_MAX_MB). Here they are 256 + 256 + 64 = 576,
+#       which leaves the 1g container more than 400 MiB for what has no
+#       setting: the usage queue (at most 128 MiB, and only while the
+#       control plane is unreachable), answers buffered for translation and
+#       the buffers of each connection. The aim is that under hostile load
+#       requests are refused (429/503) before the container is killed; the
+#       headroom is an estimate, not a measurement (docs/deployment.md).
+#       If you raise a budget, raise the container limit by at least as
+#       much; the binary's own defaults (1024 + 1024 + 64) are meant for a
+#       host without a limit and do NOT fit in 1g.
 
 services:
   control:
@@ -60,6 +74,12 @@ services:
     # Longer than OMNIGATE_SHUTDOWN_GRACE_MS (10 s by default), so in-flight
     # requests finish and queued usage is delivered before Docker kills it.
     stop_grace_period: 20s
+    environment:
+      # Memory budgets, kept in step with mem_limit (see the top of this
+      # file). Set them in .env, next to OMNIGATE_DATAPLANE_MEMORY.
+      OMNIGATE_REQUEST_MEMORY_MB: ${OMNIGATE_REQUEST_MEMORY_MB:-256}
+      OMNIGATE_PARSE_MEMORY_MB: ${OMNIGATE_PARSE_MEMORY_MB:-256}
+      OMNIGATE_CACHE_MAX_MB: ${OMNIGATE_CACHE_MAX_MB:-64}
     mem_limit: ${OMNIGATE_DATAPLANE_MEMORY:-1g}
     volumes:
       - dataplane-data:/data

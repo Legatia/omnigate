@@ -53,7 +53,8 @@ EXPOSE 4000
 # version replays all of it (about 11 s per million events measured), so the
 # start period is generous: failures inside it do not count against the
 # container, and a healthy answer ends it early.
+# (The port is the one the control plane was told to listen on, if any.)
 HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
-  CMD wget -q -O /dev/null http://127.0.0.1:4000/readyz || exit 1
+  CMD wget -q -O /dev/null "http://127.0.0.1:${OMNIGATE_CONTROL_PORT:-4000}/readyz" || exit 1
 
 CMD ["/app/bin/omnigate_control", "start"]

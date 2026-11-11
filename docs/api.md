@@ -45,7 +45,9 @@ key that never existed: `401 invalid_api_key`.
 
 Errors the gateway raises itself are written in the shape of the protocol
 the client is speaking, so that a program built on the OpenAI or the
-Anthropic SDK handles them like the provider's own.
+Anthropic SDK handles them like the provider's own. A provider's own
+errors are passed on, and put into that shape when they are not in it:
+see [Provider errors](#provider-errors).
 
 On OpenAI-style endpoints, and on everything that is not listed under
 Anthropic below (the jobs API included):
@@ -112,7 +114,7 @@ job error's reason from `error.type` must read `error.code` now.
 | 411 | `invalid_request` | `invalid_request_error` | (always the OpenAI shape) | A `POST`, `PUT` or `PATCH` without a `Content-Length`. A chunked request body (`Transfer-Encoding: chunked`) is not accepted and gets this answer too. |
 | 413 | `payload_too_large` | `invalid_request_error` | `request_too_large` | The request body exceeds 8 MiB; for `POST /v1/jobs`, 8,000,000 bytes (the size the control plane's parser reads). A declared length over the limit is refused without reading any of the body. |
 | 417 | `invalid_request` | `invalid_request_error` | (always the OpenAI shape) | An `Expect` header other than `100-continue`. |
-| 429 | `concurrency_limit_exceeded` | `rate_limit_error` | `rate_limit_error` | The key already has `OMNIGATE_MAX_CONCURRENT_PER_KEY` (512) requests in flight. Answered before the body is read, with `retry-after: 1`. |
+| 429 | `concurrency_limit_exceeded` | `rate_limit_error` | `rate_limit_error` | The key already has its `max_concurrent`, or without one `OMNIGATE_MAX_CONCURRENT_PER_KEY` (512), requests in flight. Answered before the body is read, with `retry-after: 1`. |
 | 429 | `request_memory_exceeded` | `rate_limit_error` | `rate_limit_error` | The requests the key has in flight are too large together (its share of `OMNIGATE_REQUEST_MEMORY_MB`), or it is converting as many large requests at once as it may (its share of `OMNIGATE_PARSE_MEMORY_MB`). With `retry-after: 1`. |
 | 429 | `rate_limit_exceeded` | `rate_limit_error` | `rate_limit_error` | The key is over its `rpm`. The response has a `Retry-After` header in seconds. |
 | 429 | `upstream_rate_limited` | `rate_limit_error` | `rate_limit_error` | No target succeeded and at least one answered 429. The error has `attempts`, and the response carries the longest `retry-after` any of the rate-limited targets sent. |
@@ -127,8 +129,51 @@ not in that function's table gets its category from the status alone: 401,
 403, 404 and 429 as in the rows above, 400 and 405 to 428
 `invalid_request_error`, anything else `server_error` / `api_error`. That
 is how `concurrency_limit_exceeded`, `request_memory_exceeded` and
-`request_too_complex` get theirs; the unit test there that lists the
-reasons has not been extended with these three.
+`request_too_complex` get theirs (the unit test there that lists the
+reasons covers these three since the close-out commit).
+
+### Provider errors
+
+A provider's answer with a status of 400 or above that is not retried
+(429 and 5xx fail over, see [below](#when-every-target-fails)) reaches the
+client with the provider's status. What its body looks like:
+
+- **Already the protocol's error envelope: passed on byte for byte.** For
+  an OpenAI-style upstream that is an object with an `error` object that
+  has a `message`; for an Anthropic-style one, `"type": "error"` with an
+  `error` object that has a `type` and a `message`.
+- **Anything else is put into that envelope** (since the close-out commit,
+  the one after 55a294d; before, it was passed on as it came, and an SDK
+  showed the raw text or could not read it). The message is the provider's
+  own words, `code` is the provider's when it gave one, and the
+  `content-type` becomes `application/json`. `type` follows the status: in
+  the OpenAI shape 401 `authentication_error`, 403 `permission_error`, 404
+  `not_found_error`, 429 `rate_limit_error`, 5xx `server_error`, anything
+  else `invalid_request_error` (a `type` the provider put in its `error`
+  object is kept instead); in the Anthropic shape the same names, with
+  413 `request_too_large` and 5xx `api_error`. Real examples, both from "OpenAI-compatible"
+  endpoints answering a bad provider key:
+
+  | The provider sent | The client gets |
+  |---|---|
+  | `[{"error": {"code": 400, "message": "API key not valid. ...", "status": "INVALID_ARGUMENT"}}]` (Google: an array) | `{"error": {"message": "API key not valid. ...", "type": "invalid_request_error", "param": null, "code": "INVALID_ARGUMENT"}}` |
+  | `{"code": "Client specified an invalid argument", "error": "Incorrect API key provided: ..."}` (xAI: `error` is a string) | `{"error": {"message": "Incorrect API key provided: ...", "type": "invalid_request_error", "param": null, "code": "Client specified an invalid argument"}}` |
+
+  The message is looked for in `error.message`, `error` (a string),
+  `message` and `detail`, in an object or in the first element of an
+  array; a body with none of them, or one that is not JSON (a proxy's HTML
+  page), becomes the message as text, and an empty or non-text body
+  becomes `upstream returned HTTP <status>`. `code` is a string `code`,
+  else a string `status`, else a numeric `code` in digits, else `null`
+  (left out in the Anthropic shape).
+- When the request was [translated](#translation), the error is converted
+  to the client's protocol, as before, and reads the same shapes.
+- Not covered: an error body over 64 KiB, or one sent as an event stream,
+  is relayed as it comes.
+
+`tools/sdk_compat.py` checks this with both SDKs against the mock
+providers, which send the two bodies above; the bodies themselves were
+seen from the real services, the wrapping has only met the mock.
 
 **The jobs API has more reasons.** The ones above are raised by the data
 plane. The control plane, which owns the jobs, adds `job_not_found`,
@@ -221,7 +266,7 @@ with `retry-after: 1`, so an SDK backs off and tries again by itself:
 
 | Limit | Default | Over it |
 |---|---|---|
-| Requests of one key in flight | `OMNIGATE_MAX_CONCURRENT_PER_KEY`, 512 | `429 concurrency_limit_exceeded` |
+| Requests of one key in flight | the key's `max_concurrent`, else `OMNIGATE_MAX_CONCURRENT_PER_KEY`, 512 | `429 concurrency_limit_exceeded` |
 | Request bodies of one key in flight, by declared length, each counted twice | a quarter of `OMNIGATE_REQUEST_MEMORY_MB` (256 MiB of 1,024) | `429 request_memory_exceeded` |
 | Request bodies of all keys in flight | `OMNIGATE_REQUEST_MEMORY_MB`, 1,024 | `503 overloaded` |
 
@@ -415,8 +460,10 @@ provider declared is never passed on.
 
 - An answer that is not an event stream and is at most 64 KiB is read to
   its end, then sent in one piece with a `content-length` the gateway
-  counted. If the provider cuts it short, nothing has been sent yet, and
-  the request fails over like any other failed attempt.
+  counted. If the provider cuts it short, or sends its head and then
+  nothing for `OMNIGATE_STREAM_IDLE_TIMEOUT_MS`, nothing has been sent
+  yet, and the request fails over like any other failed attempt
+  (`UpstreamTruncated`, `StreamIdleTimeout`).
 - An event stream, and any longer answer, is sent with
   `transfer-encoding: chunked` as it arrives. If the provider breaks off
   part way, or sends a body shorter than the length it declared, the
@@ -577,7 +624,8 @@ the route name in `model`, in the client's protocol.
   for other keys, so one client cannot change how another's requests are
   sent). The same applies to models that demand a thought signature on
   earlier tool calls (Gemini 3 and later). Requests in the provider's own
-  protocol are not touched and get the provider's error.
+  protocol are not touched and get the provider's error
+  ([Provider errors](#provider-errors)).
 
 The README lists what has not been verified against real providers here:
 images in translated requests, long conversations, large payloads and
@@ -794,8 +842,9 @@ Creating jobs is limited in these ways:
 - **Jobs per day per key.** A key may create at most `max_jobs_per_day`
   jobs per UTC day (10,000 unless the key or `media.max_jobs_per_day` says
   otherwise; `0` means no limit), whatever became of them. One more answers
-  `429 too_many_jobs_today`; the count starts again at midnight UTC. Jobs
-  made under the key's earlier secrets count too.
+  `429 too_many_jobs_today`; the count starts again at midnight UTC, and
+  `Retry-After` counts down to it. Jobs made under the key's earlier
+  secrets count too.
 - **Size.** `input` and `metadata` together may be at most
   `media.max_input_bytes` (1 MiB by default) as JSON; more answers
   `413 payload_too_large`.
@@ -811,10 +860,11 @@ the answer is `429 rate_limit_exceeded` ("this key is listing jobs too
 often"). Fetching one job by id is not limited.
 
 Every one of these 429 answers carries `Retry-After`: the data plane's own,
-and the control plane's (the seconds until the next request fits for the
-rate limits; 10 for `too_many_open_jobs` and, although that count only
-starts again at midnight UTC, for `too_many_jobs_today` as well), which the
-data plane passes on.
+and the control plane's, which the data plane passes on: the seconds until
+the next request fits for the rate limits; 10 for `too_many_open_jobs`;
+and for `too_many_jobs_today` the seconds until midnight UTC, when the
+count starts again, but at most 3,600 (until the close-out commit it was
+10 there as well).
 
 A key over its budget cannot create a job (`402 budget_exceeded`) but can
 still fetch, list and cancel its jobs and download their files.
@@ -1032,7 +1082,7 @@ shape, with the reason in `error.code` (see [Shape](#shape)), and the same
 | 413 | `payload_too_large` | `input` and `metadata` together are larger than `media.max_input_bytes` (1 MiB by default); or the whole body is larger than 8,000,000 bytes, the limit of the control plane's JSON parser, which the data plane applies to job requests itself so that both give the same answer. |
 | 429 | `rate_limit_exceeded` | Create: the control plane's own count of the key's `rpm` (a token bucket, like the data plane's) is used up. List: the key is listing jobs too often (its `rpm`, or 600 per minute when it has none). |
 | 429 | `too_many_open_jobs` | Create only: the key already has its limit of unfinished jobs. Wait for some to finish, or cancel some. |
-| 429 | `too_many_jobs_today` | Create only: the key already created its limit of jobs this UTC day (`max_jobs_per_day`). The count starts again at midnight UTC. |
+| 429 | `too_many_jobs_today` | Create only: the key already created its limit of jobs this UTC day (`max_jobs_per_day`). The count starts again at midnight UTC; `Retry-After` is the seconds until then, at most 3,600. |
 | 503 | `storage_unavailable` | Create only: the job could not be written to the job store (its disk, most likely). Nothing was created; try again shortly. |
 | 500 | `internal_error` | The control plane failed while handling the request. The error carries a `request_id` that is also in the control plane's log, and is the id in the response's `x-omnigate-request-id`; nothing else about the failure is disclosed. |
 | 400 | `webhook_not_configured` | `webhook_url` was given but no signing secret is configured for this key. |
@@ -1086,14 +1136,14 @@ a browser would render as a page on the gateway's origin.
   the gateway itself, with or without a proxy in front. (For a short
   while, between commits 3a0b147 and 10bc009, it did not, and the included
   proxy added them; that rule is gone from `deploy/Caddyfile`.)
-- **Framing.** A file of at most 64 KiB is sent with a `content-length`.
-  A larger one is sent with `transfer-encoding: chunked` and **no
-  `content-length`**, so a client cannot show a percentage while it
-  downloads; the size is in the job (`outputs[].bytes`), and so is the
-  SHA-256 to check the result against. If the download breaks off inside
-  the gateway, the connection is dropped without the closing chunk. A
-  client that stops reading for `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30
-  seconds) is disconnected.
+- **Framing.** A file is sent with its `content-length`, whatever its
+  size, so a client can show progress and can tell a whole file from a cut
+  one; the size is also in the job (`outputs[].bytes`), with the SHA-256
+  to check the result against. (Between commit e4e30e4 and the close-out
+  commit a file over 64 KiB was sent with `transfer-encoding: chunked` and
+  no length.) If the download breaks off inside the gateway, the
+  connection is dropped short of that length. A client that stops reading
+  for `OMNIGATE_CLIENT_STALL_TIMEOUT_MS` (30 seconds) is disconnected.
 
 To show an output in a web page, fetch it and use it from your own origin
 (or use bucket storage); do not point a page at the gateway URL and expect
@@ -1276,9 +1326,14 @@ otherwise. Besides the errors of each endpoint, any request can get:
 | 401 | `unauthorized` | `/admin/*` or `/metrics` without the admin token or a session; `/internal/*` without the internal token. |
 | 404 | `not_found` | No such endpoint. |
 | 413 | `payload_too_large` | A body larger than 8,000,000 bytes. On `POST /login`, the only endpoint that takes a body without a credential, and on `POST /logout` from a signed-in browser: a body declared larger than 4,096 bytes, or sent with chunked encoding instead of a declared length. |
-| 429 | `too_many_attempts` | `/admin/*`, `/metrics` and the dashboard page (`/`): this address has sent 20 wrong admin tokens within a minute. Every bearer token from it is refused until that minute is over, the right one included; the answer has `retry-after: 60`. See [Admin](admin.md#two-ways-in). |
+| 429 | `too_many_attempts` | `/admin/*`, `/metrics`, the dashboard page (`/`) and `GET /login`: this address has sent 20 wrong admin tokens within a minute. Every bearer token from it is refused until that minute is over, the right one included; the answer has `retry-after: 60`. See [Admin](admin.md#two-ways-in). |
 | 503 | `not_ready` | `GET /internal/config` while the ledger is starting or restarting, with `retry-after: 1`. |
 | 500 | `internal_error` | An unexpected failure. The error has a `request_id` (the same value as the `x-request-id` header) that is also in the control plane's log line for it; the cause is only in the log. |
+
+The admin API adds reasons of its own: `key_not_found` (404), `key_exists`
+(409), `read_only_key` (409) and, for a change from a browser session
+without the CSRF token, `csrf_failed` (403). They are described in
+[Admin](admin.md).
 
 A request is handled in this order: the path check above, then the
 credential for the path's first segment, then the body, then the CSRF
@@ -1302,8 +1357,8 @@ check, then the endpoint.
   The bearer count covers `/admin/*`, `/metrics`, the dashboard page (`/`)
   and `/login`, which also accept the token; until commit d79406b the last
   two compared it outside the throttle. A locked-out address gets
-  `429 too_many_attempts` on the first three; the sign-in page ignores its
-  token and shows the form. A request with no `Authorization`
+  `429 too_many_attempts` on the first three and on `GET /login` (which
+  showed the form with `200` until the close-out commit). A request with no `Authorization`
   header at all is not a guess and is not counted, and a signed-in browser
   session is not affected by a bearer lockout.
 - **HTTP/1.1 only.** The control plane's listener has HTTP/2 and WebSocket
@@ -1344,6 +1399,7 @@ curl http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-
       "period_spend_usd": 0.0108,
       "period_resets_at": null,
       "rpm": 0,
+      "max_concurrent": 0,
       "models": null,
       "max_open_jobs": 100,
       "max_jobs_per_day": 10000,
@@ -1374,6 +1430,7 @@ curl http://127.0.0.1:4000/admin/keys -H "Authorization: Bearer dev-admin-token-
 | `state` | `active`, `blocked` (budget spent for the current period), `disabled`, or `shadowed`. `blocked`, `disabled` and `shadowed` are also given as booleans. |
 | `shadowed` | `true` for a managed key that is out of use because the config file defines a key with the same name. Such a key is listed after all the others, here, in `GET /admin/overview` and in the dashboard; its secret answers `401` until one of the two is removed. See [Admin](admin.md#gateway-keys-two-sources). |
 | `budget_period`, `period_spend_usd`, `period_resets_at` | What the budget covers, the spend that counts against it, and when that starts over (`null` for a total budget). |
+| `max_concurrent` | The key's own cap on requests in flight at once per data-plane process; `0` when it has none and the data plane's `OMNIGATE_MAX_CONCURRENT_PER_KEY` applies. |
 | `max_open_jobs` | The limit on unfinished media jobs in force for the key: its own setting, or `media.max_open_jobs` when it has none. `0` means no limit. |
 | `max_jobs_per_day` | The limit on media jobs created per UTC day in force for the key: its own setting, or `media.max_jobs_per_day` when it has none. `0` means no limit. |
 | `requests` | Text calls and media jobs recorded in the ledger. `jobs` counts the media jobs among them. |
@@ -1445,7 +1502,7 @@ config and caveats.
 | Method and path | Purpose |
 |---|---|
 | `GET /` | The dashboard: totals, keys (with create, disable, rotate and delete for managed keys), recent requests and media jobs, refused requests, admin activity, and a read-only view of the configuration. Redirects to `/login` without a session. See [Admin](admin.md#the-dashboard). |
-| `GET /login` | The sign-in form. |
+| `GET /login` | The sign-in form. With a bearer token from an address that is locked out for wrong tokens: `429 too_many_attempts`, as on `/`. |
 | `POST /login` | Form field `password` = the admin token. Sets the `omnigate_session` cookie (12 hours, `HttpOnly`, `SameSite=Strict`) and redirects to `/`. A wrong token answers 401; after five failures from one address, 429 for a minute. The body may be at most 4,096 bytes, declared in `Content-Length` (413 otherwise). Failed and throttled attempts are aggregated in the audit log: at most two lines per address, outcome and minute ([Admin](admin.md#the-audit-log)). |
 | `POST /logout` | Clears the cookie. From a session it needs the CSRF token, which the dashboard's sign-out button sends. |
 

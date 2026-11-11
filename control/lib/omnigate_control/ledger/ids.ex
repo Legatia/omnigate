@@ -85,7 +85,20 @@ defmodule OmnigateControl.Ledger.Ids do
   not know is removed: it was started after the snapshot was taken.
   """
   def load(path, registry, covered) when is_map(covered) do
-    Enum.reduce(files(path), %__MODULE__{path: path, registry: registry}, fn {day, file}, ids ->
+    found = files(path)
+    present = MapSet.new(found, &elem(&1, 0))
+
+    # A day the snapshot counted ids for, without its file: those ids are
+    # gone, and an event of that day that is sent again would be counted a
+    # second time. Nothing here can bring them back; say so.
+    for {day, bytes} <- Enum.sort(covered), is_integer(bytes) and bytes > 0, not MapSet.member?(present, day) do
+      Logger.warning(
+        "ledger: the id file for #{day} (#{file(path, day)}) is missing; the snapshot recorded #{div(bytes, @record)} ids in it. " <>
+          "A usage event of that day that is delivered again will be counted twice"
+      )
+    end
+
+    Enum.reduce(found, %__MODULE__{path: path, registry: registry}, fn {day, file}, ids ->
       case covered do
         %{^day => bytes} when is_integer(bytes) and bytes > 0 ->
           keep = min(bytes, File.stat!(file).size) |> then(&(&1 - rem(&1, @record)))

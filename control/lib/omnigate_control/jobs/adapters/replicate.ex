@@ -12,6 +12,12 @@ defmodule OmnigateControl.Jobs.Adapters.Replicate do
   (November 2026): create, poll, output download, and provider errors
   (unknown model, insufficient credit). The `owner/name:version` form and
   cancel have only met the mock.
+
+  Those calls were made with the HTTP client this adapter used at the time
+  (OTP's `:httpc`). They have not been repeated on the client that replaced
+  it (`OmnigateControl.Http`): against the real service that one has only
+  sent a request with an invalid key, which shows that the service is
+  reached and its error is read, not that a job completes.
   """
   @behaviour OmnigateControl.Jobs.Adapter
 

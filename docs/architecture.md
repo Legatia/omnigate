@@ -87,8 +87,10 @@ bucket-stored file lives) and `retry-after`. Nothing else, cookies and
 server headers included. The length is not relayed: the data plane reads
 the control plane's answer with the same bounded reader as a provider's
 (`framing.zig`) and frames its own. An answer of at most 64 KiB is buffered
-and sent with a length the data plane counted; a longer one (a file, or a
-long job answer) is sent chunked. An answer whose head or framing cannot be
+and sent with a length the data plane counted. A longer one (a file, or a
+long job answer) is streamed: with the length the control plane declared
+when it gave one, which the reader then holds it to byte for byte (so a
+file download has its `content-length`), otherwise chunked. An answer whose head or framing cannot be
 read, or that is cut short within those first 64 KiB, becomes a 502
 `control_plane_unavailable`; one cut short later drops the client's
 connection without the closing chunk.
@@ -108,9 +110,9 @@ connection without the closing chunk.
   data plane sees changes, including a key flipping to blocked.
 
 There are no budgets, prices or secrets in it, and nothing about media
-beyond those names. Nor is there a per-key concurrency limit: the data
-plane would read a key's `max_concurrent`, but the control plane sends
-none, so `OMNIGATE_MAX_CONCURRENT_PER_KEY` applies to every key. The data
+beyond those names. Each key carries its `max_concurrent` (since the
+close-out commit, the one after 55a294d): `0` for a key without one, to
+which `OMNIGATE_MAX_CONCURRENT_PER_KEY` applies. The data
 plane installs a snapshot only when its version differs from the one in
 force, and writes it to the config cache file so that it can start from it
 when the control plane is down.
@@ -230,7 +232,16 @@ snapshot it has: a blocked key stays blocked.
       been read to its end nothing is sent, so a cut-off one still fails
       over. A translated answer that is not a stream is buffered whole (at
       most 16 MiB), converted in a tree capped like a request's, and sent
-      the same way.
+      the same way. While it is being buffered, a silent upstream is timed
+      by a timer next to the read (as the wait for the head is), not by
+      the watchdog: after `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` without a byte
+      only the read is cancelled, the attempt fails with
+      `StreamIdleTimeout`, and the request goes on to the next target on
+      the same, intact task.
+    - A buffered answer with a status of 400 or above that is not its
+      protocol's error envelope (an array, `error` as a string, plain
+      text) is put into that envelope, with the provider's message and
+      code; a well-formed one is relayed byte for byte.
     - Everything else, an event stream or a longer answer, is sent chunked
       and flushed chunk by chunk. If the upstream speaks the other protocol
       the stream is translated event by event, each event in parse memory
@@ -244,7 +255,16 @@ snapshot it has: a blocked key stays blocked.
     - The response head carries the gateway's own headers and the provider
       headers on a fixed allowlist (retry hints, rate-limit counters,
       request ids).
-13. **Deadlines while relaying.** The connection's deadline is set anew
+13. **Deadlines while relaying.** The watchdog cancels a connection's task
+    when its deadline passes, and that is the end of the task: it waits
+    for it, and nothing in the task can be interrupted a second time. So
+    it is only armed where ending is the right outcome: while a client
+    sends its request, while an answer is written to the client (the
+    gateway's own answers included: the client stall timeout, once the
+    request has been read), and while a response is being relayed. It is
+    not armed while an upstream is awaited before anything was sent; those
+    waits have timers of their own (steps 11 and 12).
+    The connection's deadline is set anew
     before each read and each write. Before a read from the upstream it is
     `OMNIGATE_STREAM_IDLE_TIMEOUT_MS` (5 minutes): if the upstream goes
     silent for that long in the middle of a response the watchdog cancels
@@ -727,7 +747,7 @@ optionally `poll` and `cancel`. There are seven: `replicate`, `fal`, `openai_ima
 | `jobs.jsonl` | control | A new job appends its full snapshot; each later change appends a short patch line with only the fields that changed, so a job's input is written once. Every line is synced before the change is visible. Rewritten compacted (one full line per job) at a start that finds more lines than jobs, after a retention sweep that removed jobs, and while running (checked once a minute) once the lines appended since the last compaction exceed both 5,000 and twice the number of jobs. | Job state. A job whose input is over 8 KiB has `"input": null` and `"input_file": true` here. |
 | `jobs.jsonl.inputs/<job id>.json` | control | Written once, synced, before the job that points at it is created. Deleted with the job by retention; a file without a job is removed at a start. | The `input` of a job when it is over 8 KiB as JSON, kept out of the job record and out of memory. Belongs to `jobs.jsonl`: back them up together. |
 | `keys.json` | control | Replaced whole on every key change (temp file, sync, rename). | Managed keys: name, SHA-256 of the current secret and of earlier ones, budget and period, rate limit, models, the limits on unfinished jobs and on jobs per day, disabled flag, and the webhook secret (in clear text) if set. Never a key itself. |
-| `audit.jsonl`, `audit.jsonl.1` to `.3` | control | One line appended and synced per admin action. Failed and throttled sign-ins, which anyone can cause, are not one line each: the first from an address in a minute is a line, the rest are counted and written as one summary line with `repeats`. When the file would pass `OMNIGATE_AUDIT_MAX_MB` (50) it is renamed to `.1`, the older files move up, and the fourth falls off. | Who changed which key, and sign-ins. Every text field is made single-line, valid UTF-8 before it is written. |
+| `audit.jsonl`, `audit.jsonl.1` to `.3` | control | One line appended and synced per admin action. Failed and throttled sign-ins, which anyone can cause, are not one line each: the first from an address in a minute is a line, the rest are counted and written as one summary line with `repeats` when the minute is over, or when the control plane is stopped cleanly. When the file would pass `OMNIGATE_AUDIT_MAX_MB` (50) it is renamed to `.1`, the older files move up, and the fourth falls off. | Who changed which key, and sign-ins. Every text field is made single-line, valid UTF-8 before it is written. |
 | The media directory | control | One directory per job. | Locally stored outputs. |
 | `omnigate-usage.spool` | data | Appended per usage event (not synced). Emptied when the queue drains; rewritten to hold only the undelivered events once the delivered ones at its front take more than 1 MiB and more than the undelivered ones. | Undelivered usage events, at most 100,000 and 128 MiB of them. |
 | `omnigate-config.cache.json` | data | Rewritten (temp file, then rename) when a new snapshot is installed. | Start without the control plane. Holds key hashes and routes, never secrets. |
@@ -797,9 +817,10 @@ The reasons below are the ones stated in the code and the README.
   plane reads every upstream and control-plane body with its own bounded
   framing and frames what it sends itself; the control plane reads every
   outbound response through a cap chosen by the caller, with its own
-  HTTP client. The price on the data plane's side is that an answer over
-  64 KiB goes out chunked, so a file download no longer carries its
-  length.
+  HTTP client. The price on the data plane's side is that a provider's
+  answer over 64 KiB goes out chunked. (So did file downloads, until the
+  close-out commit: the control plane's declared length is passed on
+  again, enforced by the same reader.)
 - **Bill what the provider was asked for.** A media job's price follows the
   request the adapter built, not labels in the client's input, and a
   per-second price always has seconds to apply to (the request's, or the

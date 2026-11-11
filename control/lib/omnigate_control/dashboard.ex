@@ -159,6 +159,7 @@ defmodule OmnigateControl.Dashboard do
       fmt(:int, k.jobs),
       ~s(</td><td class="num">),
       if(k.rpm > 0, do: fmt(:int, k.rpm), else: "—"),
+      if(Map.get(k, :max_concurrent, 0) > 0, do: [~s(<span class="muted sub">), fmt(:int, k.max_concurrent), " at once</span>"], else: ""),
       ~s(</td><td class="models">),
       if(k.models, do: h(Enum.join(k.models, ", ")), else: ~s(<span class="muted">all</span>)),
       ~s(</td><td class="actions">),
@@ -321,6 +322,7 @@ defmodule OmnigateControl.Dashboard do
               h(a["target"] || "—"),
               ~s(</td><td>),
               pill(a["outcome"], if(a["outcome"] == "ok", do: "ok", else: "warn")),
+              repeats(a["repeats"]),
               ~s(</td><td>),
               h(a["auth"]),
               ~s(</td><td class="mono">),
@@ -332,6 +334,10 @@ defmodule OmnigateControl.Dashboard do
       ~s(</tbody></table></div></section>)
     ]
   end
+
+  # A summary line of the audit log: how many more attempts it stands for.
+  defp repeats(n) when is_integer(n) and n > 0, do: [~s(<span class="muted sub">), fmt(:int, n), ~s( more</span>)]
+  defp repeats(_), do: []
 
   defp key_label("-"), do: "(no valid key)"
   defp key_label(name), do: name
@@ -559,7 +565,7 @@ defmodule OmnigateControl.Dashboard do
       r.appendChild(s);
       r.appendChild(td('num',int(k.requests)));r.appendChild(td('num',int(k.errors)));
       var tk=td('num',int(k.input_tokens)+' / '+int(k.output_tokens));cacheNote(tk,k.cached_input_tokens,k.cache_write_input_tokens);r.appendChild(tk);r.appendChild(td('num',int(k.jobs)));
-      r.appendChild(td('num',k.rpm>0?int(k.rpm):'—'));
+      var rc=td('num',k.rpm>0?int(k.rpm):'—');if(k.max_concurrent>0)rc.appendChild(el('span','muted sub',int(k.max_concurrent)+' at once'));r.appendChild(rc);
       r.appendChild(k.models?td('models',k.models.join(', ')):td('models',muted('all')));
       var a=td('actions');
       if(k.source==='managed'){
@@ -596,7 +602,8 @@ defmodule OmnigateControl.Dashboard do
 
     function refusedRow(x){var r=el('tr');r.appendChild(td('',x.key==='-'?'(no valid key)':x.key));r.appendChild(td('mono',x.reason));r.appendChild(td('num',int(x.count)));return r}
     function activityRow(a){var r=el('tr');r.appendChild(td('mono',stamp(a.ts)));r.appendChild(td('',a.action));r.appendChild(td('',a.target||'—'));
-      r.appendChild(td('',pill(a.outcome,a.outcome==='ok'?'ok':'warn')));r.appendChild(td('',a.auth||''));r.appendChild(td('mono',a.address||'—'));return r}
+      var oc=td('',pill(a.outcome,a.outcome==='ok'?'ok':'warn'));if(a.repeats>0)oc.appendChild(el('span','muted sub',int(a.repeats)+' more'));r.appendChild(oc);
+      r.appendChild(td('',a.auth||''));r.appendChild(td('mono',a.address||'—'));return r}
 
     var last=null;
     function render(d){

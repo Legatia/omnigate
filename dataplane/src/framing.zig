@@ -114,6 +114,18 @@ pub const BodyReader = struct {
         return r.state == .done;
     }
 
+    /// Bytes still to come, when that is known: the head gave a length, or
+    /// the body is over. Null while the end can only be seen on arrival
+    /// (chunked, or until the connection closes). Whatever `read` returns
+    /// from here on adds up to exactly this, or `read` fails.
+    pub fn remaining(r: *const BodyReader) ?u64 {
+        return switch (r.state) {
+            .length => |left| left,
+            .done => 0,
+            else => null,
+        };
+    }
+
     /// Read some of the body: whatever is at hand, up to `dest.len` bytes.
     /// Returns 0 only at the end of the body.
     pub fn read(r: *BodyReader, dest: []u8) Error!usize {

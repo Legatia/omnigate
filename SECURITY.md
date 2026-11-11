@@ -5,10 +5,7 @@
 Please report security problems privately. Do not open a public issue or
 pull request for them.
 
-> **CONTACT PLACEHOLDER. Maintainer: replace this block with the address or
-> private reporting channel to use, before publishing this file.**
->
-> Report to: `<security contact to be filled in>`
+Report to: **hello@legatia.solutions**
 
 Include, as far as you can:
 

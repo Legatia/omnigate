@@ -4,8 +4,11 @@ Thanks for looking. This page covers how to build the two processes, how to
 run every test suite, where things live, and the conventions the existing
 code follows.
 
-The repository does not have a license file yet. Ask the maintainer about
-terms before assuming any.
+The code is under the [PolyForm Noncommercial License 1.0.0](LICENSE);
+commercial use needs a separate license ([COMMERCIAL.md](COMMERCIAL.md)).
+Because the maintainer licenses the project commercially as well, ask at
+hello@legatia.solutions before sending a substantial contribution, so the
+terms for it are agreed first.
 
 Security problems: do not open a public issue. See [SECURITY.md](SECURITY.md).
 

@@ -72,11 +72,10 @@ is green.
 
 One-time things to settle. None of them is done by the workflow.
 
-1. **Decide the license.** The repository has no license file
-   (`CONTRIBUTING.md` says so). Publishing binaries and images is a
-   distribution; settle the terms first.
-2. **Fill in the security contact** in `SECURITY.md`, which still has a
-   placeholder.
+1. **License.** Done: `LICENSE` is the PolyForm Noncommercial License
+   1.0.0 and `COMMERCIAL.md` says how to get a commercial one. Published
+   binaries and images are distributed under the same terms.
+2. **Security contact.** Done: `SECURITY.md` names hello@legatia.solutions.
 3. **Repository settings.** The workflow uses only the token GitHub gives
    each run, with `packages: write` for pushing images and `contents: write`
    for creating the release, both requested in the workflow file. If the
@@ -337,5 +336,6 @@ first.
   not shipped.
 - No packages for package managers, no Helm chart, and no archive of the
   control plane.
-- No license file in the archives or images, because the repository has
-  none yet.
+- The archives and images do not yet contain the `LICENSE` file; the
+  license asks that recipients get the terms or their URL, so add it to
+  the packaging before the first release.

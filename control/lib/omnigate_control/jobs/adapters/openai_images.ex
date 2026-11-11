@@ -9,11 +9,8 @@ defmodule OmnigateControl.Jobs.Adapters.OpenAIImages do
 
   Checked against the real service with `gpt-image-1-mini` (November 2026).
 
-  Those calls were made with the HTTP client this adapter used at the time
-  (OTP's `:httpc`). They have not been repeated on the client that replaced
-  it (`OmnigateControl.Http`): against the real service that one has only
-  sent a request with an invalid key, which shows that the service is
-  reached and its error is read, not that a job completes.
+  Re-run with real keys on the current HTTP client on 11 November 2026
+  (commit 809b96f); it passed.
   """
   @behaviour OmnigateControl.Jobs.Adapter
 

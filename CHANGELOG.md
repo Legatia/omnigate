@@ -17,6 +17,10 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Verified
+
+- Re-ran the real-provider checks with real keys on the rewritten HTTP client and response reader (11 November 2026): OpenAI, Anthropic, Gemini, xAI, Replicate, ElevenLabs and Cloudflare R2 all pass. fal has still not completed a job.
+
 ### Security
 
 Five commits fix what two independent reviews of the code found in

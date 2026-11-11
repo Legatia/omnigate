@@ -72,9 +72,7 @@ response in both processes. After commits e4e30e4 and d79406b: the control
 plane's new HTTP client and the data plane's new response reader were each
 run against the real hosts of OpenAI, Anthropic, Gemini, xAI, ElevenLabs,
 Replicate and fal with deliberately invalid keys; every provider's own auth
-error came back intact. The successful paths that were verified earlier
-with real keys (text, images, speech, video, bucket storage) have NOT been
-re-run on the new client and reader.
+error came back intact. The successful paths were then re-run with real keys on 11 November 2026, at commit 809b96f, and all passed: OpenAI and Anthropic text (direct, streamed, translated both ways, tool calls, failover, metering), Gemini text, xAI text, an OpenAI image job, Gemini image, speech and video jobs, an xAI image job and a one-second xAI video, a Replicate image job, ElevenLabs speech with a cache hit, and output storage in a Cloudflare R2 bucket. fal has still only returned an auth error, never a completed job.
 
 ## If you are upgrading from an earlier commit
 

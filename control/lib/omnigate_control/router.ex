@@ -25,7 +25,7 @@ defmodule OmnigateControl.Router do
   """
   use Plug.Router
 
-  alias OmnigateControl.{Admin, AdminAuth, Audit, ConfigStore, Dashboard, Jobs, Keys, Ledger, Metrics, RateLimit, Rejections, Storage, UrlSigner}
+  alias OmnigateControl.{Admin, AdminAuth, Audit, ConfigStore, Dashboard, Jobs, Keys, Ledger, Metrics, RateLimit, Rejections, Storage, Text, UrlSigner}
 
   require Logger
 
@@ -35,26 +35,36 @@ defmodule OmnigateControl.Router do
   @public_segments ["internal", "healthz", "readyz", "login", "logout"] ++
                      if(Application.compile_env(:omnigate_control, :test_routes, false), do: ["__test"], else: [])
 
-  # Largest request body the parser reads; anything bigger is a 413.
+  # Largest request body the parser reads; anything bigger is a 413. The
+  # limit is spelled out because the data plane enforces the same number for
+  # job requests (`max_job_body` in proxy.zig): a body one process accepts
+  # must not be refused by the other.
   @max_body_bytes 8_000_000
+  # The only body an anonymous caller may have parsed is the login form,
+  # which is a few dozen bytes.
+  @public_body_limit 4096
+
+  @parse_full Plug.Parsers.init(parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"], length: @max_body_bytes)
+  @parse_small Plug.Parsers.init(parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"], length: @public_body_limit)
+
+  # `GET /v1/jobs` per key per minute when the key has no `rpm` of its own.
+  @list_rpm 600
 
   # Order matters. The guards below decide by `conn.path_info`, which is the
   # path exactly as sent, while the router matches on the percent-DECODED
   # path: `/%61dmin/keys` used to slip past every guard and still reach the
   # `/admin/keys` handler. `plain_path` makes the two views identical before
   # anything else runs, and the guards refuse whatever they do not recognise.
-  # Authentication also comes before body parsing, so an anonymous caller
-  # cannot make this process parse megabytes of JSON.
+  # Authentication also comes before body parsing, and `parse_body` parses
+  # only for callers who have authenticated (and the login form), so an
+  # anonymous caller cannot make this process read or parse megabytes.
   plug(:request_id)
+  plug(:close_unread)
   plug(:plain_path)
   plug(:match)
   plug(:internal_auth)
   plug(:admin_auth)
-  plug(:small_public_body)
-  # The limit is spelled out because the data plane enforces the same number
-  # for job requests (`max_job_body` in proxy.zig): a body one process
-  # accepts must not be refused by the other.
-  plug(Plug.Parsers, parsers: [:urlencoded, :json], json_decoder: JSON, pass: ["*/*"], length: @max_body_bytes)
+  plug(:parse_body)
   plug(:csrf)
   plug(:dispatch)
 
@@ -88,7 +98,8 @@ defmodule OmnigateControl.Router do
     # The id ties the client's error to this log line; nothing else about the
     # failure leaves the process.
     id = conn.assigns[:request_id] || new_request_id()
-    Logger.error("request #{id} #{conn.method} #{conn.request_path} failed: " <> Exception.format(:error, error, stack))
+    # The method and the path are the caller's words: one line of plain text, whatever was sent.
+    Logger.error("request #{id} #{Text.line(conn.method, 20)} #{Text.line(conn.request_path, 200)} failed: " <> Exception.format(:error, error, stack))
 
     conn
     |> put_resp_header("x-request-id", id)
@@ -121,8 +132,16 @@ defmodule OmnigateControl.Router do
     |> send_resp(200, Metrics.render())
   end
 
+  # The snapshot says which keys are out of budget, and that comes from the
+  # ledger. While the ledger is starting (or restarting) there is no spend to
+  # read, and "nothing spent" would unblock every key. Answer "not now"
+  # instead: a data plane keeps the config it has until it gets a new one.
   get "/internal/config" do
-    send_json(conn, 200, snapshot())
+    if Ledger.ready?() do
+      send_json(conn, 200, snapshot())
+    else
+      conn |> put_resp_header("retry-after", "1") |> send_error(503, "not_ready", "the ledger is starting; keep the current config and ask again")
+    end
   end
 
   post "/internal/usage/batch" do
@@ -154,11 +173,13 @@ defmodule OmnigateControl.Router do
     with {:ok, key} <- gateway_key(conn),
          :ok <- within_budget(key),
          :ok <- model_allowed(key, conn.body_params["model"]),
-         :ok <- within_rate(key) do
-      idempotency_key = conn |> get_req_header("idempotency-key") |> List.first()
+         idempotency_key = conn |> get_req_header("idempotency-key") |> List.first(),
+         :ok <- within_rate(key, idempotency_key) do
+      # Unfinished jobs, and jobs created today, are counted across the key's rotations.
+      hashes = Keys.hashes(key)
+      caps = [open_cap: {Keys.max_open_jobs(key), hashes}, day_cap: {Keys.max_jobs_per_day(key), hashes}]
 
-      # Unfinished jobs are counted across the key's rotations.
-      case Jobs.create(key.key_sha256, conn.body_params, idempotency_key, open_cap: {Keys.max_open_jobs(key), Keys.hashes(key)}) do
+      case Jobs.create(key.key_sha256, conn.body_params, idempotency_key, caps) do
         {:ok, job} -> send_json(conn, 202, Jobs.view(job))
         {:existing, job} -> send_json(conn, 200, Jobs.view(job))
         # Too many unfinished jobs: worth trying again once some have finished.
@@ -172,7 +193,8 @@ defmodule OmnigateControl.Router do
   end
 
   get "/internal/v1/jobs" do
-    with {:ok, key} <- gateway_key(conn) do
+    with {:ok, key} <- gateway_key(conn),
+         :ok <- list_within_rate(key) do
       conn = fetch_query_params(conn)
 
       limit =
@@ -189,8 +211,10 @@ defmodule OmnigateControl.Router do
         |> Enum.sort_by(& &1["created_ms"], :desc)
         |> Enum.take(limit)
 
-      send_json(conn, 200, %{object: "list", data: Enum.map(jobs, &Jobs.view/1)})
+      # A list leaves large inputs out (`"input_omitted": true`); fetch the job to see one.
+      send_json(conn, 200, %{object: "list", data: Enum.map(jobs, &Jobs.view(&1, input: false))})
     else
+      {:error, 429, type, message, retry_after_s} -> conn |> put_resp_header("retry-after", Integer.to_string(retry_after_s)) |> send_error(429, type, message)
       {:error, status, type, message} -> send_error(conn, status, type, message)
     end
   end
@@ -307,24 +331,27 @@ defmodule OmnigateControl.Router do
     # A bearer-token request has no session to tie a CSRF token to; it does
     # not need one either.
     csrf =
-      case AdminAuth.session(conn) do
-        nil -> ""
-        session -> AdminAuth.csrf_token(session)
+      case conn.assigns[:auth] == :session && AdminAuth.session(conn) do
+        session when is_binary(session) -> AdminAuth.csrf_token(session)
+        _ -> ""
       end
 
     send_html(conn, 200, Dashboard.page(Admin.overview(), csrf, nonce), nonce)
   end
 
   get "/login" do
-    if AdminAuth.authorized?(conn), do: redirect(conn, "/"), else: send_html(conn, 200, login_page(nil))
+    if conn.assigns[:auth] in [:session, :token], do: redirect(conn, "/"), else: send_html(conn, 200, login_page(nil))
   end
 
+  # Failed and throttled attempts are anyone's to cause: they go to the
+  # audit log through `Audit.anonymous/4`, which never makes this request
+  # (or an operator's) wait and writes at most two lines per address a minute.
   post "/login" do
     address = AdminAuth.client_address(conn)
 
     cond do
       AdminAuth.throttled?(address) ->
-        Audit.record(conn, "login", nil, "throttled", auth: "password")
+        Audit.anonymous(conn, "login", "throttled", auth: "password")
         send_html(conn, 429, login_page("Too many failed attempts. Wait a minute and try again."))
 
       AdminAuth.valid_token?(conn.body_params["password"]) ->
@@ -342,14 +369,14 @@ defmodule OmnigateControl.Router do
 
       true ->
         AdminAuth.note_failure(address)
-        Audit.record(conn, "login", nil, "denied", auth: "password")
+        Audit.anonymous(conn, "login", "denied", auth: "password")
         send_html(conn, 401, login_page("That is not the admin token."))
     end
   end
 
   post "/logout" do
     # Only a logout that ends a session is worth a line.
-    if AdminAuth.session(conn), do: Audit.record(conn, "logout", nil, "ok")
+    if conn.assigns[:auth] == :session, do: Audit.record(conn, "logout", nil, "ok")
 
     conn
     |> delete_resp_cookie(AdminAuth.cookie_name(), http_only: true, same_site: "Strict", secure: secure_cookie?(conn))
@@ -454,10 +481,35 @@ defmodule OmnigateControl.Router do
   # The key's requests-per-minute limit, counted here for job creation. The
   # data plane counts too, but only for the exact paths it recognises, and a
   # limit that guards paid work must not depend on that.
-  defp within_rate(key) do
-    case RateLimit.check(key.name, Map.get(key, :rpm, 0)) do
+  #
+  # Counted per key (by the hash of its current secret, like the data plane),
+  # not per name: two keys never share an allowance. A request that repeats
+  # an Idempotency-Key this key already used creates nothing (it gets the
+  # first job back), so it does not use up the allowance either.
+  defp within_rate(key, idempotency_key) do
+    if is_binary(idempotency_key) and Jobs.Store.idempotent?(key.key_sha256, idempotency_key) do
+      :ok
+    else
+      case RateLimit.check(Keys.identity(key), Map.get(key, :rpm, 0)) do
+        :ok -> :ok
+        {:error, retry_after_s} -> {:error, 429, "rate_limit_exceeded", "this key is over its requests-per-minute limit", retry_after_s}
+      end
+    end
+  end
+
+  # Listing jobs is cheap but not free, and nothing else limits it for a key
+  # without an `rpm`. It has a bucket of its own, so listing never eats into
+  # the allowance for creating jobs.
+  defp list_within_rate(key) do
+    rpm =
+      case Map.get(key, :rpm, 0) do
+        n when is_integer(n) and n > 0 -> n
+        _ -> @list_rpm
+      end
+
+    case RateLimit.check({:list, Keys.identity(key)}, rpm) do
       :ok -> :ok
-      {:error, retry_after_s} -> {:error, 429, "rate_limit_exceeded", "this key is over its requests-per-minute limit", retry_after_s}
+      {:error, retry_after_s} -> {:error, 429, "rate_limit_exceeded", "this key is listing jobs too often", retry_after_s}
     end
   end
 
@@ -584,29 +636,24 @@ defmodule OmnigateControl.Router do
   # `/admin/*` is an API: answer 401. The dashboard is a page: send the
   # browser to the login form. Everything else here is either public
   # (`/healthz`, `/login`) or guarded by `internal_auth` above.
+  #
+  # Wherever the admin token is accepted, it is checked in one place
+  # (`AdminAuth.authenticate/1`), which counts wrong tokens per address and
+  # stops comparing once there were too many: token guessing is slowed the
+  # same way password guessing is. That includes the dashboard and the login
+  # page, which also accept the token; they used to compare it on their own.
   defp admin_auth(%{path_info: [first | _]} = conn, _opts) when first in ["admin", "metrics"] do
-    address = AdminAuth.client_address(conn)
+    conn = assign(conn, :auth, AdminAuth.authenticate(conn))
 
-    cond do
-      AdminAuth.session(conn) != nil ->
+    case conn.assigns.auth do
+      ok when ok in [:session, :token] ->
         conn
 
-      # Token guessing is slowed the same way password guessing is: after too
-      # many wrong tokens from one address, every token from it is refused
-      # for a while, the right one included.
-      AdminAuth.bearer_throttled?(address) ->
-        conn
-        |> put_resp_header("retry-after", "60")
-        |> send_error(429, "too_many_attempts", "too many wrong admin tokens from this address; wait a minute")
-        |> halt()
+      :throttled ->
+        too_many_tokens(conn)
 
-      AdminAuth.bearer?(conn) ->
-        conn
-
-      true ->
-        # Only a wrong token counts; a request with no token at all is not a guess.
-        if get_req_header(conn, "authorization") != [], do: AdminAuth.note_bearer_failure(address)
-
+      # `:denied` (a wrong token, now counted) or `:none` (no token: not a guess).
+      _ ->
         conn
         |> put_resp_header("www-authenticate", "Bearer")
         |> send_error(401, "unauthorized", "send Authorization: Bearer <admin token>")
@@ -615,7 +662,19 @@ defmodule OmnigateControl.Router do
   end
 
   defp admin_auth(%{path_info: []} = conn, _opts) do
-    if AdminAuth.authorized?(conn), do: conn, else: conn |> redirect("/login") |> halt()
+    conn = assign(conn, :auth, AdminAuth.authenticate(conn))
+
+    case conn.assigns.auth do
+      ok when ok in [:session, :token] -> conn
+      :throttled -> too_many_tokens(conn)
+      _ -> conn |> redirect("/login") |> halt()
+    end
+  end
+
+  # The login form and logout are public, but both look at who is asking
+  # (the form sends a signed-in visitor on to the dashboard).
+  defp admin_auth(%{path_info: [first]} = conn, _opts) when first in ["login", "logout"] do
+    assign(conn, :auth, AdminAuth.authenticate(conn))
   end
 
   # Everything else must be one of the few paths that are public on purpose.
@@ -627,35 +686,78 @@ defmodule OmnigateControl.Router do
     conn |> send_error(404, "not_found", "no such endpoint") |> halt()
   end
 
-  # The only body an anonymous caller may send is the login form, which is a
-  # few dozen bytes. Refusing anything larger by its declared length (and
-  # anything that does not declare one) keeps the parser away from megabytes
-  # sent by someone who has not authenticated.
-  @public_body_limit 4096
-  defp small_public_body(%{method: method, path_info: [first]} = conn, _opts) when first in ["login", "logout"] and method in ["POST", "PUT", "PATCH"] do
-    declared =
-      case get_req_header(conn, "content-length") do
-        [n] ->
-          case Integer.parse(n) do
-            {bytes, ""} -> bytes
-            _ -> :invalid
-          end
+  defp too_many_tokens(conn) do
+    conn
+    |> put_resp_header("retry-after", "60")
+    |> send_error(429, "too_many_attempts", "too many wrong admin tokens from this address; wait a minute")
+    |> halt()
+  end
 
-        [] ->
-          if get_req_header(conn, "transfer-encoding") == [], do: 0, else: :invalid
+  # Whose request bodies are read and parsed:
+  #
+  #   * `/internal/*` and `/admin/*`: the caller has authenticated by now
+  #     (the two plugs before this one refused everyone else);
+  #   * `POST /login`: the login form, at most a few KiB;
+  #   * `POST /logout` from a signed-in browser: it carries the CSRF token.
+  #
+  # Nobody else's. `POST /healthz`, `DELETE /login`, `POST /login/x`, a body
+  # on a GET: none of them is read at all, whatever the method. They get the
+  # answer the path deserves (usually 404) and, because an unread body is
+  # still on the connection, the connection is closed afterwards
+  # (`close_unread`) rather than drained.
+  defp parse_body(conn, _opts) do
+    case body_policy(conn) do
+      :full ->
+        conn |> put_private(:omnigate_body_parsed, true) |> Plug.Parsers.call(@parse_full)
 
-        _ ->
-          :invalid
-      end
+      :small ->
+        if declared_length(conn) in 0..@public_body_limit do
+          conn |> put_private(:omnigate_body_parsed, true) |> Plug.Parsers.call(@parse_small)
+        else
+          conn |> send_error(413, "payload_too_large", "the request body is larger than this endpoint accepts") |> halt()
+        end
 
-    if is_integer(declared) and declared <= @public_body_limit do
-      conn
-    else
-      conn |> send_error(413, "payload_too_large", "the request body is larger than this endpoint accepts") |> halt()
+      :none ->
+        %{conn | body_params: %{}}
     end
   end
 
-  defp small_public_body(conn, _opts), do: conn
+  defp body_policy(%{path_info: [first | _]}) when first in ["internal", "admin"], do: :full
+  defp body_policy(%{method: "POST", path_info: ["login"]}), do: :small
+  defp body_policy(%{method: "POST", path_info: ["logout"], assigns: %{auth: :session}}), do: :small
+  defp body_policy(_conn), do: :none
+
+  # The body length a request declares: a number, 0 when it declares no body
+  # at all, `:unknown` for chunked or malformed.
+  defp declared_length(conn) do
+    case get_req_header(conn, "content-length") do
+      [n] ->
+        case Integer.parse(n) do
+          {bytes, ""} when bytes >= 0 -> bytes
+          _ -> :unknown
+        end
+
+      [] ->
+        if get_req_header(conn, "transfer-encoding") == [], do: 0, else: :unknown
+
+      _ ->
+        :unknown
+    end
+  end
+
+  # A request body that nothing read is still in the socket when the answer
+  # goes out. The server would read it (up to megabytes) just to throw it
+  # away before the next request on the connection; closing the connection
+  # costs the sender more than it costs us.
+  defp close_unread(conn, _opts) do
+    register_before_send(conn, fn conn ->
+      if conn.private[:omnigate_body_parsed] != true and declared_length(conn) != 0 do
+        put_resp_header(conn, "connection", "close")
+      else
+        conn
+      end
+    end)
+  end
 
   # No route here needs a percent-encoded character (ids, names and file
   # names are all plain), so any `%` in the path is refused outright, as is

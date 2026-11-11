@@ -118,7 +118,52 @@ defmodule OmnigateControl.AdminAuth do
 
   def valid_session?(_, _), do: false
 
-  @doc "True when the request carries the admin token as a bearer token, or a valid session cookie."
+  @doc """
+  Who is asking, decided once per request and behind the throttle:
+
+    * `:session` — a valid session cookie;
+    * `:token` — the admin token as a bearer token;
+    * `:denied` — an `Authorization` header that is not the admin token
+      (counted against the caller's address);
+    * `:throttled` — an `Authorization` header from an address that has sent
+      too many wrong ones; it is not even compared, so the answer says
+      nothing about whether the token was right;
+    * `:none` — no credentials at all.
+
+  Every place that accepts the bearer token goes through here (the router
+  keeps the answer in `conn.assigns.auth`). A path that compared the token
+  on its own, outside the throttle, would be a place to guess it at full
+  speed: its answer, or how long it takes, tells right from wrong.
+  """
+  def authenticate(conn) do
+    cond do
+      session(conn) != nil ->
+        :session
+
+      Plug.Conn.get_req_header(conn, "authorization") == [] ->
+        :none
+
+      true ->
+        address = client_address(conn)
+
+        cond do
+          bearer_throttled?(address) ->
+            :throttled
+
+          bearer?(conn) ->
+            :token
+
+          true ->
+            note_bearer_failure(address)
+            :denied
+        end
+    end
+  end
+
+  @doc """
+  True when the request carries the admin token as a bearer token, or a valid
+  session cookie. Not throttled: request handling uses `authenticate/1`.
+  """
   def authorized?(conn) do
     bearer?(conn) or session?(conn)
   end
@@ -150,11 +195,15 @@ defmodule OmnigateControl.AdminAuth do
   header or the `_csrf` body field.
   """
   def csrf_ok?(conn) do
+    # What the router decided for this request; decided here (also behind
+    # the throttle) only when called without it.
+    auth = Map.get(conn.assigns, :auth) || authenticate(conn)
+
     cond do
-      bearer?(conn) ->
+      auth == :token ->
         true
 
-      session = session(conn) ->
+      session = auth == :session && session(conn) ->
         sent =
           case Plug.Conn.get_req_header(conn, "x-csrf-token") do
             [token] -> token

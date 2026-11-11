@@ -55,7 +55,7 @@ defmodule OmnigateControl.RetentionMetricsTest do
                config.routes
 
       # Everything is kept forever by default, except the ledger's duplicate-detection ids.
-      assert config.retention == %{jobs_days: 0, ledger_ids_days: 14, ledger_days: 0, delete_bucket_objects: true}
+      assert config.retention == %{jobs_days: 0, ledger_ids_days: 3, ledger_days: 0, delete_bucket_objects: true}
     end
 
     test "bad values are refused with a message that names the problem" do
@@ -258,35 +258,34 @@ defmodule OmnigateControl.RetentionMetricsTest do
       File.rm!(outside)
     end
 
+    # Ids are kept per UTC day and go a whole day at a time (the day-by-day
+    # behaviour, with a clock, is tested in wave6_test.exs). Through the real
+    # sweep: a day that is not over yet stays; once the window has passed it,
+    # its ids go and the totals do not.
     test "ledger ids are forgotten after their window; totals stay; a fresh duplicate is still refused" do
       key = "ledger-prune-#{unique()}"
       event = fn id -> %{"id" => id, "key_sha256" => key, "status" => 200, "input_tokens" => 10, "output_tokens" => 5} end
-      old_id = "old-#{unique()}"
-      new_id = "new-#{unique()}"
+      id = "old-#{unique()}"
 
-      assert {:ok, %{accepted: 1}} = Ledger.record_batch([event.(old_id)])
-      Process.sleep(20)
-      boundary = System.os_time(:millisecond)
-      Process.sleep(20)
-      assert {:ok, %{accepted: 1}} = Ledger.record_batch([event.(new_id)])
-
+      assert {:ok, %{accepted: 1}} = Ledger.record_batch([event.(id)])
       totals = Ledger.totals(key)
-      assert totals.requests == 2
-      ids_before = Ledger.stats().dedup_ids
+      now = System.os_time(:millisecond)
 
-      # "Now" is one day after the boundary, with a one-day window: everything
-      # recorded before the boundary is past it.
-      result = Retention.sweep(%{jobs_days: 0, ledger_ids_days: 1}, boundary + @day_ms)
+      # One day later with a one-day window: the cutoff is "now", today is not over. Nothing goes.
+      assert Retention.sweep(%{jobs_days: 0, ledger_ids_days: 1}, now + @day_ms).ledger_ids == 0
+      assert {:ok, %{accepted: 0, duplicates: 1}} = Ledger.record_batch([event.(id)])
+
+      # Two days later: today ended before the cutoff.
+      ids_before = Ledger.stats().dedup_ids
+      result = Retention.sweep(%{jobs_days: 0, ledger_ids_days: 1}, now + 2 * @day_ms)
       assert result.ledger_ids >= 1
       assert Ledger.stats().dedup_ids == ids_before - result.ledger_ids
 
       # Spend is untouched by pruning.
       assert Ledger.totals(key) == totals
-      # Still inside the window: refused as a duplicate.
-      assert {:ok, %{accepted: 0, duplicates: 1}} = Ledger.record_batch([event.(new_id)])
       # The documented cost of a short window: a resend this late counts again.
-      assert {:ok, %{accepted: 1, duplicates: 0}} = Ledger.record_batch([event.(old_id)])
-      assert Ledger.totals(key).requests == 3
+      assert {:ok, %{accepted: 1, duplicates: 0}} = Ledger.record_batch([event.(id)])
+      assert Ledger.totals(key).requests == 2
     end
 
     test "the sweeper is running under the supervisor" do

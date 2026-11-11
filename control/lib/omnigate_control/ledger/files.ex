@@ -17,6 +17,12 @@ defmodule OmnigateControl.Ledger.Files do
       have produced, with the position it covers: `{segment, byte offset}`.
     * `ledger.snapshot.prev` — the snapshot before that, kept as a spare.
     * `ledger.snapshot.tmp` — a snapshot being written; never read.
+    * `ledger.ids.YYYY-MM-DD` — the ids of the events recorded on that UTC
+      day, 16 bytes each, for duplicate detection
+      (`OmnigateControl.Ledger.Ids`).
+
+  A ledger path without an extension works the same way (`ledger`,
+  `ledger.000001`, `ledger.snapshot`, ...).
 
   ## Snapshot file
 
@@ -73,8 +79,10 @@ defmodule OmnigateControl.Ledger.Files do
         for name <- names,
             String.starts_with?(name, prefix),
             String.ends_with?(name, ext),
-            middle = name |> String.trim_leading(prefix) |> String.trim_trailing(ext),
-            middle =~ ~r/^\d{6,}$/ do
+            # `ext` is empty for a ledger path without an extension; the
+            # sealed names are then `ledger.000001`, and nothing is stripped.
+            middle = name |> String.replace_prefix(prefix, "") |> String.replace_suffix(ext, ""),
+            middle =~ ~r/\A\d{6,}\z/ do
           {String.to_integer(middle), Path.join(dir, name)}
         end
         |> Enum.sort()
@@ -324,9 +332,21 @@ defmodule OmnigateControl.Ledger.Files do
             # put into the tables: a file that does not look exactly like a
             # snapshot is ignored and the ledger is replayed instead.
             case :erlang.binary_to_term(payload, [:safe]) do
+              # Version 1 carried the event ids themselves (`seen`); it is
+              # still read, so an upgrade starts from its last snapshot.
               %{version: 1, covered: {seq, offset}, totals: t, seen: s} = snapshot
               when is_integer(seq) and seq >= 0 and is_integer(offset) and offset >= 0 and is_list(t) and is_list(s) ->
                 if Enum.all?(t, &totals_row?/1) and Enum.all?(s, &seen_row?/1) and recent?(Map.get(snapshot, :recent, [])) do
+                  {:ok, snapshot}
+                else
+                  {:error, "unexpected contents"}
+                end
+
+              # Version 2 records how long each day's id file was instead
+              # (see `OmnigateControl.Ledger.Ids`).
+              %{version: 2, covered: {seq, offset}, totals: t, ids: ids} = snapshot
+              when is_integer(seq) and seq >= 0 and is_integer(offset) and offset >= 0 and is_list(t) and is_map(ids) ->
+                if Enum.all?(t, &totals_row?/1) and Enum.all?(ids, &ids_row?/1) and recent?(Map.get(snapshot, :recent, [])) do
                   {:ok, snapshot}
                 else
                   {:error, "unexpected contents"}
@@ -356,6 +376,8 @@ defmodule OmnigateControl.Ledger.Files do
   defp totals_row?(row), do: is_tuple(row) and tuple_size(row) >= 2
   defp seen_row?({id, at}), do: is_binary(id) and is_integer(at)
   defp seen_row?(_), do: false
+  defp ids_row?({day, bytes}), do: is_binary(day) and day =~ ~r/\A\d{4}-\d{2}-\d{2}\z/ and is_integer(bytes) and bytes >= 0
+  defp ids_row?(_), do: false
   defp recent?(list), do: is_list(list) and Enum.all?(list, &is_map/1)
 
   # The bytes the snapshot covers must still exist and be the same bytes.

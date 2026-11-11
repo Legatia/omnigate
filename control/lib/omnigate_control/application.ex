@@ -39,10 +39,17 @@ defmodule OmnigateControl.Application do
   defp start_children(config) do
     OmnigateControl.Rejections.setup()
     OmnigateControl.RateLimit.setup()
+    OmnigateControl.Counters.setup()
+    OmnigateControl.Audit.setup()
     {:ok, ip} = bind_address()
 
-    children = [
-      {OmnigateControl.ConfigStore, path: config},
+    # Everything that holds state: the logs, the keys, the ledger, the jobs.
+    # They restart one by one under their own supervisor, and that supervisor
+    # is watched by a guard instead of sitting directly under the
+    # application's: if one of them crashes again and again, the group is
+    # restarted with a pause in between and the listener below is not
+    # touched (see `OmnigateControl.Guard`).
+    state = [
       {OmnigateControl.Audit, path: audit_path()},
       {OmnigateControl.Keys, path: keys_path()},
       {OmnigateControl.Ledger, path: ledger_path()},
@@ -51,13 +58,18 @@ defmodule OmnigateControl.Application do
       OmnigateControl.Webhooks,
       # One-shot: continue jobs and webhooks left unfinished by the last run.
       Supervisor.child_spec({Task, &OmnigateControl.Jobs.resume_all/0}, id: :jobs_resume, restart: :temporary),
-      OmnigateControl.Retention,
+      OmnigateControl.Retention
+    ]
+
+    children = [
+      {OmnigateControl.ConfigStore, path: config},
+      {OmnigateControl.Guard, name: OmnigateControl.StateGuard, supervisor_name: OmnigateControl.Supervisor, children: state, strategy: :one_for_one},
       # HTTP/1.1 only: nothing here needs HTTP/2 or WebSockets, and every
       # protocol left on is one more parser in front of the authentication.
       {Bandit, plug: OmnigateControl.Router, ip: ip, port: port(), http_2_options: [enabled: false], websocket_options: [enabled: false]}
     ]
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: OmnigateControl.Supervisor)
+    Supervisor.start_link(children, strategy: :one_for_one, name: OmnigateControl.Root)
   end
 
   @doc false

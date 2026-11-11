@@ -33,7 +33,7 @@ defmodule OmnigateControl.Jobs.Adapters.Gemini do
          {:ok, body} <- request_body(input) do
       url = "#{up.base_url}/v1beta/models/#{model}:generateContent"
 
-      case Http.request(:post, url, [{"x-goog-api-key", ctx.api_key}], JSON.encode!(body), timeout: ctx.timeout_ms) do
+      case Http.request(:post, url, [{"x-goog-api-key", ctx.api_key}], JSON.encode!(body), timeout: ctx.timeout_ms, max_body: Adapter.inline_cap(ctx)) do
         {:ok, %{status: 200, body: resp}} -> outputs(decode(resp))
         other -> {:error, describe(other)}
       end

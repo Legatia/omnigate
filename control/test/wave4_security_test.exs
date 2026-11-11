@@ -243,7 +243,7 @@ defmodule OmnigateControl.Wave4SecurityTest do
   describe "job creation limits enforced in the control plane" do
     test "the key's requests-per-minute limit applies, whatever spelling of the path is used" do
       key = managed_key(%{"rpm" => 2})
-      RateLimit.reset(key.name)
+      RateLimit.reset(key.key_sha256)
       body = %{"model" => "img", "input" => %{"prompt" => "x"}}
 
       assert post_job(key.key_sha256, body).status == 202
@@ -258,15 +258,18 @@ defmodule OmnigateControl.Wave4SecurityTest do
       assert post_job(key.key_sha256, body).status == 429
     end
 
-    test "the rate limiter counts per key and per minute" do
+    # A token bucket, the data plane's (dataplane/src/ratelimit.zig); the
+    # same numbers as its own tests are in wave6_test.exs.
+    test "the rate limiter counts per key: a burst of rpm, then a steady refill" do
       id = "rl-#{System.unique_integer([:positive])}"
-      now = 1_800_000_000 - rem(1_800_000_000, 60)
+      now = 1_000_000
       assert :ok = RateLimit.check(id, 2, now)
-      assert :ok = RateLimit.check(id, 2, now + 10)
-      assert {:error, 30} = RateLimit.check(id, 2, now + 30)
-      assert :ok = RateLimit.check(id <> "-other", 2, now + 30)
-      # The next minute starts fresh; no limit means no counting.
-      assert :ok = RateLimit.check(id, 2, now + 60)
+      assert :ok = RateLimit.check(id, 2, now + 10_000)
+      # 10 s refilled a third of a request; the rest takes 20.01 s more, rounded up.
+      assert {:error, 21} = RateLimit.check(id, 2, now + 10_000)
+      assert :ok = RateLimit.check(id <> "-other", 2, now + 10_000)
+      # One request is back every 30 s; no limit means no counting.
+      assert :ok = RateLimit.check(id, 2, now + 30_000)
       for _ <- 1..50, do: assert(:ok = RateLimit.check(id, 0, now))
       for _ <- 1..50, do: assert(:ok = RateLimit.check(id, nil, now))
     end
@@ -702,11 +705,11 @@ defmodule OmnigateControl.Wave4SecurityTest do
 
   describe "retention defaults" do
     test "ledger ids are kept for a finite time unless told otherwise" do
-      assert ConfigStore.normalize(%{}).retention.ledger_ids_days == 14
-      assert ConfigStore.normalize(%{"retention" => %{"jobs_days" => 30}}).retention.ledger_ids_days == 14
+      assert ConfigStore.normalize(%{}).retention.ledger_ids_days == 3
+      assert ConfigStore.normalize(%{"retention" => %{"jobs_days" => 30}}).retention.ledger_ids_days == 3
       # An explicit 0 still means "keep forever".
       assert ConfigStore.normalize(%{"retention" => %{"ledger_ids_days" => 0}}).retention.ledger_ids_days == 0
-      assert ConfigStore.normalize(%{"retention" => %{"ledger_ids_days" => 3}}).retention.ledger_ids_days == 3
+      assert ConfigStore.normalize(%{"retention" => %{"ledger_ids_days" => 14}}).retention.ledger_ids_days == 14
     end
   end
 

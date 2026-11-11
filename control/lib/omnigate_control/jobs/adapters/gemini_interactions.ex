@@ -28,7 +28,10 @@ defmodule OmnigateControl.Jobs.Adapters.GeminiInteractions do
   @impl true
   def submit(up, model, input, ctx) do
     with {:ok, body} <- request_body(input, model) do
-      case Http.request(:post, "#{up.base_url}/v1beta/interactions", headers(ctx), JSON.encode!(body), timeout: ctx.timeout_ms) do
+      case Http.request(:post, "#{up.base_url}/v1beta/interactions", headers(ctx), JSON.encode!(body),
+             timeout: ctx.timeout_ms,
+             max_body: Adapter.inline_cap(ctx)
+           ) do
         {:ok, %{status: 200, body: resp}} ->
           interaction = decode(resp)
 
@@ -47,7 +50,9 @@ defmodule OmnigateControl.Jobs.Adapters.GeminiInteractions do
 
   @impl true
   def poll(up, _model, id, _state, ctx) do
-    case Http.request(:get, "#{up.base_url}/v1beta/interactions/#{URI.encode(id, &URI.char_unreserved?/1)}", headers(ctx)) do
+    case Http.request(:get, "#{up.base_url}/v1beta/interactions/#{URI.encode(id, &URI.char_unreserved?/1)}", headers(ctx), nil,
+           max_body: Adapter.inline_cap(ctx)
+         ) do
       {:ok, %{status: 200, body: body}} -> interpret(decode(body))
       other -> if transient?(other), do: {:transient, describe(other)}, else: {:error, describe(other)}
     end

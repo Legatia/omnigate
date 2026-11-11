@@ -479,6 +479,9 @@ def hardening():
     if COMPOSE:
         grace = {s: docker("inspect", cname(s), "--format", "{{.Config.StopTimeout}}") for s in ("control", "dataplane")}
         check("compose.yaml gives both services time to stop cleanly", grace == {"control": "30", "dataplane": "20"}, grace)
+        limit = {s: int(docker("inspect", cname(s), "--format", "{{.HostConfig.Memory}}") or 0) for s in ("control", "dataplane")}
+        check("compose.yaml gives both services a memory limit (1 GiB unless .env says otherwise)",
+              limit == {"control": 1 << 30, "dataplane": 1 << 30}, limit)
 
     section("malformed requests over raw TLS")
     host, auth = f"Host: {API_HOST}:{PORT}", f"Authorization: Bearer {OTHER}"
@@ -525,6 +528,45 @@ def hardening():
     s, _, _ = req("GET", ADMIN_HOST, "/healthz")
     ok, state = alive("control")
     check("the control plane is still up after malformed requests", s == 200 and ok, (s, state, got))
+
+    forwarded_for()
+
+
+def forwarded_for():
+    """The control plane counts failed logins per address, and reads the
+    address from X-Forwarded-For because the proxy is the only way in. So the
+    proxy must write that header itself, whatever the client put there."""
+    section("X-Forwarded-For through the proxy")
+    host = f"Host: {ADMIN_HOST}:{PORT}"
+    body = "password=definitely-not-the-token"
+
+    def login(forwarded):
+        head = f"POST /login HTTP/1.1\r\n{host}\r\nContent-Type: application/x-www-form-urlencoded\r\n" \
+               f"X-Forwarded-For: {forwarded}\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}"
+        return raw(ADMIN_HOST, head.encode("latin-1"), timeout=5)[0]
+
+    # A different claimed address on every attempt. If the claim chose the
+    # bucket, each attempt would be the first from its address and none would
+    # ever be throttled; the limit is five failures per address a minute.
+    codes = [login(f"203.0.113.{i}") for i in range(1, 9)]
+    check("a client cannot pick the address its failed logins are counted under",
+          set(codes) <= {401, 429} and codes[-1] == 429 and codes.count(401) <= 5, codes)
+
+    # Bytes that are not text, a line break smuggled in as an obsolete header
+    # fold, and a long value: none of it may reach the audit log as written,
+    # and none of it may stop the process that writes the log.
+    codes = [login(v) for v in ("203.0.113.77, \xff\xfe", "\xff", "203.0.113.78,\r\n forged", "9" * 3000)]
+    ok, state = alive("control")
+    s, _, audit = jreq("GET", ADMIN_HOST, "/admin/audit?limit=200", key=ADMIN)
+    logins = [e for e in audit.get("entries", []) if e.get("action") == "login"]
+    claimed = [e.get("forwarded_for") for e in logins if "203.0.113." in str(e.get("forwarded_for")) or "forged" in str(e.get("forwarded_for"))]
+    plain = all(str(e.get("forwarded_for", "0")).replace(".", "").replace(":", "").isalnum() for e in logins)
+    check("odd X-Forwarded-For values are answered, not fatal: the control plane is the same process and still logs",
+          all(c in (400, 401, 429) for c in codes) and ok and s == 200 and len(logins) >= 2, (codes, state, s, len(logins)))
+    check("the audit log holds the address the proxy saw, never the one the client claimed",
+          not claimed and plain and any(e.get("forwarded_for") for e in logins), (claimed, [e.get("forwarded_for") for e in logins][:5]))
+    summary = [e for e in logins if e.get("outcome") in ("denied", "throttled")]
+    check("a dozen failed logins from one address are a few audit lines, not a dozen", 1 <= len(summary) <= 4, len(summary))
 
 
 def main():

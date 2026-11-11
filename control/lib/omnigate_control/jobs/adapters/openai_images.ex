@@ -19,7 +19,10 @@ defmodule OmnigateControl.Jobs.Adapters.OpenAIImages do
   def submit(up, model, input, ctx) do
     body = Map.put(input, "model", model)
 
-    case Http.request(:post, "#{up.base_url}/v1/images/generations", [{"authorization", "Bearer #{ctx.api_key}"}], JSON.encode!(body), timeout: ctx.timeout_ms) do
+    case Http.request(:post, "#{up.base_url}/v1/images/generations", [{"authorization", "Bearer #{ctx.api_key}"}], JSON.encode!(body),
+           timeout: ctx.timeout_ms,
+           max_body: Adapter.inline_cap(ctx)
+         ) do
       {:ok, %{status: 200, body: resp}} ->
         content_type = content_type(input["output_format"])
 

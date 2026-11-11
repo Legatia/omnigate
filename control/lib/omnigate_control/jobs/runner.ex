@@ -11,16 +11,25 @@ defmodule OmnigateControl.Jobs.Runner do
   so `run/1` can be called again after a restart and continues where the
   previous process stopped. A job that already has a provider id is polled,
   never resubmitted.
+
+  The job store can restart while a job is running (it is supervised like
+  everything else). A runner then waits for it to come back instead of
+  dying or failing the job: every read and write of job state goes through
+  `with_store/1`.
+
+  Whatever a provider says about a failure is treated as bytes from outside:
+  it becomes one line of valid UTF-8 (`OmnigateControl.Text.line/2`) before
+  it is logged or stored.
   """
   require Logger
 
-  alias OmnigateControl.{ConfigStore, Http, Jobs, NetGuard, Storage}
+  alias OmnigateControl.{ConfigStore, Counters, Http, Jobs, NetGuard, Storage, Text}
   alias OmnigateControl.Jobs.{Adapter, Store}
 
   @max_transient_poll_errors 5
 
   def run(id) do
-    case Store.get(id) do
+    case with_store(fn -> Store.get(id) end) do
       %{"status" => s} = job when s in ["queued", "running"] ->
         attempt(job, get_in(job, ["run", "target_index"]) || 0)
 
@@ -30,8 +39,28 @@ defmodule OmnigateControl.Jobs.Runner do
   rescue
     e ->
       Logger.error("job #{id} crashed: " <> Exception.format(:error, e, __STACKTRACE__))
-      Jobs.finish(id, "failed", %{"error" => %{"type" => "internal_error", "message" => "the gateway failed while running this job"}})
+      finish(id, "failed", %{"error" => %{"type" => "internal_error", "message" => "the gateway failed while running this job"}})
   end
+
+  # Run `fun`, which reads or writes job state. While the store is restarting
+  # its tables do not exist (reads raise) and its process is gone (calls
+  # exit); wait for it, up to about half a minute, rather than give up.
+  defp with_store(fun, tries \\ 60) do
+    fun.()
+  rescue
+    e in ArgumentError ->
+      if tries > 0, do: retry_store(fun, tries), else: reraise(e, __STACKTRACE__)
+  catch
+    :exit, reason ->
+      if tries > 0, do: retry_store(fun, tries), else: exit(reason)
+  end
+
+  defp retry_store(fun, tries) do
+    Process.sleep(500)
+    with_store(fun, tries - 1)
+  end
+
+  defp finish(id, status, changes), do: with_store(fn -> Jobs.finish(id, status, changes) end)
 
   @doc "Best-effort cancel of the provider-side job recorded in `job`."
   def cancel_provider(%{"run" => %{"provider_id" => pid, "target_index" => index} = run} = job) when is_binary(pid) do
@@ -56,16 +85,16 @@ defmodule OmnigateControl.Jobs.Runner do
 
     cond do
       route == nil ->
-        Jobs.finish(job["id"], "failed", %{"error" => %{"type" => "route_removed", "message" => "the route for this model no longer exists"}})
+        finish(job["id"], "failed", %{"error" => %{"type" => "route_removed", "message" => "the route for this model no longer exists"}})
 
       index >= length(route.targets) ->
-        Jobs.finish(job["id"], "failed", %{"error" => %{"type" => "all_targets_failed", "message" => "every target for this model failed"}})
+        finish(job["id"], "failed", %{"error" => %{"type" => "all_targets_failed", "message" => "every target for this model failed"}})
 
       true ->
         target = Enum.at(route.targets, index)
 
         case resolve(target, route) do
-          {:ok, t} -> run_target(job, index, Map.merge(t, %{target: target, timeout_ms: route.timeout_s * 1000}))
+          {:ok, t} -> run_target(job, index, Map.merge(t, %{route: route, target: target, timeout_ms: route.timeout_s * 1000}))
           {:error, outcome} -> next(job, index, target.upstream, outcome)
         end
     end
@@ -80,7 +109,7 @@ defmodule OmnigateControl.Jobs.Runner do
       upstream == nil -> {:error, "unknown_upstream"}
       adapter == nil -> {:error, "unsupported_kind:#{upstream.kind}"}
       api_key in [nil, ""] -> {:error, "missing_api_key_env:#{upstream.api_key_env}"}
-      true -> {:ok, %{upstream: upstream, adapter: adapter, ctx: %{api_key: api_key, timeout_ms: route.timeout_s * 1000}}}
+      true -> {:ok, %{upstream: upstream, adapter: adapter, ctx: %{api_key: api_key, timeout_ms: route.timeout_s * 1000, max_inline_bytes: inline_cap()}}}
     end
   end
 
@@ -89,7 +118,7 @@ defmodule OmnigateControl.Jobs.Runner do
 
     if run["target_index"] == index and is_binary(run["provider_id"]) do
       # Resumed after a restart: the provider already has this job.
-      Logger.info("job #{job["id"]}: resuming provider job #{run["provider_id"]} on #{t.upstream.name}")
+      Logger.info("job #{job["id"]}: resuming provider job #{Text.line(run["provider_id"], 100)} on #{t.upstream.name}")
       poll_loop(job, index, t, 0)
     else
       now = System.os_time(:millisecond)
@@ -103,7 +132,7 @@ defmodule OmnigateControl.Jobs.Runner do
         end)
 
       with {:ok, job} <- started do
-        case t.adapter.submit(t.upstream, t.target.model, job["input"], t.ctx) do
+        case t.adapter.submit(t.upstream, t.target.model, Jobs.input!(job), t.ctx) do
           {:async, provider_id, state} ->
             recorded =
               update_running(job["id"], fn j ->
@@ -128,7 +157,7 @@ defmodule OmnigateControl.Jobs.Runner do
 
   defp poll_loop(job, index, t, errors) do
     Process.sleep(ConfigStore.get().media.poll_interval_ms)
-    current = Store.get(job["id"])
+    current = with_store(fn -> Store.get(job["id"]) end)
     run = job["run"]
 
     cond do
@@ -152,6 +181,7 @@ defmodule OmnigateControl.Jobs.Runner do
 
   # Record a failed attempt and move on to the next target.
   defp next(job, index, upstream_name, outcome) do
+    outcome = Text.line(outcome, 300)
     Logger.warning("job #{job["id"]}: #{upstream_name} failed (#{outcome}), trying next target")
 
     moved =
@@ -161,7 +191,19 @@ defmodule OmnigateControl.Jobs.Runner do
         |> Map.put("run", %{"target_index" => index + 1})
       end)
 
-    with {:ok, job} <- moved, do: attempt(job, index + 1)
+    case moved do
+      {:ok, job} ->
+        attempt(job, index + 1)
+
+      {:error, reason} ->
+        # The store could not record the move (its disk, most likely). The
+        # job stays as it is and is picked up again at the next start.
+        Logger.error("job #{job["id"]}: could not record a failed attempt (#{Text.line(reason, 100)}); leaving it for the next start")
+
+      # Finished in the meantime (canceled).
+      other ->
+        other
+    end
   end
 
   # -- outputs ---------------------------------------------------------------
@@ -207,12 +249,15 @@ defmodule OmnigateControl.Jobs.Runner do
 
     case stored do
       {:ok, records} ->
-        Jobs.finish(job["id"], "succeeded", %{
+        input = Jobs.input!(job)
+        unpriced(job, t)
+
+        finish(job["id"], "succeeded", %{
           "outputs" => records,
           "upstream" => t.upstream.name,
           "target_model" => t.target.model,
-          "cost_usd" => Jobs.cost(t.target.price, t.adapter.billable(job["input"]), length(records)),
-          "attempts" => (Store.get(job["id"])["attempts"] || []) ++ [%{"upstream" => t.upstream.name, "outcome" => "ok"}]
+          "cost_usd" => Jobs.job_cost(t.route, t.target, t.adapter.billable(input), input, length(records)),
+          "attempts" => (with_store(fn -> Store.get(job["id"]) end)["attempts"] || []) ++ [%{"upstream" => t.upstream.name, "outcome" => "ok"}]
         })
 
       {:error, reason} ->
@@ -220,11 +265,27 @@ defmodule OmnigateControl.Jobs.Runner do
         Logger.error("job #{job["id"]}: storing outputs failed: #{describe(reason)}")
 
         # Another provider would hit the same broken storage; fail the job.
-        Jobs.finish(job["id"], "failed", %{
+        finish(job["id"], "failed", %{
           "upstream" => t.upstream.name,
           "target_model" => t.target.model,
           "error" => %{"type" => "storage_error", "message" => "the provider produced outputs but they could not be stored"}
         })
+    end
+  end
+
+  # A target with no price at all makes every job on it free for the key's
+  # budget. That may be meant (a local model), but it is also what a
+  # forgotten `price` looks like, so it is counted and said once per target.
+  defp unpriced(job, t) do
+    if not Enum.any?(Map.values(t.target.price), &(is_number(&1) and &1 > 0)) do
+      Counters.bump(:ledger_unpriced_events, 1)
+
+      if Counters.once({:unpriced_job, job["model"], t.upstream.name, t.target.model}) do
+        Logger.warning(
+          "media route #{Text.line(job["model"], 80)}: target #{t.upstream.name}/#{Text.line(t.target.model, 80)} has no price, so its jobs are recorded at $0 " <>
+            "(logged once per target; see omnigate_ledger_unpriced_events_total)"
+        )
+      end
     end
   end
 
@@ -297,9 +358,13 @@ defmodule OmnigateControl.Jobs.Runner do
   defp url_ext(url), do: (URI.parse(url).path || "") |> Path.extname() |> String.downcase()
 
   defp update_running(id, fun) do
-    Store.update(id, fn job -> if Jobs.terminal?(job), do: :noop, else: fun.(job) end)
+    with_store(fn -> Store.update(id, fn job -> if Jobs.terminal?(job), do: :noop, else: fun.(job) end) end)
   end
 
-  defp describe(reason) when is_binary(reason), do: reason
-  defp describe(reason), do: reason |> inspect() |> String.slice(0, 200)
+  defp describe(reason), do: Text.line(reason, 200)
+
+  # Largest provider answer read when the media comes back inline: the output
+  # limit, as base64 (4/3) plus the JSON around it, and never more than 256 MiB
+  # in memory at once.
+  defp inline_cap, do: min(div(ConfigStore.get().media.max_output_bytes * 4, 3) + 65_536, 256 * 1024 * 1024)
 end

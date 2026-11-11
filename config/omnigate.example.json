@@ -21,7 +21,8 @@
         "grok-video",
         "gemini-video"
       ],
-      "webhook_secret_env": "MY_APP_WEBHOOK_SECRET"
+      "webhook_secret_env": "MY_APP_WEBHOOK_SECRET",
+      "max_jobs_per_day": 2000
     }
   ],
   "upstreams": [
@@ -87,6 +88,7 @@
     "max_output_bytes": 536870912,
     "max_input_bytes": 1048576,
     "max_open_jobs": 100,
+    "max_jobs_per_day": 10000,
     "upstreams": [
       {
         "name": "replicate",
@@ -161,7 +163,10 @@
             "model": "<fal video model id>",
             "price": {
               "per_second_usd": 0.0
-            }
+            },
+            "default_seconds": 5,
+            "min_seconds": 1,
+            "max_seconds": 10
           }
         ]
       },
@@ -175,7 +180,28 @@
               "per_output_usd": 0.0
             }
           }
-        ]
+        ],
+        "allowed_input": [
+          "prompt",
+          "size",
+          "quality",
+          "background",
+          "output_format"
+        ],
+        "price_multipliers": {
+          "quality": {
+            "low": 1,
+            "medium": 4,
+            "high": 16,
+            "default": 16
+          },
+          "size": {
+            "1024x1024": 1,
+            "1024x1536": 1.5,
+            "1536x1024": 1.5,
+            "default": 1.5
+          }
+        }
       },
       {
         "model": "speech",
@@ -224,7 +250,10 @@
             "model": "<xai video model id>",
             "price": {
               "per_second_usd": 0.0
-            }
+            },
+            "default_seconds": 5,
+            "min_seconds": 1,
+            "max_seconds": 10
           }
         ]
       },
@@ -264,12 +293,14 @@
         7200000,
         21600000
       ],
-      "max_attempts": 8
+      "max_attempts": 8,
+      "max_concurrent": 16,
+      "max_concurrent_per_key": 4
     }
   },
   "retention": {
     "jobs_days": 30,
-    "ledger_ids_days": 14,
+    "ledger_ids_days": 3,
     "delete_bucket_objects": true,
     "ledger_days": 90
   }

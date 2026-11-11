@@ -25,7 +25,10 @@ defmodule OmnigateControl.Jobs.Adapters.ElevenLabs do
       url = "#{up.base_url}/v1/text-to-speech/#{voice}?" <> URI.encode_query(%{"output_format" => format})
       body = input |> Map.drop(["voice_id", "output_format"]) |> Map.put("model_id", model)
 
-      case Http.request(:post, url, [{"xi-api-key", ctx.api_key}, {"accept", "*/*"}], JSON.encode!(body), timeout: ctx.timeout_ms) do
+      case Http.request(:post, url, [{"xi-api-key", ctx.api_key}, {"accept", "*/*"}], JSON.encode!(body),
+             timeout: ctx.timeout_ms,
+             max_body: Adapter.inline_cap(ctx)
+           ) do
         {:ok, %{status: 200, body: audio, headers: headers}} when byte_size(audio) > 0 ->
           {:done, [{:binary, audio, headers["content-type"] || content_type(format)}]}
 

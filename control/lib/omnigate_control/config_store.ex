@@ -11,6 +11,17 @@ defmodule OmnigateControl.ConfigStore do
 
   @reload_ms 2_000
 
+  # Numbers the data plane reads out of the config snapshot go into 32-bit
+  # fields there (`rpm`, `weight`, `cache_ttl_s`, `timeout_ms` in
+  # dataplane/src/config.zig). One value that does not fit makes the whole
+  # snapshot unparseable, and every data plane then keeps its old config for
+  # good. So each is bounded here, well inside 32 bits, where a bad value
+  # only costs the reload that carried it.
+  @max_rpm 1_000_000
+  @max_weight 1_000_000
+  @max_cache_ttl_s 31_536_000
+  @max_timeout_ms 3_600_000
+
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc """
@@ -82,6 +93,11 @@ defmodule OmnigateControl.ConfigStore do
   writes cost the input price unless the target says otherwise.
   """
   def prices(route_model, upstream, target_model) do
+    find_prices(route_model, upstream, target_model) || %{in: 0.0, cached_in: 0.0, cache_write: 0.0, out: 0.0}
+  end
+
+  @doc "Like `prices/3`, but nil when the config has no such route or target (so the caller can tell \"free\" from \"unknown\")."
+  def find_prices(route_model, upstream, target_model) do
     target =
       case Enum.find(get().routes, &(&1.model == route_model)) do
         nil -> nil
@@ -90,7 +106,7 @@ defmodule OmnigateControl.ConfigStore do
 
     case target do
       nil ->
-        %{in: 0.0, cached_in: 0.0, cache_write: 0.0, out: 0.0}
+        nil
 
       t ->
         %{
@@ -169,11 +185,13 @@ defmodule OmnigateControl.ConfigStore do
             # current UTC month or day, after which the key unblocks again.
             budget_period: budget_period!(k["budget_period"], k["name"]),
             # Requests per minute enforced by the data plane; 0 = unlimited.
-            rpm: to_int(k["rpm"], 0),
+            rpm: int!(k["rpm"], 0, 0..@max_rpm, "key #{inspect(k["name"])}: \"rpm\""),
             # Route model names (text or media) this key may use; nil = all.
             models: models(k["models"]),
             # Jobs this key may have unfinished at once; nil = the media default.
             max_open_jobs: open_jobs!(k["max_open_jobs"], "key #{inspect(k["name"])}"),
+            # Jobs this key may create per UTC day; nil = the media default.
+            max_jobs_per_day: jobs_per_day!(k["max_jobs_per_day"], "key #{inspect(k["name"])}"),
             webhook_secret: secret(k, "webhook_secret"),
             # Switched off by the operator: refused everywhere, usage kept.
             disabled: k["disabled"] == true,
@@ -190,7 +208,7 @@ defmodule OmnigateControl.ConfigStore do
             base_url: Map.fetch!(u, "base_url"),
             api_key_env: Map.fetch!(u, "api_key_env"),
             # Max wait for response headers; 0 = the data plane's default.
-            timeout_ms: to_int(u["timeout_ms"], 0),
+            timeout_ms: int!(u["timeout_ms"], 0, 0..@max_timeout_ms, "upstream #{inspect(u["name"])}: \"timeout_ms\""),
             # Where the provider serves the API when not under /v1 (nil = /v1).
             v1_path: u["v1_path"]
           }
@@ -201,7 +219,7 @@ defmodule OmnigateControl.ConfigStore do
 
           targets =
             Enum.map(Map.fetch!(r, "targets"), fn t ->
-              price_in = to_float(t["price_in_per_mtok"] || 0)
+              price_in = price!(t["price_in_per_mtok"], 0.0, model)
 
               %{
                 upstream: Map.fetch!(t, "upstream"),
@@ -213,7 +231,7 @@ defmodule OmnigateControl.ConfigStore do
                 # Both cost the plain input price unless given.
                 price_cached_in_per_mtok: price!(t["price_cached_in_per_mtok"], price_in, model),
                 price_cache_write_per_mtok: price!(t["price_cache_write_per_mtok"], price_in, model),
-                price_out_per_mtok: to_float(t["price_out_per_mtok"] || 0)
+                price_out_per_mtok: price!(t["price_out_per_mtok"], 0.0, model)
               }
             end)
 
@@ -231,11 +249,32 @@ defmodule OmnigateControl.ConfigStore do
     }
   end
 
+  @doc false
+  def limits, do: %{rpm: @max_rpm, weight: @max_weight, cache_ttl_s: @max_cache_ttl_s, timeout_ms: @max_timeout_ms}
+
+  # A whole number within `range`, or `default` when the setting is left out.
+  defp int!(nil, default, _range, _what), do: default
+
+  defp int!(n, _default, first..last//_, what) do
+    if is_integer(n) and n >= first and n <= last do
+      n
+    else
+      raise ArgumentError, "#{what} must be a whole number from #{first} to #{last}, got #{inspect(n)}"
+    end
+  end
+
   defp open_jobs!(nil, _where), do: nil
-  defp open_jobs!(n, _where) when is_integer(n) and n >= 0, do: n
+  defp open_jobs!(n, _where) when is_integer(n) and n >= 0 and n <= 1_000_000_000, do: n
 
   defp open_jobs!(other, where) do
     raise ArgumentError, "#{where}: \"max_open_jobs\" must be a whole number, 0 (no limit) or more, got #{inspect(other)}"
+  end
+
+  defp jobs_per_day!(nil, _where), do: nil
+  defp jobs_per_day!(n, _where) when is_integer(n) and n >= 0 and n <= 1_000_000_000, do: n
+
+  defp jobs_per_day!(other, where) do
+    raise ArgumentError, "#{where}: \"max_jobs_per_day\" must be a whole number, 0 (no limit) or more, got #{inspect(other)}"
   end
 
   defp models(nil), do: nil
@@ -272,17 +311,18 @@ defmodule OmnigateControl.ConfigStore do
   end
 
   defp price!(nil, default, _model), do: default
-  defp price!(n, _default, _model) when is_number(n) and n >= 0, do: n * 1.0
+  defp price!(n, _default, _model) when is_number(n) and n >= 0 and n <= 1.0e9, do: n * 1.0
 
   defp price!(other, _default, model) do
     raise ArgumentError, "route #{inspect(model)}: a price must be a number of dollars per 1M tokens, 0 or more, got #{inspect(other)}"
   end
 
   defp cache_ttl!(nil, _model), do: 0
-  defp cache_ttl!(n, _model) when is_integer(n) and n >= 0, do: n
+  defp cache_ttl!(n, _model) when is_integer(n) and n >= 0 and n <= @max_cache_ttl_s, do: n
 
   defp cache_ttl!(other, model) do
-    raise ArgumentError, "route #{inspect(model)}: \"cache_ttl_s\" must be a whole number of seconds, 0 or more, got #{inspect(other)}"
+    raise ArgumentError,
+          "route #{inspect(model)}: \"cache_ttl_s\" must be a whole number of seconds, 0 or more (at most #{@max_cache_ttl_s}), got #{inspect(other)}"
   end
 
   @budget_periods ~w(total monthly daily)
@@ -299,15 +339,25 @@ defmodule OmnigateControl.ConfigStore do
   end
 
   defp weight(nil, _model), do: 1
-  defp weight(n, _model) when is_integer(n) and n >= 0, do: n
+  defp weight(n, _model) when is_integer(n) and n >= 0 and n <= @max_weight, do: n
 
   defp weight(other, model) do
-    raise ArgumentError, "route #{inspect(model)}: a target's \"weight\" must be a non-negative integer, got #{inspect(other)}"
+    raise ArgumentError, "route #{inspect(model)}: a target's \"weight\" must be a non-negative integer (at most #{@max_weight}), got #{inspect(other)}"
   end
 
   # How long finished things are kept, in days. 0 keeps them forever, and is
   # the default for everything except the ledger's duplicate-detection ids.
-  @default_ledger_ids_days 14
+  #
+  # An id is needed for as long as a data plane might still send its event
+  # again. Events wait in a data plane's spool file until the control plane
+  # has acknowledged them, and are resent after an outage or a data-plane
+  # restart; the spool is the only place a resend can come from. Three days
+  # covers a control plane that is down over a weekend, or a data plane that
+  # was stopped on Friday with events still spooled and started on Monday.
+  # It used to be fourteen, which kept (at 61 MiB per million ids) five times
+  # the memory for outages nobody leaves that long. Raise it if a data plane
+  # can be off for longer with usage it has not delivered.
+  @default_ledger_ids_days 3
 
   defp normalize_retention(r) do
     %{
@@ -339,16 +389,21 @@ defmodule OmnigateControl.ConfigStore do
   # Media (async job) config. Never sent to data planes.
   defp normalize_media(m) do
     webhooks = m["webhooks"] || %{}
-    schedule = webhooks["retry_schedule_ms"] || @default_retry_schedule_ms
+    schedule = retry_schedule!(webhooks["retry_schedule_ms"])
 
     %{
       public_base_url: String.trim_trailing(m["public_base_url"] || "http://127.0.0.1:8080", "/"),
-      poll_interval_ms: to_int(m["poll_interval_ms"], 2_000),
-      max_output_bytes: to_int(m["max_output_bytes"], 512 * 1024 * 1024),
-      # A job's input and metadata are kept in memory and on disk while the job exists.
-      max_input_bytes: to_int(m["max_input_bytes"], 1_048_576),
+      poll_interval_ms: int!(m["poll_interval_ms"], 2_000, 1..3_600_000, "media.poll_interval_ms"),
+      max_output_bytes: int!(m["max_output_bytes"], 512 * 1024 * 1024, 1..1_099_511_627_776, "media.max_output_bytes"),
+      # A job's input and metadata are kept on disk while the job exists.
+      max_input_bytes: int!(m["max_input_bytes"], 1_048_576, 1..8_000_000, "media.max_input_bytes"),
       # Unfinished jobs one key may have at a time (a key can set its own); 0 = no limit.
       max_open_jobs: open_jobs!(m["max_open_jobs"], "media") || 100,
+      # Jobs one key may create per UTC day (a key can set its own); 0 = no
+      # limit. The open-jobs limit does not bound jobs that end at once (a
+      # refused input, a provider that is down), and each of those still
+      # costs a log line, a ledger event and a webhook call.
+      max_jobs_per_day: jobs_per_day!(m["max_jobs_per_day"], "media") || 10_000,
       upstreams:
         Enum.map(m["upstreams"] || [], fn u ->
           %{
@@ -363,7 +418,11 @@ defmodule OmnigateControl.ConfigStore do
           %{
             model: Map.fetch!(r, "model"),
             cache_ttl_s: r["cache_ttl_s"],
-            timeout_s: to_int(r["timeout_s"], 600),
+            timeout_s: int!(r["timeout_s"], 600, 1..604_800, "media route #{inspect(r["model"])}: \"timeout_s\""),
+            # Top-level input fields a job may carry; nil = any.
+            allowed_input: allowed_input!(r["allowed_input"], r["model"]),
+            # Input field => value => factor on the job's price.
+            price_multipliers: price_multipliers!(r["price_multipliers"], r["model"]),
             targets:
               Enum.map(Map.fetch!(r, "targets"), fn t ->
                 price = t["price"] || %{}
@@ -378,14 +437,18 @@ defmodule OmnigateControl.ConfigStore do
                     per_second_usd: media_price!(price["per_second_usd"], r["model"])
                   }
                 }
+                |> Map.merge(seconds!(t, r["model"]))
               end)
           }
         end),
       storage: normalize_storage(m["storage"] || %{}),
       webhooks: %{
         retry_schedule_ms: schedule,
-        max_attempts: to_int(webhooks["max_attempts"], length(schedule) + 1),
-        timeout_ms: to_int(webhooks["timeout_ms"], 10_000),
+        max_attempts: int!(webhooks["max_attempts"], length(schedule) + 1, 1..100, "media.webhooks.max_attempts"),
+        timeout_ms: int!(webhooks["timeout_ms"], 10_000, 1..600_000, "media.webhooks.timeout_ms"),
+        # Deliveries in flight at once: overall, and for one gateway key's jobs.
+        max_concurrent: int!(webhooks["max_concurrent"], 16, 1..10_000, "media.webhooks.max_concurrent"),
+        max_concurrent_per_key: int!(webhooks["max_concurrent_per_key"], 4, 1..10_000, "media.webhooks.max_concurrent_per_key"),
         # Refuse webhook URLs that resolve to loopback/private addresses
         # unless explicitly allowed (local development).
         allow_private: webhooks["allow_private"] == true,
@@ -394,8 +457,79 @@ defmodule OmnigateControl.ConfigStore do
     }
   end
 
+  defp retry_schedule!(nil), do: @default_retry_schedule_ms
+
+  defp retry_schedule!(list) do
+    if is_list(list) and length(list) <= 50 and Enum.all?(list, &(is_integer(&1) and &1 >= 0 and &1 <= 2_592_000_000)) do
+      list
+    else
+      raise ArgumentError, "media.webhooks.retry_schedule_ms must be a list of at most 50 waits in milliseconds (each up to 30 days), got #{inspect(list)}"
+    end
+  end
+
+  # What a per-second price is applied to when the request does not settle
+  # it: `default_seconds` when the request names no duration, never less than
+  # `min_seconds`, and requests above `max_seconds` are refused.
+  defp seconds!(t, model) do
+    get = fn name ->
+      case t[name] do
+        nil -> nil
+        n when is_number(n) and n >= 0 and n <= 1.0e9 -> n
+        other -> raise ArgumentError, "media route #{inspect(model)}: \"#{name}\" must be a number of seconds, 0 or more, got #{inspect(other)}"
+      end
+    end
+
+    seconds = %{default_seconds: get.("default_seconds"), min_seconds: get.("min_seconds"), max_seconds: get.("max_seconds")}
+
+    cond do
+      seconds.default_seconds == 0 ->
+        raise ArgumentError, "media route #{inspect(model)}: \"default_seconds\" must be above 0 (leave it out for no default)"
+
+      seconds.min_seconds && seconds.max_seconds && seconds.min_seconds > seconds.max_seconds ->
+        raise ArgumentError, "media route #{inspect(model)}: \"min_seconds\" must not be above \"max_seconds\""
+
+      seconds.default_seconds && seconds.max_seconds && seconds.default_seconds > seconds.max_seconds ->
+        raise ArgumentError, "media route #{inspect(model)}: \"default_seconds\" must not be above \"max_seconds\""
+
+      true ->
+        seconds
+    end
+  end
+
+  defp allowed_input!(nil, _model), do: nil
+
+  defp allowed_input!(list, model) do
+    if is_list(list) and Enum.all?(list, &(is_binary(&1) and &1 != "")) do
+      Enum.uniq(list)
+    else
+      raise ArgumentError, "media route #{inspect(model)}: \"allowed_input\" must be a list of input field names, got #{inspect(list)}"
+    end
+  end
+
+  defp price_multipliers!(nil, _model), do: %{}
+
+  defp price_multipliers!(%{} = fields, model) do
+    Map.new(fields, fn {field, factors} ->
+      ok =
+        is_map(factors) and map_size(factors) > 0 and
+          Enum.all?(factors, fn {value, factor} -> is_binary(value) and is_number(factor) and factor >= 0 and factor <= 1.0e6 end)
+
+      if ok do
+        {field, Map.new(factors, fn {value, factor} -> {value, factor * 1.0} end)}
+      else
+        raise ArgumentError,
+              "media route #{inspect(model)}: \"price_multipliers\".#{inspect(field)} must map each allowed value to a factor of 0 or more " <>
+                "(for example {\"low\": 1, \"high\": 4}), got #{inspect(factors)}"
+      end
+    end)
+  end
+
+  defp price_multipliers!(other, model) do
+    raise ArgumentError, "media route #{inspect(model)}: \"price_multipliers\" must be an object of input field => {value: factor}, got #{inspect(other)}"
+  end
+
   defp media_price!(nil, _model), do: 0.0
-  defp media_price!(n, _model) when is_number(n) and n >= 0, do: n * 1.0
+  defp media_price!(n, _model) when is_number(n) and n >= 0 and n <= 1.0e9, do: n * 1.0
 
   defp media_price!(other, model) do
     raise ArgumentError, "media route #{inspect(model)}: a price must be a number of dollars, 0 or more, got #{inspect(other)}"
@@ -431,7 +565,7 @@ defmodule OmnigateControl.ConfigStore do
       dir:
         s["dir"] || System.get_env("OMNIGATE_MEDIA_DIR") || Application.get_env(:omnigate_control, :media_dir) ||
           Path.expand("data/media", File.cwd!()),
-      url_ttl_s: to_int(s["url_ttl_s"], 3_600)
+      url_ttl_s: int!(s["url_ttl_s"], 3_600, 1..31_536_000, "media.storage.url_ttl_s")
     }
   end
 
@@ -479,11 +613,7 @@ defmodule OmnigateControl.ConfigStore do
     :persistent_term.put({__MODULE__, :config}, %{get() | media: media})
   end
 
-  defp to_int(nil, default), do: default
-  defp to_int(n, _default) when is_integer(n), do: n
-  defp to_int(n, _default) when is_float(n), do: trunc(n)
-
   defp to_float(nil), do: nil
-  defp to_float(n) when is_integer(n), do: n * 1.0
-  defp to_float(n) when is_float(n), do: n
+  defp to_float(n) when is_number(n) and n >= 0 and n <= 1.0e12, do: n * 1.0
+  defp to_float(other), do: raise(ArgumentError, "a key's \"budget_usd\" must be a number of dollars, 0 or more, got #{inspect(other)}")
 end

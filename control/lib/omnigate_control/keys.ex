@@ -24,7 +24,7 @@ defmodule OmnigateControl.Keys do
   alias OmnigateControl.{ConfigStore, Ledger}
 
   @name_format ~r/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
-  @fields [:budget_usd, :budget_period, :rpm, :models, :max_open_jobs, :webhook_secret, :disabled]
+  @fields [:budget_usd, :budget_period, :rpm, :models, :max_open_jobs, :max_jobs_per_day, :webhook_secret, :disabled]
   @max_old_hashes 50
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -101,6 +101,22 @@ defmodule OmnigateControl.Keys do
     end
   end
 
+  @doc "How many jobs the key may create per UTC day: its own setting, else the media default. 0 = no limit."
+  def max_jobs_per_day(key) do
+    case Map.get(key, :max_jobs_per_day) do
+      nil -> ConfigStore.get().media |> Map.get(:max_jobs_per_day, 10_000)
+      n -> n
+    end
+  end
+
+  @doc """
+  What a key's rate limits are counted under: the hash of its current
+  secret, which is also what the data plane counts by. Two keys never share
+  it (names in a config file are not checked for uniqueness), and a rotation
+  starts a new allowance in both processes alike.
+  """
+  def identity(key), do: key.key_sha256
+
   @doc "`active`, `blocked` (budget spent) or `disabled` (switched off by an operator)."
   def state(key) do
     cond do
@@ -138,6 +154,7 @@ defmodule OmnigateControl.Keys do
             rpm: 0,
             models: nil,
             max_open_jobs: nil,
+            max_jobs_per_day: nil,
             webhook_secret: nil,
             disabled: false,
             source: :managed,
@@ -254,7 +271,7 @@ defmodule OmnigateControl.Keys do
   end
 
   defp validate(:budget_usd, nil), do: {:ok, nil}
-  defp validate(:budget_usd, n) when is_number(n) and n >= 0, do: {:ok, n * 1.0}
+  defp validate(:budget_usd, n) when is_number(n) and n >= 0 and n <= 1.0e12, do: {:ok, n * 1.0}
   defp validate(:budget_usd, _), do: invalid("budget_usd must be a number of dollars, 0 or more, or null for no budget")
 
   defp validate(:budget_period, nil), do: {:ok, "total"}
@@ -264,20 +281,34 @@ defmodule OmnigateControl.Keys do
   end
 
   defp validate(:rpm, nil), do: {:ok, 0}
-  defp validate(:rpm, n) when is_integer(n) and n >= 0, do: {:ok, n}
+  # The data plane reads `rpm` into a 32-bit field: a larger number would
+  # make the config snapshot unreadable for every data plane (see
+  # `ConfigStore.limits/0`).
+  defp validate(:rpm, n) when is_integer(n) and n >= 0 do
+    if n <= ConfigStore.limits().rpm, do: {:ok, n}, else: invalid("rpm must be at most #{ConfigStore.limits().rpm} (0 for no limit)")
+  end
+
   defp validate(:rpm, _), do: invalid("rpm must be a whole number of requests per minute, or 0 for no limit")
 
   defp validate(:models, nil), do: {:ok, nil}
 
   defp validate(:models, list) when is_list(list) do
-    if Enum.all?(list, &(is_binary(&1) and &1 != "")), do: {:ok, Enum.uniq(list)}, else: invalid("models must be a list of model names, or null for all models")
+    if length(list) <= 1_000 and Enum.all?(list, &(is_binary(&1) and &1 != "" and byte_size(&1) <= 256)) do
+      {:ok, Enum.uniq(list)}
+    else
+      invalid("models must be a list of at most 1000 model names, or null for all models")
+    end
   end
 
   defp validate(:models, _), do: invalid("models must be a list of model names, or null for all models")
 
   defp validate(:max_open_jobs, nil), do: {:ok, nil}
-  defp validate(:max_open_jobs, n) when is_integer(n) and n >= 0, do: {:ok, n}
+  defp validate(:max_open_jobs, n) when is_integer(n) and n >= 0 and n <= 1_000_000_000, do: {:ok, n}
   defp validate(:max_open_jobs, _), do: invalid("max_open_jobs must be a whole number (0 for no limit), or null for the default")
+
+  defp validate(:max_jobs_per_day, nil), do: {:ok, nil}
+  defp validate(:max_jobs_per_day, n) when is_integer(n) and n >= 0 and n <= 1_000_000_000, do: {:ok, n}
+  defp validate(:max_jobs_per_day, _), do: invalid("max_jobs_per_day must be a whole number (0 for no limit), or null for the default")
 
   defp validate(:disabled, b) when is_boolean(b), do: {:ok, b}
   defp validate(:disabled, _), do: invalid("disabled must be true or false")
@@ -304,9 +335,11 @@ defmodule OmnigateControl.Keys do
           key_sha256: hash,
           budget_usd: if(is_number(k["budget_usd"]), do: k["budget_usd"] * 1.0),
           budget_period: if(k["budget_period"] in ConfigStore.budget_periods(), do: k["budget_period"], else: "total"),
-          rpm: if(is_integer(k["rpm"]), do: k["rpm"], else: 0),
+          # A file written before `rpm` was bounded may hold anything.
+          rpm: if(is_integer(k["rpm"]), do: k["rpm"] |> max(0) |> min(ConfigStore.limits().rpm), else: 0),
           models: if(is_list(k["models"]), do: k["models"]),
           max_open_jobs: if(is_integer(k["max_open_jobs"]) and k["max_open_jobs"] >= 0, do: k["max_open_jobs"]),
+          max_jobs_per_day: if(is_integer(k["max_jobs_per_day"]) and k["max_jobs_per_day"] >= 0, do: k["max_jobs_per_day"]),
           webhook_secret: k["webhook_secret"],
           disabled: k["disabled"] == true,
           source: :managed,

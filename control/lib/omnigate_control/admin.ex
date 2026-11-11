@@ -23,6 +23,7 @@ defmodule OmnigateControl.Admin do
       rpm: Map.get(key, :rpm, 0),
       models: Map.get(key, :models),
       max_open_jobs: Keys.max_open_jobs(key),
+      max_jobs_per_day: Keys.max_jobs_per_day(key),
       disabled: Keys.disabled?(key),
       blocked: Keys.over_budget?(key),
       state: Keys.state(key),

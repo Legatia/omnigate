@@ -27,6 +27,10 @@ defmodule OmnigateControl.Errors do
     "overloaded" => "server_error"
   }
 
+  @doc false
+  # For the test that compares this table with the Zig source.
+  def by_reason, do: @by_reason
+
   @doc "The OpenAI-style category for a gateway reason; reasons not listed fall back on the status."
   def category(reason, status) do
     case @by_reason do

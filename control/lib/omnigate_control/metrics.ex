@@ -7,7 +7,7 @@ defmodule OmnigateControl.Metrics do
   to instrument and nothing extra to store. Per-key series are labelled with
   the key's configured name, never its hash.
   """
-  alias OmnigateControl.{ConfigStore, Keys, Ledger, Rejections}
+  alias OmnigateControl.{ConfigStore, Counters, Keys, Ledger, Rejections}
   alias OmnigateControl.Jobs.Store
 
   @job_statuses ~w(queued running succeeded failed canceled)
@@ -18,15 +18,18 @@ defmodule OmnigateControl.Metrics do
     config = ConfigStore.get()
     meta = ConfigStore.meta()
     ledger = Ledger.stats()
-    jobs = Store.all()
     {uptime_ms, _} = :erlang.statistics(:wall_clock)
 
     # Across rotations of a managed key, so its series never restart.
     keys = Enum.map(config.keys, fn k -> {k, Keys.totals(k)} end)
     per_key = fn fun -> Enum.map(keys, fn {k, t} -> {[key: k.name], fun.(k, t)} end) end
 
-    by_status = Enum.frequencies_by(jobs, & &1["status"])
-    by_webhook = jobs |> Enum.filter(&is_map(&1["webhook"])) |> Enum.frequencies_by(& &1["webhook"]["status"])
+    # Counted in one pass over the job table, without copying it.
+    {by_status, by_webhook} =
+      Store.fold({%{}, %{}}, fn job, {by_status, by_webhook} ->
+        by_webhook = if is_map(job["webhook"]), do: Map.update(by_webhook, job["webhook"]["status"], 1, &(&1 + 1)), else: by_webhook
+        {Map.update(by_status, job["status"], 1, &(&1 + 1)), by_webhook}
+      end)
 
     [
       metric("omnigate_build_info", :gauge, "Build information; the value is always 1.", [{[version: version()], 1}]),
@@ -96,7 +99,19 @@ defmodule OmnigateControl.Metrics do
         Enum.map(@webhook_states, &{[state: &1], Map.get(by_webhook, &1, 0)})
       ),
       metric("omnigate_ledger_events_total", :counter, "Usage events in the ledger.", [{[], ledger.events}]),
-      metric("omnigate_ledger_dedup_ids", :gauge, "Event ids held in memory to reject resent events.", [{[], ledger.dedup_ids}])
+      metric("omnigate_ledger_dedup_ids", :gauge, "Event ids held in memory to reject resent events.", [{[], ledger.dedup_ids}]),
+      metric(
+        "omnigate_ledger_invalid_events_total",
+        :counter,
+        "Usage events dropped because they were malformed, since this control plane started.",
+        [{[], Counters.get(:ledger_invalid_events)}]
+      ),
+      metric(
+        "omnigate_ledger_unpriced_events_total",
+        :counter,
+        "Usage events recorded at $0 because the config has no such route or target, since this control plane started.",
+        [{[], Counters.get(:ledger_unpriced_events)}]
+      )
     ]
     |> IO.iodata_to_binary()
   end

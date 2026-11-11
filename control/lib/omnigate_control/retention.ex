@@ -1,10 +1,12 @@
 defmodule OmnigateControl.Retention do
   @moduledoc """
   Keeps state from growing forever, according to the config's `retention`
-  section. Everything is off unless configured, so an upgrade never deletes
-  anything by itself.
+  section. Jobs and ledger segments are kept until a setting says otherwise,
+  so an upgrade never deletes either by itself. The one thing with a finite
+  default is the ledger's set of duplicate-detection ids (`ledger_ids_days`,
+  3 days), which is not history but working memory.
 
-      "retention": { "jobs_days": 30, "ledger_ids_days": 14, "ledger_days": 90, "delete_bucket_objects": true }
+      "retention": { "jobs_days": 30, "ledger_ids_days": 3, "ledger_days": 90, "delete_bucket_objects": true }
 
     * `jobs_days`: finished jobs (succeeded, failed, canceled) that finished
       more than this many days ago are removed from the job store and from
@@ -21,11 +23,15 @@ defmodule OmnigateControl.Retention do
       an object a remaining job still points at (a cache hit shares the
       original's object) is kept.
 
-    * `ledger_ids_days`: the ledger forgets event ids it recorded more than
-      this many days ago (see `OmnigateControl.Ledger`). Spend totals and the
-      ledger file are untouched. An event resent after its id was forgotten
-      would be counted twice, so keep this well above the longest outage a
-      data plane might spool through.
+    * `ledger_ids_days`: the ledger forgets the event ids of whole UTC days
+      that ended more than this many days ago (see
+      `OmnigateControl.Ledger.Ids`), so an id is kept for at least this long
+      and at most a day longer. Spend totals and the ledger file are
+      untouched. An event resent after its id was forgotten would be counted
+      twice, so keep this above the longest time a data plane may hold
+      undelivered usage in its spool: the longest control-plane outage, or
+      the longest a data plane is switched off, that you expect to ride out.
+      The default is 3.
 
     * `ledger_days`: sealed ledger segments (the files `ledger.NNNNNN.jsonl`
       next to the active `ledger.jsonl`) older than this are deleted. Their
@@ -36,7 +42,7 @@ defmodule OmnigateControl.Retention do
       always kept.
 
   A value of 0, or leaving a setting out, means "keep forever" (except
-  `ledger_ids_days`, which defaults to 14 when left out).
+  `ledger_ids_days`, which defaults to 3 when left out).
 
   One sweep runs shortly after boot and then every hour.
   """

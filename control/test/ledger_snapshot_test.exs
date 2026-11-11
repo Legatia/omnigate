@@ -249,7 +249,7 @@ defmodule OmnigateControl.LedgerSnapshotTest do
       kill(pid)
 
       # Redo the next snapshot by hand, stopping where the crash happens.
-      snapshot = %{version: 1, covered: {state.segment, state.offset}, totals: totals.totals, seen: Enum.map(totals.ids, &{&1, 0}), recent: [], taken_ms: 0}
+      snapshot = %{version: 2, covered: {state.segment, state.offset}, totals: totals.totals, ids: Ledger.Ids.sizes(state.ids), recent: [], taken_ms: 0}
       :ok = Files.write_snapshot_tmp(path, snapshot)
       if step in [:old_moved_aside, :installed], do: :ok = Files.install_snapshot_step1(path)
       if step == :installed, do: :ok = Files.install_snapshot_step2(path)

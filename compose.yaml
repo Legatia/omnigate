@@ -13,6 +13,23 @@
 # it gets the internal token and the text providers' keys and nothing else:
 # no admin token, no media provider keys, no webhook secrets, no bucket
 # credentials. Keep it that way when you add variables.
+#
+# Both omnigate containers have a memory limit (mem_limit below; 1 GiB each
+# unless .env says otherwise). A process that grows past its limit is killed
+# and restarted by Docker instead of taking the host down with it, and both
+# are built to restart cleanly: the control plane comes back from its ledger
+# snapshot, the data plane from its cached config and its usage spool.
+#
+#   OMNIGATE_CONTROL_MEMORY    The control plane holds one small record per
+#       recent request (about 61 MiB per million requests inside
+#       retention.ledger_ids_days, 3 days by default), every unfinished job,
+#       and one media output at a time for providers that answer inline.
+#       1g is comfortable up to a few million requests per day; raise it, or
+#       shorten ledger_ids_days, beyond that. `GET /metrics` shows
+#       omnigate_ledger_dedup_ids.
+#   OMNIGATE_DATAPLANE_MEMORY  The data plane's own limits add up to well
+#       under this by default: its response cache (OMNIGATE_CACHE_MAX_MB, 64)
+#       and what it may hold of requests being parsed. Raise both together.
 
 services:
   control:
@@ -29,6 +46,7 @@ services:
       OMNIGATE_TRUST_FORWARDED: "1"
     # A clean stop writes a ledger snapshot; give it time.
     stop_grace_period: 30s
+    mem_limit: ${OMNIGATE_CONTROL_MEMORY:-1g}
     volumes:
       - ./config/omnigate.json:/config/omnigate.json:ro
       - control-data:/data
@@ -42,8 +60,12 @@ services:
     # Longer than OMNIGATE_SHUTDOWN_GRACE_MS (10 s by default), so in-flight
     # requests finish and queued usage is delivered before Docker kills it.
     stop_grace_period: 20s
+    mem_limit: ${OMNIGATE_DATAPLANE_MEMORY:-1g}
     volumes:
       - dataplane-data:/data
+    # Started after the control plane, but not made to wait until it is
+    # healthy: a data plane with a cached config serves without it, and one
+    # without fetches the config as soon as the control plane answers.
     depends_on:
       - control
 
@@ -63,6 +85,10 @@ services:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    # No health condition here either. Both images have a HEALTHCHECK
+    # (`docker ps` shows it), but making the proxy wait for "healthy" would
+    # keep the dashboard unreachable exactly when someone needs to look at
+    # it, and Caddy retries an upstream that is not there yet by itself.
     depends_on:
       - dataplane
       - control

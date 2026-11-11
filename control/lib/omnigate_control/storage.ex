@@ -103,7 +103,7 @@ defmodule OmnigateControl.Storage do
               true
 
             {:error, reason} ->
-              Logger.warning("retention: could not delete bucket object #{key}: #{reason}")
+              Logger.warning("retention: could not delete bucket object #{key}: #{OmnigateControl.Text.line(reason, 200)}")
               false
           end
         end)

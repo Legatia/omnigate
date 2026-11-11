@@ -6,11 +6,24 @@
 # names) it issues certificates from its own local CA, which is what you want
 # for a trial on one machine.
 
+# X-Forwarded-For is written here, from the address of the connection, in
+# both blocks. Whatever a client sent under that name is replaced, never
+# appended to: the control plane counts failed logins and wrong tokens per
+# address it reads from this header (OMNIGATE_TRUST_FORWARDED=1 in
+# compose.yaml), so a client that could write it could pick a fresh address
+# for every guess. Caddy already ignores a client's value unless
+# `trusted_proxies` says otherwise; spelling it out keeps that true if this
+# file is ever given trusted proxies, and makes it visible. If Caddy itself
+# sits behind another proxy or a load balancer, replace {remote_host} with
+# {client_ip} AND list that proxy under `trusted_proxies` in the global
+# options, or every request will carry the load balancer's address.
+
 # Applications: the data plane.
 {$OMNIGATE_API_HOST:localhost} {
 	reverse_proxy dataplane:8080 {
 		# Pass streamed tokens through as they arrive.
 		flush_interval -1
+		header_up X-Forwarded-For {remote_host}
 	}
 }
 
@@ -32,5 +45,7 @@
 	@outside not remote_ip {$OMNIGATE_ADMIN_ALLOW:0.0.0.0/0 ::/0}
 	respond @outside 403
 
-	reverse_proxy control:4000
+	reverse_proxy control:4000 {
+		header_up X-Forwarded-For {remote_host}
+	}
 }

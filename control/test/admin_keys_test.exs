@@ -285,7 +285,11 @@ defmodule OmnigateControl.AdminKeysTest do
       assert %{"name" => _, "kind" => _, "host" => _} = hd(config["upstreams"])
       assert %{"model" => _, "strategy" => _, "targets" => [%{"upstream" => _, "model" => _, "weight" => _} | _]} = hd(config["routes"])
 
-      for secret <- [raw, OmnigateControl.sha256_hex(raw), "super-secret-signing-value", "key_sha256", "api_key_env"], do: refute(conn.resp_body =~ secret)
+      for secret <- [raw, OmnigateControl.sha256_hex(raw), "super-secret-signing-value", "key_sha256"], do: refute(conn.resp_body =~ secret)
+      # The config and key sections never name the variables provider keys are read from. (Only those sections:
+      # a recent job that failed over a missing key says `missing_api_key_env:<VAR>` in its attempts, by design,
+      # and whether such a job is among the newest depends on which tests ran before this one.)
+      refute JSON.encode!(Map.take(o, ["config", "keys"])) =~ "api_key_env"
       assert Enum.find(o["keys"], &(&1["has_webhook_secret"] == true))
       assert {401, _, _} = request(:get, "/admin/overview", nil, [])
     end

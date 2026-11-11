@@ -12,11 +12,21 @@ defmodule OmnigateControl.Ledger do
   whose id was already recorded is skipped, so resends never double-bill.
 
   The set of seen ids lives in memory and would grow with the log, so
-  `prune_ids/1` (driven by `retention.ledger_ids_days`) drops ids recorded
-  before a cutoff. An id only matters while a data plane might still resend
-  its event, which is minutes to hours. The trade is explicit: an event resent
-  after its id was pruned is counted a second time. Totals and the log file
-  are never touched by pruning.
+  `prune_ids/1` (driven by `retention.ledger_ids_days`) drops the ids of whole
+  UTC days that ended before a cutoff (`OmnigateControl.Ledger.Ids` explains
+  the layout: one table and one small file per day, outside the snapshot). An
+  id only matters while a data plane might still resend its event. The trade
+  is explicit: an event resent after its id was pruned is counted a second
+  time. Totals and the log file are never touched by pruning.
+
+  ## While it is starting
+
+  The tables other processes read (`totals/1`, `spend/1`, ...) get their
+  public names only once the snapshot is loaded and the later events are
+  replayed. Until then a read raises instead of answering from a half-filled
+  table: "this key has spent nothing" must never be an artefact of a restart.
+  Callers that decide something from spend check `ready?/0` first or let the
+  error turn into a refusal.
 
   ## Tokens and cost
 
@@ -58,7 +68,8 @@ defmodule OmnigateControl.Ledger do
   use GenServer
   require Logger
 
-  alias OmnigateControl.Ledger.Files
+  alias OmnigateControl.{Counters, Text}
+  alias OmnigateControl.Ledger.{Files, Ids}
 
   @table :omnigate_ledger_totals
   @prune_periods_ms 3_600_000
@@ -111,24 +122,34 @@ defmodule OmnigateControl.Ledger do
   """
   def record_media(%{"id" => _} = event), do: GenServer.call(__MODULE__, {:record_batch, [event], :media})
 
-  @doc "Forget dedup ids recorded before `cutoff_ms` (unix milliseconds). Returns how many were dropped."
-  def prune_ids(cutoff_ms) when is_integer(cutoff_ms), do: GenServer.call(__MODULE__, {:prune_ids, cutoff_ms}, 60_000)
+  @doc """
+  Forget the dedup ids of every UTC day that ended at or before `cutoff_ms`
+  (unix milliseconds). Returns how many ids were dropped.
+  """
+  def prune_ids(cutoff_ms, server \\ __MODULE__) when is_integer(cutoff_ms), do: GenServer.call(server, {:prune_ids, cutoff_ms}, 60_000)
+
+  @doc "True once the tables are loaded and published. False while the ledger is starting, restarting or down."
+  def ready?, do: :ets.whereis(@table) != :undefined
 
   @doc "Counts for monitoring: events recorded since the log began, and dedup ids currently held."
   def stats do
-    %{events: grand_totals().requests, dedup_ids: :ets.info(@seen, :size)}
+    %{events: grand_totals().requests, dedup_ids: Ids.count(@seen)}
   end
 
-  @doc "Totals over every key."
+  @doc """
+  Totals over every key.
+
+  Added up in key order, not in the order the table happens to hold its
+  rows: floating-point sums depend on the order of their terms, and a table
+  rebuilt from a snapshot holds the same rows in a different order. This way
+  the grand total after a restart is the grand total from before it, to the
+  last digit.
+  """
   def grand_totals do
-    :ets.foldl(
-      fn
-        {key, totals}, sum when is_binary(key) -> Map.merge(sum, totals, fn _field, a, b -> a + b end)
-        _day_or_period_row, sum -> sum
-      end,
-      empty_totals(),
-      @table
-    )
+    @table
+    |> :ets.select([{{:"$1", :"$2"}, [{:is_binary, :"$1"}], [{{:"$1", :"$2"}}]}])
+    |> Enum.sort()
+    |> Enum.reduce(empty_totals(), fn {_key, totals}, sum -> Map.merge(sum, totals, fn _field, a, b -> a + b end) end)
   end
 
   @doc "Totals over every key for one UTC day, given as `\"YYYY-MM-DD\"` (default: today)."
@@ -210,8 +231,12 @@ defmodule OmnigateControl.Ledger do
 
   def valid?(_), do: false
 
+  # More tokens than any request has: a count beyond this is a broken
+  # reporter, and arithmetic on it would overflow a float.
+  @max_tokens 1_000_000_000_000
+
   defp tokens_ok?(nil), do: true
-  defp tokens_ok?(n), do: is_integer(n) and n >= 0
+  defp tokens_ok?(n), do: is_integer(n) and n >= 0 and n <= @max_tokens
 
   # -- server --------------------------------------------------------------
 
@@ -219,20 +244,34 @@ defmodule OmnigateControl.Ledger do
   def init(opts) do
     path = Keyword.fetch!(opts, :path)
     {table, seen} = Keyword.get(opts, :tables, {@table, @seen})
-    Process.put(:ledger_tables, {table, seen})
+    Process.put(:ledger_clock, Keyword.get(opts, :clock, fn -> System.os_time(:millisecond) end))
     Process.flag(:trap_exit, true)
 
-    :ets.new(table, [:named_table, :set, :protected, read_concurrency: true])
-    :ets.new(seen, [:named_table, :set, :protected])
+    # Both tables are filled under a private name and only get the name
+    # readers use when everything is loaded (see "While it is starting").
+    loading = fn name -> :"#{name}_loading" end
+    :ets.new(loading.(table), [:named_table, :set, :protected, read_concurrency: true])
+    # Day -> the table holding that day's event ids.
+    :ets.new(loading.(seen), [:named_table, :set, :protected])
+    # Table ids stay valid across the rename.
+    totals_tid = :ets.whereis(loading.(table))
+    registry = :ets.whereis(loading.(seen))
+    Process.put(:ledger_tables, {totals_tid, registry})
 
     offset = Files.repair_active(path)
     started = System.monotonic_time(:millisecond)
 
-    {covered, recent, generations} =
+    {covered, recent, generations, ids, migrated} =
       case Files.load_snapshot(path) do
         {:ok, snapshot, which} ->
-          :ets.insert(table, snapshot.totals)
-          :ets.insert(seen, snapshot.seen)
+          :ets.insert(totals_tid, snapshot.totals)
+
+          {ids, migrated} =
+            case snapshot do
+              %{version: 2, ids: sizes} -> {Ids.load(path, registry, sizes), false}
+              # From before ids had their own files: write them out, by the day they were recorded.
+              %{seen: seen_rows} -> {migrate_ids(Ids.reset(path, registry), seen_rows), true}
+            end
 
           if which == :prev do
             Logger.warning("ledger: using the previous snapshot; the newest one was unusable")
@@ -245,21 +284,36 @@ defmodule OmnigateControl.Ledger do
           # The snapshot just read is the only one vouched for. Segments are
           # deleted only when two validated generations cover them: this one
           # and the next one this run writes.
-          {snapshot.covered, Map.get(snapshot, :recent, []), {seq, nil}}
+          {snapshot.covered, Map.get(snapshot, :recent, []), {seq, nil}, ids, migrated}
 
         :none ->
           warn_if_history_missing(path)
-          {nil, [], {nil, nil}}
+          # Every event still on disk is replayed and brings its id back.
+          {nil, [], {nil, nil}, Ids.reset(path, registry), false}
       end
 
-    {replayed, recent} =
-      Enum.reduce(Files.tail(path, covered), {0, recent}, fn {file, from}, acc ->
-        Files.fold(file, from, acc, fn event, {n, recent} ->
-          apply_event(event)
-          {n + 1, Enum.take([event | recent], @recent)}
+    today = day_of(now_ms())
+
+    # The ids loaded so far are exactly those of the events the snapshot
+    # counted. An event after the snapshot whose id is among them has been
+    # counted already (a snapshot and its offset that disagree, a batch
+    # written twice): it is skipped rather than counted again.
+    {replayed, skipped, recent, ids} =
+      Enum.reduce(Files.tail(path, covered), {0, 0, recent, ids}, fn {file, from}, acc ->
+        Files.fold(file, from, acc, fn event, {n, skipped, recent, ids} ->
+          key = is_binary(event["id"]) && Ids.key(event["id"])
+
+          if key && Ids.member?(ids, key) do
+            {n, skipped + 1, recent, ids}
+          else
+            apply_event(event)
+            ids = if key, do: Ids.add(ids, [key], received_day(event, today)), else: ids
+            {n + 1, skipped, Enum.take([event | recent], @recent), ids}
+          end
         end)
       end)
 
+    if skipped > 0, do: Logger.warning("ledger: skipped #{skipped} events after the snapshot that it had already counted")
     took = System.monotonic_time(:millisecond) - started
 
     if replayed > 0 or covered do
@@ -273,6 +327,7 @@ defmodule OmnigateControl.Ledger do
     state = %{
       path: path,
       file: file,
+      ids: ids,
       recent: recent,
       segment: Files.active_seq(path),
       offset: offset,
@@ -283,13 +338,19 @@ defmodule OmnigateControl.Ledger do
       # Segment numbers the two snapshot generations cover up to (nil = none).
       covered: current,
       covered_prev: prev,
+      # How a segment is sealed; replaced only by tests that make it fail.
+      seal: Keyword.get(opts, :seal, &Files.seal/1),
       snapshot_every: Keyword.get(opts, :snapshot_every, env(:ledger_snapshot_every, 50_000)),
       segment_bytes: Keyword.get(opts, :segment_bytes, env(:ledger_segment_bytes, 64 * 1024 * 1024)),
       tick_ms: Keyword.get(opts, :tick_ms, env(:ledger_snapshot_interval_ms, 300_000))
     }
 
     # A boot that had to replay leaves a snapshot behind, so the next one does not.
-    state = if replayed > 0 or is_nil(covered), do: take_snapshot(state), else: state
+    state = if replayed > 0 or is_nil(covered) or migrated, do: take_snapshot(state), else: state
+
+    # Loaded: from here on readers may see the tables.
+    :ets.rename(totals_tid, table)
+    :ets.rename(registry, seen)
 
     Process.send_after(self(), :prune_periods, @prune_periods_ms)
     Process.send_after(self(), :tick, state.tick_ms)
@@ -297,6 +358,24 @@ defmodule OmnigateControl.Ledger do
   end
 
   defp env(key, default), do: Application.get_env(:omnigate_control, key, default)
+
+  defp now_ms, do: Process.get(:ledger_clock).()
+  defp day_of(ms), do: ms |> DateTime.from_unix!(:millisecond) |> DateTime.to_date() |> Date.to_iso8601()
+
+  # The UTC day an event was recorded on, from the stamp it got then.
+  defp received_day(event, default) do
+    case event["received_at"] do
+      <<day::binary-size(10), "T", _::binary>> -> day
+      _ -> default
+    end
+  end
+
+  # Ids from a version 1 snapshot, `{id, recorded_ms}`, into per-day files.
+  defp migrate_ids(ids, rows) do
+    rows
+    |> Enum.group_by(fn {_id, ms} -> day_of(ms) end, fn {id, _ms} -> Ids.key(id) end)
+    |> Enum.reduce(ids, fn {day, keys}, ids -> Ids.add(ids, keys, day) end)
+  end
 
   # Segments are numbered from 1. If the oldest one left is not number 1 and no
   # snapshot vouches for the deleted ones, their totals are gone.
@@ -348,11 +427,17 @@ defmodule OmnigateControl.Ledger do
 
   def handle_info(_other, state), do: {:noreply, state}
 
-  # A clean stop leaves a snapshot, so the next boot replays nothing.
+  # A clean stop leaves a snapshot, so the next boot replays nothing. Only a
+  # clean one: after a crash the tables may hold a batch this state never
+  # heard of, and a snapshot of that with the old offset would make the next
+  # boot count the batch a second time. A crashed ledger is rebuilt from the
+  # last good snapshot and the events after it.
   @impl true
-  def terminate(_reason, state) do
-    if state.since_snapshot > 0, do: take_snapshot(state)
+  def terminate(reason, state) do
+    clean = reason in [:normal, :shutdown] or match?({:shutdown, _}, reason)
+    if clean and state.since_snapshot > 0, do: take_snapshot(state)
     File.close(state.file)
+    Ids.close(state.ids)
     :ok
   end
 
@@ -374,19 +459,23 @@ defmodule OmnigateControl.Ledger do
 
   @impl true
   def handle_call({:record_batch, events, kind}, _from, state) do
-    {accepted, counts} = classify(events, kind)
+    {accepted, counts} = classify(events, kind, state.ids)
 
     state =
       if accepted != [] do
         # Write-ahead: the whole batch is on disk before totals change or we ack.
-        bytes = IO.iodata_to_binary(Enum.map(accepted, &[JSON.encode!(&1), ?\n]))
+        bytes = IO.iodata_to_binary(Enum.map(accepted, fn {_event, line} -> [line, ?\n] end))
+        accepted = Enum.map(accepted, fn {event, _line} -> event end)
         :ok = IO.binwrite(state.file, bytes)
         :ok = :file.datasync(state.file)
+        keys = for %{"id" => id} <- accepted, is_binary(id), do: Ids.key(id)
+        ids = Ids.add(state.ids, keys, day_of(now_ms()))
         Enum.each(accepted, &apply_event/1)
 
         %{
           state
-          | offset: state.offset + byte_size(bytes),
+          | ids: ids,
+            offset: state.offset + byte_size(bytes),
             since_snapshot: state.since_snapshot + length(accepted),
             segment_day: state.segment_day || Date.utc_today() |> Date.to_iso8601(),
             recent: Enum.take(Enum.reverse(accepted) ++ state.recent, @recent)
@@ -402,18 +491,25 @@ defmodule OmnigateControl.Ledger do
         true -> state
       end
 
-    {:reply, {:ok, Map.put(counts, :accepted, length(accepted))}, state}
+    {:reply, {:ok, counts}, state}
   end
 
   def handle_call(:recent, _from, state), do: {:reply, state.recent, state}
 
   def handle_call({:prune_periods, now}, _from, state), do: {:reply, prune_periods(now), state}
 
+  # Whole days only: a day goes once its last millisecond is at or before the
+  # cutoff, so every id is kept for at least the configured window.
+  #
+  # A snapshot follows at once. The replay after a restart skips events whose
+  # ids it already holds; an event that was resent after its id was forgotten
+  # (and so, by the documented trade, counted again) must then be covered by
+  # a snapshot, or the next boot would see its first copy's id come back from
+  # the replay and count the second copy differently from how this run did.
   def handle_call({:prune_ids, cutoff_ms}, _from, state) do
-    dropped = :ets.select_delete(seen_tab(), [{{:_, :"$1"}, [{:<, :"$1", cutoff_ms}], [true]}])
-    # The snapshot would bring them back at the next boot otherwise.
-    state = if dropped > 0, do: %{state | since_snapshot: max(state.since_snapshot, 1)}, else: state
-    {:reply, dropped, state}
+    {ids, dropped} = Ids.drop_before(state.ids, day_of(cutoff_ms))
+    state = %{state | ids: ids}
+    {:reply, dropped, if(dropped > 0, do: take_snapshot(state), else: state)}
   end
 
   def handle_call(:snapshot, _from, state) do
@@ -462,25 +558,57 @@ defmodule OmnigateControl.Ledger do
   end
 
   def handle_call(:dump, _from, state) do
-    {:reply, %{totals: Enum.sort(:ets.tab2list(tab())), ids: seen_tab() |> :ets.tab2list() |> Enum.map(&elem(&1, 0)) |> Enum.sort()}, state}
+    {:reply, %{totals: Enum.sort(:ets.tab2list(tab())), ids: Ids.all(state.ids)}, state}
   end
 
   # Close the active file under its number and start the next one.
+  #
+  # Never fatal, like a snapshot: by the time a seal is due the batch that
+  # filled the segment is already on disk and in the totals. Failing here
+  # (a full disk, a permission) must not undo that or take the process down
+  # with totals its state does not describe; the segment simply stays active
+  # and the seal is tried again after the next batch.
   defp seal(state) do
     File.close(state.file)
-    segment = Files.seal(state.path)
-    Logger.info("ledger: sealed segment #{segment - 1} (#{state.offset} bytes)")
-    %{state | file: File.open!(state.path, [:append, :binary]), segment: segment, offset: 0, segment_day: nil}
+
+    sealed =
+      try do
+        {:ok, state.seal.(state.path)}
+      rescue
+        e -> {:error, e}
+      end
+
+    case sealed do
+      {:ok, segment} ->
+        Logger.info("ledger: sealed segment #{segment - 1} (#{state.offset} bytes)")
+        %{state | file: File.open!(state.path, [:append, :binary]), segment: segment, offset: 0, segment_day: nil}
+
+      {:error, e} ->
+        Logger.error("ledger: sealing segment #{state.segment} failed, will try again: #{Text.line(Exception.message(e))}")
+        # Whatever step failed, the active file is (or becomes) the one the
+        # numbering says it is, and its size is where the next write goes.
+        file = File.open!(state.path, [:append, :binary])
+        segment = Files.active_seq(state.path)
+        offset = File.stat!(state.path).size
+        %{state | file: file, segment: segment, offset: offset, segment_day: if(offset > 0, do: state.segment_day, else: nil)}
+    end
   end
 
   # Never fatal: a snapshot that cannot be written costs boot time later, and
   # recording usage must go on.
+  #
+  # A snapshot holds the totals, not the event ids: its size follows the
+  # number of keys, not the number of requests, so writing it does not stall
+  # recording. The ids are in their own files; the snapshot only notes how
+  # long each one is, after making sure those bytes are on disk.
   defp take_snapshot(state) do
+    ids = Ids.sync(state.ids)
+
     snapshot = %{
-      version: 1,
+      version: 2,
       covered: {state.segment, state.offset},
       totals: :ets.tab2list(tab()),
-      seen: :ets.tab2list(seen_tab()),
+      ids: Ids.sizes(ids),
       recent: state.recent,
       taken_ms: System.os_time(:millisecond)
     }
@@ -489,38 +617,66 @@ defmodule OmnigateControl.Ledger do
     %{state | since_snapshot: 0, snapshot_ms: snapshot.taken_ms, covered: state.segment, covered_prev: state.covered}
   rescue
     e ->
-      Logger.error("ledger: snapshot failed: #{Exception.message(e)}")
+      Logger.error("ledger: snapshot failed: #{Text.line(Exception.message(e))}")
       state
   end
 
   defp tab, do: Process.get(:ledger_tables) |> elem(0)
-  defp seen_tab, do: Process.get(:ledger_tables) |> elem(1)
 
-  # Splits a batch into events to record, in order, plus duplicate/invalid counts.
-  defp classify(events, kind) do
-    {accepted, _ids, counts} =
-      Enum.reduce(events, {[], MapSet.new(), %{duplicates: 0, invalid: 0}}, fn event, {acc, ids, counts} ->
-        id = is_map(event) && event["id"]
+  # Splits a batch into `{event, json_line}` pairs to record, in order, plus
+  # counts. An event that cannot be recorded (missing fields, wrong types,
+  # text that is not valid UTF-8 and so cannot be written as JSON) is counted
+  # as invalid, reported in the log and in a metric, and never takes the
+  # process down.
+  defp classify(events, kind, ids) do
+    {accepted, _batch_ids, counts} =
+      Enum.reduce(events, {[], MapSet.new(), %{accepted: 0, duplicates: 0, invalid: 0}}, fn event, {acc, batch, counts} ->
+        key = is_map(event) && is_binary(event["id"]) && Ids.key(event["id"])
 
         cond do
           not valid?(event) ->
-            {acc, ids, %{counts | invalid: counts.invalid + 1}}
+            {acc, batch, %{counts | invalid: counts.invalid + 1}}
 
-          id && (MapSet.member?(ids, id) or :ets.member(seen_tab(), id)) ->
-            {acc, ids, %{counts | duplicates: counts.duplicates + 1}}
+          key && (MapSet.member?(batch, key) or Ids.member?(ids, key)) ->
+            {acc, batch, %{counts | duplicates: counts.duplicates + 1}}
 
           true ->
-            ids = if id, do: MapSet.put(ids, id), else: ids
-            {[enrich(event, kind) | acc], ids, counts}
+            case encode(enrich(event, kind)) do
+              {:ok, enriched, line} ->
+                batch = if key, do: MapSet.put(batch, key), else: batch
+                {[{enriched, line} | acc], batch, %{counts | accepted: counts.accepted + 1}}
+
+              :error ->
+                {acc, batch, %{counts | invalid: counts.invalid + 1}}
+            end
         end
       end)
+
+    if counts.invalid > 0 do
+      Counters.bump(:ledger_invalid_events, counts.invalid)
+      Logger.warning("ledger: dropped #{counts.invalid} of #{length(events)} usage events in a batch as invalid (missing or mistyped fields)")
+    end
 
     {Enum.reverse(accepted), counts}
   end
 
+  defp encode(event) do
+    {:ok, event, JSON.encode!(event)}
+  rescue
+    _ ->
+      # Something in it is not valid UTF-8. Usage must not be lost over a
+      # label, so the strings are repaired and the event is kept.
+      try do
+        clean = Text.clean(event)
+        {:ok, clean, JSON.encode!(clean)}
+      rescue
+        _ -> :error
+      end
+  end
+
   # Media job events are priced by the job runner; only timestamps are added.
   defp enrich(event, :media) do
-    cost = if is_number(event["cost_usd"]) and event["cost_usd"] >= 0, do: event["cost_usd"] * 1.0, else: 0.0
+    cost = if is_number(event["cost_usd"]) and event["cost_usd"] >= 0 and event["cost_usd"] <= 1.0e12, do: event["cost_usd"] * 1.0, else: 0.0
 
     event
     |> Map.merge(%{"kind" => "media", "cost_usd" => cost})
@@ -543,31 +699,60 @@ defmodule OmnigateControl.Ledger do
         # Served from the data plane's response cache: no provider was paid.
         usage["cached"] == true -> 0.0
         is_nil(usage["upstream"]) -> 0.0
-        true -> cost(tokens, OmnigateControl.ConfigStore.prices(usage["route_model"], usage["upstream"], usage["target_model"]))
+        true -> cost(tokens, prices(usage))
       end
 
     usage |> Map.put("cost_usd", cost) |> stamp()
   end
 
+  # An event for a route or target the config does not have is recorded at
+  # no cost: there is no price to apply. That is how real spend goes missing
+  # from a budget (a route renamed while data planes still use the old
+  # snapshot, a typo in a target), so it is counted in a metric and logged
+  # once per (route, upstream, model).
+  defp prices(usage) do
+    triple = {usage["route_model"], usage["upstream"], usage["target_model"]}
+
+    case OmnigateControl.ConfigStore.find_prices(usage["route_model"], usage["upstream"], usage["target_model"]) do
+      nil ->
+        Counters.bump(:ledger_unpriced_events, 1)
+        warned = Process.get(:ledger_unpriced_warned, MapSet.new())
+
+        if not MapSet.member?(warned, triple) and MapSet.size(warned) < 1_000 do
+          Process.put(:ledger_unpriced_warned, MapSet.put(warned, triple))
+
+          Logger.warning(
+            "ledger: usage for route #{Text.line(triple |> elem(0), 80)} via #{Text.line(triple |> elem(1), 80)}/#{Text.line(triple |> elem(2), 80)} " <>
+              "has no price in the config and is recorded at $0 (logged once per route and target; see omnigate_ledger_unpriced_events_total)"
+          )
+        end
+
+        %{in: 0.0, cached_in: 0.0, cache_write: 0.0, out: 0.0}
+
+      prices ->
+        prices
+    end
+  end
+
   # `ts` is when the request finished on the data plane, not when the event
   # reached us: events can arrive late after an outage.
   defp stamp(event) do
+    now = DateTime.from_unix!(now_ms(), :millisecond)
+
     ts =
       case event["ts_ms"] do
-        ms when is_integer(ms) -> DateTime.from_unix!(ms, :millisecond)
-        _ -> DateTime.utc_now()
+        # A time no calendar has (a huge or negative number) is not worth a crash.
+        ms when is_integer(ms) and ms >= 0 and ms < 253_402_300_800_000 -> DateTime.from_unix!(ms, :millisecond)
+        _ -> now
       end
 
     Map.merge(event, %{
       "ts" => DateTime.to_iso8601(ts),
-      "received_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+      "received_at" => DateTime.to_iso8601(now)
     })
   end
 
   defp apply_event(event) do
-    # Kept with the time we recorded it, so old ids can be pruned.
-    if id = event["id"], do: :ets.insert(seen_tab(), {id, recorded_ms(event)})
-
     add(event["key_sha256"], event)
 
     # One extra row per UTC day (of the event's own time), for "today" figures,
@@ -618,15 +803,6 @@ defmodule OmnigateControl.Ledger do
            cost_usd: t.cost_usd + (event["cost_usd"] || 0.0)
        }}
     )
-  end
-
-  defp recorded_ms(event) do
-    with at when is_binary(at) <- event["received_at"],
-         {:ok, dt, _offset} <- DateTime.from_iso8601(at) do
-      DateTime.to_unix(dt, :millisecond)
-    else
-      _ -> System.os_time(:millisecond)
-    end
   end
 
   defp empty_totals do

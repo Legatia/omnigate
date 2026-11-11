@@ -23,45 +23,7 @@ A self-hostable AI gateway in two small processes. The data plane (Zig) is the p
 | `tools/` | Python (stdlib) | Mock providers, end-to-end test, SDK compatibility test, container test, hostile-input test, a one-command runner for all of them (`check.py`), load test, benchmark, LiteLLM config importer, the live NEAR AI Cloud check (`near_live.py`) |
 | `compose.yaml`, `deploy/` | Docker | Both images plus a Caddy proxy for TLS, with one environment file per container |
 
-## NEAR hackathon
-
-This repository is an entry in the NEAR hackathon (1 to 14 November 2026), track **Privacy & Private AI**. This section is for the people and the coding agents that review it: what was built, what NEAR does in it, and steps to see it work.
-
-**What it is.** omnigate is a self-hostable gateway that applications call instead of calling AI providers directly. The whole repository was written inside the hackathon window (first commit 10 November 2026; see `git log`), with Claude Code.
-
-**The problem.** A team that wants to use hosted models on sensitive text has two worries: what the model is shown, and who else at the provider can read the request. Promises in a privacy policy answer neither in a way that can be checked.
-
-**What was built for it, and NEAR's part.**
-
-1. **Redaction at the gateway** (not NEAR-specific): e-mail addresses, phone numbers, card numbers, IP addresses and secrets in a request are replaced by placeholders before it leaves, and put back in the answer. This limits what the model is shown.
-2. **Attested-only routing, on NEAR AI Cloud's TEE attestation**: NEAR AI Cloud runs its gateway and its own models in Intel TDX machines and publishes attestation reports. omnigate verifies those reports itself, natively, with no verification library: the Intel quote and its certificate chain to Intel's pinned root, revocation lists, platform patch status, debug mode, the fresh nonce, the measured configuration, the event log, and NVIDIA's verdict on the GPU evidence. It keeps each model verified (re-checked with a new nonce every few minutes), and a request marked `attested` is sent **only** to a model whose attestation is verified right now. Otherwise it is refused, never sent elsewhere. This answers "who else can read it" with evidence instead of a promise.
-3. **A page that shows both**: `/private-chat` in the dashboard has the conversation, the request exactly as the gateway's redaction leaves it, and the verification checklist with the raw evidence.
-4. **Nothing kept**: requests from that page go out as `no-store`; the gateway keeps no content of them, and the end-to-end test searches every file both processes wrote for a marked prompt to check it.
-
-What the attestation check does **not** establish is written down as plainly: [docs/attestation.md](docs/attestation.md#what-is-not-checked) (no image-provenance check; the measurement allowlist is empty unless set; the data plane's TLS connections are not bound to the report; NEAR's per-response signatures are not checked).
-
-**See it work.** Prerequisites: Zig 0.17, Erlang/OTP 29 with Elixir 1.20, Python 3.9+ ([docs/quickstart.md](docs/quickstart.md) has the setup, including the Windows `PATH`). Build once:
-
-```bash
-cd dataplane && zig build && cd ../control && mix deps.get && mix compile && cd ..
-```
-
-Without any API key (an attestation report is public):
-
-1. Run `python tools/near_live.py`. See: a checklist of what was verified for NEAR's gateway and for `z-ai/glm-5.3-flash` (genuine TDX quotes, status `UpToDate`, nonce bound, configuration measured, GPU evidence accepted by NVIDIA), then 11 checks that end in `11/11 checks passed`: the running gateway verifies the model NEAR serves itself, refuses `openai/gpt-5` (which NEAR only relays and cannot attest), lets an `attested` request through to the verified model, and refuses it, unsent, on the two other routes.
-2. Run `python tools/near_live.py --serve`. It prints an address and an admin token. Open `http://127.0.0.1:4000/private-chat`, sign in with the token. See: the **Verified** panel with a green check per item; each opens to the raw values. Press **Verify again now**: a new nonce, a new verdict in about two seconds.
-3. On that page, press **Fill in an example**, then **Send**. See: the middle panel shows the message with `[EMAIL_1]`, `[PHONE_1]` and `[CARD_1]` where the values were. Without a NEAR key the provider answers 401, and the page says so.
-4. Choose the model **unattested** (the same NEAR endpoint, configured without attestation) and send again. See: `Not sent`, `attestation_unverified`. Choose **relayed** and see the same, with NEAR's own reason in the Verified panel.
-5. Run the offline tests: `cd control && mix test test/attestation_test.exs test/attestation_manager_test.exs`. See: `12 passed`. The first of them is 96 checks on a saved real report, in which each kind of tampering has to fail with its own error. `python tools/check.py` from the repository root runs every suite (about six minutes).
-
-With a NEAR AI Cloud key (`NEAR_AI_API_KEY`; from https://cloud.near.ai, or $10 of credits at https://nearbuilders.org/dashboard):
-
-6. Set `NEAR_AI_API_KEY` in the shell and run `python tools/near_live.py` again. See: four more checks, a real completion whose answer contains the real e-mail address and card number although the model was only sent placeholders, with `x-omnigate-attestation: verified; tcb=UpToDate; ...` on the response.
-7. Run `python tools/near_live.py --serve` with the key set and chat on the page with the model **private**. See: the answer with your values in it on the left, placeholders in the middle, and "Attestation: verified" under them.
-
-**Status of this part, honestly.** Steps 1 to 5 were run on 11 November 2026 and pass. Steps 6 and 7 had not been run when this was written: no NEAR key was at hand, so a completion coming back through an attested target is exercised only up to NEAR's own 401.
-
-**Built with.** Zig 0.17 (standard library only) for the data plane; Elixir 1.20 on Erlang/OTP 29 with [Bandit](https://github.com/mtrudel/bandit) and [Plug](https://github.com/elixir-plug/plug) for the control plane; Python's standard library for the tools (the SDK test uses the official `openai` and `anthropic` packages, the end-to-end test `pyrage` when installed); Docker and Caddy for the Compose deployment. The TDX verification was written for this project in Elixir on OTP's `:crypto`, following Intel's DCAP rules as implemented in Phala's [dcap-qvl](https://github.com/Phala-Network/dcap-qvl) and NEAR's verification documentation; the Intel SGX Root CA certificate is pinned in the source. License: [PolyForm Noncommercial 1.0.0](LICENSE).
+> **NEAR hackathon reviewers:** the entry (track Privacy & Private AI) is the opt-in part described under [Optional: attested private inference on NEAR AI Cloud](#optional-attested-private-inference-on-near-ai-cloud), with numbered steps to see it work.
 
 ## Features
 
@@ -283,6 +245,48 @@ The security model is in [SECURITY.md](SECURITY.md); the detail behind each line
 - **Ledger retention.** Once `retention.ledger_days` has deleted ledger segments, the two snapshot files hold the only copy of the totals those segments contributed, so back up the whole data directory. Deleting bucket objects under retention is best effort. Duplicate-detection ids are forgotten after 3 days by default, so a usage event resent later than that would be counted twice; raise `retention.ledger_ids_days` if a data plane can hold undelivered usage for longer. A ledger snapshot written by the current code is not read by code from before commit d79406b ([docs/upgrading.md](docs/upgrading.md#going-back)).
 - **Metrics.** Each scrape scans the whole job store, and the output has been checked by tests, not by a real Prometheus server.
 - **Zig 0.17 standard-library quirks worked around** in the data plane: `http.Client.fetch` panics on a reset keep-alive connection, `privileged_headers` are never sent, and `http.BodyWriter.flush` does not flush the body's own buffer. More are kept away from by validating input first or by not using the code at all: `http.HeaderIterator` unwraps a null on a header line without a colon, the server asserts on a request body without a length, the chunked body reader overflows on a chunk size that does not fit its integer (so chunked request bodies are refused and upstream bodies are read by the gateway's own reader), the server asserts when a response ends with a different number of bytes than its head promised (so an upstream's length is never forwarded), the head parser lets a bare line feed through in a header value, the JSON object's hash map has a fixed seed, and the JSON serialiser indexes past a fixed stack beyond 256 levels of nesting.
+
+## Optional: attested private inference on NEAR AI Cloud
+
+**This part is opt-in.** omnigate is a model gateway and stays one: nothing here runs unless the config gives an upstream an `"attestation"` setting. Without it no attestation is fetched or checked, no request is restricted, and the dashboard has no Private chat page. `config/omnigate.near.json` is a config that switches it on; the default and dev configs do not.
+
+This repository is an entry in the NEAR hackathon (1 to 14 November 2026), track **Privacy & Private AI**. This section is for the people and the coding agents that review it: what was built, what NEAR does in it, and steps to see it work.
+
+**What it is.** omnigate is a self-hostable gateway that applications call instead of calling AI providers directly. The whole repository was written inside the hackathon window (first commit 10 November 2026; see `git log`), with Claude Code.
+
+**The problem.** A team that wants to use hosted models on sensitive text has two worries: what the model is shown, and who else at the provider can read the request. Promises in a privacy policy answer neither in a way that can be checked.
+
+**What was built for it, and NEAR's part.**
+
+1. **Redaction at the gateway** (not NEAR-specific): e-mail addresses, phone numbers, card numbers, IP addresses and secrets in a request are replaced by placeholders before it leaves, and put back in the answer. This limits what the model is shown.
+2. **Attested-only routing, on NEAR AI Cloud's TEE attestation**: NEAR AI Cloud runs its gateway and its own models in Intel TDX machines and publishes attestation reports. omnigate verifies those reports itself, natively, with no verification library: the Intel quote and its certificate chain to Intel's pinned root, revocation lists, platform patch status, debug mode, the fresh nonce, the measured configuration, the event log, and NVIDIA's verdict on the GPU evidence. It keeps each model verified (re-checked with a new nonce every few minutes), and a request marked `attested` is sent **only** to a model whose attestation is verified right now. Otherwise it is refused, never sent elsewhere. This answers "who else can read it" with evidence instead of a promise.
+3. **A page that shows both**: `/private-chat` in the dashboard has the conversation, the request exactly as the gateway's redaction leaves it, and the verification checklist with the raw evidence.
+4. **Nothing kept**: requests from that page go out as `no-store`; the gateway keeps no content of them, and the end-to-end test searches every file both processes wrote for a marked prompt to check it.
+
+What the attestation check does **not** establish is written down as plainly: [docs/attestation.md](docs/attestation.md#what-is-not-checked) (no image-provenance check; the measurement allowlist is empty unless set; the data plane's TLS connections are not bound to the report; NEAR's per-response signatures are not checked).
+
+**See it work.** Prerequisites: Zig 0.17, Erlang/OTP 29 with Elixir 1.20, Python 3.9+ ([docs/quickstart.md](docs/quickstart.md) has the setup, including the Windows `PATH`). Build once:
+
+```bash
+cd dataplane && zig build && cd ../control && mix deps.get && mix compile && cd ..
+```
+
+Without any API key (an attestation report is public):
+
+1. Run `python tools/near_live.py`. See: a checklist of what was verified for NEAR's gateway and for `z-ai/glm-5.3-flash` (genuine TDX quotes, status `UpToDate`, nonce bound, configuration measured, GPU evidence accepted by NVIDIA), then 11 checks that end in `11/11 checks passed`: the running gateway verifies the model NEAR serves itself, refuses `openai/gpt-5` (which NEAR only relays and cannot attest), lets an `attested` request through to the verified model, and refuses it, unsent, on the two other routes.
+2. Run `python tools/near_live.py --serve`. It prints an address and an admin token. Open `http://127.0.0.1:4000/private-chat`, sign in with the token. See: the **Verified** panel with a green check per item; each opens to the raw values. Press **Verify again now**: a new nonce, a new verdict in about two seconds.
+3. On that page, press **Fill in an example**, then **Send**. See: the middle panel shows the message with `[EMAIL_1]`, `[PHONE_1]` and `[CARD_1]` where the values were. Without a NEAR key the provider answers 401, and the page says so.
+4. Choose the model **unattested** (the same NEAR endpoint, configured without attestation) and send again. See: `Not sent`, `attestation_unverified`. Choose **relayed** and see the same, with NEAR's own reason in the Verified panel.
+5. Run the offline tests: `cd control && mix test test/attestation_test.exs test/attestation_manager_test.exs`. See: `12 passed`. The first of them is 96 checks on a saved real report, in which each kind of tampering has to fail with its own error. `python tools/check.py` from the repository root runs every suite (about six minutes).
+
+With a NEAR AI Cloud key (`NEAR_AI_API_KEY`; from https://cloud.near.ai, or $10 of credits at https://nearbuilders.org/dashboard):
+
+6. Set `NEAR_AI_API_KEY` in the shell and run `python tools/near_live.py` again. See: four more checks, a real completion whose answer contains the real e-mail address and card number although the model was only sent placeholders, with `x-omnigate-attestation: verified; tcb=UpToDate; ...` on the response.
+7. Run `python tools/near_live.py --serve` with the key set and chat on the page with the model **private**. See: the answer with your values in it on the left, placeholders in the middle, and "Attestation: verified" under them.
+
+**Status of this part, honestly.** Steps 1 to 5 were run on 11 November 2026 and pass. Steps 6 and 7 had not been run when this was written: no NEAR key was at hand, so a completion coming back through an attested target is exercised only up to NEAR's own 401.
+
+**Built with.** Zig 0.17 (standard library only) for the data plane; Elixir 1.20 on Erlang/OTP 29 with [Bandit](https://github.com/mtrudel/bandit) and [Plug](https://github.com/elixir-plug/plug) for the control plane; Python's standard library for the tools (the SDK test uses the official `openai` and `anthropic` packages, the end-to-end test `pyrage` when installed); Docker and Caddy for the Compose deployment. The TDX verification was written for this project in Elixir on OTP's `:crypto`, following Intel's DCAP rules as implemented in Phala's [dcap-qvl](https://github.com/Phala-Network/dcap-qvl) and NEAR's verification documentation; the Intel SGX Root CA certificate is pinned in the source. License: [PolyForm Noncommercial 1.0.0](LICENSE).
 
 ## Documentation and license
 

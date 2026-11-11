@@ -408,7 +408,33 @@ defmodule OmnigateControl.Router do
 
   # -- the Private chat page ----------------------------------------------------
 
+  # Opt-in: the page exists only while the config has an attested upstream.
   get "/private-chat" do
+    if Attestation.configured?(), do: private_chat_page(conn), else: no_private_chat(conn)
+  end
+
+  get "/admin/private-chat/state" do
+    if Attestation.configured?(), do: send_json(conn, 200, PrivateChat.state()), else: no_private_chat(conn)
+  end
+
+  # One turn of the page's conversation: a dry run and the real request,
+  # both through the data plane's public port with the page's own key.
+  # Nothing of the body is logged or audited.
+  post "/admin/private-chat/send" do
+    if Attestation.configured?() do
+      case PrivateChat.send_turn(json_object(conn)) do
+        {:ok, result} -> send_json(conn, 200, result)
+        {:error, status, type, message} -> send_error(conn, status, type, message)
+      end
+    else
+      no_private_chat(conn)
+    end
+  end
+
+  defp no_private_chat(conn),
+    do: send_error(conn, 404, "not_found", "the Private chat page is off: no upstream in the config has an \"attestation\" setting")
+
+  defp private_chat_page(conn) do
     nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
 
     csrf =
@@ -418,20 +444,6 @@ defmodule OmnigateControl.Router do
       end
 
     send_html(conn, 200, PrivateChatPage.page(csrf, nonce), nonce)
-  end
-
-  get "/admin/private-chat/state" do
-    send_json(conn, 200, PrivateChat.state())
-  end
-
-  # One turn of the page's conversation: a dry run and the real request,
-  # both through the data plane's public port with the page's own key.
-  # Nothing of the body is logged or audited.
-  post "/admin/private-chat/send" do
-    case PrivateChat.send_turn(json_object(conn)) do
-      {:ok, result} -> send_json(conn, 200, result)
-      {:error, status, type, message} -> send_error(conn, status, type, message)
-    end
   end
 
   get "/login" do

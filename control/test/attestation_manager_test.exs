@@ -317,6 +317,12 @@ defmodule OmnigateControl.AttestationManagerTest do
     assert metrics =~ "# TYPE omnigate_attestation_verified gauge"
     assert metrics =~ ~s(omnigate_attestation_checks_total{outcome="ok"})
 
+    # The feature is opt-in: no page, no nav link, nothing to send through.
+    assert admin(:get, "/private-chat").status == 404
+    assert admin(:get, "/admin/private-chat/state").status == 404
+    assert admin(:post, "/admin/private-chat/send", %{"model" => "x", "messages" => []}).status == 404
+    refute admin(:get, "/").resp_body =~ "private-chat"
+
     # No target in the snapshot claims an attestation.
     refute Router.snapshot() |> JSON.encode!() |> String.contains?("attestation")
   end

@@ -11,6 +11,11 @@ which runs its gateway and the models it serves itself in Intel TDX
 machines, with NVIDIA GPUs that attest too. `"provider": "near"` is the one
 kind there is.
 
+**All of this is opt-in.** It is switched on by giving an upstream an
+`"attestation"` setting. A config without one fetches and checks nothing,
+restricts no request, and has no Private chat page (`/private-chat` and its
+endpoints answer 404, and the dashboard shows no link to it).
+
 Read [What a pass means](#what-a-pass-means) and
 [What is not checked](#what-is-not-checked) before you rely on it.
 
@@ -393,6 +398,9 @@ check:
 ```
 
 ## The Private chat page
+
+Only present while the config has an upstream with an `"attestation"`
+setting; otherwise it answers 404.
 
 `/private-chat` on the control plane (same sign-in as the dashboard, linked
 from its top bar) is a chat with three panels:

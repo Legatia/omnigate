@@ -28,7 +28,10 @@ defmodule OmnigateControl.Dashboard do
       ~s(<header class="top"><div class="brand">omnigate <span>control plane</span></div>),
       ~s(<nav aria-label="Sections"><a href="#overview">Overview</a><a href="#keys">Keys</a>),
       ~s(<a href="#requests">Requests</a><a href="#jobs">Jobs</a><a href="#refused">Refused</a><a href="#activity">Activity</a>),
-      ~s(<a href="#config">Configuration</a><a href="/private-chat">Private chat</a></nav>),
+      ~s(<a href="#config">Configuration</a>),
+      # Only where the config has an attested upstream (the feature is opt-in).
+      if(OmnigateControl.Attestation.configured?(), do: ~s(<a href="/private-chat">Private chat</a>), else: ""),
+      ~s(</nav>),
       ~s(<div class="right"><span id="updated" class="muted" role="status">Updated ),
       h(clock(o.generated_at)),
       ~s( UTC</span>),

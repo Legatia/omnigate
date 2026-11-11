@@ -42,7 +42,8 @@ only met a mock, is tracked in the README's
   `x-omnigate-attestation: verified; tcb=...; since=...`.
 - **A privacy dry run.** `x-omnigate-dry-run: privacy` on a text request
   answers with the request as privacy mode left it and sends nothing.
-- **The Private chat page** (`/private-chat` on the control plane): the
+- **The Private chat page** (`/private-chat` on the control plane; only
+  present while the config has an upstream with an `attestation` setting): the
   conversation, what the provider is sent for it, and the attestation
   checklist with its raw values and a "verify again now" button. It sends
   through the data plane with a managed key of its own (`private-chat`) and

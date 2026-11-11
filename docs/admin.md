@@ -84,7 +84,8 @@ data with JavaScript off. With JavaScript on it refreshes itself every four
 seconds from `GET /admin/overview` (the top bar shows the time of the last
 update, in UTC), and the buttons that change keys work.
 
-The top bar also links to the **Private chat** page (`/private-chat`, same
+When the config has an [attested upstream](attestation.md) (opt-in; not
+otherwise), the top bar also links to the **Private chat** page (`/private-chat`, same
 sign-in): a chat that shows what privacy mode sends to the provider and
 what was verified about the machine that answers. It uses a managed key of
 its own, `private-chat`, which appears in the key list like any other and

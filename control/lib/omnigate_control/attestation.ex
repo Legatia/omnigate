@@ -149,6 +149,20 @@ defmodule OmnigateControl.Attestation do
   # ---- What has to be attested ---------------------------------------------
 
   @doc """
+  Whether the running config asks for attestation at all: some upstream
+  carries an `attestation` setting. Without one this whole feature is off:
+  nothing is fetched or checked, and the dashboard has no Private chat page.
+  """
+  def configured? do
+    case OmnigateControl.ConfigStore.get() do
+      %{upstreams: upstreams} -> Enum.any?(upstreams, &is_map(Map.get(&1, :attestation)))
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  @doc """
   Every (upstream, model) the config routes to on an upstream that has an
   attestation setting: `[%{upstream, model, base_url, setting}]`, once each.
   """

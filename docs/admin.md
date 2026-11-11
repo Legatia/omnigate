@@ -141,6 +141,14 @@ Upstreams are shown by host only; keys, hashes and secrets never appear.
 Routes, upstreams and everything under `media` are still changed by editing
 the config file.
 
+A key's [privacy mode](privacy.md) shows under its state (`private:
+no-store, redact, unlink`). Managed keys have a **Privacy on** / **Privacy
+off** button: on sets `"privacy": true`; off removes the whole setting, an
+`encrypt_to` recipient included, and like the other destructive buttons asks
+for a second click. The form that creates a key has a privacy choice and a
+field for the recipient. Anything finer (single parts, single classes) is set
+over the admin API.
+
 ## Gateway keys: two sources
 
 | | File keys | Managed keys |
@@ -415,6 +423,7 @@ summed up, as described [below](#failed-and-throttled-sign-ins).
 | `forwarded_for` | Present when the request had an `X-Forwarded-For` header: the first 400 bytes of its value, made one line of valid UTF-8 and cut to 200 characters. A direct caller can fake it, so it is recorded, not trusted. |
 | `outcome` | `ok`, or the error's reason, its `error.code` (`invalid_request`, `key_exists`, `read_only_key`, `key_not_found`, ...). For logins: `ok`, `denied` or `throttled`. |
 | `fields` | For `key.update`: the names of the fields that were sent (sorted, at most 20), never their values. |
+| `privacy` | For a `key.create` or `key.update` that set the key's [privacy mode](privacy.md): what it became, in a few words (`no-store, redact, unlink, encrypt`), or `off`. The `encrypt_to` recipient itself is never written. |
 | `repeats` | Only on a summary line: how many more sign-in attempts with this outcome the address made in that minute, beyond the one that has its own line. |
 
 What is and is not recorded:
@@ -543,7 +552,7 @@ All on the control plane's port, all behind the admin token or a session.
 |---|---|
 | `GET /admin/keys` | Every key with its usage. |
 | `POST /admin/keys` | Create a managed key. `201`, with the key itself. |
-| `PATCH /admin/keys/{name}` | Change a managed key: `budget_usd`, `budget_period`, `rpm`, `models`, `max_open_jobs`, `max_jobs_per_day`, `webhook_secret`, `disabled`. |
+| `PATCH /admin/keys/{name}` | Change a managed key: `budget_usd`, `budget_period`, `rpm`, `max_concurrent`, `models`, `max_open_jobs`, `max_jobs_per_day`, `webhook_secret`, `disabled`, `privacy` ([Privacy mode](privacy.md#switching-it-on)). |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. `200`, with the new key. |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
@@ -561,8 +570,9 @@ All on the control plane's port, all behind the admin token or a session.
 | `requests` | Up to 25 text requests, taken from the 50 newest ledger events. Each has the request's `id` (the `x-omnigate-request-id` the client was given) and `estimated`, which is `true` when its token counts are an estimate because the response ended before the provider's final usage arrived. |
 | `jobs` | The 25 newest media jobs, with output URLs and webhook state. |
 | `rejected` | Up to 50 `{key, reason, count}` series of refused requests, largest first. |
+| `redactions` | Up to 50 `{key, class, count}` series: values [privacy mode](privacy.md#redaction) replaced before a provider saw them. Counts only. |
 | `audit` | The 10 newest audit entries. |
-| `config` | The read-only configuration view: upstreams by host, routes, media, storage, retention (`jobs_days`, `ledger_ids_days`, `ledger_days`, `delete_bucket_objects`). |
+| `config` | The read-only configuration view: upstreams by host, routes, media, storage, retention (`jobs_days`, `ledger_ids_days`, `ledger_days`, `delete_bucket_objects`, `private_outputs_hours`). |
 
 It is the dashboard's own feed rather than a versioned interface: expect its
 shape to follow the dashboard.

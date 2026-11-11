@@ -691,7 +691,8 @@ defmodule OmnigateControl.Wave2Test do
                jobs_days: 30,
                ledger_ids_days: 3,
                ledger_days: 0,
-               delete_bucket_objects: true
+               delete_bucket_objects: true,
+               private_outputs_hours: 24
              }
 
       assert ConfigStore.normalize(%{"retention" => %{"delete_bucket_objects" => false}}).retention.delete_bucket_objects == false
@@ -738,7 +739,7 @@ defmodule OmnigateControl.Wave2Test do
 
   test "the overview document lists what the dashboard needs" do
     {200, overview, _} = request(:get, "/admin/overview", nil, admin())
-    assert Enum.sort(Map.keys(overview)) == ~w(audit config generated_at jobs keys rejected requests today totals)
+    assert Enum.sort(Map.keys(overview)) == ~w(audit config generated_at jobs keys redactions rejected requests today totals)
     assert %{"delete_bucket_objects" => _, "jobs_days" => _, "ledger_ids_days" => _} = overview["config"]["retention"]
     assert is_list(Admin.overview().audit)
   end

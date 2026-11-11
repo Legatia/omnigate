@@ -20,6 +20,10 @@ pub const Upstream = struct {
     /// `/v1` of the client's path is replaced by this. Gemini's
     /// OpenAI-compatible endpoint, for example, is `/v1beta/openai`.
     v1_path: ?[]const u8 = null,
+    /// Whether a private request to this upstream is sent `"store": false`
+    /// (see proxy.zig, `takesStoreFlag`). Null: only when the host is
+    /// api.openai.com.
+    privacy_store_flag: ?bool = null,
 };
 
 /// The client's path as an upstream spells it.
@@ -62,6 +66,17 @@ pub const Route = struct {
     cache_ttl_s: u32 = 0,
 };
 
+pub const Privacy = struct {
+    /// Keep nothing of a request here: no response cache.
+    no_store: bool = false,
+    /// Names of the classes of values to replace by placeholders before a
+    /// provider sees them ("email", "phone", "card", "ip", "secret"). A
+    /// name this build does not know is ignored.
+    redact: []const []const u8 = &.{},
+    /// Remove the fields that name an end user.
+    unlink: bool = false,
+};
+
 pub const Key = struct {
     key_sha256: []const u8,
     name: []const u8,
@@ -73,6 +88,9 @@ pub const Key = struct {
     max_concurrent: u32 = 0,
     /// Route models this key may use; null means all of them.
     models: ?[]const []const u8 = null,
+    /// Privacy mode for every request of this key (see redact.zig); null
+    /// means none. A request can add to it with `x-omnigate-privacy`.
+    privacy: ?Privacy = null,
 
     pub fn allows(key: *const Key, route_model: []const u8) bool {
         const allowed = key.models orelse return true;
@@ -133,6 +151,18 @@ test "snapshots parse with and without the newer optional fields" {
     try std.testing.expectEqual(@as(u32, 600), newer.value.routes[0].cache_ttl_s);
     try std.testing.expectEqual(@as(usize, 2), newer.value.media_models.?.len);
     try std.testing.expectEqualStrings("video", newer.value.media_models.?[1]);
+
+    var private = try parse(gpa,
+        \\{"version":"v4","upstreams":[],"routes":[],"keys":[{"key_sha256":"aa","name":"p","privacy":{"no_store":true,"redact":["email","later"],"unlink":true,"encrypt":true}},
+        \\ {"key_sha256":"bb","name":"q","privacy":null},{"key_sha256":"cc","name":"r","privacy":{}}]}
+    );
+    defer private.deinit();
+    const p = private.value.keys[0].privacy.?;
+    try std.testing.expect(p.no_store and p.unlink);
+    try std.testing.expectEqual(@as(usize, 2), p.redact.len);
+    try std.testing.expectEqual(@as(?Privacy, null), private.value.keys[1].privacy);
+    try std.testing.expect(!private.value.keys[2].privacy.?.no_store and private.value.keys[2].privacy.?.redact.len == 0);
+    try std.testing.expectEqual(@as(?Privacy, null), old.value.keys[0].privacy);
 }
 
 pub const Snapshot = struct {

@@ -38,6 +38,7 @@ const limits = @import("limits.zig");
 const models = @import("models.zig");
 const logging = @import("logging.zig");
 const quirks = @import("quirks.zig");
+const redact = @import("redact.zig");
 const translate = @import("translate.zig");
 const usage_mod = @import("usage.zig");
 const watchdog = @import("watchdog.zig");
@@ -227,7 +228,80 @@ const ClientHeaders = struct {
     anthropic_version: ?[]const u8 = null,
     anthropic_beta: ?[]const u8 = null,
     idempotency_key: ?[]const u8 = null,
+    /// `x-omnigate-privacy`, as sent.
+    privacy: ?[]const u8 = null,
+    privacy_repeated: bool = false,
 };
+
+/// What privacy mode does to one request: the key's setting, plus whatever
+/// the request's own header added (it can add, never take away).
+const Privacy = struct {
+    /// Nothing of the request or the answer is kept here: no response cache.
+    no_store: bool = false,
+    /// Classes of values replaced by placeholders before the provider.
+    redact: redact.ClassSet = .none,
+    /// Fields that name an end user are removed.
+    unlink: bool = false,
+
+    fn of(key: *const config.Key, header: redact.Request) Privacy {
+        var p: Privacy = .{ .no_store = header.no_store, .unlink = header.unlink };
+        if (header.redact) p.redact = .every;
+        if (key.privacy) |k| {
+            p.no_store = p.no_store or k.no_store;
+            p.unlink = p.unlink or k.unlink;
+            for (k.redact) |name| {
+                if (redact.Class.parse(name)) |c| p.redact.add(c);
+            }
+        }
+        return p;
+    }
+
+    /// For the `x-omnigate-privacy` response header: what was applied.
+    fn note(p: Privacy) ?[]const u8 {
+        const r = !p.redact.isEmpty();
+        if (p.no_store and r and p.unlink) return "no-store, redact, unlink";
+        if (p.no_store and r) return "no-store, redact";
+        if (p.no_store and p.unlink) return "no-store, unlink";
+        if (r and p.unlink) return "redact, unlink";
+        if (p.no_store) return "no-store";
+        if (r) return "redact";
+        if (p.unlink) return "unlink";
+        return null;
+    }
+};
+
+/// Request fields that name an end user to a provider, or tie one request to
+/// another, by the protocol the client speaks (checked against both
+/// providers' API references in November 2026):
+///
+///   * OpenAI: `user` (deprecated), `safety_identifier`, `prompt_cache_key`,
+///     and `metadata` (free-form tags, kept with a stored completion);
+///   * Anthropic: `metadata` (its one field is `user_id`) and `diagnostics`
+///     (its `previous_message_id` names the client's previous response).
+///
+/// Fields a request needs in order to work at all are not on the list, even
+/// where they link requests (`previous_response_id`, `conversation`,
+/// Anthropic's `container`): removing them would change what was asked for.
+const linking_fields_openai = [_][]const u8{ "user", "safety_identifier", "prompt_cache_key", "metadata" };
+const linking_fields_anthropic = [_][]const u8{ "metadata", "diagnostics" };
+
+/// Counter names for redactions, by class (see counters.zig).
+const redaction_counters = [redact.Class.count][]const u8{ "redacted_email", "redacted_phone", "redacted_card", "redacted_ip", "redacted_secret" };
+
+/// Does this upstream keep what it is sent unless told `"store": false`?
+/// Only OpenAI itself documents the flag (chat completions and responses);
+/// other servers that speak its protocol are not sent a field they may
+/// refuse.
+fn takesStoreFlag(up: *const config.Upstream, path: []const u8) bool {
+    if (up.kind != .openai) return false;
+    if (!std.mem.eql(u8, path, "/v1/chat/completions") and !std.mem.eql(u8, path, "/v1/responses")) return false;
+    // The operator may say so either way (a proxy in front of OpenAI, or a
+    // compatible server that is known to take the flag).
+    if (up.privacy_store_flag) |flag| return flag;
+    const after_scheme = if (std.mem.find(u8, up.base_url, "://")) |at| up.base_url[at + 3 ..] else up.base_url;
+    const host = after_scheme[0 .. std.mem.findAny(u8, after_scheme, "/:?") orelse after_scheme.len];
+    return std.ascii.eqlIgnoreCase(host, "api.openai.com");
+}
 
 fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn, acc: *logging.Access) !void {
     var arena_state: std.heap.ArenaAllocator = .init(app.gpa);
@@ -277,6 +351,10 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             hdrs.anthropic_beta = try arena.dupe(u8, h.value);
         } else if (std.ascii.eqlIgnoreCase(h.name, "idempotency-key")) {
             hdrs.idempotency_key = try arena.dupe(u8, h.value);
+        } else if (std.ascii.eqlIgnoreCase(h.name, "x-omnigate-privacy")) {
+            // Sent twice, there is no telling which one a reader would take.
+            if (hdrs.privacy != null) hdrs.privacy_repeated = true;
+            hdrs.privacy = try arena.dupe(u8, h.value);
         }
     }
 
@@ -302,6 +380,16 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         return respondError(acc, request, .bad_request, "invalid_request", "invalid anthropic-version header");
     if (hdrs.anthropic_beta) |v| if (!guard_mod.safeHeaderValue(v, "-._, ", 512))
         return respondError(acc, request, .bad_request, "invalid_request", "invalid anthropic-beta header");
+    // The privacy header can only switch protections on. Anything it does
+    // not spell exactly is refused: a request that asked for privacy and
+    // mistyped it must not go out without.
+    if (hdrs.privacy_repeated)
+        return respondError(acc, request, .bad_request, "invalid_request", "x-omnigate-privacy was sent more than once");
+    const privacy_request: redact.Request = if (hdrs.privacy) |v|
+        redact.Request.parse(v) orelse
+            return respondError(acc, request, .bad_request, "invalid_request", "invalid x-omnigate-privacy header: use \"on\", or a comma-separated list of no-store, redact, unlink (it can only switch protections on)")
+    else
+        .{};
     // `idempotency-key` is looked at where it is used: on job requests,
     // below. Elsewhere it is not forwarded, so what it contains is the
     // client's business (SDKs send one of their own on every call).
@@ -314,7 +402,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
 
     // A signed output URL carries its own proof; the control plane checks it.
     if (is_files and method == .GET and hdrs.api_key == null and hasQueryParam(query, "sig")) {
-        return forwardToControl(app, acc, arena, request, guard, method, path, query, null, null, null);
+        return forwardToControl(app, acc, arena, request, guard, method, path, query, null, null, null, false);
     }
 
     // --- authentication -------------------------------------------------
@@ -370,7 +458,9 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             null;
         if (job_body) |b| if (!guard_mod.jsonDepthOk(b, guard_mod.max_client_json_depth))
             return respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply");
-        return forwardToControl(app, acc, arena, request, guard, method, path, query, job_body, hdrs.idempotency_key, &key_hash);
+        // (The key's own setting is the control plane's to apply; the
+        // header's wish for this one job is passed on.)
+        return forwardToControl(app, acc, arena, request, guard, method, path, query, job_body, hdrs.idempotency_key, &key_hash, is_job_create and privacy_request.no_store);
     }
 
     const ep = endpoint orelse
@@ -391,20 +481,20 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     }
 
     // --- body -------------------------------------------------------------
-    const body = (try readBody(app, arena, request, guard, max_request_body)) orelse
+    const client_body = (try readBody(app, arena, request, guard, max_request_body)) orelse
         return respondError(acc, request, .payload_too_large, "payload_too_large", "request body exceeds 8 MiB");
 
     // Bounded nesting, before anything parses it: the serialiser this body
     // may go through again indexes past a fixed stack beyond 256 levels.
-    if (!guard_mod.jsonDepthOk(body, guard_mod.max_client_json_depth))
+    if (!guard_mod.jsonDepthOk(client_body, guard_mod.max_client_json_depth))
         return respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply");
 
     // One pass over the body, in place, nothing allocated: is it JSON, what
     // model does it name, is it a stream (jsonscan.zig).
-    const top = jsonscan.scan(body, .{ .max_depth = guard_mod.max_client_json_depth }) catch |err| {
-        const first = std.mem.findNone(u8, body, " \t\r\n");
+    const client_top = jsonscan.scan(client_body, .{ .max_depth = guard_mod.max_client_json_depth }) catch |err| {
+        const first = std.mem.findNone(u8, client_body, " \t\r\n");
         return switch (err) {
-            error.InvalidJson => if (first != null and body[first.?] != '{' and std.json.validate(arena, body) catch false)
+            error.InvalidJson => if (first != null and client_body[first.?] != '{' and std.json.validate(arena, client_body) catch false)
                 respondError(acc, request, .bad_request, "invalid_json", "request body must be a JSON object")
             else
                 respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON"),
@@ -418,9 +508,9 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         };
     };
 
-    const model_span = top.model orelse
+    const model_span = client_top.model orelse
         return respondError(acc, request, .bad_request, "missing_model", "request has no \"model\" field");
-    const model_text = body[model_span.start..model_span.end];
+    const model_text = client_body[model_span.start..model_span.end];
     if (model_text.len < 2 or model_text[0] != '"')
         return respondError(acc, request, .bad_request, "missing_model", "\"model\" must be a string");
     const route_model: []const u8 = if (std.mem.findScalar(u8, model_text, '\\') == null)
@@ -430,7 +520,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         std.json.parseFromSliceLeaky([]const u8, arena, model_text, .{}) catch
             return respondError(acc, request, .bad_request, "missing_model", "\"model\" is not a valid string");
     acc.model.set(route_model);
-    const is_stream = top.stream;
+    const is_stream = client_top.stream;
 
     // --- model limits -------------------------------------------------------
     // Before the route lookup, so the answer does not reveal which other
@@ -441,18 +531,84 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     const route = snapshot.findRoute(route_model) orelse
         return respondError(acc, request, .not_found, "model_not_found", "no route for this model");
 
+    // --- privacy mode -------------------------------------------------------
+    // What the provider is not shown (redact.zig): the fields that name an
+    // end user are taken out, and addresses, numbers and secrets in the text
+    // are replaced by placeholders, which `forward` turns back in the answer.
+    // Everything from here on works on the result as if the client had sent
+    // it; the map lives in this request's arena and nowhere else.
+    const privacy: Privacy = .of(key, privacy_request);
+    var body: []const u8 = client_body;
+    var top = client_top;
+    var redactions: redact.Map = .{};
+    var redact_reserved: u64 = 0;
+    defer if (redact_reserved != 0) app.gate.releaseTree(app.io, &key_hash, redact_reserved);
+    if (privacy.unlink) {
+        const linking: []const []const u8 = switch (kind) {
+            .openai => &linking_fields_openai,
+            .anthropic => &linking_fields_anthropic,
+        };
+        if (redact.editTop(arena, body, linking, "") catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.InvalidJson => return respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON"),
+        }) |edited| body = edited;
+    }
+    if (!privacy.redact.isEmpty() and ep.redact) {
+        // The copy with placeholders in it is held next to the original.
+        const reserve: u64 = 2 * @as(u64, body.len);
+        switch (app.gate.reserveTree(app.io, &key_hash, reserve)) {
+            .ok => redact_reserved = reserve,
+            .key_share => return respondTreeRefusal(acc, request, .key_share),
+            .budget, .concurrency => return respondTreeRefusal(acc, request, .budget),
+        }
+        var seed: [8]u8 = undefined;
+        app.io.random(&seed);
+        redactions.seed = std.mem.readInt(u64, &seed, .little);
+        // Looking through megabytes takes a moment, and that moment is ours:
+        // the deadline for a client that does not take its answer (armed when
+        // the body had been read) does not run meanwhile.
+        guard.disarm();
+        const redacted = redact.redactBody(arena, body, privacy.redact, &redactions);
+        guard.arm(app.io, app.client_stall_timeout_ms);
+        body = redacted catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.InvalidJson => return respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON"),
+            error.TooManyRedactions => return respondError(acc, request, .bad_request, "too_many_redactions", "this request holds more distinct values to redact than one request may (16384); send less text at once"),
+        };
+        for (redact.Class.all) |c| {
+            const hits = redactions.hits[c.index()];
+            if (hits != 0) app.counters.countN(app.gpa, app.io, key.name, redaction_counters[c.index()], hits);
+        }
+    }
+    if (body.ptr != client_body.ptr) {
+        // Only string contents and whole members changed: still one object.
+        top = jsonscan.scan(body, .{ .max_depth = guard_mod.max_client_json_depth }) catch
+            return respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON");
+        if (top.model == null) return respondError(acc, request, .bad_request, "missing_model", "request has no \"model\" field");
+    }
+    var restorer: redact.Restorer = .init(&redactions);
+
     const started = Io.Timestamp.now(app.io, .awake);
 
     // --- response cache -----------------------------------------------------
     // Only for routes that ask for it, and never for streams. The lookup comes
     // after authentication, model limits, the budget and the rate limit, so a
     // cached answer is subject to all of them.
-    var extras: ForwardExtras = .{ .key_hash = &key_hash };
+    var extras: ForwardExtras = .{
+        .key_hash = &key_hash,
+        .privacy_note = privacy.note(),
+        // Only an endpoint that answers with text has anything to put back.
+        .restorer = if (ep.restore and !redactions.isEmpty()) &restorer else null,
+    };
     // An exchange `forward` handed back and nobody took over is closed here.
     defer if (extras.parked) |*left| left.req.deinit();
     var capture: Capture = .{ .limit = app.cache.maxEntryBytes() };
     var cache_key: ?cache.Key = null;
-    const cache_ttl_ms: i64 = if (ep.metered and !is_stream and app.cache.max_bytes > 0) @as(i64, route.cache_ttl_s) * 1000 else 0;
+    // Never for a private request: a "no-store" request leaves nothing
+    // behind, and an answer that was written around placeholders belongs to
+    // the request that made them.
+    const cacheable = ep.metered and !is_stream and app.cache.max_bytes > 0 and !privacy.no_store and privacy.redact.isEmpty();
+    const cache_ttl_ms: i64 = if (cacheable) @as(i64, route.cache_ttl_s) * 1000 else 0;
     // The key is the request in canonical form, which takes a tree of it. A
     // body too costly to parse (see `cacheKeyFor`) is simply not cached.
     if (cache_ttl_ms > 0) if (cacheKeyFor(app, route_model, path, &key_hash, body, top)) |ck| {
@@ -592,6 +748,15 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             .openai => "/v1/chat/completions",
             .anthropic => "/v1/messages",
         };
+        // A private request tells a provider that would otherwise keep the
+        // exchange not to (`"store": false`), whatever the client said.
+        if (privacy.no_store and takesStoreFlag(up, upstream_path)) {
+            const drop: []const []const u8 = if (std.mem.eql(u8, upstream_path, "/v1/chat/completions")) &.{ "store", "metadata" } else &.{"store"};
+            if (redact.editTop(arena, out_body, drop, "\"store\":false") catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.InvalidJson => null,
+            }) |edited| out_body = edited;
+        }
         var mode: ForwardMode = if (xlate) |x|
             .{ .translate = x }
         else if (injected_usage)
@@ -1024,16 +1189,20 @@ const Endpoint = struct {
     inject_stream_usage: bool = false,
     /// Counts against rate limits and is written to the usage ledger.
     metered: bool = true,
+    /// Its request carries text that privacy mode looks through ...
+    redact: bool = true,
+    /// ... and its answer carries text the placeholders may come back in.
+    restore: bool = true,
 
     fn forPath(path: []const u8) ?Endpoint {
         const eql = std.mem.eql;
         if (eql(u8, path, "/v1/chat/completions")) return .{ .kind = .openai, .translatable = true, .inject_stream_usage = true };
         if (eql(u8, path, "/v1/messages")) return .{ .kind = .anthropic, .translatable = true };
         if (eql(u8, path, "/v1/completions")) return .{ .kind = .openai, .inject_stream_usage = true };
-        if (eql(u8, path, "/v1/embeddings")) return .{ .kind = .openai };
+        if (eql(u8, path, "/v1/embeddings")) return .{ .kind = .openai, .restore = false };
         if (eql(u8, path, "/v1/responses")) return .{ .kind = .openai };
         // Free at the provider, and its `input_tokens` answer is not usage.
-        if (eql(u8, path, "/v1/messages/count_tokens")) return .{ .kind = .anthropic, .metered = false };
+        if (eql(u8, path, "/v1/messages/count_tokens")) return .{ .kind = .anthropic, .metered = false, .restore = false };
         return null;
     }
 };
@@ -1116,6 +1285,11 @@ const ForwardExtras = struct {
     capture: ?*Capture = null,
     /// Value for `x-omnigate-cache` on the response ("miss"), if any.
     cache_note: ?[]const u8 = null,
+    /// Value for `x-omnigate-privacy` on the response: what was applied.
+    privacy_note: ?[]const u8 = null,
+    /// Puts back what privacy mode replaced in the request; null when
+    /// nothing was replaced.
+    restorer: ?*redact.Restorer = null,
     /// Out: the upstream's `retry-after` when it answered with a status we
     /// fail over on.
     retry_after: ?[]const u8 = null,
@@ -1490,6 +1664,7 @@ fn forward(
         .{ .name = "request-id", .value = ids.request_id },
     });
     if (extras.cache_note) |note| try out_headers.append(arena, .{ .name = "x-omnigate-cache", .value = note });
+    if (extras.privacy_note) |note| try out_headers.append(arena, .{ .name = "x-omnigate-privacy", .value = note });
     for (relayed) |h| {
         // Already set above.
         if (std.ascii.eqlIgnoreCase(h.name, "x-request-id") or std.ascii.eqlIgnoreCase(h.name, "request-id")) continue;
@@ -1521,10 +1696,11 @@ fn forward(
             c.content_type = "application/json";
             c.complete = !c.overflow;
         }
+        const restored = if (extras.restorer) |r| try r.restoreDoc(arena, converted) else converted;
         committed.* = true;
         out_headers.items[0].value = "application/json";
         guard.arm(app.io, app.client_stall_timeout_ms);
-        try request.respond(converted, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
+        try request.respond(restored, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
         return .{ .done = status };
     }
 
@@ -1533,9 +1709,12 @@ fn forward(
     // is cut short there is still time to fail over: nothing has been sent.
     var head_start: []const u8 = "";
     if (!is_sse) {
-        var start: Buffered = .{ .body = &upstream_body, .arena = arena, .limit = small_body_max };
+        // An answer that has placeholders to turn back is read whole, however
+        // long: they cannot be found in half a document.
+        var start: Buffered = .{ .body = &upstream_body, .arena = arena, .limit = if (extras.restorer != null) max_translated_body else small_body_max };
         try start.read(app.io, app.stream_idle_timeout_ms);
         const small = start.bytes.items;
+        if (!start.ended and extras.restorer != null) return error.UpstreamUnparseable;
         if (start.ended) {
             framing.release(&call.req, &upstream_body);
             usage.feed(small);
@@ -1561,6 +1740,7 @@ fn forward(
                     out_headers.items[0].value = "application/json";
                 }
             }
+            if (extras.restorer) |r| answer = try r.restoreDoc(arena, answer);
             committed.* = true;
             guard.arm(app.io, app.client_stall_timeout_ms);
             try request.respond(answer, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
@@ -1595,6 +1775,11 @@ fn forward(
     } else null;
     var usage_filter: usage_mod.UsageChunkFilter = .{};
     defer usage_filter.deinit(arena);
+    // With placeholders to turn back, the stages above write into `staged`,
+    // and the restorer passes on what it can (redact.zig): it is the last
+    // thing between the stream and the client.
+    var staged: Io.Writer.Allocating = .init(arena);
+    const sink: *Io.Writer = if (extras.restorer != null) &staged.writer else &body_writer.writer;
 
     var pending: []const u8 = head_start;
     while (true) {
@@ -1614,12 +1799,16 @@ fn forward(
         guard.arm(app.io, app.client_stall_timeout_ms);
         const sent: anyerror!void = sent: {
             if (translator) |*tr| {
-                tr.feed(data, &body_writer.writer) catch |e| break :sent e;
+                tr.feed(data, sink) catch |e| break :sent e;
             } else if (mode == .hide_usage_chunk and is_sse) {
-                usage_filter.feed(arena, data, &body_writer.writer) catch |e| break :sent e;
+                usage_filter.feed(arena, data, sink) catch |e| break :sent e;
             } else {
                 if (capturing) |c| c.add(arena, data);
-                body_writer.writer.writeAll(data) catch |e| break :sent e;
+                sink.writeAll(data) catch |e| break :sent e;
+            }
+            if (extras.restorer) |r| {
+                r.feed(arena, staged.written(), &body_writer.writer) catch |e| break :sent e;
+                staged.clearRetainingCapacity();
             }
             // Flush per chunk so SSE tokens reach the client immediately: first
             // our body buffer into the HTTP framing, then the framing to the socket
@@ -1645,8 +1834,12 @@ fn forward(
     }
     framing.release(&call.req, &upstream_body);
     guard.arm(app.io, app.client_stall_timeout_ms);
-    if (translator) |*tr| try tr.finish(&body_writer.writer);
-    if (mode == .hide_usage_chunk and is_sse) try usage_filter.finish(&body_writer.writer);
+    if (translator) |*tr| try tr.finish(sink);
+    if (mode == .hide_usage_chunk and is_sse) try usage_filter.finish(sink);
+    if (extras.restorer) |r| {
+        try r.feed(arena, staged.written(), &body_writer.writer);
+        try r.finish(arena, &body_writer.writer);
+    }
     try body_writer.end();
     if (capturing) |c| {
         c.content_type = content_type;
@@ -1876,6 +2069,8 @@ fn forwardToControl(
     /// Checked by the caller (`guard.visibleToken`).
     idempotency_key: ?[]const u8,
     key_sha256: ?[]const u8,
+    /// The request asked (`x-omnigate-privacy`) for nothing of it to be kept.
+    private: bool,
 ) !void {
     // The control plane's address comes from our own configuration; the
     // client contributes a path and a query that were validated character by
@@ -1898,6 +2093,7 @@ fn forwardToControl(
     try extra.append(arena, .{ .name = control.internal_header, .value = app.internal_token });
     if (key_sha256) |k| try extra.append(arena, .{ .name = "x-omnigate-key-sha256", .value = k });
     if (idempotency_key) |k| if (guard_mod.visibleToken(k, 255)) try extra.append(arena, .{ .name = "idempotency-key", .value = k });
+    if (private) try extra.append(arena, .{ .name = "x-omnigate-privacy", .value = "no-store" });
     // Our id for this request, so that the control plane's log lines (and
     // the `request_id` in a 500 from it) match what the client was given.
     try extra.append(arena, .{ .name = "x-omnigate-request-id", .value = acc.request_id.get() });

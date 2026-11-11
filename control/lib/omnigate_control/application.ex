@@ -38,6 +38,7 @@ defmodule OmnigateControl.Application do
 
   defp start_children(config) do
     OmnigateControl.Rejections.setup()
+    OmnigateControl.Redactions.setup()
     OmnigateControl.RateLimit.setup()
     OmnigateControl.Counters.setup()
     OmnigateControl.Audit.setup()

@@ -199,6 +199,8 @@ defmodule OmnigateControl.ConfigStore do
             webhook_secret: secret(k, "webhook_secret"),
             # Switched off by the operator: refused everywhere, usage kept.
             disabled: k["disabled"] == true,
+            # Privacy mode (`OmnigateControl.Privacy`); nil = none.
+            privacy: OmnigateControl.Privacy.normalize!(k["privacy"], "key #{inspect(k["name"])}"),
             source: :file,
             created_at: nil,
             old_hashes: []
@@ -214,7 +216,10 @@ defmodule OmnigateControl.ConfigStore do
             # Max wait for response headers; 0 = the data plane's default.
             timeout_ms: int!(u["timeout_ms"], 0, 0..@max_timeout_ms, "upstream #{inspect(u["name"])}: \"timeout_ms\""),
             # Where the provider serves the API when not under /v1 (nil = /v1).
-            v1_path: u["v1_path"]
+            v1_path: u["v1_path"],
+            # Whether a private request is sent `"store": false` here; nil =
+            # only when the host is api.openai.com.
+            privacy_store_flag: store_flag!(u)
           }
         end),
       routes:
@@ -264,6 +269,14 @@ defmodule OmnigateControl.ConfigStore do
       n
     else
       raise ArgumentError, "#{what} must be a whole number from #{first} to #{last}, got #{inspect(n)}"
+    end
+  end
+
+  defp store_flag!(u) do
+    case u["privacy_store_flag"] do
+      nil -> nil
+      b when is_boolean(b) -> b
+      other -> raise ArgumentError, "upstream #{inspect(u["name"])}: \"privacy_store_flag\" must be true or false, got #{inspect(other)}"
     end
   end
 
@@ -373,6 +386,15 @@ defmodule OmnigateControl.ConfigStore do
       # Ledger segments (the event history) older than this are deleted;
       # totals are kept in the ledger's snapshots.
       ledger_days: days(r["ledger_days"], "ledger_days"),
+      # Outputs of private jobs (privacy mode, `no_store`) are deleted this
+      # many hours after the job finished, whatever `jobs_days` says. A day
+      # unless set; 0 keeps them like any other job's.
+      private_outputs_hours:
+        case r["private_outputs_hours"] do
+          nil -> 24
+          n when is_number(n) and n >= 0 and n <= 87_600 -> n
+          other -> raise ArgumentError, "retention.private_outputs_hours must be a number of hours (0 = keep like other jobs), got #{inspect(other)}"
+        end,
       # Also delete a removed job's objects from the bucket. On unless
       # switched off; it only ever does anything when jobs_days is set.
       delete_bucket_objects:

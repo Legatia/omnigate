@@ -899,9 +899,11 @@ The reasons below are the ones stated in the code and the README.
 - **Small dependency surface.** The data plane uses only the Zig standard
   library, the control plane has two direct Hex packages (its outbound
   HTTP client is its own code on OTP's sockets), the tools use only
-  the Python standard library. The one exception is deliberate and
+  the Python standard library. The exceptions are deliberate and
   optional: `tools/sdk_compat.py` needs the official OpenAI and Anthropic
-  SDKs, because testing them is its purpose.
+  SDKs, because testing them is its purpose, and `tools/e2e.py` uses
+  `pyrage` when it is installed, because reading the gateway's encrypted
+  files with someone else's implementation is the point of that check.
 - **Provider output URLs expire.** So outputs are copied into storage the
   operator controls and jobs hand out the operator's URLs.
 - **Paying a provider twice is worse than a slow restart.** So the provider

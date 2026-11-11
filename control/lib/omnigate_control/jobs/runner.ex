@@ -39,7 +39,7 @@ defmodule OmnigateControl.Jobs.Runner do
   """
   require Logger
 
-  alias OmnigateControl.{ConfigStore, Counters, Http, Jobs, NetGuard, Storage, Text}
+  alias OmnigateControl.{Age, ConfigStore, Counters, Http, Jobs, NetGuard, Storage, Text}
   alias OmnigateControl.Jobs.{Adapter, Store}
 
   @max_transient_poll_errors 5
@@ -281,7 +281,9 @@ defmodule OmnigateControl.Jobs.Runner do
 
   # Record a failed attempt and move on to the next target.
   defp next(job, index, upstream_name, outcome) do
-    outcome = Text.line(outcome, 300)
+    # A provider's words about a failure can quote what it was sent. For a
+    # private job only the kind of failure is kept (`http_400`, `timeout`).
+    outcome = if job["private"] == true, do: kind_only(outcome), else: Text.line(outcome, 300)
     Logger.warning("job #{job["id"]}: #{upstream_name} failed (#{outcome}), trying next target")
 
     moved =
@@ -304,6 +306,15 @@ defmodule OmnigateControl.Jobs.Runner do
       _other ->
         settle_canceled(job["id"], %{})
     end
+  end
+
+  defp kind_only(outcome) do
+    case Regex.run(~r/\A[a-z0-9_]{1,40}(?=:|\z)/, to_string(outcome)) do
+      [kind] -> kind
+      _ -> "provider_error"
+    end
+  rescue
+    _ -> "provider_error"
   end
 
   # -- outputs ---------------------------------------------------------------
@@ -348,9 +359,10 @@ defmodule OmnigateControl.Jobs.Runner do
         |> Enum.with_index()
         |> Enum.reduce_while({:ok, [], media.max_job_output_bytes}, fn {{output, tmp}, i}, {:ok, acc, left} ->
           # Never more than one file's limit, nor than what is left of the job's.
-          case fetch(output, tmp, min(media.max_output_bytes, left)) do
+          # (With `encrypt_to`, what reaches `tmp` is already ciphertext.)
+          case fetch(output, tmp, min(media.max_output_bytes, left), job["encrypt_to"]) do
             {:ok, meta} ->
-              {:cont, {:ok, acc ++ [{i, tmp, meta, output}], left - meta["bytes"]}}
+              {:cont, {:ok, acc ++ [{i, tmp, meta, output}], left - (meta["plaintext_bytes"] || meta["bytes"])}}
 
             {:error, :output_too_large} when left < media.max_output_bytes ->
               {:halt, {:error, "the outputs together exceed media.max_job_output_bytes (#{media.max_job_output_bytes})"}}
@@ -375,7 +387,8 @@ defmodule OmnigateControl.Jobs.Runner do
   defp store(job, t, files) do
     stored =
       Enum.reduce_while(files, {:ok, []}, fn {i, tmp, meta, output}, {:ok, acc} ->
-        name = "out-#{i}#{extension(meta["content_type"], output)}"
+        # An encrypted output keeps the extension of what is inside: `out-0.png.age`.
+        name = "out-#{i}#{extension(meta["plaintext_content_type"] || meta["content_type"], output)}#{if meta["encryption"], do: ".age", else: ""}"
 
         case Storage.put(job["id"], name, tmp, meta) do
           {:ok, record} -> {:cont, {:ok, acc ++ [record]}}
@@ -442,34 +455,65 @@ defmodule OmnigateControl.Jobs.Runner do
     end
   end
 
-  defp fetch({:url, url}, tmp, max), do: fetch({:url, url, nil}, tmp, max)
+  # `recipient` is the age recipient the job's outputs are encrypted to, or
+  # nil. With one, the plaintext is never written: a download is encrypted
+  # as it arrives, bytes that came inline are encrypted in memory.
+  defp fetch({:url, url}, tmp, max, recipient), do: fetch({:url, url, nil}, tmp, max, recipient)
 
-  defp fetch(_output, _tmp, max) when max <= 0, do: {:error, :output_too_large}
+  defp fetch(_output, _tmp, max, _recipient) when max <= 0, do: {:error, :output_too_large}
 
-  defp fetch({:url, url, hint}, tmp, max) when is_binary(url) do
+  defp fetch({:url, url, hint}, tmp, max, recipient) when is_binary(url) do
     # The URL came out of a provider's answer: never fetch it, or anything
     # it redirects to, from an address we would not call for a webhook.
-    with {:ok, meta} <- Http.download(url, tmp, max, guard: &NetGuard.target(&1, "output url")) do
-      {:ok, %{"bytes" => meta.bytes, "sha256" => meta.sha256, "content_type" => content_type(hint, meta.content_type, url)}}
-    end
-  end
+    with {:ok, meta} <- Http.download(url, tmp, max, guard: &NetGuard.target(&1, "output url"), encrypt: recipient) do
+      type = content_type(hint, meta.content_type, url)
 
-  defp fetch({:binary, bytes, content_type}, tmp, max) when is_binary(bytes) do
-    if byte_size(bytes) > max do
-      {:error, :output_too_large}
-    else
-      with :ok <- File.write(tmp, bytes) do
-        {:ok,
-         %{
-           "bytes" => byte_size(bytes),
-           "sha256" => :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower),
-           "content_type" => clean(content_type) || "application/octet-stream"
-         }}
+      if recipient do
+        {:ok, encrypted(meta.bytes, meta.sha256, meta.plaintext_bytes, meta.plaintext_sha256, type)}
+      else
+        {:ok, %{"bytes" => meta.bytes, "sha256" => meta.sha256, "content_type" => type}}
       end
     end
   end
 
-  defp fetch(_output, _tmp, _max), do: {:error, "the provider's answer names an output that is neither a URL nor bytes"}
+  defp fetch({:binary, bytes, content_type}, tmp, max, recipient) when is_binary(bytes) do
+    type = clean(content_type) || "application/octet-stream"
+
+    cond do
+      byte_size(bytes) > max ->
+        {:error, :output_too_large}
+
+      recipient ->
+        sealed = Age.encrypt(recipient, bytes)
+
+        with :ok <- File.write(tmp, sealed) do
+          {:ok, encrypted(byte_size(sealed), sha256(sealed), byte_size(bytes), sha256(bytes), type)}
+        end
+
+      true ->
+        with :ok <- File.write(tmp, bytes) do
+          {:ok, %{"bytes" => byte_size(bytes), "sha256" => sha256(bytes), "content_type" => type}}
+        end
+    end
+  end
+
+  defp fetch(_output, _tmp, _max, _recipient), do: {:error, "the provider's answer names an output that is neither a URL nor bytes"}
+
+  # The record of an output that is stored encrypted: what the stored file
+  # is (opaque bytes), and what is inside it once decrypted.
+  defp encrypted(bytes, sha256, plaintext_bytes, plaintext_sha256, type) do
+    %{
+      "bytes" => bytes,
+      "sha256" => sha256,
+      "content_type" => "application/octet-stream",
+      "encryption" => "age",
+      "plaintext_bytes" => plaintext_bytes,
+      "plaintext_sha256" => plaintext_sha256,
+      "plaintext_content_type" => type
+    }
+  end
+
+  defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
   @types %{
     "image/png" => ".png",

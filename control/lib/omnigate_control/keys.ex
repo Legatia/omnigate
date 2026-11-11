@@ -26,7 +26,7 @@ defmodule OmnigateControl.Keys do
   # `\A...\z`, not `^...$`: `$` also matches before a trailing newline, and a
   # name ends up in log lines, file names and the audit log.
   @name_format ~r/\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/
-  @fields [:budget_usd, :budget_period, :rpm, :max_concurrent, :models, :max_open_jobs, :max_jobs_per_day, :webhook_secret, :disabled]
+  @fields [:budget_usd, :budget_period, :rpm, :max_concurrent, :models, :max_open_jobs, :max_jobs_per_day, :webhook_secret, :disabled, :privacy]
   @max_old_hashes 50
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -37,7 +37,7 @@ defmodule OmnigateControl.Keys do
   @doc "Create a key. Returns `{:ok, key, raw_key}`; the raw key is not kept."
   def create(attrs) when is_map(attrs), do: GenServer.call(__MODULE__, {:create, attrs})
 
-  @doc "Change `budget_usd`, `budget_period`, `rpm`, `models`, `disabled` or `webhook_secret` of a managed key."
+  @doc "Change `budget_usd`, `budget_period`, `rpm`, `models`, `disabled`, `webhook_secret` or `privacy` of a managed key."
   def update(name, attrs) when is_map(attrs), do: GenServer.call(__MODULE__, {:update, name, attrs})
 
   @doc "Give a managed key a new secret. Returns `{:ok, key, raw_key}`; the old secret stops working."
@@ -185,6 +185,7 @@ defmodule OmnigateControl.Keys do
             max_jobs_per_day: nil,
             webhook_secret: nil,
             disabled: false,
+            privacy: nil,
             source: :managed,
             created_at: now_iso(),
             old_hashes: [],
@@ -365,6 +366,14 @@ defmodule OmnigateControl.Keys do
   defp validate(:disabled, b) when is_boolean(b), do: {:ok, b}
   defp validate(:disabled, _), do: invalid("disabled must be true or false")
 
+  # `true`, `false`/`null`, or the parts one by one (see `OmnigateControl.Privacy`).
+  defp validate(:privacy, value) do
+    case OmnigateControl.Privacy.normalize(value) do
+      {:ok, privacy} -> {:ok, privacy}
+      {:error, message} -> invalid(message)
+    end
+  end
+
   defp validate(:webhook_secret, nil), do: {:ok, nil}
   defp validate(:webhook_secret, ""), do: {:ok, nil}
   defp validate(:webhook_secret, s) when is_binary(s) and byte_size(s) <= 256, do: {:ok, s}
@@ -395,6 +404,7 @@ defmodule OmnigateControl.Keys do
           max_jobs_per_day: if(is_integer(k["max_jobs_per_day"]) and k["max_jobs_per_day"] >= 0, do: k["max_jobs_per_day"]),
           webhook_secret: k["webhook_secret"],
           disabled: k["disabled"] == true,
+          privacy: OmnigateControl.Privacy.load(k["privacy"]),
           source: :managed,
           created_at: k["created_at"],
           old_hashes: if(is_list(k["old_hashes"]), do: k["old_hashes"], else: []),

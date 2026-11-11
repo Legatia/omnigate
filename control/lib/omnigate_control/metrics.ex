@@ -7,7 +7,7 @@ defmodule OmnigateControl.Metrics do
   to instrument and nothing extra to store. Per-key series are labelled with
   the key's configured name, never its hash.
   """
-  alias OmnigateControl.{ConfigStore, Counters, Keys, Ledger, Rejections}
+  alias OmnigateControl.{ConfigStore, Counters, Keys, Ledger, Redactions, Rejections}
   alias OmnigateControl.Jobs.Store
 
   @job_statuses ~w(queued running succeeded failed canceled)
@@ -90,6 +90,18 @@ defmodule OmnigateControl.Metrics do
         :counter,
         "Requests data planes refused before routing, by key name and reason, since this control plane started.",
         Enum.map(Rejections.all(), &{[key: &1.key, reason: &1.reason], &1.count})
+      ),
+      metric(
+        "omnigate_redactions_total",
+        :counter,
+        "Values privacy mode replaced by placeholders before a provider saw them, by key name and class, since this control plane started.",
+        Enum.map(Redactions.all(), &{[key: &1.key, class: &1.class], &1.count})
+      ),
+      metric(
+        "omnigate_key_private",
+        :gauge,
+        "1 when the key has privacy mode switched on (any part of it), else 0.",
+        per_key.(fn k, _ -> if(Map.get(k, :privacy), do: 1, else: 0) end)
       ),
       metric("omnigate_jobs", :gauge, "Media jobs currently in the job store, by status.", Enum.map(@job_statuses, &{[status: &1], Map.get(by_status, &1, 0)})),
       metric(

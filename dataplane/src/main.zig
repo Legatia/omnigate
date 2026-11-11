@@ -598,6 +598,7 @@ test {
     _ = @import("errors.zig");
     _ = @import("models.zig");
     _ = quirks;
+    _ = @import("redact.zig");
     _ = logging;
     _ = watchdog;
     _ = @import("translate.zig");

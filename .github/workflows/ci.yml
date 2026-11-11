@@ -65,6 +65,9 @@ env:
   # docs/api.md in the same pull request.
   OPENAI_SDK_VERSION: "3.49.0"
   ANTHROPIC_SDK_VERSION: "2.8.0"
+  # tools/e2e.py decrypts the gateway's age files with this (the Python
+  # binding of the Rust implementation of age).
+  PYRAGE_VERSION: "1.4.0"
 
 jobs:
   dataplane:
@@ -173,12 +176,19 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # An independent implementation of the age format (the Python binding
+      # of the Rust one): the test decrypts with it what the gateway
+      # encrypted. Optional on a developer's machine, required here.
+      - name: Install pyrage
+        run: python -m pip install "pyrage==${PYRAGE_VERSION}"
+
       # Listens on 127.0.0.1 only: 9001-9005 and 9101-9109 (mocks), 14000
       # (control plane), 18080 (gateway). State and logs go to a directory
       # named omnigate-e2e-* under TMPDIR.
       - name: End-to-end test
         env:
           TMPDIR: ${{ runner.temp }}
+          OMNIGATE_REQUIRE_PYRAGE: "1"
         run: python tools/e2e.py
 
       - name: Upload logs and state

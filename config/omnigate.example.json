@@ -24,6 +24,15 @@
       ],
       "webhook_secret_env": "MY_APP_WEBHOOK_SECRET",
       "max_jobs_per_day": 2000
+    },
+    {
+      "name": "my-private-app",
+      "key_sha256": "<sha256 hex of another gateway key>",
+      "privacy": {
+        "no_store": true,
+        "redact": true,
+        "unlink": true
+      }
     }
   ],
   "upstreams": [
@@ -87,6 +96,8 @@
     "public_base_url": "https://gateway.example.com",
     "poll_interval_ms": 2000,
     "max_output_bytes": 536870912,
+    "max_outputs_per_job": 16,
+    "max_job_output_bytes": 2147483648,
     "max_input_bytes": 1048576,
     "max_open_jobs": 100,
     "max_jobs_per_day": 10000,
@@ -303,6 +314,7 @@
     "jobs_days": 30,
     "ledger_ids_days": 3,
     "delete_bucket_objects": true,
-    "ledger_days": 90
+    "ledger_days": 90,
+    "private_outputs_hours": 24
   }
 }

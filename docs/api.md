@@ -102,6 +102,7 @@ job error's reason from `error.type` must read `error.code` now.
 | 400 | `missing_model` | `invalid_request_error` | `invalid_request_error` | No `"model"` string in the body. |
 | 400 | `invalid_request` | `invalid_request_error` | `invalid_request_error` | The request head is malformed or ambiguous, the path is not in canonical form, the query string has characters outside the allowed set, an `anthropic-version` or `anthropic-beta` header (or, on a job request, `Idempotency-Key`) has a value the gateway will not forward, or the JSON body has an object with more than 65,536 members, a key longer than 8 KiB, `model`, `stream` or `stream_options` twice, spelled with escapes or in another letter case (`"Model"`, `"STREAM"`; `include_usage` inside `stream_options` likewise), or a `stream` or `stream_options.include_usage` that is not `true`, `false` or `null`. See [Request heads, paths and queries](#request-heads-paths-and-queries). |
 | 400 | `request_too_complex` | `invalid_request_error` | `invalid_request_error` | The request has to be parsed into a tree (to translate it for a provider of the other protocol, or to rewrite its `stream_options`) and is too costly for that: an object with more than 1,024 members, or far more values than its size suggests. The same body is accepted on a route that needs no such step. See [Limits on what one request and one key may hold](#limits-on-what-one-request-and-one-key-may-hold). |
+| 400 | `too_many_redactions` | `invalid_request_error` | `invalid_request_error` | A request of a key that redacts ([privacy mode](privacy.md#redaction)) holds more than 16,384 distinct values to replace. It is refused rather than sent on with some of them in clear. |
 | 400 | `endpoint_not_supported` | `invalid_request_error` | `invalid_request_error` | The route exists, but every one of its upstreams speaks the other protocol and this endpoint is not translated (only chat completions and messages are). Nothing was sent to a provider. |
 | 400 | `untranslatable_request` | `invalid_request_error` | `invalid_request_error` | No target could be sent the request: it would have to be translated and uses something that cannot be (audio or file parts). Nothing was sent to a provider. |
 | 401 | `missing_api_key` | `invalid_request_error` | `authentication_error` | No key was sent. |
@@ -423,9 +424,10 @@ Request headers the gateway acts on:
 | `anthropic-version` | Forwarded to `anthropic` upstreams. Defaults to `2023-06-01` when absent. |
 | `anthropic-beta` | Forwarded to `anthropic` upstreams. |
 | `Idempotency-Key` | Jobs API only. |
+| `x-omnigate-privacy` | Switches parts of [privacy mode](privacy.md#the-request-header) on for this one request: `on`, or a comma-separated list of `no-store`, `redact`, `unlink`. It can only add to the key's setting; any other value, or the header sent twice, answers `400 invalid_request`. Never forwarded. |
 
 Other request headers are not forwarded to the provider. The values of
-these three are restricted to plain characters; see
+the first three are restricted to plain characters; see
 [Request heads, paths and queries](#request-heads-paths-and-queries). A
 request body needs a `Content-Length`: chunked request bodies answer `411`.
 
@@ -440,6 +442,7 @@ The provider's response, with these headers added:
 | `x-omnigate-request-id` | Id of this request (32 hex characters); also the id of its usage event in the ledger. |
 | `x-request-id`, `request-id` | The request id where the OpenAI and the Anthropic SDK look for it. The provider's own id is preferred, so that a support ticket can quote it: when the provider sent both headers each keeps its value, when it sent only one of them that id goes into both, and when it sent neither both carry the gateway's id (the value of `x-omnigate-request-id`). |
 | `x-omnigate-cache` | Only on routes with `cache_ttl_s`, for non-streaming requests: `hit` or `miss`. See [Response cache](#response-cache). |
+| `x-omnigate-privacy` | Only when a part of [privacy mode](privacy.md) applied to the request (from the key or from the request header): the parts, in the order `no-store, redact, unlink`. |
 
 **Request ids are on every answer the gateway produces, with three
 exceptions**: provider responses, the gateway's own errors, the model
@@ -587,6 +590,10 @@ what "identical" means and what bounds the cache. From the client's side:
   bills it as zero tokens and zero cost.
 - Only complete 2xx answers are stored. Errors are never cached.
 - Translated answers are cached too, in the client's protocol.
+- A request under [privacy mode](privacy.md)'s `no_store` or `redact` (from
+  the key or from `x-omnigate-privacy`) takes no part: it is neither
+  answered from the cache nor stored in it, and carries no
+  `x-omnigate-cache` header.
 
 ```bash
 curl -i http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer <gateway key>" -d '{"model":"<a route with cache_ttl_s>","messages":[{"role":"user","content":"hi"}]}'
@@ -888,8 +895,12 @@ Request body:
 | `metadata` | object | no | Stored with the job and returned unchanged. At most 16 KiB as JSON. A list of jobs leaves out metadata over 1 KiB (`"metadata": null, "metadata_omitted": true`); the job itself always shows it. |
 | `cache` | boolean | no | `true` allows reuse of a stored output; `false` forbids it. See [Caching](#caching). |
 
-Optional header: `Idempotency-Key` (1 to 255 visible ASCII characters,
-without spaces).
+Optional headers: `Idempotency-Key` (1 to 255 visible ASCII characters,
+without spaces), and `x-omnigate-privacy: no-store` (or `on`), which makes
+this one job private: its `input` and `metadata` are kept out of the job log
+and erased when the job ends, and its outputs are deleted a day later
+([Privacy mode](privacy.md#no-retention)). Every job of a key whose privacy
+mode has `no_store` is private without the header.
 
 Some members of `input` are checked whatever the adapter, because they feed
 the price. Anything else than what this list allows answers
@@ -991,12 +1002,15 @@ Fields:
 | Field | Meaning |
 |---|---|
 | `status` | `queued`, `running`, `succeeded`, `failed` or `canceled`. The last three are final. |
-| `outputs[]` | One entry per stored file: `url`, `content_type`, `bytes`, `sha256`. The URL is generated fresh on every fetch. |
+| `outputs[]` | One entry per stored file: `url`, `content_type`, `bytes`, `sha256`. The URL is generated fresh on every fetch. For a key with [`encrypt_to`](privacy.md#encrypted-outputs) the file is an age file: `content_type` is `application/octet-stream`, `bytes` and `sha256` describe the encrypted file, and the entry also has `"encryption": "age"`, `plaintext_content_type`, `plaintext_bytes` and `plaintext_sha256`; the file name ends in `.age`. |
+| `private` | Present and `true` for a private job ([privacy mode](privacy.md#no-retention)). |
+| `input_erased` | Present and `true` once a private job has ended: `input` and `metadata` are then `null`, here, in lists and in the webhook. |
+| `outputs_expired` | Present and `true` once a private job's outputs have been deleted (`retention.private_outputs_hours` after it finished); `outputs` is then empty. |
 | `error` | `null`, or `{"type", "message"}` for a failed job. |
 | `cost_usd` | The configured price of the target that delivered, applied to what its adapter sent to the provider ([Configuration](configuration.md#mediaroutes)). `0` until the job succeeds, and for failed and cached jobs. A canceled job costs `0` unless the provider completed the call all the same ([Cancel a job](#cancel-a-job)). |
 | `cached` | `true` when the outputs were reused from an earlier identical job. |
 | `upstream`, `target_model` | Which target delivered. |
-| `attempts[]` | Each target tried, with its `outcome` (`ok`, `cache_hit`, `timeout`, `no_outputs`, or the reason it failed). |
+| `attempts[]` | Each target tried, with its `outcome` (`ok`, `cache_hit`, `timeout`, `no_outputs`, or the reason it failed). For a private job the reason is cut down to its kind (`http_400`, `provider_failed`): a provider's own words can quote the request. |
 | `webhook` | `null`, or the delivery state: `url`, `status`, `attempts`, `last_status`, `last_error`, `next_attempt_at`, `delivered_at`. |
 
 `error.type` of a failed job:
@@ -1083,6 +1097,11 @@ outcome is `cache_hit`.
 
 From the README: the cache is shared across gateway keys, and two identical
 cacheable jobs submitted at the same moment both run.
+
+Two kinds of job stay out of it, in both directions: a private job
+([privacy mode](privacy.md#no-retention), `no_store`), and a job of a key
+with `encrypt_to`, whose stored output only that key's owner can read.
+`"cache": true` changes nothing for them.
 
 ### Job errors
 
@@ -1507,6 +1526,8 @@ curl http://127.0.0.1:4000/metrics -H "Authorization: Bearer dev-admin-token-cha
 | `omnigate_key_period_cost_usd` | gauge | `key` | Spend in the key's current budget period: this month, this day, or everything for a total budget. |
 | `omnigate_key_blocked` | gauge | `key` | 1 when the key has spent its budget for the current period and is refused, else 0. |
 | `omnigate_rejected_requests_total` | counter | `key`, `reason` | Requests data planes refused before routing, since this control plane started. `reason` is the `error.code` the client got; `key` is the key's name, or `-` when the request had no usable key. |
+| `omnigate_redactions_total` | counter | `key`, `class` | Values [privacy mode](privacy.md#redaction) replaced by placeholders before a provider saw them, since this control plane started. `class` is `email`, `phone`, `card`, `ip` or `secret`. Counts only. |
+| `omnigate_key_private` | gauge | `key` | 1 when the key has any part of privacy mode switched on, else 0. |
 | `omnigate_jobs` | gauge | `status` | Media jobs currently in the job store, by status. |
 | `omnigate_webhooks` | gauge | `state` | Webhook deliveries of the jobs currently in the job store, by state. |
 | `omnigate_ledger_events_total` | counter | | Usage events in the ledger. |

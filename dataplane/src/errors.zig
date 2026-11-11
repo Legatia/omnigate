@@ -156,6 +156,8 @@ test "every reason the gateway uses has the right category in both protocols" {
         .{ "concurrency_limit_exceeded", 429, "rate_limit_error", "rate_limit_error" },
         .{ "request_memory_exceeded", 429, "rate_limit_error", "rate_limit_error" },
         .{ "request_too_complex", 400, "invalid_request_error", "invalid_request_error" },
+        // Privacy mode (redact.zig): more distinct values than a request may hold.
+        .{ "too_many_redactions", 400, "invalid_request_error", "invalid_request_error" },
         .{ "all_upstreams_failed", 502, "server_error", "api_error" },
         .{ "gateway_not_ready", 503, "server_error", "api_error" },
         .{ "control_plane_unavailable", 503, "server_error", "api_error" },

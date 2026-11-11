@@ -600,6 +600,108 @@ def async_cases(openai, anthropic):
 
 
 # --------------------------------------------------------------------------
+# privacy mode, as the SDKs see it
+# --------------------------------------------------------------------------
+
+def privacy_cases(openai, anthropic):
+    """A key with privacy mode on (e2e's `private` key), through both SDKs: what the client sent
+    comes back in the answer, whole and in every streaming helper, while the provider (the mock,
+    which remembers what it received) saw placeholders."""
+    group("privacy", "privacy mode: a private key through both SDKs")
+    text = e2e.PRIVATE_TEXT
+    said = "You said: " + text
+    msg = [{"role": "user", "content": text}]
+    ask = [{"role": "user", "content": "Please use the tool with " + text}]
+    oa = openai.OpenAI(base_url=OPENAI_BASE, api_key=e2e.KEY_PRIVATE, max_retries=0, timeout=30)
+    an = anthropic.Anthropic(base_url=ANTHROPIC_BASE, api_key=e2e.KEY_PRIVATE, max_retries=0, timeout=30)
+
+    def unseen(port):
+        seen = e2e.seen_by(port)
+        if not e2e.hidden(seen):
+            return "the provider received a value that should have been a placeholder: " + seen.get("body", "")[:200]
+        return None if "[EMAIL_1]" in seen.get("body", "") else "the provider did not receive placeholders: " + seen.get("body", "")[:200]
+
+    def openai_plain(route, port):
+        raw = oa.chat.completions.with_raw_response.create(model=route, messages=msg)
+        answer = raw.parse()
+        return differ(text=(answer.choices[0].message.content, said), finish_reason=(answer.choices[0].finish_reason, "stop"),
+                      applied=(raw.headers.get("x-omnigate-privacy"), "no-store, redact, unlink")) or unseen(port)
+    case("OpenAI SDK: the answer carries the values the client sent, the provider got placeholders", lambda: openai_plain("echo", 9002))
+    case("OpenAI SDK, Anthropic-style upstream: the same", lambda: openai_plain("echo-claude", 9003))
+
+    def openai_stream(route, **extra):
+        got, finish, usage, _ = read_openai_stream(oa.chat.completions.create(model=route, messages=msg, stream=True, **extra))
+        problem = differ(text=(got, said), finish_reason=(finish, "stop"))
+        if not problem and extra and usage is None:
+            problem = "include_usage was asked for and no usage arrived"
+        return problem
+    case("OpenAI SDK stream: placeholders cut across chunks are put back together", lambda: openai_stream("echo"))
+    case("OpenAI SDK stream with include_usage", lambda: openai_stream("echo", stream_options={"include_usage": True}))
+    case("OpenAI SDK stream, Anthropic-style upstream", lambda: openai_stream("echo-claude"))
+
+    def openai_tool_stream():
+        fragments, name = [], None
+        for chunk in oa.chat.completions.create(model="echo", messages=ask, tools=OPENAI_TOOLS, stream=True):
+            for choice in chunk.choices:
+                for call in choice.delta.tool_calls or []:
+                    name = call.function.name or name
+                    fragments.append(call.function.arguments or "")
+        arguments = json.loads("".join(fragments))
+        return differ(name=(name, "get_weather"), text=(arguments.get("text"), ask[0]["content"]))
+    case("OpenAI SDK: streamed tool-call arguments parse and carry the values", openai_tool_stream)
+
+    def openai_responses():
+        answer = oa.responses.create(model="echo", input=text)
+        return differ(output_text=(answer.output_text, said)) or unseen(9002)
+    case("OpenAI SDK, Responses API", openai_responses)
+
+    def openai_responses_stream():
+        deltas, final = [], None
+        for event in oa.responses.create(model="echo", input=text, stream=True):
+            if event.type == "response.output_text.delta":
+                deltas.append(event.delta)
+            elif event.type == "response.completed":
+                final = event.response.output_text
+        return differ(deltas=("".join(deltas), said), completed=(final, said))
+    case("OpenAI SDK, Responses API event stream", openai_responses_stream)
+
+    def with_header():
+        plain = openai.OpenAI(base_url=OPENAI_BASE, api_key=e2e.KEY_PLAIN, max_retries=0, timeout=30)
+        raw = plain.chat.completions.with_raw_response.create(model="echo", messages=msg, extra_headers={"x-omnigate-privacy": "redact"})
+        return differ(text=(raw.parse().choices[0].message.content, said), applied=(raw.headers.get("x-omnigate-privacy"), "redact")) or unseen(9002)
+    case("OpenAI SDK: extra_headers={'x-omnigate-privacy': 'redact'} on a key without privacy mode", with_header)
+    case("OpenAI SDK: a privacy header the gateway does not understand is a BadRequestError",
+         raises(openai.BadRequestError, 400, lambda: oa.chat.completions.create(model="echo", messages=msg, extra_headers={"x-omnigate-privacy": "off"})))
+
+    def anthropic_plain(route, port):
+        answer = an.messages.create(model=route, max_tokens=64, messages=msg)
+        return differ(text=(answer.content[0].text, said), stop_reason=(answer.stop_reason, "end_turn")) or unseen(port)
+    case("Anthropic SDK: the answer carries the values, the provider got placeholders", lambda: anthropic_plain("echo-claude", 9003))
+    case("Anthropic SDK, OpenAI-style upstream: the same", lambda: anthropic_plain("echo", 9002))
+
+    def anthropic_stream(route):
+        with an.messages.stream(model=route, max_tokens=64, messages=msg) as stream:
+            pieces = "".join(stream.text_stream)
+            final = stream.get_final_message()
+        return differ(text_stream=(pieces, said), final=(final.content[0].text, said), stop_reason=(final.stop_reason, "end_turn"))
+    case("Anthropic SDK messages.stream(): text_stream and the final message", lambda: anthropic_stream("echo-claude"))
+    case("Anthropic SDK messages.stream(), OpenAI-style upstream", lambda: anthropic_stream("echo"))
+
+    def anthropic_tool_stream():
+        with an.messages.stream(model="echo-claude", max_tokens=64, messages=ask, tools=ANTHROPIC_TOOLS) as stream:
+            final = stream.get_final_message()
+        block = final.content[0]
+        return differ(type=(block.type, "tool_use"), text=((block.input or {}).get("text"), ask[0]["content"]), stop_reason=(final.stop_reason, "tool_use"))
+    case("Anthropic SDK: a streamed tool_use block's input is assembled with the values in it", anthropic_tool_stream)
+
+    async def async_stream():
+        async with openai.AsyncOpenAI(base_url=OPENAI_BASE, api_key=e2e.KEY_PRIVATE, max_retries=0, timeout=30) as client:
+            got, finish, _, _ = await read_openai_stream_async(await client.chat.completions.create(model="echo", messages=msg, stream=True))
+        return differ(text=(got, said), finish_reason=(finish, "stop"))
+    case("AsyncOpenAI stream on the private key", lambda: asyncio.run(async_stream()))
+
+
+# --------------------------------------------------------------------------
 # the details an SDK user would notice
 # --------------------------------------------------------------------------
 
@@ -852,6 +954,9 @@ def main():
         anthropic_cases(anthropic)
         async_cases(openai, anthropic)
         fidelity_cases(openai, anthropic)
+        # Last: its streams take a while, and cases above count on the
+        # rate-limited key not having been refilled in between.
+        privacy_cases(openai, anthropic)
     finally:
         stack.stop_all()
 

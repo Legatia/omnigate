@@ -22,6 +22,7 @@ exercised against a mock, or not at all, the page says so.
 | Put it on a server with TLS | [Deployment](deployment.md) |
 | Upgrade an installation that runs an earlier commit: what changes on disk, which defaults changed, what clients will notice, the order to upgrade the two processes, and going back | [Upgrading](upgrading.md) |
 | Harden a deployment: what to expose, where each credential lives, the admin allow-list, backups, logs | [Security hardening](security.md) |
+| Keep less of a request, and show a provider less of it: redaction, no retention, encrypted job outputs, unlinking, and what none of them does | [Privacy mode](privacy.md) |
 | Monitor it, understand limits and timeouts, read its logs, or debug an error | [Operations](operations.md) |
 | Understand how the two processes divide the work | [Architecture](architecture.md) |
 | Convert a LiteLLM proxy config | [Migrating from LiteLLM](migrating-from-litellm.md) |

@@ -255,25 +255,43 @@ const Walker = struct {
 /// few other characters Unicode case folding maps onto ASCII letters).
 /// `.other` when that spells none of the names this module cares about.
 fn foldedName(raw: []const u8) Name {
-    // "stream_options" is the longest name: 14 characters, each at most six
-    // bytes escaped. (The two ligatures below are one character for two.)
-    if (raw.len > 14 * 6) return .other;
+    // "stream_options" is the longest name: 14 characters. (The two
+    // ligatures below are one character for two, hence the spare byte.)
     var buf: [15]u8 = undefined;
+    return nameOf(foldInto(raw, &buf) orelse return .other);
+}
+
+/// Does `raw` (a key as it stands between its quotes) spell `name` (lower
+/// case ASCII) to a parser that ignores case? True for the exact spelling
+/// too. For callers that remove a member by name (privacy mode): what is
+/// removed here must be everything a provider could read as that member.
+pub fn folds(raw: []const u8, name: []const u8) bool {
+    var buf: [40]u8 = undefined;
+    std.debug.assert(name.len < buf.len);
+    const folded = foldInto(raw, buf[0 .. name.len + 1]) orelse return false;
+    return std.mem.eql(u8, folded, name);
+}
+
+/// `raw` folded into `buf`; null when it does not fit or holds a character
+/// that folds onto nothing in ASCII.
+fn foldInto(raw: []const u8, buf: []u8) ?[]const u8 {
+    // Each character takes at most six bytes escaped.
+    if (raw.len > buf.len * 6) return null;
     var n: usize = 0;
     var i: usize = 0;
     while (i < raw.len) {
         var cp: u21 = raw[i];
         if (cp == '\\') {
             // Only \uXXXX can spell a letter or an underscore.
-            if (i + 6 > raw.len or raw[i + 1] != 'u') return .other;
-            cp = std.fmt.parseInt(u16, raw[i + 2 .. i + 6], 16) catch return .other;
+            if (i + 6 > raw.len or raw[i + 1] != 'u') return null;
+            cp = std.fmt.parseInt(u16, raw[i + 2 .. i + 6], 16) catch return null;
             i += 6;
         } else if (cp < 0x80) {
             i += 1;
         } else {
-            const len = std.unicode.utf8ByteSequenceLength(raw[i]) catch return .other;
-            if (i + len > raw.len) return .other;
-            cp = std.unicode.utf8Decode(raw[i..][0..len]) catch return .other;
+            const len = std.unicode.utf8ByteSequenceLength(raw[i]) catch return null;
+            if (i + len > raw.len) return null;
+            cp = std.unicode.utf8Decode(raw[i..][0..len]) catch return null;
             i += len;
         }
         var one: [1]u8 = undefined;
@@ -296,13 +314,13 @@ fn foldedName(raw: []const u8) Name {
                 break :wide &one;
             },
             0xff3f => "_",
-            else => return .other,
+            else => return null,
         };
-        if (n + folded.len > buf.len) return .other;
+        if (n + folded.len > buf.len) return null;
         @memcpy(buf[n..][0..folded.len], folded);
         n += folded.len;
     }
-    return nameOf(buf[0..n]);
+    return buf[0..n];
 }
 
 /// `true`, `false` or `null` (which every parser reads as "not set").
@@ -563,6 +581,11 @@ test "a field name in another letter case is refused, as is a flag that is not a
     // Other keys may be spelled however the client likes, at any depth.
     const fine = try scan("{\"model\":\"a\",\"Models\":1,\"streams\":2,\"x\":{\"Model\":\"b\",\"Stream\":\"yes\"},\"include_Usage\":3,\"stream\":false,\"stream_options\":{\"include_usage\":null,\"Other\":1}}", .{});
     try testing.expect(!fine.stream and !fine.include_usage and fine.stream_options_plain);
+
+    // The same folding, for callers that match a name of their own.
+    try testing.expect(folds("user", "user") and folds("User", "user") and folds("u\xc5\xbfer", "user") and folds("\\u0055ser", "user"));
+    try testing.expect(folds("prompt_cache_\xe2\x84\xaaey", "prompt_cache_key"));
+    try testing.expect(!folds("users", "user") and !folds("use", "user") and !folds("", "user") and !folds("us\\ner", "user"));
 }
 
 test "stream_options that cannot be spliced safely are flagged, not guessed" {

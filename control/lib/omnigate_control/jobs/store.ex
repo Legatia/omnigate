@@ -205,7 +205,32 @@ defmodule OmnigateControl.Jobs.Store do
     end
   end
 
-  def delete_input(id), do: File.rm(input_path(id))
+  @doc "Remove what is kept in files for job `id`: its input, and (a private job's) its metadata."
+  def delete_input(id) do
+    File.rm(metadata_path(id))
+    File.rm(input_path(id))
+  end
+
+  # A private job (privacy mode, `no_store`) keeps its metadata out of the
+  # job log too: in a file next to its input, deleted with it.
+  defp metadata_path(id), do: String.replace_suffix(input_path(id), ".json", ".meta.json")
+
+  @doc "Write the JSON of a private job's metadata to its file, synced."
+  def put_metadata(id, json) when is_binary(json) do
+    path = metadata_path(id)
+    File.mkdir_p!(Path.dirname(path))
+    File.write(path, json, [:sync])
+  end
+
+  @doc "The metadata kept on disk for job `id`: a map, or nil."
+  def read_metadata(id) do
+    with {:ok, json} <- File.read(metadata_path(id)),
+         {:ok, %{} = metadata} <- JSON.decode(json) do
+      metadata
+    else
+      _ -> nil
+    end
+  end
 
   # -- server --------------------------------------------------------------
 
@@ -256,7 +281,7 @@ defmodule OmnigateControl.Jobs.Store do
   # then refused, or belongs to a job purged just before a crash.
   defp sweep_inputs(dir) do
     with {:ok, names} <- File.ls(dir) do
-      for name <- names, String.ends_with?(name, ".json"), fetch(String.replace_suffix(name, ".json", "")) == nil do
+      for name <- names, String.ends_with?(name, ".json"), fetch(name |> String.replace_suffix(".json", "") |> String.replace_suffix(".meta", "")) == nil do
         File.rm(Path.join(dir, name))
       end
     end
@@ -388,7 +413,7 @@ defmodule OmnigateControl.Jobs.Store do
         # rewrite is atomic (temp file, then rename); if we crash before it,
         # the old log is replayed and the next sweep removes them again.
         state = recompact(state, nil)
-        for %{"input_file" => true, "id" => id} <- doomed, do: delete_input(id)
+        for %{"id" => id} = job <- doomed, job["input_file"] == true or job["metadata_file"] == true, do: delete_input(id)
         {:reply, doomed, state}
     end
   end

@@ -21,7 +21,10 @@ content-length, both framings at once and a header smuggled into the content
 type (special model names of tools/mock_upstream.py on :9005), an upstream
 that breaks connections (inside this script on :9006: it resets them while
 they idle, resets them while a request is being written, or never reads the
-request, and the next request must work on a new connection), and a control
+request, and the next request must work on a new connection), a private key
+whose requests privacy mode has to look through (megabytes of text made to be
+expensive for a pattern matcher, more distinct values than a request may
+carry, hostile answers while there are placeholders to turn back), and a control
 plane that does the same (a stand-in inside this script on :4300, with a
 second gateway on :8190 pointed at it). And it checks the limits that apply
 before a request body is read: the per-key concurrency cap, the rate limit,
@@ -392,6 +395,113 @@ def third_review():
          expect=200, read_timeout=5, keep_reading=8)
     case('other keys in any case, and the names nested deeper, are the client\'s business: served',
          body('{"model":%(m)s,"Models":1,"metadata":{"Model":"x","Stream":"yes"},"User":"u",' + msgs + '}'), expect=200, read_timeout=5, keep_reading=8)
+
+
+def privacy_mode():
+    """Privacy mode (dataplane/src/redact.zig) looks through a private request's text and through
+    the answer. Both are bytes somebody else chose: a header that must only ever switch protections
+    on, text built to make a pattern matcher work hard, more distinct values than a request may
+    carry, and an upstream that answers badly while there are placeholders to turn back."""
+    import e2e
+    section("privacy mode: the header, text that is expensive to look through, hostile answers")
+    key = e2e.KEY_PRIVATE
+
+    def ask(content, model="direct", extra=b"", key=key, stream=False):
+        body = json.dumps({"model": model, "stream": stream, "messages": [{"role": "user", "content": content}]})
+        return post("/v1/chat/completions", body, key=key, extra=extra)
+
+    def header(value):
+        return b"X-Omnigate-Privacy: " + value + b"\r\n"
+
+    for value in (b"off", b"0", b"false", b"", b"redact,", b"on, off", b"no-store redact", b"\xff\xfe", b"x" * 200, b"redact\tunlink", b"none"):
+        case(f"x-omnigate-privacy: {value[:24]!r} is refused (400): the header can only switch protections on",
+             ask("hi", key=ARGS.key, extra=header(value)), expect=400, read_timeout=3, keep_reading=5)
+    case("x-omnigate-privacy sent twice is refused (400), whatever the two say",
+         ask("hi", key=ARGS.key, extra=header(b"on") + header(b"on")), expect=400, read_timeout=3, keep_reading=5)
+
+    def applied(wanted):
+        def check(raw, status):
+            head = raw.split(b"\r\n\r\n")[0].lower()
+            return None if b"x-omnigate-privacy: " + wanted in head else "the response does not say %r was applied" % wanted
+        return check
+    case("... in capitals and with spaces it is taken (200)", ask("hi", key=ARGS.key, extra=header(b" No-Store , REDACT,unlink ")),
+         expect=200, check=applied(b"no-store, redact, unlink"), read_timeout=5, keep_reading=8)
+    case("a header that asks for less than the key's setting takes nothing away", ask("hi", extra=header(b"redact")),
+         expect=200, check=applied(b"no-store, redact, unlink"), read_timeout=5, keep_reading=8)
+
+    served = {"read_timeout": 30, "keep_reading": 40}
+    size = 1024 * 1024
+    for name, piece in [("@", "@"), ("digits", "7"), ("half placeholders", "[EMAIL_"), ("a@", "a@"), ("digit-space pairs", "1 "),
+                        ("plus signs", "+"), ("sk-", "sk-"), ("colons", "::"), ("JWT heads", "eyJa."),
+                        ("private key headers", "-----BEGIN PRIVATE KEY-----"), ("opening brackets", "["),
+                        ("almost-phone-numbers", "(555) 123-456"), ("almost-cards", "4111 1111 1111 111 "), ("dotted digits", "1.2.3.")]:
+        started = time.time()
+        case(f"a megabyte of {name} in a private request is served (200)", ask(piece * (size // len(piece))), expect=200, **served)
+        took = time.time() - started
+        record(f"... in time that fits its size ({name})", took < 6, round(took, 1))
+    started = time.time()
+    case("a megabyte of escaped backslashes in front of an address",
+         post("/v1/chat/completions", '{"model":"direct","messages":[{"role":"user","content":"' + "\\\\" * (size // 2) + 'n@example.com"}]}', key=key),
+         expect=200, **served)
+    record("... in time that fits its size (backslashes)", time.time() - started < 6, round(time.time() - started, 1))
+
+    def refused_as(code):
+        return lambda raw, status: None if code in raw else "not refused as %r" % code
+    many = " ".join("user%d@example.com" % i for i in range(20_000))
+    case("20,000 different addresses in one request: refused (400 too_many_redactions), not sent on with some in clear",
+         ask(many), expect=400, check=refused_as(b"too_many_redactions"), read_timeout=10, keep_reading=15)
+    case("16,000 different addresses: served", ask(" ".join("user%d@example.com" % i for i in range(16_000))), expect=200, **served)
+
+    def all_back(raw, status):
+        got = raw.count(b"same.person@example.com")
+        return None if got == 50_000 else "%d of 50,000 addresses came back" % got
+    started = time.time()
+    case("one address 50,000 times, echoed by the provider: every one is put back",
+         ask("same.person@example.com " * 50_000, model="echo"), expect=200, check=all_back, **served)
+    record("... in time that fits its size (echo)", time.time() - started < 10, round(time.time() - started, 1))
+    seen = e2e.seen_by(9002).get("body", "")
+    record("... and the provider saw the placeholder 50,000 times, never the address",
+           seen.count("[EMAIL_1]") == 50_000 and "same.person" not in seen, (seen.count("[EMAIL_1]"), "same.person" in seen))
+
+    nested = "[" * 58 + '"deep@example.com"' + "]" * 58
+    case("text nested 58 arrays deep is still looked through and served",
+         post("/v1/chat/completions", '{"model":"echo","messages":[{"role":"user","content":%s}]}' % nested, key=key), expect=200, **served)
+    record("... the provider saw a placeholder there", "deep@example.com" not in e2e.seen_by(9002).get("body", "deep@example.com"))
+    case("a private request that is not JSON is refused like any other (400)",
+         post("/v1/chat/completions", '{"model":"direct","messages":[{"role":"user","content":"a@b.com"}],}', key=key), expect=400)
+    case("... and so is one whose model is given twice", post("/v1/chat/completions", '{"model":"direct","model":"echo","messages":[]}', key=key), expect=400)
+    case("removing the fields that name a user does not let a second model through under another name",
+         post("/v1/chat/completions", '{"user":"u","model":"direct","User":{"model":"echo"},"messages":[{"role":"user","content":"hi"}]}', key=key), expect=200, **served)
+
+    # An upstream that answers like an attacker, while there are placeholders to turn back.
+    with_address = "write to someone@example.com"
+
+    def whole_json(raw, status):
+        body = body_of(raw)
+        try:
+            json.loads(body)
+        except ValueError:
+            return "the long answer did not arrive whole (%d bytes)" % len(body)
+        return None
+
+    def cut_short(raw, status):
+        return "the response was ended properly, as if it were complete" if b"0\r\n\r\n" in raw[-7:] else None
+
+    case("a 200 kB answer is read whole before it is looked through (200)", ask(with_address, model="hostile-long"),
+         expect=200, check=whole_json, read_timeout=10, keep_reading=15)
+    case("an overflowing chunk size in a JSON answer: a failed upstream (502)", ask(with_address, model="hostile-chunk-json"), expect=502, read_timeout=5, keep_reading=8)
+    case("... in a stream: the client's stream is cut, never ended as if complete",
+         ask(with_address, model="hostile-chunk-sse", stream=True), expect=200, check=cut_short, read_timeout=3, keep_reading=6)
+    case("a JSON answer shorter than it promised: a failed upstream (502)", ask(with_address, model="hostile-short-json"), expect=502, read_timeout=5, keep_reading=8)
+
+    def ended(raw, status):
+        if not raw.endswith(b"0\r\n\r\n"):
+            return "the stream did not end properly (%d bytes received)" % len(raw)
+        return None if len(raw) > 15 * 1024 * 1024 else "only %d bytes of the stream arrived" % len(raw)
+    started = time.time()
+    case("16 MiB of stream pass through the placeholder restorer and end properly",
+         ask(with_address, model="flood", stream=True), expect=200, check=ended, read_timeout=15, keep_reading=90)
+    record("... without holding it up", time.time() - started < 45, round(time.time() - started, 1))
 
 
 def limits_before_body():
@@ -1408,6 +1518,7 @@ def run(stack=None):
     limits_before_body()
     if stack:
         hostile_upstream()
+        privacy_mode()
         broken_connections()
         own_answers_stall()
         hostile_control(stack)

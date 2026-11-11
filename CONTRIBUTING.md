@@ -16,9 +16,12 @@ Security problems: do not open a public issue. See [SECURITY.md](SECURITY.md).
 
 - Zig 0.17 (the container build pins 0.17.0; see `dataplane/Dockerfile`)
 - Erlang/OTP 29 with Elixir 1.20 (the container build uses Elixir 1.20.5)
-- Python 3.9 or newer; the tools use the standard library only, with one
-  exception: the SDK compatibility test needs the official SDKs, at the
-  versions CI pins (`pip install openai==3.49.0 anthropic==2.8.0`)
+- Python 3.9 or newer; the tools use the standard library only, with two
+  exceptions: the SDK compatibility test needs the official SDKs, at the
+  versions CI pins (`pip install openai==3.49.0 anthropic==2.8.0`), and the
+  end-to-end test uses `pyrage` when it is installed (`pip install pyrage`),
+  to decrypt with an independent implementation what the gateway encrypted;
+  without it that one check is skipped, and the run says so
 - Docker with the Compose plugin, only for the container test
 
 On Windows, Erlang and Elixir are installed but not on `PATH`. In
@@ -283,6 +286,7 @@ dataplane/            Zig data plane: the public port
   src/health.zig      upstream cooldowns
   src/balance.zig     target ordering: failover, round_robin, weighted
   src/quirks.zig      learned provider quirks (sampling parameters, thought signatures), per gateway key
+  src/redact.zig      privacy mode: placeholders for addresses, numbers and secrets in a request, the originals back in the answer, top-level member edits
   Dockerfile
 
 control/              Elixir control plane
@@ -300,6 +304,9 @@ control/              Elixir control plane
     rate_limit.ex     per-key requests per minute for creating and listing jobs (the data plane's token bucket)
     net_guard.ex      which addresses may be called when the URL came from a client or a provider
     keys.ex           managed gateway keys and the keys file
+    privacy.ex        a key's privacy mode: the setting, its validation, what a data plane is sent
+    age.ex            encryption to an age recipient (job outputs), as a stream; no decryption
+    redactions.ex     counts of what data planes redacted, by key and class
     admin.ex          what operators see: key listings, the overview document
     dashboard.ex      the dashboard page (HTML, CSS and script in one module)
     audit.ex          the admin audit log
@@ -324,7 +331,7 @@ config/
   omnigate.dev.json       mock providers; the default config for local runs
   omnigate.example.json   template for real providers
 
-tools/                Python, standard library only (sdk_compat.py excepted)
+tools/                Python, standard library only (sdk_compat.py excepted; e2e.py uses pyrage if it is there)
   mock_upstream.py, mock_media.py   mock providers, object store, webhook receiver
   e2e.py, container_test.py         the two system tests
   sdk_compat.py                     the official OpenAI and Anthropic SDKs as clients
@@ -582,7 +589,10 @@ The existing adapters all followed the same steps:
 ### Python (tools)
 
 - Standard library only, Python 3.9 compatible. `sdk_compat.py` is the one
-  exception, and says how to install what it needs when it is missing.
+  tool that cannot run without packages, and says how to install what it
+  needs when it is missing. `e2e.py` imports `pyrage` if it can (to decrypt
+  the gateway's age files with someone else's code) and skips that check,
+  visibly, if it cannot; CI installs it and sets `OMNIGATE_REQUIRE_PYRAGE=1`.
 - Each tool starts with a docstring that shows how to run it and what it
   needs.
 - The system tests print one `PASS` / `FAIL` line per check and exit

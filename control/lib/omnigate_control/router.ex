@@ -25,7 +25,24 @@ defmodule OmnigateControl.Router do
   """
   use Plug.Router
 
-  alias OmnigateControl.{Admin, AdminAuth, Audit, ConfigStore, Dashboard, Jobs, Keys, Ledger, Metrics, RateLimit, Rejections, Storage, Text, UrlSigner}
+  alias OmnigateControl.{
+    Admin,
+    AdminAuth,
+    Audit,
+    ConfigStore,
+    Dashboard,
+    Jobs,
+    Keys,
+    Ledger,
+    Metrics,
+    Privacy,
+    RateLimit,
+    Redactions,
+    Rejections,
+    Storage,
+    Text,
+    UrlSigner
+  }
 
   require Logger
 
@@ -160,7 +177,10 @@ defmodule OmnigateControl.Router do
   post "/internal/counters" do
     case conn.body_params do
       %{"counters" => counters} when is_list(counters) ->
-        send_json(conn, 200, %{accepted: Rejections.record(counters)})
+        # The same report carries what privacy mode replaced (counts by
+        # class): those are not refusals and are kept apart.
+        {redactions, rejections} = Enum.split_with(counters, &Redactions.counter?/1)
+        send_json(conn, 200, %{accepted: Rejections.record(rejections) + Redactions.record(redactions)})
 
       _ ->
         send_error(conn, 400, "invalid_request", "expected {\"counters\": [...]}")
@@ -173,13 +193,16 @@ defmodule OmnigateControl.Router do
     with {:ok, key} <- gateway_key(conn),
          :ok <- within_budget(key),
          :ok <- model_allowed(key, conn.body_params["model"]),
+         {:ok, asked_private} <- privacy_header(conn),
          idempotency_key = conn |> get_req_header("idempotency-key") |> List.first(),
          :ok <- within_rate(key, idempotency_key) do
       # Unfinished jobs, and jobs created today, are counted across the key's rotations.
       hashes = Keys.hashes(key)
       caps = [open_cap: {Keys.max_open_jobs(key), hashes}, day_cap: {Keys.max_jobs_per_day(key), hashes}]
+      # Privacy mode: the key's setting, and what this request added to it.
+      privacy = %{no_store: Privacy.no_store?(key) or asked_private, encrypt_to: Privacy.recipient(key)}
 
-      case Jobs.create(key.key_sha256, conn.body_params, idempotency_key, caps) do
+      case Jobs.create(key.key_sha256, conn.body_params, idempotency_key, [{:privacy, privacy} | caps]) do
         {:ok, job} ->
           send_json(conn, 202, Jobs.view(job))
 
@@ -283,7 +306,7 @@ defmodule OmnigateControl.Router do
   post "/admin/keys" do
     attrs = json_object(conn)
     result = Keys.create(attrs)
-    Audit.record(conn, "key.create", audit_name(attrs["name"]), outcome(result))
+    Audit.record(conn, "key.create", audit_name(attrs["name"]), outcome(result), privacy: privacy_change(attrs, result))
 
     case result do
       # The only response that ever contains the key itself.
@@ -296,7 +319,10 @@ defmodule OmnigateControl.Router do
     attrs = json_object(conn)
     result = Keys.update(name, attrs)
     # Which fields were sent, never their values (one of them is a secret).
-    Audit.record(conn, "key.update", audit_name(name), outcome(result), fields: attrs |> Map.keys() |> Enum.sort() |> Enum.take(20))
+    Audit.record(conn, "key.update", audit_name(name), outcome(result),
+      fields: attrs |> Map.keys() |> Enum.sort() |> Enum.take(20),
+      privacy: privacy_change(attrs, result)
+    )
 
     case result do
       {:ok, key} -> send_json(conn, 200, Admin.key_view(key))
@@ -444,7 +470,9 @@ defmodule OmnigateControl.Router do
             rpm: k.rpm,
             # Requests in flight at once; 0 = the data plane's own default.
             max_concurrent: Map.get(k, :max_concurrent, 0),
-            models: k.models
+            models: k.models,
+            # Privacy mode, as far as a data plane applies it; null = none.
+            privacy: Privacy.for_data_plane(Map.get(k, :privacy))
           }
         end,
       upstreams: config.upstreams,
@@ -477,6 +505,44 @@ defmodule OmnigateControl.Router do
       _ -> {:error, 401, "invalid_api_key", "unknown gateway key"}
     end
   end
+
+  # `x-omnigate-privacy` on a job request: `{:ok, true}` when it asks for
+  # nothing of the job to be kept. (The data plane validated it and sends
+  # `no-store`; checked again, like everything that arrives.)
+  defp privacy_header(conn) do
+    case get_req_header(conn, "x-omnigate-privacy") do
+      [] ->
+        {:ok, false}
+
+      [value] ->
+        case Privacy.header(value) do
+          {:ok, private} -> {:ok, private}
+          :error -> {:error, 400, "invalid_request", "invalid x-omnigate-privacy header: use \"on\", or a comma-separated list of no-store, redact, unlink"}
+        end
+
+      _ ->
+        {:error, 400, "invalid_request", "x-omnigate-privacy was sent more than once"}
+    end
+  end
+
+  # For the audit log: a key's privacy mode after a change that set it
+  # ("off" when the change switched it off); nil when the change did not
+  # touch it or did not happen.
+  defp privacy_change(attrs, result) do
+    with true <- Map.has_key?(attrs, "privacy"),
+         key when is_map(key) <- changed_key(result) do
+      case Privacy.summary(Map.get(key, :privacy)) do
+        "" -> "off"
+        summary -> summary
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp changed_key({:ok, key}), do: key
+  defp changed_key({:ok, key, _raw}), do: key
+  defp changed_key(_), do: nil
 
   # A job belongs to a key under its current secret or one from before a rotation.
   defp own_job(key, id), do: Enum.find_value(Keys.hashes(key), &Jobs.get(&1, id))

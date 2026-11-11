@@ -44,7 +44,7 @@ LOCKED_PORT = 18444                      # the proxy whose admin allow-list excl
 SERVICES = ("mocks", "control", "dataplane", "proxy", "proxy-locked")
 API_HOST, ADMIN_HOST = "localhost", "admin.localhost"
 INTERNAL, ADMIN = "container-internal-token-0123456789", "container-admin-token-0123456789"
-KEY, OTHER = "og-container-main", "og-container-other"
+KEY, OTHER, PRIVATE = "og-container-main", "og-container-other", "og-container-private"
 HOOK_SECRET = "container-webhook-secret"
 IMAGES = {"dataplane": f"{P}-dataplane", "control": f"{P}-control"}
 COMPOSE = False                          # set by --compose
@@ -136,10 +136,10 @@ def jreq(*a, **k):
         return s, h, {"_raw": raw[:200].decode("utf-8", "replace")}
 
 
-def stream(path, body):
+def stream(path, body, key=None):
     """POST to the gateway; return (status, joined text, seconds between first and last data line)."""
     c = Conn(API_HOST, PORT, context=CTX, timeout=30)
-    c.request("POST", path, body=json.dumps(body), headers={"content-type": "application/json", "authorization": f"Bearer {KEY}"})
+    c.request("POST", path, body=json.dumps(body), headers={"content-type": "application/json", "authorization": f"Bearer {key or KEY}"})
     r = c.getresponse()
     text, first, last = [], None, None
     while True:
@@ -214,11 +214,15 @@ def config():
     price = {"price_in_per_mtok": 100.0, "price_out_per_mtok": 300.0}
     up = lambda name, kind, port: {"name": name, "kind": kind, "base_url": f"http://mocks:{port}", "api_key_env": "MOCK_API_KEY"}
     return {
-        "keys": [{"name": "main", "key": KEY, "webhook_secret": HOOK_SECRET}, {"name": "other", "key": OTHER}],
+        "keys": [{"name": "main", "key": KEY, "webhook_secret": HOOK_SECRET}, {"name": "other", "key": OTHER},
+                 # Privacy mode on: what the optimized build in the image does with it.
+                 {"name": "private", "key": PRIVATE, "privacy": True}],
         "upstreams": [up("mock-flaky", "openai", 9001), up("mock-ok", "openai", 9002), up("mock-anthropic", "anthropic", 9003)],
         "routes": [
             {"model": "chat", "targets": [dict(upstream="mock-flaky", model="f", **price), dict(upstream="mock-ok", model="ok-1", **price)]},
             {"model": "claude", "targets": [dict(upstream="mock-anthropic", model="mock-claude", **price)]},
+            # Answers with what it was sent (tools/mock_upstream.py).
+            {"model": "echo", "targets": [dict(upstream="mock-ok", model="echo-1", **price)]},
         ],
         "media": {
             # The address clients use, i.e. the proxy's.
@@ -375,6 +379,20 @@ def checks():
     check("protocol translation works", s == 200 and h.get("x-omnigate-upstream") == "mock-anthropic" and b.get("object") == "chat.completion", (s, b))
     s, _, _ = chat(key="og-wrong")
     check("unknown key is refused", s == 401, s)
+
+    section("privacy mode in the built images")
+    secret_text = "mail bob.stone@example.com from 10.20.30.40 with key sk-proj-Abc123Def456Ghi789Jkl012"
+    said = "You said: " + secret_text
+    s, h, b = jreq("POST", API_HOST, "/v1/chat/completions", key=PRIVATE, body={"model": "echo", "messages": [{"role": "user", "content": secret_text}]})
+    check("a private key's request comes back with its values, and the response says what applied",
+          s == 200 and b["choices"][0]["message"]["content"] == said and h.get("x-omnigate-privacy") == "no-store, redact, unlink", (s, h.get("x-omnigate-privacy"), b))
+    # Asked from inside the mocks' container: what the provider was sent.
+    seen = docker("exec", cname("mocks"), "python", "-c",
+                  "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:9002/__last?model=echo-1').read().decode())", check_rc=False)
+    check("the provider received placeholders, none of the values",
+          "[EMAIL_1]" in seen and "[IP_1]" in seen and "[SECRET_1]" in seen and "bob.stone" not in seen and "10.20.30.40" not in seen and "sk-proj" not in seen, seen[:300])
+    s, text, _ = stream("/v1/chat/completions", {"model": "echo", "stream": True, "messages": [{"role": "user", "content": secret_text}]}, key=PRIVATE)
+    check("streamed in three-character pieces through the proxy, every placeholder is put back", s == 200 and text == said, (s, text))
     s, _, _ = req("GET", API_HOST, "/admin/usage", key=ADMIN)
     check("the gateway host does not serve the admin API", s in (401, 404), s)
     calls = 3

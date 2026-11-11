@@ -98,8 +98,14 @@ defmodule OmnigateControl.Http do
   that came out of a provider's answer is kept away from internal addresses
   (see `OmnigateControl.NetGuard`).
 
+  With `encrypt: recipient` (an age recipient, see `OmnigateControl.Age`)
+  the body is encrypted as it arrives and only ciphertext is written to
+  `dest`. `bytes` and `sha256` then describe the file as written, and
+  `plaintext_bytes` and `plaintext_sha256` what was downloaded; `max_bytes`
+  still bounds the download.
+
   Options: `:idle_timeout` (ms without a byte, default 60 s), `:timeout` (ms
-  for one hop as a whole, default 30 min), `:headers`.
+  for one hop as a whole, default 30 min), `:headers`, `:encrypt`.
   """
   def download(url, dest, max_bytes, opts \\ []) do
     File.mkdir_p!(Path.dirname(dest))
@@ -141,14 +147,25 @@ defmodule OmnigateControl.Http do
     idle = Keyword.get(opts, :idle_timeout, 60_000)
     owner = self()
 
+    recipient = Keyword.get(opts, :encrypt)
+
     sink = fn chunk, st ->
       bytes = st.bytes + byte_size(chunk)
 
       if bytes > max_bytes do
         {:halt, {:error, :output_too_large}}
       else
-        :ok = :file.write(st.io, chunk)
-        {:cont, %{st | bytes: bytes, hash: :crypto.hash_update(st.hash, chunk)}}
+        st = %{st | bytes: bytes, hash: :crypto.hash_update(st.hash, chunk)}
+
+        case st.seal do
+          nil ->
+            :ok = :file.write(st.io, chunk)
+            {:cont, st}
+
+          seal ->
+            {sealed, seal} = OmnigateControl.Age.update(seal, chunk)
+            {:cont, written(%{st | seal: seal}, sealed)}
+        end
       end
     end
 
@@ -163,13 +180,34 @@ defmodule OmnigateControl.Http do
         io = File.open!(dest, [:write, :binary, :raw])
         # Remembered so the file is closed however the exchange ends.
         send(owner, {:http_download_file, io})
-        {:read, sink, %{io: io, bytes: 0, hash: :crypto.hash_init(:sha256), ctype: headers["content-type"]}}
+        st = %{io: io, bytes: 0, hash: :crypto.hash_init(:sha256), ctype: headers["content-type"], seal: nil, out_bytes: 0, out_hash: nil}
+
+        st =
+          if recipient do
+            {header, seal} = OmnigateControl.Age.start(recipient)
+            written(%{st | seal: seal, out_hash: :crypto.hash_init(:sha256)}, header)
+          else
+            st
+          end
+
+        {:read, sink, st}
 
       status, _headers ->
         {:stop, {:error, {:http_status, status}}}
     end
 
     result = exchange(:get, url, Keyword.get(opts, :headers, []), nil, opts, handler, deadline(Keyword.get(opts, :timeout, 1_800_000)), idle)
+
+    # An encrypted file ends with its last chunk, which only now is known to
+    # be the last. (The file is still open.)
+    result =
+      case result do
+        {:ok, status, headers, %{seal: seal} = st} when seal != nil ->
+          {:ok, status, headers, written(%{st | seal: nil}, OmnigateControl.Age.finish(seal))}
+
+        other ->
+          other
+      end
 
     receive do
       {:http_download_file, io} -> File.close(io)
@@ -178,8 +216,18 @@ defmodule OmnigateControl.Http do
     end
 
     case result do
-      {:ok, _status, _headers, %{bytes: bytes, hash: hash, ctype: ctype}} ->
+      {:ok, _status, _headers, %{bytes: bytes, hash: hash, ctype: ctype, out_hash: nil}} ->
         {:ok, %{bytes: bytes, sha256: hash |> :crypto.hash_final() |> Base.encode16(case: :lower), content_type: ctype}}
+
+      {:ok, _status, _headers, %{bytes: bytes, hash: hash, ctype: ctype, out_bytes: out_bytes, out_hash: out_hash}} ->
+        {:ok,
+         %{
+           bytes: out_bytes,
+           sha256: out_hash |> :crypto.hash_final() |> Base.encode16(case: :lower),
+           content_type: ctype,
+           plaintext_bytes: bytes,
+           plaintext_sha256: hash |> :crypto.hash_final() |> Base.encode16(case: :lower)
+         }}
 
       {:ok, _status, _headers, other} ->
         File.rm(dest)
@@ -189,6 +237,12 @@ defmodule OmnigateControl.Http do
         File.rm(dest)
         {:error, reason}
     end
+  end
+
+  # Ciphertext written to a download's file, counted and hashed.
+  defp written(st, data) do
+    :ok = :file.write(st.io, data)
+    %{st | out_bytes: st.out_bytes + IO.iodata_length(data), out_hash: :crypto.hash_update(st.out_hash, data)}
   end
 
   # -- one exchange ------------------------------------------------------------

@@ -41,8 +41,16 @@ defmodule OmnigateControl.Retention do
       two snapshot generations cover it, and the newest sealed segment is
       always kept.
 
+    * `private_outputs_hours`: the outputs of private jobs (privacy mode,
+      `no_store`) are deleted, from local disk and from the bucket, once the
+      job finished more than this many hours ago. The job itself stays (its
+      status and cost; its input and metadata were erased when it ended) and
+      says `"outputs_expired": true`. The default is 24; 0 keeps them like
+      any other job's.
+
   A value of 0, or leaving a setting out, means "keep forever" (except
-  `ledger_ids_days`, which defaults to 3 when left out).
+  `ledger_ids_days`, which defaults to 3, and `private_outputs_hours`, which
+  defaults to 24, when left out).
 
   One sweep runs shortly after boot and then every hour.
   """
@@ -58,7 +66,8 @@ defmodule OmnigateControl.Retention do
 
   @doc """
   Run one sweep now and return what it removed:
-  `%{jobs: n, files: n, bucket_objects: n, ledger_ids: n, ledger_segments: n}`.
+  `%{jobs: n, files: n, bucket_objects: n, ledger_ids: n, ledger_segments: n, private_outputs: n}`
+  (`private_outputs` counts the private jobs whose outputs were deleted).
   """
   def sweep(retention \\ ConfigStore.get().retention, now_ms \\ System.os_time(:millisecond)) do
     {jobs, files, objects} =
@@ -96,17 +105,41 @@ defmodule OmnigateControl.Retention do
         cutoff_ms -> Ledger.prune_segments(cutoff_ms)
       end
 
-    result = %{jobs: jobs, files: files, bucket_objects: objects, ledger_ids: ledger_ids, ledger_segments: ledger_segments}
+    private_outputs = expire_private_outputs(Map.get(retention, :private_outputs_hours, 24), now_ms)
 
-    if jobs + files + objects + ledger_ids + ledger_segments > 0 do
+    result = %{jobs: jobs, files: files, bucket_objects: objects, ledger_ids: ledger_ids, ledger_segments: ledger_segments, private_outputs: private_outputs}
+
+    if jobs + files + objects + ledger_ids + ledger_segments + private_outputs > 0 do
       Logger.info(
         "retention sweep removed #{jobs} finished jobs, #{files} stored files, #{objects} bucket objects, " <>
-          "#{ledger_ids} ledger dedup ids, #{ledger_segments} ledger segments"
+          "#{ledger_ids} ledger dedup ids, #{ledger_segments} ledger segments, and the outputs of #{private_outputs} private jobs"
       )
     end
 
     result
   end
+
+  # Private jobs that finished before the cutoff and still have outputs:
+  # the files (and bucket objects) go, the record stays and says so.
+  defp expire_private_outputs(hours, now_ms) when is_number(hours) and hours > 0 do
+    cutoff_ms = now_ms - round(hours * 3_600_000)
+
+    []
+    |> Store.fold(fn job, acc ->
+      if job["private"] == true and job["status"] in ["succeeded", "failed", "canceled"] and (job["outputs"] || []) != [] and
+           is_integer(job["finished_ms"]) and job["finished_ms"] < cutoff_ms do
+        [job | acc]
+      else
+        acc
+      end
+    end)
+    |> Enum.count(fn job ->
+      Storage.discard(job["id"], job["outputs"])
+      match?({:ok, _}, Store.update(job["id"], &Map.merge(&1, %{"outputs" => [], "outputs_expired" => true})))
+    end)
+  end
+
+  defp expire_private_outputs(_hours, _now_ms), do: 0
 
   defp cutoff(days, now_ms) when is_number(days) and days > 0, do: now_ms - round(days * @day_ms)
   defp cutoff(_, _now_ms), do: nil

@@ -107,11 +107,25 @@ defmodule OmnigateControl.Dashboard do
       ~s(<option value="monthly">each calendar month, UTC</option><option value="daily">each day, UTC</option></select></label>),
       ~s(<label>Requests per minute <span class="muted">optional</span><input name="rpm" type="number" min="0" step="1" inputmode="numeric"></label>),
       ~s(<label>Models <span class="muted">optional, comma-separated</span><input name="models" placeholder="all models"></label>),
+      ~s(<label>Privacy mode<select name="privacy"><option value="">off</option>),
+      ~s(<option value="on">on: keep nothing, redact, unlink</option></select></label>),
+      ~s(<label>Encrypt job outputs to <span class="muted">optional, an age recipient</span><input name="encrypt_to" maxlength="90" placeholder="age1…" spellcheck="false"></label>),
       ~s(</div><div class="row"><button type="submit">Create key</button><span id="create-status" role="status" aria-live="polite"></span></div>),
       ~s(<noscript><p class="muted">Creating and changing keys from this page needs JavaScript. The same actions are available over the admin API at <code>/admin/keys</code>.</p></noscript>),
       ~s(</form></section>)
     ]
   end
+
+  # Privacy mode in a few words under the key's state ("private: no-store,
+  # redact, unlink"); nothing when it is off.
+  defp privacy_note(k) do
+    case Map.get(k, :privacy_summary, "") do
+      "" -> ""
+      summary -> [~s(<span class="muted sub">private: ), h(summary), ~s(</span>)]
+    end
+  end
+
+  defp private?(k), do: Map.get(k, :privacy_summary, "") != ""
 
   defp key_row(k) do
     managed = k.source == "managed"
@@ -123,6 +137,7 @@ defmodule OmnigateControl.Dashboard do
       h(k.source),
       ~s(</span></td><td>),
       pill(k.state, state_class(k.state)),
+      privacy_note(k),
       ~s(</td><td class="spend">),
       case k.budget_usd do
         nil ->
@@ -169,6 +184,12 @@ defmodule OmnigateControl.Dashboard do
           h(k.name),
           ~s(">),
           if(k.disabled, do: "Enable", else: "Disable"),
+          ~s(</button><button type="button" class="small" data-action="privacy" data-private="),
+          if(private?(k), do: "1", else: ""),
+          ~s(" data-name="),
+          h(k.name),
+          ~s(">),
+          if(private?(k), do: "Privacy off", else: "Privacy on"),
           ~s(</button><button type="button" class="small" data-action="rotate" data-name="),
           h(k.name),
           ~s(">Rotate</button><button type="button" class="small danger" data-action="delete" data-name="),
@@ -339,6 +360,10 @@ defmodule OmnigateControl.Dashboard do
   defp repeats(n) when is_integer(n) and n > 0, do: [~s(<span class="muted sub">), fmt(:int, n), ~s( more</span>)]
   defp repeats(_), do: []
 
+  # Privacy mode: how long the outputs of private jobs stay.
+  defp private_outputs(hours) when is_number(hours) and hours > 0, do: "#{fmt(:int, round(hours))} h after the job ends"
+  defp private_outputs(_), do: "like any other job's"
+
   defp key_label("-"), do: "(no valid key)"
   defp key_label(name), do: name
 
@@ -383,7 +408,8 @@ defmodule OmnigateControl.Dashboard do
         ["Finished jobs kept", days(c.retention.jobs_days)],
         ["Ledger ids kept", days(c.retention.ledger_ids_days)],
         ["Usage history kept", days(c.retention.ledger_days)],
-        ["Expired jobs' bucket objects", if(c.retention.delete_bucket_objects, do: "deleted with the job", else: "left in the bucket")]
+        ["Expired jobs' bucket objects", if(c.retention.delete_bucket_objects, do: "deleted with the job", else: "left in the bucket")],
+        ["Private jobs' outputs kept", private_outputs(Map.get(c.retention, :private_outputs_hours, 24))]
       ]),
       ~s(</div></div></section>)
     ]
@@ -551,11 +577,11 @@ defmodule OmnigateControl.Dashboard do
 
     function actionButton(k,action,label,danger){
       var id=k.name+'|'+action,on=armed===id,b=el('button','small'+(danger?' danger':'')+(on?' armed':''),on?'Confirm '+label.toLowerCase()+'?':label);
-      b.type='button';b.dataset.action=action;b.dataset.name=k.name;b.dataset.disabled=k.disabled?'1':'';return b}
+      b.type='button';b.dataset.action=action;b.dataset.name=k.name;b.dataset.disabled=k.disabled?'1':'';b.dataset.private=k.privacy_summary?'1':'';return b}
 
     function keyRow(k){
       var r=el('tr'),n=td('');n.appendChild(el('span','name',k.name));n.appendChild(document.createTextNode(' '));n.appendChild(el('span','tag',k.source));r.appendChild(n);
-      r.appendChild(td('',pill(k.state,stateClass(k.state))));
+      var st=td('',pill(k.state,stateClass(k.state)));if(k.privacy_summary)st.appendChild(el('span','muted sub','private: '+k.privacy_summary));r.appendChild(st);
       var s=td('spend');
       if(k.budget_usd==null){s.appendChild(document.createTextNode(usd(k.cost_usd)+' '));s.appendChild(muted('no budget'))}
       else{var total=k.budget_period==='total'||!k.budget_period,spent=total?k.cost_usd:k.period_spend_usd;
@@ -570,6 +596,7 @@ defmodule OmnigateControl.Dashboard do
       var a=td('actions');
       if(k.source==='managed'){
         a.appendChild(actionButton(k,'toggle',k.disabled?'Enable':'Disable',false));
+        a.appendChild(actionButton(k,'privacy',k.privacy_summary?'Privacy off':'Privacy on',false));
         a.appendChild(actionButton(k,'rotate','Rotate',false));
         a.appendChild(actionButton(k,'delete','Delete',true));
         if(armed&&armed.split('|')[0]===k.name){var c=el('button','small ghost','Cancel');c.type='button';c.dataset.action='cancel';a.appendChild(c)}
@@ -649,12 +676,14 @@ defmodule OmnigateControl.Dashboard do
       var b=ev.target.closest('button[data-action]');if(!b)return;
       var action=b.dataset.action,name=b.dataset.name;
       if(action==='cancel'){disarm();return}
-      var enable=action==='toggle'&&b.dataset.disabled==='1',id=name+'|'+action;
+      // Switching a key on, or its privacy mode on, needs no second click.
+      var enable=(action==='toggle'&&b.dataset.disabled==='1')||(action==='privacy'&&b.dataset.private!=='1'),id=name+'|'+action;
       if(!enable&&armed!==id){armed=id;clearTimeout(armTimer);armTimer=setTimeout(disarm,6000);if(last)render(last);
         var again=document.querySelector('button.armed');if(again)again.focus();return}
       armed=null;clearTimeout(armTimer);
       var path='/admin/keys/'+encodeURIComponent(name),call=
         action==='toggle'?api('PATCH',path,{disabled:!enable}):
+        action==='privacy'?api('PATCH',path,{privacy:enable}):
         action==='rotate'?api('POST',path+'/rotate'):api('DELETE',path);
       call.then(function(res){if(action==='rotate'&&res&&res.key)showSecret(name,res.key,'New');status('',false);return refresh()})
         .catch(function(e){status(e.message,true);if(last)render(last)})});
@@ -664,6 +693,8 @@ defmodule OmnigateControl.Dashboard do
       if(f.elements.budget_usd.value!==''){body.budget_usd=Number(f.elements.budget_usd.value);body.budget_period=f.elements.budget_period.value}
       if(f.elements.rpm.value!=='')body.rpm=Number(f.elements.rpm.value);
       var models=f.elements.models.value.split(',').map(function(s){return s.trim()}).filter(Boolean);if(models.length)body.models=models;
+      var pv=f.elements.privacy.value==='on',enc=f.elements.encrypt_to.value.trim();
+      if(enc)body.privacy={no_store:pv,redact:pv,unlink:pv,encrypt_to:enc};else if(pv)body.privacy=true;
       var submit=f.querySelector('button[type=submit]');submit.disabled=true;status('Creating…',false);
       api('POST','/admin/keys',body).then(function(res){f.reset();status('Created.',false);showSecret(res.name,res.key,'New');return refresh()})
         .catch(function(e){status(e.message,true)}).finally(function(){submit.disabled=false})});

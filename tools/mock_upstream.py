@@ -18,6 +18,15 @@ Special model names, on the working mocks (9002 and 9003):
   no-usage-1       (9002) streams, and ends properly, without ever reporting
                    usage, whatever `stream_options` asks for (as several
                    OpenAI-compatible servers do)
+  echo-1           answers "You said: " and the text of the last user message
+                   (or of `prompt` / `input`), in pieces of three characters
+                   when streaming; a tool call's arguments are {"text": <that
+                   text>}. For tests of what comes back through the gateway.
+  echo-err-1       (9002) 400 whose error message quotes that text
+
+Every working mock remembers the last request it received per model name:
+`GET /__last?model=<name>` returns its path, headers and body, so a test can
+assert on what a provider was, and was not, sent.
 
 Error bodies that are not the protocol's error envelope, as real providers
 send them (the gateway puts them into the envelope), and one that is:
@@ -70,6 +79,7 @@ import os
 import struct
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WORDS = ["Hello", " from", " the", " mock", " upstream", "."]
@@ -83,6 +93,33 @@ ERR_STRING = {"code": "Client specified an invalid argument",
 ERR_EXACT = b'{ "error" : {"code":"context_length_exceeded","param":"messages", "type":"invalid_request_error",\n  "message":"This model\'s maximum context length is 8 tokens."} }\n'
 
 
+# (port, model name) -> the last request received for it; see `GET /__last`.
+LAST = {}
+LAST_LOCK = threading.Lock()
+ECHO_PREFIX = "You said: "
+
+
+def echo_text(req):
+    """What an `echo-1` model repeats: the last user message, or the prompt, or the input."""
+    text = last_user_text(req.get("messages")) if isinstance(req.get("messages"), list) else ""
+    if not text and isinstance(req.get("prompt"), str):
+        text = req["prompt"]
+    given = req.get("input")
+    if not text and isinstance(given, str):
+        text = given
+    if not text and isinstance(given, list) and given and isinstance(given[-1], dict):
+        content = given[-1].get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return text
+
+
+def is_echo(req):
+    return str(req.get("model", "")).startswith("echo-")
+
+
 class Base(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -91,7 +128,25 @@ class Base(BaseHTTPRequestHandler):
 
     def read_json(self):
         length = int(self.headers.get("content-length", 0))
-        return json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length) or b"{}"
+        req = json.loads(raw)
+        if isinstance(req, dict):
+            with LAST_LOCK:
+                LAST[(self.server.server_port, str(req.get("model")))] = {
+                    "path": self.path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "body": raw.decode("utf-8", "replace"),
+                }
+        return req
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path == "/__last":
+            model = urllib.parse.parse_qs(query).get("model", [""])[0]
+            with LAST_LOCK:
+                entry = LAST.get((self.server.server_port, model))
+            return self.send_json(200 if entry else 404, entry or {"error": "nothing received for this model"})
+        self.send_json(404, {"error": {"message": "unknown path"}})
 
     def send_json(self, status, body, headers=None):
         data = json.dumps(body).encode()
@@ -195,17 +250,24 @@ class OpenAIOk(Base):
         if req.get("model") == "rate-limited-1":
             return self.send_json(429, {"error": {"message": "Rate limit reached for mock requests.", "type": "requests",
                                                   "param": None, "code": "rate_limit_exceeded"}}, {"retry-after": "7"})
+        if req.get("model") == "echo-err-1":
+            return self.send_json(400, {"error": {"message": "cannot process: " + echo_text(req), "type": "invalid_request_error",
+                                                  "param": None, "code": None}})
         extra = {"x-request-id": "req_mock_openai_1"} if req.get("model") == "rid-1" else None
+        # What is said: the usual sentence, or (echo-1) what the request said.
+        words = pieces(ECHO_PREFIX + echo_text(req), 3) if is_echo(req) else WORDS
         if path.endswith("/embeddings"):
             return self.embeddings_api(req)
         if path.endswith("/responses"):
-            return self.responses_api(req)
-        usage = {"prompt_tokens": 11, "completion_tokens": len(WORDS), "total_tokens": 11 + len(WORDS)}
+            return self.responses_api(req, words)
+        usage = {"prompt_tokens": 11, "completion_tokens": len(words), "total_tokens": 11 + len(words)}
         created = int(time.time())
         head = {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": created, "model": req.get("model")}
         tools = [t.get("function") or {} for t in req.get("tools") or [] if isinstance(t, dict)]
         if tools and TOOL_TRIGGER in last_user_text(req.get("messages")):
             name, arguments = tools[0].get("name"), json.dumps(example_arguments(tools[0].get("parameters")))
+            if is_echo(req):
+                arguments = json.dumps({"text": echo_text(req)})
             if not req.get("stream"):
                 return self.send_json(200, {
                     "id": "chatcmpl-mock", "object": "chat.completion", "created": created, "model": req.get("model"),
@@ -227,7 +289,7 @@ class OpenAIOk(Base):
             self.sse("data: [DONE]\n\n")
             return self.end_sse()
         if not req.get("stream"):
-            text = "".join(WORDS)
+            text = "".join(words)
             response_format = req.get("response_format") or {}
             if response_format.get("type") == "json_schema":
                 text = json.dumps(example_arguments((response_format.get("json_schema") or {}).get("schema")))
@@ -239,7 +301,7 @@ class OpenAIOk(Base):
             }, extra)
         # As at the provider: the role first, one chunk per token, then a chunk
         # that carries only the finish_reason, then (if asked for) usage alone.
-        deltas = [({"role": "assistant", "content": ""}, None)] + [({"content": w}, None) for w in WORDS] + [({}, "stop")]
+        deltas = [({"role": "assistant", "content": ""}, None)] + [({"content": w}, None) for w in words] + [({}, "stop")]
         self.start_sse(extra)
         for delta, finish in deltas:
             chunk = dict(head, choices=[{"index": 0, "delta": delta, "finish_reason": finish}])
@@ -268,12 +330,12 @@ class OpenAIOk(Base):
         self.send_json(200, {"object": "list", "data": data, "model": req.get("model"),
                              "usage": {"prompt_tokens": tokens, "total_tokens": tokens}})
 
-    def responses_api(self, req):
+    def responses_api(self, req, words=WORDS):
         """POST /responses: the Responses API shape, as JSON or as its typed event stream."""
-        text = "".join(WORDS)
+        text = "".join(words)
         usage = {"input_tokens": 11, "input_tokens_details": {"cached_tokens": 0},
-                 "output_tokens": len(WORDS), "output_tokens_details": {"reasoning_tokens": 0},
-                 "total_tokens": 11 + len(WORDS)}
+                 "output_tokens": len(words), "output_tokens_details": {"reasoning_tokens": 0},
+                 "total_tokens": 11 + len(words)}
         part = {"type": "output_text", "text": text, "annotations": []}
         item = {"id": "msg_mock", "type": "message", "status": "completed", "role": "assistant", "content": [part]}
         base = {"id": "resp_mock", "object": "response", "created_at": int(time.time()), "model": req.get("model"),
@@ -289,7 +351,7 @@ class OpenAIOk(Base):
             {"type": "response.in_progress", "response": started},
             {"type": "response.output_item.added", "output_index": 0, "item": dict(item, status="in_progress", content=[])},
             dict(where, type="response.content_part.added", part=dict(part, text="")),
-        ] + [dict(where, type="response.output_text.delta", delta=w) for w in WORDS] + [
+        ] + [dict(where, type="response.output_text.delta", delta=w) for w in words] + [
             dict(where, type="response.output_text.done", text=text),
             dict(where, type="response.content_part.done", part=part),
             {"type": "response.output_item.done", "output_index": 0, "item": item},
@@ -322,18 +384,19 @@ class AnthropicOk(Base):
                                                                   "message": "This request would exceed the mock rate limit."}},
                                   {"retry-after": "7"})
         extra = {"request-id": "req_mock_anthropic_1"} if req.get("model") == "rid-1" else None
+        words = pieces(ECHO_PREFIX + echo_text(req), 3) if is_echo(req) else WORDS
         tools = [t for t in req.get("tools") or [] if isinstance(t, dict)]
         if tools and TOOL_TRIGGER in last_user_text(req.get("messages")):
             return self.tool_use(req, tools[0], extra)
         if not req.get("stream"):
-            text = "".join(WORDS)
+            text = "".join(words)
             output_format = (req.get("output_config") or {}).get("format") or {}
             if output_format.get("type") == "json_schema":
                 text = json.dumps(example_arguments(output_format.get("schema")))
             return self.send_json(200, {
                 "id": "msg_mock", "type": "message", "role": "assistant", "model": req.get("model"),
                 "content": [{"type": "text", "text": text}], "stop_reason": "end_turn", "stop_sequence": None,
-                "usage": {"input_tokens": 13, "output_tokens": len(WORDS)},
+                "usage": {"input_tokens": 13, "output_tokens": len(words)},
             }, extra)
         # The documented event flow: the empty message, the content block
         # opened, a ping, its text deltas, the block closed, then the stop
@@ -345,11 +408,11 @@ class AnthropicOk(Base):
             {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
             {"type": "ping"},
         ] + [
-            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": w}} for w in WORDS
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": w}} for w in words
         ] + [
             {"type": "content_block_stop", "index": 0},
             {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-             "usage": {"output_tokens": len(WORDS)}},
+             "usage": {"output_tokens": len(words)}},
             {"type": "message_stop"},
         ]
         self.start_sse(extra)
@@ -360,6 +423,8 @@ class AnthropicOk(Base):
     def tool_use(self, req, tool, extra):
         """Answer with one tool_use block for `tool`, as JSON or as the documented event flow."""
         name, arguments = tool.get("name"), example_arguments(tool.get("input_schema"))
+        if is_echo(req):
+            arguments = {"text": echo_text(req)}
         usage = {"input_tokens": 13, "output_tokens": len(WORDS)}
         if not req.get("stream"):
             return self.send_json(200, {

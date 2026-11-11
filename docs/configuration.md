@@ -85,6 +85,7 @@ listed before the managed keys created through it
 | `disabled` | boolean | `false` | `true` switches the key off without removing it: the gateway answers it with 401, and its usage stays in the ledger. |
 | `webhook_secret` | string | none | Signing secret for this key's job webhooks. |
 | `webhook_secret_env` | string | none | Name of an environment variable (read by the control plane) holding that secret. Used when `webhook_secret` is absent. |
+| `privacy` | `true`, or an object | absent (off) | Privacy mode for every request of the key: `true`, or `{"no_store", "redact", "unlink", "encrypt_to"}` part by part. What each part does, and what none of them does, is in [Privacy mode](privacy.md). Anything it does not know (a field, a class of `redact`, a recipient that is not a valid `age1...` address) is rejected when the file is loaded. |
 
 `max_concurrent` is new with the close-out commit (the one after
 55a294d). Until then every key had the data plane's
@@ -136,6 +137,7 @@ Example:
 | `api_key_env` | string | required | Environment variable, read by the **data plane**, holding the provider key. |
 | `timeout_ms` | whole number, 0 to 3,600,000 | `0` | Maximum wait for the provider's response headers. `0` uses the data plane's `OMNIGATE_UPSTREAM_TIMEOUT_MS`. |
 | `v1_path` | string | absent (`/v1`) | For providers that do not serve the API under `/v1`: the leading `/v1` of the request path is replaced by this value. Gemini's OpenAI-compatible endpoint uses `/v1beta/openai`. An empty string puts the API at the root. |
+| `privacy_store_flag` | boolean | absent (only when the host is `api.openai.com`) | Whether a request of a key with [privacy mode](privacy.md#no-retention)'s `no_store` is sent `"store": false` on chat completions and the Responses API. Set `true` for a proxy in front of OpenAI or a compatible server known to take the field; `false` to switch it off for an OpenAI upstream. Only read for `openai` upstreams. Anything but `true` or `false` is rejected when the file is loaded. |
 
 How the key is sent: `openai` upstreams get `Authorization: Bearer <key>`;
 `anthropic` upstreams get `x-api-key: <key>` and an `anthropic-version`
@@ -260,9 +262,12 @@ successful answers and reuse them:
   routes say). The least recently used answers are evicted first, an answer
   larger than a quarter of that budget is not kept, and a restart starts
   empty. Several data planes each have their own cache.
-- There is no per-request switch; a client cannot opt out or force a
-  refresh. Removing `cache_ttl_s` from the route stops lookups as soon as
-  the data planes have polled the new config.
+- There is no per-request switch to force a refresh. Removing
+  `cache_ttl_s` from the route stops lookups as soon as the data planes
+  have polled the new config. A key with [privacy mode](privacy.md)'s
+  `no_store` or `redact`, and a request that sends
+  `x-omnigate-privacy: no-store` (or `redact`, or `on`), is never answered
+  from the cache and never stored in it.
 
 Responses carry `x-omnigate-cache: hit` or `miss`; see
 [API](api.md#response-cache). This is separate from the media job cache
@@ -272,7 +277,7 @@ control plane and is shared across keys.
 ### Retention
 
 ```json
-"retention": { "jobs_days": 30, "ledger_ids_days": 3, "ledger_days": 90, "delete_bucket_objects": true }
+"retention": { "jobs_days": 30, "ledger_ids_days": 3, "ledger_days": 90, "delete_bucket_objects": true, "private_outputs_hours": 24 }
 ```
 
 | Field | Type | Default | Meaning |
@@ -281,9 +286,13 @@ control plane and is shared across keys.
 | `ledger_ids_days` | number, fractions allowed | `3` | The ledger forgets the duplicate-detection ids of whole UTC days that ended longer ago than this, so an id is kept for at least this long and at most a day longer. An explicit `0` keeps them for ever. The default was 14 until commit d79406b. |
 | `ledger_days` | number, fractions allowed | `0` (keep forever) | Sealed ledger segments (the history of usage events) last written longer ago than this are deleted. Spend totals are not affected: they are carried in the ledger's snapshots. |
 | `delete_bucket_objects` | boolean | `true` | Whether a removed job's objects are also deleted from an S3-compatible bucket. Only has an effect when `jobs_days` is set. Anything but `true` or `false` is rejected when the file is loaded. |
+| `private_outputs_hours` | number, 0 to 87,600, fractions allowed | `24` | The outputs of private jobs ([privacy mode](privacy.md#no-retention), `no_store`) are deleted this long after the job finished, on local disk and in the bucket, whatever `jobs_days` and `delete_bucket_objects` say. The job itself stays and says `"outputs_expired": true`. `0` keeps them like any other job's. A value outside the range is rejected when the file is loaded. |
 
-No job, file or ledger segment is deleted unless you set these. The one
-setting with a default is `ledger_ids_days`: with no `retention` section at
+No job, file or ledger segment is deleted unless you set these, with two
+exceptions that have a default. One only concerns jobs created under privacy
+mode's `no_store`, whose outputs are deleted after `private_outputs_hours`
+(a deployment that does not use privacy mode has no such job). The other is
+`ledger_ids_days`: with no `retention` section at
 all, duplicate-detection ids older than 3 days are dropped from memory and
 their per-day files (`ledger.ids.YYYY-MM-DD`) are deleted. That touches no
 total and no file of events; what it costs, and when to raise it, is
@@ -631,7 +640,12 @@ control plane (`GET /internal/config`) that contains:
   is currently blocked by its budget (a disabled key is left out, so the
   data plane treats it as unknown), and its `max_concurrent` (`0` when the
   key has none of its own);
-- the text upstreams as configured (the `api_key_env` name, never a secret);
+- for each of those keys, the parts of its [privacy mode](privacy.md) that a
+  data plane applies (`no_store`, the classes to `redact`, `unlink`), or
+  `null`; never the `encrypt_to` recipient, which only the control plane
+  uses;
+- the text upstreams as configured (the `api_key_env` name, never a secret;
+  `privacy_store_flag` when set);
 - for each text route: `model`, `strategy`, `cache_ttl_s`, and each target's
   `upstream`, `model` and `weight`;
 - the names of the media routes, which the data plane only uses to list

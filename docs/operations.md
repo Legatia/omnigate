@@ -170,8 +170,18 @@ table and as `omnigate_rejected_requests_total{key, reason}`.
 `untranslatable_request`, `gateway_not_ready`, `control_plane_unavailable`,
 and `overloaded` (a connection refused at the connection cap, under the key
 `-`, or a request refused because the gateway's memory budgets were spoken
-for, under the key's name). One more has no error body: `client_timeout`, a
-client that was disconnected for sending too slowly.
+for, under the key's name), and `too_many_redactions` (a private request
+with more distinct values to replace than one request may hold). One more
+has no error body: `client_timeout`, a client that was disconnected for
+sending too slowly.
+
+The same report from the data planes carries one more kind of count, which
+is not a refusal and is kept apart: how many values
+[privacy mode](privacy.md#redaction) replaced before a provider saw them,
+per key and class. They appear as `omnigate_redactions_total{key, class}`
+and in `GET /admin/overview` under `redactions`; like the refusals they are
+held in memory and start from zero with the control plane. They are counts:
+what was replaced is never reported.
 
 `upstream_rate_limited` and `all_upstreams_failed` are not in this list.
 Those requests reached the failover loop, so they are in the ledger (and in
@@ -685,6 +695,28 @@ kept for ever.)
 Without `ledger_days` the segments are kept for ever. They no longer slow
 down a start, which loads the newest snapshot and replays only what came
 after it; they only take disk space.
+
+### Private jobs
+
+Jobs created under [privacy mode](privacy.md#no-retention)'s `no_store` have
+a rule of their own, which does not wait for `jobs_days`:
+
+- their `input` and `metadata` are erased the moment the job ends (not by
+  the sweep; the job does it), and
+- their outputs are deleted by the sweep once the job finished more than
+  `retention.private_outputs_hours` ago (24 by default; `0` keeps them like
+  any other job's). Local files and bucket objects alike, whatever
+  `delete_bucket_objects` says. The job stays, with `"outputs_expired": true`.
+
+The sweep runs hourly, so the outputs live between 24 and 25 hours with the
+default. Its log line counts them:
+
+```text
+retention sweep removed 0 finished jobs, 0 stored files, 0 bucket objects, 0 ledger dedup ids, 0 ledger segments, and the outputs of 3 private jobs
+```
+
+A bucket lifecycle rule is still a good backstop for objects a failed delete
+left behind.
 
 ## When the control plane is down
 

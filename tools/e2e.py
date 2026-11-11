@@ -43,9 +43,49 @@ KEY_BUDGET = "og-e2e-budget"
 KEY_RPM = "og-e2e-rpm"
 KEY_OTHER = "og-e2e-other"
 KEY_LIMITED = "og-e2e-limited"
+# Privacy mode: everything on; redaction of two classes only; job outputs
+# encrypted to an age recipient.
+KEY_PRIVATE = "og-e2e-private"
+KEY_REDACT = "og-e2e-redact"
+KEY_SEALED = "og-e2e-sealed"
+# No privacy mode: the comparison in the privacy checks. (Not the main key,
+# whose calls are reconciled against the ledger one by one.)
+KEY_PLAIN = "og-e2e-plain"
 WEBHOOK_SECRET = "e2e-webhook-secret"
 
+# A string that only ever goes into private requests. After the run, no file
+# the gateway or the control plane wrote may contain it.
+CANARY = "CANARY-e2e-7f3a9c41"
+PII = {
+    "email": "bob.stone@example.com",
+    "phone": "+1 (555) 123-4567",
+    "ip": "10.20.30.40",
+    "secret": "sk-proj-Abc123Def456Ghi789Jkl012",
+    "card": "4111 1111 1111 1111",
+}
+PRIVATE_TEXT = (f"{CANARY}: mail {PII['email']}, call {PII['phone']}, host {PII['ip']}, "
+                f"key {PII['secret']}, card {PII['card']}.")
+PLACEHOLDERS = ("[EMAIL_1]", "[PHONE_1]", "[IP_1]", "[SECRET_1]", "[CARD_1]")
+
+# An independent implementation of the age format (the Rust one), to decrypt
+# what the gateway encrypted. Optional locally; CI installs it and sets
+# OMNIGATE_REQUIRE_PYRAGE=1 so that the check cannot be skipped there.
+try:
+    import pyrage
+except ImportError:
+    pyrage = None
+if pyrage:
+    AGE_IDENTITY = pyrage.x25519.Identity.generate()
+    AGE_RECIPIENT = str(AGE_IDENTITY.to_public())
+else:
+    AGE_IDENTITY = None
+    # The example recipient of the age documentation: nobody here can read
+    # what is encrypted to it, which is all a run without pyrage needs.
+    AGE_RECIPIENT = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
+
 results = []
+# The run's state directory (set in main).
+WORK = ""
 
 
 def check(name, ok, detail=""):
@@ -231,6 +271,10 @@ def text_config():
             {"name": "other", "key": KEY_OTHER},
             # May use the "direct" route and nothing else.
             {"name": "limited", "key": KEY_LIMITED, "models": ["direct"]},
+            {"name": "private", "key": KEY_PRIVATE, "privacy": True, "webhook_secret": WEBHOOK_SECRET},
+            {"name": "redact-only", "key": KEY_REDACT, "privacy": {"redact": ["email", "secret"]}},
+            {"name": "sealed", "key": KEY_SEALED, "privacy": {"encrypt_to": AGE_RECIPIENT}},
+            {"name": "plain", "key": KEY_PLAIN, "webhook_secret": WEBHOOK_SECRET},
         ],
         "upstreams": [
             {"name": "mock-flaky", "kind": "openai", "base_url": "http://127.0.0.1:9001", "api_key_env": "MOCK_API_KEY"},
@@ -241,6 +285,9 @@ def text_config():
             {"name": "mock-compat", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY", "v1_path": "/v1beta/openai"},
             # Nothing listens here: every call is refused at once.
             {"name": "mock-dead", "kind": "openai", "base_url": "http://127.0.0.1:9", "api_key_env": "MOCK_API_KEY"},
+            # The working mock again, declared to take OpenAI's `"store": false`.
+            {"name": "mock-store", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY",
+             "privacy_store_flag": True},
         ],
         "routes": [
             {"model": "chat", "targets": [dict(upstream="mock-flaky", model="flaky-1", **price),
@@ -260,6 +307,12 @@ def text_config():
             {"model": "claude", "targets": [dict(upstream="mock-anthropic", model="mock-claude", **price)]},
             {"model": "slow", "targets": [dict(upstream="mock-slow", model="slow-1", **price),
                                           dict(upstream="mock-ok", model="ok-1", **price)]},
+            # Models that answer with what they were sent (see tools/mock_upstream.py).
+            {"model": "echo", "targets": [dict(upstream="mock-ok", model="echo-1", **price)]},
+            {"model": "echo-claude", "targets": [dict(upstream="mock-anthropic", model="echo-1", **price)]},
+            {"model": "echo-store", "targets": [dict(upstream="mock-store", model="echo-1", **price)]},
+            {"model": "echo-cached", "cache_ttl_s": 60, "targets": [dict(upstream="mock-ok", model="echo-1", **price)]},
+            {"model": "echo-err", "targets": [dict(upstream="mock-ok", model="echo-err-1", **price)]},
         ],
     }
 
@@ -386,12 +439,24 @@ def control_raw(method, path, headers=None, form=None, raw=None):
     if form is not None:
         body = "&".join(f"{k}={v}" for k, v in form.items())
         h["content-type"] = "application/x-www-form-urlencoded"
-    conn.request(method, path, body=body, headers=h)
-    resp = conn.getresponse()
-    data = resp.read().decode("utf-8", "replace")
-    out = (resp.status, {k.lower(): v for k, v in resp.getheaders()}, data)
-    conn.close()
-    return out
+    # A request that is refused before its body is read is answered and the
+    # connection closed with the body still unread; on some systems that
+    # close reaches the client as a reset ahead of the answer. Such a request
+    # changed nothing, so it is simply sent again.
+    for attempt in range(4):
+        try:
+            conn.request(method, path, body=body, headers=h)
+            resp = conn.getresponse()
+            data = resp.read().decode("utf-8", "replace")
+            out = (resp.status, {k.lower(): v for k, v in resp.getheaders()}, data)
+            conn.close()
+            return out
+        except (ConnectionResetError, ConnectionAbortedError):
+            conn.close()
+            if attempt == 3:
+                raise
+            conn = http.client.HTTPConnection("127.0.0.1", CONTROL_PORT, timeout=15)
+            time.sleep(0.1)
 
 
 def login_checks():
@@ -720,6 +785,245 @@ MOCK = {name: f"http://127.0.0.1:{port}" for name, port in [
 TERMINAL = ("succeeded", "failed", "canceled")
 
 
+# --------------------------------------------------------------------------
+# privacy mode
+# --------------------------------------------------------------------------
+
+def seen_by(port, model="echo-1"):
+    """The last request the mock on `port` received for `model`."""
+    return jcall("GET", f"http://127.0.0.1:{port}/__last?model={model}")[2]
+
+
+def hidden(entry, values=None):
+    """True when none of the private values reached the provider in that request."""
+    body = entry.get("body", "<nothing received>")
+    return all(v not in body for v in (values or PII.values()))
+
+
+def privacy_text_checks():
+    said = "You said: " + PRIVATE_TEXT
+    user = [{"role": "user", "content": PRIVATE_TEXT}]
+    anthropic = {"anthropic-version": "2023-06-01"}
+
+    section("privacy mode: redaction before the provider, originals back to the client")
+    status, headers, body = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PRIVATE, body={"model": "echo", "messages": user})
+    text = ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
+    check("a private key's request comes back with the client's own values in it", status == 200 and text == said, (status, body))
+    check("the response says which protections applied", headers.get("x-omnigate-privacy") == "no-store, redact, unlink", headers.get("x-omnigate-privacy"))
+    seen = seen_by(9002)
+    check("the provider was sent placeholders and none of the values",
+          hidden(seen) and all(p in seen.get("body", "") for p in PLACEHOLDERS), seen.get("body", "")[:400])
+    check("everything else reached the provider as written", CANARY in seen.get("body", ""), seen.get("body", "")[:200])
+
+    status, events, _ = sse("/v1/chat/completions", KEY_PRIVATE, {"model": "echo", "messages": user, "stream": True})
+    check("streamed in three-character pieces, every placeholder is put back together",
+          status == 200 and openai_stream_text(events) == said and events[-1][1] == "[DONE]", (status, openai_stream_text(events)))
+
+    status, _, body = jcall("POST", GATEWAY + "/v1/messages", key=KEY_PRIVATE, headers=anthropic,
+                            body={"model": "echo-claude", "max_tokens": 64, "messages": user})
+    text = ((body.get("content") or [{}])[0]).get("text")
+    check("the same over the Anthropic protocol", status == 200 and text == said and hidden(seen_by(9003)), (status, body))
+    status, events, _ = sse("/v1/messages", KEY_PRIVATE, {"model": "echo-claude", "max_tokens": 64, "messages": user, "stream": True}, headers=anthropic)
+    check("and as an Anthropic event stream", status == 200 and anthropic_stream_text(events) == said, (status, anthropic_stream_text(events)))
+
+    status, _, body = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PRIVATE, body={"model": "echo-claude", "messages": user})
+    text = ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
+    check("translated to an Anthropic provider: redacted going out, restored coming back",
+          status == 200 and text == said and hidden(seen_by(9003)) and "[EMAIL_1]" in seen_by(9003).get("body", ""), (status, body))
+    status, events, _ = sse("/v1/chat/completions", KEY_PRIVATE, {"model": "echo-claude", "messages": user, "stream": True})
+    check("translated and streamed", status == 200 and openai_stream_text(events) == said, (status, openai_stream_text(events)))
+    status, _, body = jcall("POST", GATEWAY + "/v1/messages", key=KEY_PRIVATE, headers=anthropic,
+                            body={"model": "echo", "max_tokens": 64, "messages": user})
+    text = ((body.get("content") or [{}])[0]).get("text")
+    check("translated the other way (Anthropic client, OpenAI provider)", status == 200 and text == said and hidden(seen_by(9002)), (status, body))
+    status, events, _ = sse("/v1/messages", KEY_PRIVATE, {"model": "echo", "max_tokens": 64, "messages": user, "stream": True}, headers=anthropic)
+    check("and streamed", status == 200 and anthropic_stream_text(events) == said, (status, anthropic_stream_text(events)))
+
+    section("privacy mode: tool calls, other endpoints, errors")
+    ask = "use the tool with " + PRIVATE_TEXT
+    tools = [{"type": "function", "function": {"name": "send", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}}}]
+    status, _, body = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PRIVATE,
+                            body={"model": "echo", "messages": [{"role": "user", "content": ask}], "tools": tools})
+    calls = ((body.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or [{}]
+    arguments = (calls[0].get("function") or {}).get("arguments") or "{}"
+    check("a tool call's arguments carry the original values", status == 200 and json.loads(arguments).get("text") == ask and hidden(seen_by(9002)), (status, body))
+    status, events, _ = sse("/v1/chat/completions", KEY_PRIVATE, {"model": "echo", "messages": [{"role": "user", "content": ask}], "tools": tools, "stream": True})
+    fragments = []
+    for _, data in events:
+        if data != "[DONE]":
+            for choice in json.loads(data).get("choices", []):
+                for tc in choice.get("delta", {}).get("tool_calls") or []:
+                    fragments.append((tc.get("function") or {}).get("arguments") or "")
+    try:
+        streamed = json.loads("".join(fragments)).get("text")
+    except ValueError:
+        streamed = "".join(fragments)
+    check("also when the arguments are streamed in fragments", status == 200 and streamed == ask, streamed)
+    status, _, body = jcall("POST", GATEWAY + "/v1/messages", key=KEY_PRIVATE, headers=anthropic,
+                            body={"model": "echo-claude", "max_tokens": 64, "messages": [{"role": "user", "content": ask}],
+                                  "tools": [{"name": "send", "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}}}]})
+    block = (body.get("content") or [{}])[0]
+    check("an Anthropic tool_use block's input carries them too", status == 200 and (block.get("input") or {}).get("text") == ask, (status, body))
+    status, events, _ = sse("/v1/messages", KEY_PRIVATE, {"model": "echo-claude", "max_tokens": 64, "stream": True, "messages": [{"role": "user", "content": ask}],
+                                                           "tools": [{"name": "send", "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}}}]}, headers=anthropic)
+    partial = "".join(json.loads(d).get("delta", {}).get("partial_json", "") for _, d in events if json.loads(d).get("type") == "content_block_delta")
+    try:
+        streamed = json.loads(partial).get("text")
+    except ValueError:
+        streamed = partial
+    check("and its streamed partial JSON", status == 200 and streamed == ask, streamed)
+
+    status, _, body = jcall("POST", GATEWAY + "/v1/responses", key=KEY_PRIVATE, body={"model": "echo", "input": PRIVATE_TEXT})
+    text = (((body.get("output") or [{}])[0].get("content") or [{}])[0]).get("text")
+    check("the Responses API: input redacted, output restored", status == 200 and text == said and hidden(seen_by(9002)), (status, body))
+    status, events, _ = sse("/v1/responses", KEY_PRIVATE, {"model": "echo", "input": PRIVATE_TEXT, "stream": True})
+    deltas = "".join(json.loads(d).get("delta", "") for e, d in events if e == "response.output_text.delta")
+    final = [json.loads(d) for e, d in events if e == "response.completed"]
+    final_text = ((((final or [{}])[0].get("response") or {}).get("output") or [{}])[0].get("content") or [{}])[0].get("text")
+    check("the Responses API's event stream: the deltas and the closing response", status == 200 and deltas == said and final_text == said, (status, deltas))
+    status, _, body = jcall("POST", GATEWAY + "/v1/embeddings", key=KEY_PRIVATE, body={"model": "echo", "input": [PRIVATE_TEXT, "plain"]})
+    seen = seen_by(9002)
+    check("embeddings: the text is redacted before it is embedded", status == 200 and len(body.get("data", [])) == 2 and hidden(seen) and "[EMAIL_1]" in seen.get("body", ""), (status, seen.get("body", "")[:200]))
+    status, _, body = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PRIVATE, body={"model": "echo-err", "messages": user})
+    message = (body.get("error") or {}).get("message", "")
+    check("a provider's error that quotes the request is restored as well", status == 400 and PII["email"] in message and hidden(seen_by(9002, "echo-err-1")), (status, body))
+    literal = "the text [EMAIL_1] is mine, " + PII["email"] + " is real, [EMAIL_2] too"
+    status, _, body = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PRIVATE, body={"model": "echo", "messages": [{"role": "user", "content": literal}]})
+    text = ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
+    check("text of the client's that already looks like a placeholder comes back as it was written", status == 200 and text == "You said: " + literal, (status, text))
+
+    section("privacy mode: unlinking, no retention, the request header")
+    linking = {"user": "end-user-8842", "safety_identifier": "sid-5521", "prompt_cache_key": "pck-7719", "metadata": {"customer": "acme-3306"}}
+    names = ("end-user-8842", "sid-5521", "pck-7719", "acme-3306")
+    status, _, _ = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PRIVATE, body=dict({"model": "echo", "messages": user}, **linking))
+    seen = seen_by(9002)
+    check("fields that name an end user are not sent on", status == 200 and hidden(seen, names) and not any(k in json.loads(seen.get("body", "{}")) for k in linking), seen.get("body", "")[:300])
+    sent_headers = seen.get("headers", {})
+    check("nothing in the request to the provider names the key or the client",
+          sent_headers.get("authorization") == "Bearer mock-secret" and not any(n.startswith("x-omnigate") or n in ("x-forwarded-for", "forwarded", "cookie", "via") for n in sent_headers)
+          and not any("private" in v or KEY_PRIVATE in v for v in sent_headers.values()), sent_headers)
+    status, _, _ = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PLAIN, body=dict({"model": "echo", "messages": CHAT["messages"]}, **linking))
+    check("a key without privacy mode still sends them (the fields work)", status == 200 and all(n in seen_by(9002).get("body", "") for n in names))
+    status, _, _ = jcall("POST", GATEWAY + "/v1/messages", key=KEY_PRIVATE, headers=anthropic,
+                         body={"model": "echo-claude", "max_tokens": 64, "messages": user, "metadata": {"user_id": "end-user-8842"},
+                               "diagnostics": {"previous_message_id": "msg_prev_sid-5521"}, "user": "kept-for-the-provider-to-refuse"})
+    sent = json.loads(seen_by(9003).get("body", "{}"))
+    check("Anthropic's metadata.user_id and diagnostics.previous_message_id are removed too; what is not Anthropic's is left alone",
+          status == 200 and hidden(seen_by(9003), names) and "metadata" not in sent and "diagnostics" not in sent and "user" in sent, sent)
+
+    def cache_note(key):
+        return jcall("POST", GATEWAY + "/v1/chat/completions", key=key, body={"model": "echo-cached", "messages": CHAT["messages"]})[1].get("x-omnigate-cache")
+    check("a private key's answers are neither taken from nor put into the response cache", [cache_note(KEY_PRIVATE), cache_note(KEY_PRIVATE)] == [None, None])
+    check("the same route still caches for other keys", [cache_note(KEY_PLAIN), cache_note(KEY_PLAIN)] == ["miss", "hit"])
+
+    status, _, _ = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PRIVATE,
+                         body={"model": "echo-store", "messages": user, "store": True, "metadata": {"a": "b"}})
+    sent = json.loads(seen_by(9002).get("body", "{}"))
+    check("an upstream that takes OpenAI's store flag is told \"store\": false, whatever the client said",
+          status == 200 and sent.get("store") is False and "metadata" not in sent, sent)
+    status, _, _ = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PRIVATE, body={"model": "echo", "messages": user})
+    check("an upstream that is not known to take it is not sent the field", status == 200 and "store" not in json.loads(seen_by(9002).get("body", "{}")))
+    status, _, _ = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PLAIN, body={"model": "echo-store", "messages": CHAT["messages"], "store": True})
+    check("and a key without privacy mode keeps its own \"store\"", status == 200 and json.loads(seen_by(9002).get("body", "{}")).get("store") is True)
+
+    status, headers, body = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PLAIN, headers={"x-omnigate-privacy": "redact"},
+                                  body={"model": "echo", "messages": user})
+    text = ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
+    check("x-omnigate-privacy: redact switches redaction on for one request of any key",
+          status == 200 and text == said and headers.get("x-omnigate-privacy") == "redact" and hidden(seen_by(9002)), (status, headers.get("x-omnigate-privacy")))
+    status, headers, _ = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PLAIN, headers={"x-omnigate-privacy": "on"}, body={"model": "echo", "messages": user})
+    check("x-omnigate-privacy: on switches everything on", status == 200 and headers.get("x-omnigate-privacy") == "no-store, redact, unlink", headers.get("x-omnigate-privacy"))
+    for value in ("off", "false", "redact, sometimes"):
+        status, _, body = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_PRIVATE, headers={"x-omnigate-privacy": value}, body={"model": "echo", "messages": user})
+        check(f"x-omnigate-privacy: {value} is refused (the header cannot switch anything off)",
+              status == 400 and (body.get("error") or {}).get("code") == "invalid_request", (status, body))
+    status, headers, body = jcall("POST", GATEWAY + "/v1/chat/completions", key=KEY_REDACT, body={"model": "echo", "messages": user})
+    seen = seen_by(9002).get("body", "")
+    check("a key that redacts only e-mail and secrets leaves the other classes alone",
+          status == 200 and headers.get("x-omnigate-privacy") == "redact" and PII["email"] not in seen and PII["secret"] not in seen
+          and PII["phone"] in seen and PII["ip"] in seen and PII["card"] in seen, seen[:300])
+
+    def counted():
+        _, _, raw = call("GET", CONTROL + "/metrics", key=ADMIN_TOKEN)
+        page = raw.decode("utf-8", "replace")
+        return all(f'omnigate_redactions_total{{key="private",class="{c}"}}' in page for c in PII) and 'omnigate_key_private{key="private"} 1' in page
+    check("redactions are counted per key and class in the metrics (counts only)", wait_until(counted, 10))
+    row = usage_row("private")
+    check("private requests are metered like any other", row.get("requests", 0) >= 10 and row.get("cost_usd", 0) > 0, row)
+
+
+def privacy_media_checks():
+    section("privacy mode: media jobs")
+    prompt = f"{CANARY} a private lighthouse"
+    body = {"model": "image", "input": {"prompt": prompt}, "metadata": {"order": CANARY + "-order"}, "webhook_url": MOCK["webhooks"] + "/hook"}
+    status, _, job = jcall("POST", GATEWAY + "/v1/jobs", key=KEY_PLAIN, body=body, headers={"x-omnigate-privacy": "no-store"})
+    check("x-omnigate-privacy: no-store makes one job private", status == 202 and job.get("private") is True, (status, job))
+    done = wait_job(job.get("id", "missing"), key=KEY_PLAIN)
+    check("when it ends, its input and metadata are erased; the result stays",
+          done.get("status") == "succeeded" and done.get("input") is None and done.get("metadata") is None
+          and done.get("input_erased") is True and len(done.get("outputs") or []) == 1, done)
+    def delivered():
+        recs = [d for d in jcall("GET", MOCK["webhooks"] + "/received")[2].get("deliveries", []) if d.get("webhook_id") == "msg_" + job.get("id", "")]
+        return recs if recs and recs[-1]["responded"] == 200 else None
+    recs = wait_until(delivered, 20) or [{}]
+    payload = json.dumps(recs[-1].get("payload", {}))
+    check("its webhook carries neither", recs[-1].get("responded") == 200 and CANARY not in payload and "input_erased" in payload, payload[:300])
+    listed = jcall("GET", GATEWAY + "/v1/jobs?limit=50", key=KEY_PLAIN)[2]
+    check("nor does the list of jobs", CANARY not in json.dumps(listed), json.dumps(listed)[:200])
+
+    status, _, job = create_job({"model": "image", "input": {"prompt": prompt}}, key=KEY_PRIVATE)
+    done = wait_job(job.get("id", "missing"), key=KEY_PRIVATE)
+    check("every job of a private key is private", status == 202 and job.get("private") is True and done.get("input_erased") is True, (status, done))
+    status, _, refused = jcall("POST", GATEWAY + "/v1/jobs", key=KEY_PLAIN, body=body, headers={"x-omnigate-privacy": "never"})
+    check("a privacy header the gateway does not understand is refused for jobs too", status == 400, (status, refused))
+
+    status, _, job = create_job({"model": "image", "input": {"prompt": "a sealed lighthouse"}}, key=KEY_SEALED)
+    done = wait_job(job.get("id", "missing"), key=KEY_SEALED)
+    out = (done.get("outputs") or [{}])[0]
+    url = out.get("url", "")
+    check("a key with encrypt_to gets its output as an age file",
+          done.get("status") == "succeeded" and out.get("encryption") == "age" and out.get("content_type") == "application/octet-stream"
+          and ".age?" in url and out.get("plaintext_content_type") == "image/png", done)
+    st, hdrs, sealed = call("GET", url) if url else (0, {}, b"")
+    check("what is stored and served is ciphertext, with the hash the job reports",
+          st == 200 and sealed.startswith(b"age-encryption.org/v1\n-> X25519 ") and b"\x89PNG" not in sealed
+          and hashlib.sha256(sealed).hexdigest() == out.get("sha256") and len(sealed) == out.get("bytes"), (st, sealed[:60]))
+    stored = [os.path.join(d, f) for d, _, fs in os.walk(os.path.join(WORK, "media", done.get("id", "none"))) for f in fs]
+    check("on disk there is the encrypted file and nothing else of that job",
+          [os.path.basename(f) for f in stored] == ["out-0.png.age"] and all(b"\x89PNG" not in open(f, "rb").read() for f in stored), stored)
+    if pyrage:
+        try:
+            plain = pyrage.decrypt(sealed, [AGE_IDENTITY])
+        except Exception as e:  # noqa: BLE001 - whatever the library raises is a failure here
+            plain = repr(e).encode()
+        check("an independent age implementation (pyrage) decrypts it to the original PNG",
+              plain.startswith(b"\x89PNG\r\n\x1a\n") and hashlib.sha256(plain).hexdigest() == out.get("plaintext_sha256")
+              and len(plain) == out.get("plaintext_bytes"), plain[:60])
+    elif os.environ.get("OMNIGATE_REQUIRE_PYRAGE"):
+        check("an independent age implementation (pyrage) decrypts it to the original PNG", False, "pyrage is not installed")
+    else:
+        print("  note  pyrage is not installed: the decryption check was skipped (pip install pyrage)", flush=True)
+
+
+def leftovers(work):
+    """Files the stack wrote that still contain the private canary."""
+    found = []
+    for folder, _, names in os.walk(work):
+        for name in names:
+            # The mocks are the providers: they are meant to see the prompt.
+            if name in ("mock_upstream.log", "mock_media.log"):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                with open(path, "rb") as f:
+                    if CANARY.encode() in f.read():
+                        found.append(os.path.relpath(path, work))
+            except OSError:
+                pass
+    return found
+
+
+
 def control_env(work):
     return {
         "OMNIGATE_JOBS": os.path.join(work, "jobs.jsonl"),
@@ -794,6 +1098,7 @@ def close(a, b):
 
 
 def media_checks(stack):
+    privacy_media_checks()
     section("media job: failover, re-hosting, idempotency")
     before = {n: stats(n) for n in ("replicate", "replicate_broken")}
     body = {"model": "image", "input": {"prompt": "a lighthouse at dusk"},
@@ -1067,7 +1372,8 @@ def main():
     run_text = args.only in (None, "text")
     run_media = args.only in (None, "media")
 
-    work = tempfile.mkdtemp(prefix="omnigate-e2e-")
+    global WORK
+    work = WORK = tempfile.mkdtemp(prefix="omnigate-e2e-")
     config = text_config()
     if run_media:
         config["media"] = media_config(work)
@@ -1082,12 +1388,19 @@ def main():
             stack.fail("gateway never received its config from the control plane", "gateway")
         login_checks()
         key_checks()
+        if run_text:
+            privacy_text_checks()
         if run_media:
             media_checks(stack)
         if run_text:
             text_checks(stack)
     finally:
         stack.stop_all()
+
+    # Everything is stopped and flushed: look through what was left behind.
+    section("privacy mode: nothing of a private request is left on disk")
+    left = leftovers(work)
+    check("no log, spool, ledger, job store or cache file holds the private prompt or metadata", left == [], left)
 
     failed = [name for name, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed in {time.time() - started:.0f}s")

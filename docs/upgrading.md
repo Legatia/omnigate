@@ -481,6 +481,63 @@ code whose account is still open (`"provider_pending": true`) is not
 settled by the old code: let such jobs finish (at most a route's timeout)
 before going back, or accept that they stay out of the ledger.
 
+## The privacy mode commit
+
+The commit that follows 8421df7 adds [privacy mode](privacy.md). Nothing
+changes for a key that does not use it, with the exceptions in the last
+table.
+
+Upgrade both processes before you give a key the setting, and check
+`GET /admin/keys` afterwards: a control plane from before this commit
+ignores a `privacy` it is sent (in the config file and on
+`PATCH /admin/keys` alike), without an error, and the key is then simply
+not private.
+
+**Mixed versions**
+
+| Control plane | Data plane | What happens |
+|---|---|---|
+| new | old | The snapshot carries each key's `privacy`; an old data plane ignores it. **Redaction, unlinking, `"store": false` and the cache exemption do not happen** until the data plane is upgraded, and no response says `x-omnigate-privacy`. Media jobs are private and encrypted as configured (that is the control plane's work). An `x-omnigate-privacy` request header is ignored by the old data plane and not passed on. |
+| old | new | No key has the setting. The request header works for text requests (`redact`, `unlink`, `no-store`); on `POST /v1/jobs` the new data plane passes `x-omnigate-privacy: no-store` on and the old control plane ignores it, so **the job is not private**. Redaction counts are reported with the refusal counters and an old control plane shows them there, as `omnigate_rejected_requests_total{reason="redacted_email"}` and so on. |
+
+Upgrade both before telling anyone a key is private.
+
+**On disk**
+
+- `keys.json`: a managed key can have a `privacy` object. Older code
+  ignores it; if an older control plane then rewrites the file (any key
+  change), the setting is lost.
+- The job log: jobs gain `private`, `encrypt_to`, `metadata_file`, and later
+  `erased` and `outputs_expired`. A private job's input and metadata are in
+  `<jobs file>.inputs/<id>.json` and `<id>.meta.json`, not in the log.
+  **Going back with private jobs unfinished:** older code reads the input
+  file (it knows large inputs live there) and runs the job, but does not
+  know `.meta.json` (it deletes it at its next start as a stray file, so the
+  job's metadata is lost), does not erase anything when the job ends, and
+  stores the outputs unencrypted. Let private jobs finish before going back.
+- Stored outputs of keys with `encrypt_to` are age files named
+  `out-N.<ext>.age`. Older code serves them like any other stored file.
+
+**New settings, and one new default**
+
+| Setting | Default | Note |
+|---|---|---|
+| key `privacy` | off | [Privacy mode](privacy.md#switching-it-on). |
+| upstream `privacy_store_flag` | by host (`api.openai.com`) | [Configuration](configuration.md#text-upstreams). |
+| `retention.private_outputs_hours` | `24` | Only concerns private jobs, which exist only once the setting or the header is used. |
+
+**What clients and operators can notice without using it**
+
+| Change | Before | Now |
+|---|---|---|
+| A request with an `x-omnigate-privacy` header | Ignored | Acted on; a value that is not understood answers `400 invalid_request` |
+| The config snapshot (`GET /internal/config`) | No `privacy` on keys | Every key has `privacy` (`null` when off), every upstream `privacy_store_flag`; the snapshot's version changes once with the upgrade |
+| `GET /admin/keys`, `GET /admin/overview` | | Keys gain `privacy` and `privacy_summary`; the overview gains `redactions` |
+| `/metrics` | | `omnigate_redactions_total`, `omnigate_key_private` |
+| The retention sweep's log line | Ends with the ledger segments | Ends with "and the outputs of N private jobs" |
+| A job's `outputs[]` entries | `url`, `content_type`, `bytes`, `sha256` | The same for jobs that are not encrypted; four more fields for those that are |
+| `tools/e2e.py` | Standard library only | Uses `pyrage` when it is installed, to decrypt what the gateway encrypted; without it that one check is skipped and the run says so (`OMNIGATE_REQUIRE_PYRAGE=1` turns the skip into a failure, as CI does) |
+
 ## Going back
 
 **Data plane.** The old binary reads the new binary's spool and config

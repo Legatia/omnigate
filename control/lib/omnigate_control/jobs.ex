@@ -32,6 +32,9 @@ defmodule OmnigateControl.Jobs do
   @public ~w(id status model input metadata error cost_usd cached upstream target_model attempts
              created_at updated_at started_at finished_at)
 
+  # What a job's output record may show a client, next to its fresh URL.
+  @output_fields ~w(content_type bytes sha256 encryption plaintext_sha256 plaintext_bytes plaintext_content_type)
+
   def terminal?(%{"status" => status}), do: status in @terminal
 
   @doc """
@@ -42,6 +45,14 @@ defmodule OmnigateControl.Jobs do
   the job is refused (429) when the key already has `limit` unfinished jobs;
   with `day_cap: {limit, hashes}`, when it already created `limit` jobs this
   UTC day.
+
+  `privacy: %{no_store: bool, encrypt_to: recipient | nil}` is the key's
+  privacy mode for this job (`OmnigateControl.Privacy`). A `no_store` job is
+  "private": its input and metadata are kept in files of their own, never in
+  the job log, and are erased when the job ends; it neither reads nor feeds
+  the job cache. With `encrypt_to`, its outputs are encrypted to that age
+  recipient before they are stored (and are not shared through the cache
+  either).
   """
   def create(key_sha256, params, idempotency_key \\ nil, opts \\ []) do
     with {:ok, route} <- route(params["model"]),
@@ -55,9 +66,16 @@ defmodule OmnigateControl.Jobs do
          {:ok, webhook_url} <- webhook_url(params["webhook_url"], key_sha256),
          :ok <- idempotency_key_ok(idempotency_key) do
       now = DateTime.utc_now()
-      cache? = params["cache"] == true or (is_integer(route.cache_ttl_s) and params["cache"] != false)
+      privacy = Keyword.get(opts, :privacy) || %{}
+      private = privacy[:no_store] == true
+      encrypt_to = privacy[:encrypt_to]
+      # A private job leaves nothing for a later one to reuse, and an output
+      # encrypted for one key is of no use to another.
+      shared = not private and is_nil(encrypt_to)
+      cache? = shared and (params["cache"] == true or (is_integer(route.cache_ttl_s) and params["cache"] != false))
       id = "job_" <> random_id()
-      on_disk = byte_size(input_json) > @inline_input_bytes
+      on_disk = private or byte_size(input_json) > @inline_input_bytes
+      metadata_on_disk = private and metadata != nil
 
       job = %{
         "id" => id,
@@ -66,7 +84,11 @@ defmodule OmnigateControl.Jobs do
         # A large input lives in its own file; `input/1` reads it back.
         "input" => if(on_disk, do: nil, else: input),
         "input_file" => on_disk,
-        "metadata" => metadata,
+        "metadata" => if(metadata_on_disk, do: nil, else: metadata),
+        "metadata_file" => metadata_on_disk,
+        # Privacy mode, fixed when the job is created.
+        "private" => private,
+        "encrypt_to" => encrypt_to,
         "outputs" => [],
         "error" => nil,
         "cost_usd" => 0.0,
@@ -84,13 +106,17 @@ defmodule OmnigateControl.Jobs do
         "created_ms" => DateTime.to_unix(now, :millisecond),
         "idempotency_key" => idempotency_key,
         "request_hash" => hash(canonical(Map.take(params, ~w(model input metadata webhook_url cache)))),
-        "cache_key" => cache_key(route.model, input),
+        "cache_key" => if(shared, do: cache_key(route.model, input)),
         "ledgered" => false,
         "run" => nil
       }
 
       # The input is on disk before the job that points at it exists.
-      stored = if on_disk, do: Store.put_input(id, input_json), else: :ok
+      stored =
+        with :ok <- if(on_disk, do: Store.put_input(id, input_json), else: :ok),
+             :ok <- if(metadata_on_disk, do: Store.put_metadata(id, JSON.encode!(metadata)), else: :ok) do
+          :ok
+        end
 
       created =
         case stored do
@@ -99,7 +125,7 @@ defmodule OmnigateControl.Jobs do
         end
 
       # A job that was not created leaves no input file behind.
-      if on_disk and not match?({:ok, _}, created), do: Store.delete_input(id)
+      if (on_disk or metadata_on_disk) and not match?({:ok, _}, created), do: Store.delete_input(id)
 
       case created do
         {:error, :too_many_open} ->
@@ -158,6 +184,10 @@ defmodule OmnigateControl.Jobs do
   end
 
   def input(job), do: job["input"]
+
+  @doc "The metadata of a job: from the record, or (a private job's) from its file."
+  def metadata(%{"metadata_file" => true, "id" => id}), do: Store.read_metadata(id)
+  def metadata(job), do: job["metadata"]
 
   @doc "Like `input/1`, but raises when a job's input file cannot be read (the job then fails as an internal error)."
   def input!(job) do
@@ -243,10 +273,35 @@ defmodule OmnigateControl.Jobs do
       end)
 
     with {:ok, job} <- result do
-      settle(job)
+      job |> erase_private() |> settle()
       {:ok, Store.get(id)}
     end
   end
+
+  @doc """
+  A private job that has ended (and whose account is closed) loses what it
+  was asked: the files that held its input and metadata are deleted, and the
+  record says so (`"erased"`). Before the webhook goes out, so that it
+  carries neither. Safe to repeat; a no-op for any other job. Returns the
+  job as it is afterwards.
+
+  (Deleted, not overwritten: what a file system or a disk keeps of a deleted
+  file is outside this program's reach.)
+  """
+  def erase_private(%{"private" => true, "id" => id} = job) do
+    if terminal?(job) and not provider_pending?(job) and job["erased"] != true do
+      Store.delete_input(id)
+
+      case Store.update(id, &Map.merge(&1, %{"input" => nil, "input_file" => false, "metadata" => nil, "metadata_file" => false, "erased" => true})) do
+        {:ok, erased} -> erased
+        _ -> job
+      end
+    else
+      job
+    end
+  end
+
+  def erase_private(job), do: job
 
   @doc """
   Close the account of a canceled job whose provider call was still in flight
@@ -271,7 +326,7 @@ defmodule OmnigateControl.Jobs do
       end)
 
     with {:ok, job} <- result do
-      settle(job)
+      job |> erase_private() |> settle()
       {:ok, Store.get(id)}
     end
   end
@@ -330,6 +385,8 @@ defmodule OmnigateControl.Jobs do
           start_runner(job["id"])
 
         true ->
+          # (A stop between a private job's end and its erasure.)
+          job = erase_private(job)
           if job["ledgered"] != true, do: record_cost(job)
 
           case job["webhook"] do
@@ -357,33 +414,49 @@ defmodule OmnigateControl.Jobs do
   response cannot be made of a hundred megabyte-sized inputs.
   """
   def view(job, opts \\ []) do
+    listing = not Keyword.get(opts, :input, true)
+    erased = job["erased"] == true
+
     {input, omitted} =
       cond do
+        erased -> {nil, false}
         job["input_file"] != true -> {job["input"], false}
-        Keyword.get(opts, :input, true) -> {input(job), false}
+        not listing -> {input(job), false}
         true -> {nil, true}
       end
 
     # Metadata is capped when a job is created; a list still leaves out all
-    # but small ones, so that its size does not depend on what clients stored.
-    metadata_omitted =
-      not Keyword.get(opts, :input, true) and is_map(job["metadata"]) and map_size(job["metadata"]) > 0 and
-        byte_size(JSON.encode!(job["metadata"])) > @listed_metadata_bytes
+    # but small ones, so that its size does not depend on what clients
+    # stored (and never reads a private job's metadata file).
+    {metadata, metadata_omitted} =
+      cond do
+        erased ->
+          {nil, false}
+
+        job["metadata_file"] == true and listing ->
+          {nil, true}
+
+        job["metadata_file"] == true ->
+          {metadata(job), false}
+
+        listing and is_map(job["metadata"]) and map_size(job["metadata"]) > 0 and byte_size(JSON.encode!(job["metadata"])) > @listed_metadata_bytes ->
+          {nil, true}
+
+        true ->
+          {job["metadata"], false}
+      end
 
     job
     |> Map.take(@public)
     |> Map.merge(%{
       "object" => "job",
       "input" => input,
-      "metadata" => if(metadata_omitted, do: nil, else: job["metadata"]),
+      "metadata" => metadata,
       "outputs" =>
         Enum.map(job["outputs"] || [], fn o ->
-          %{
-            "url" => Storage.url(job["id"], o),
-            "content_type" => o["content_type"],
-            "bytes" => o["bytes"],
-            "sha256" => o["sha256"]
-          }
+          # An encrypted output also says how (`"encryption": "age"`), and
+          # what its plaintext is, so that it can be checked after decrypting.
+          o |> Map.take(@output_fields) |> Map.put("url", Storage.url(job["id"], o))
         end),
       "webhook" =>
         case job["webhook"] do
@@ -393,6 +466,10 @@ defmodule OmnigateControl.Jobs do
     })
     |> then(&if(omitted, do: Map.put(&1, "input_omitted", true), else: &1))
     |> then(&if(metadata_omitted, do: Map.put(&1, "metadata_omitted", true), else: &1))
+    # Privacy mode: say that the job is private, and what that has removed.
+    |> then(&if(job["private"] == true, do: Map.put(&1, "private", true), else: &1))
+    |> then(&if(erased, do: Map.put(&1, "input_erased", true), else: &1))
+    |> then(&if(job["outputs_expired"] == true, do: Map.put(&1, "outputs_expired", true), else: &1))
   end
 
   @doc """

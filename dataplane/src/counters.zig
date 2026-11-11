@@ -48,6 +48,12 @@ pub const Counters = struct {
         c.add(gpa, io, if (key_name.len == 0) unknown_key else key_name, reason, 1);
     }
 
+    /// Count `n` of something that is not a refusal (values redacted, by
+    /// class: the reasons that start `redacted_`). Same rules as `count`.
+    pub fn countN(c: *Counters, gpa: std.mem.Allocator, io: Io, key_name: []const u8, reason: []const u8, n: u64) void {
+        c.add(gpa, io, if (key_name.len == 0) unknown_key else key_name, reason, n);
+    }
+
     fn add(c: *Counters, gpa: std.mem.Allocator, io: Io, key_name: []const u8, reason: []const u8, n: u64) void {
         var buf: [256]u8 = undefined;
         const series = std.fmt.bufPrint(&buf, "{s}\n{s}", .{ key_name, reason }) catch return;

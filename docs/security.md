@@ -487,6 +487,25 @@ out: clients get presigned URLs. Keep the bucket private and give the
 gateway's credentials no more than put, get and (for retention) delete on
 its prefix.
 
+## Privacy mode
+
+A key can be set to keep nothing of its requests in the gateway, to have
+addresses, numbers and secrets replaced by placeholders before a provider
+sees them, to drop the fields that name an end user, and to have its media
+outputs encrypted to a key only its owner holds: [Privacy mode](privacy.md).
+Three things about it belong on this page:
+
+- It narrows what a provider is shown and what the gateway keeps. It does
+  not hide a prompt from the provider that answers it, and it does not find
+  names. The page says plainly what each part does not do; read that part
+  before you describe the feature to anyone else.
+- Redaction and unlinking run in the data plane on every request of the
+  key, so they hold for whatever client uses the key. A request can add
+  protections with a header and cannot remove any; a header the gateway
+  does not understand is refused, not ignored.
+- An operator can switch a key's privacy mode off. Every change is in the
+  [audit log](admin.md#the-audit-log) with what the setting became.
+
 ## Backups of `/data`
 
 The control plane's `/data` volume is the installation: the ledger

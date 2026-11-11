@@ -55,7 +55,7 @@ defmodule OmnigateControl.RetentionMetricsTest do
                config.routes
 
       # Everything is kept forever by default, except the ledger's duplicate-detection ids.
-      assert config.retention == %{jobs_days: 0, ledger_ids_days: 3, ledger_days: 0, delete_bucket_objects: true}
+      assert config.retention == %{jobs_days: 0, ledger_ids_days: 3, ledger_days: 0, delete_bucket_objects: true, private_outputs_hours: 24}
     end
 
     test "bad values are refused with a message that names the problem" do

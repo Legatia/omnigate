@@ -5,7 +5,7 @@ defmodule OmnigateControl.Admin do
   Nothing here ever contains a gateway key, its hash, a provider key or a
   webhook secret. Upstreams are shown by host only.
   """
-  alias OmnigateControl.{Audit, ConfigStore, Jobs, Keys, Ledger, Rejections}
+  alias OmnigateControl.{Audit, ConfigStore, Jobs, Keys, Ledger, Privacy, Redactions, Rejections}
 
   @doc "One key as the admin API and the dashboard show it."
   def key_view(key) do
@@ -32,6 +32,9 @@ defmodule OmnigateControl.Admin do
       # True for a managed key that a config-file key of the same name has put out of use.
       shadowed: false,
       has_webhook_secret: Map.get(key, :webhook_secret) != nil,
+      # Privacy mode: the setting (null when off), and the same in a few words.
+      privacy: Privacy.view(Map.get(key, :privacy)),
+      privacy_summary: Privacy.summary(Map.get(key, :privacy)),
       requests: totals.requests,
       errors: totals.errors,
       input_tokens: totals.input_tokens,
@@ -80,6 +83,8 @@ defmodule OmnigateControl.Admin do
       requests: Ledger.recent() |> Enum.reject(&(&1["kind"] == "media")) |> Enum.take(25) |> Enum.map(&request_view(&1, names)),
       jobs: Enum.map(Jobs.Store.recent(25), &job_view(&1, names)),
       rejected: Enum.take(Rejections.all(), 50),
+      # Values privacy mode replaced before a provider saw them: counts only.
+      redactions: Enum.take(Redactions.all(), 50),
       audit: Audit.recent(10),
       config: config_view(config)
     }
@@ -166,7 +171,8 @@ defmodule OmnigateControl.Admin do
             _ -> %{kind: "local"}
           end
       },
-      retention: Map.merge(%{jobs_days: 0, ledger_ids_days: 0, ledger_days: 0, delete_bucket_objects: true}, Map.get(config, :retention, %{}))
+      retention:
+        Map.merge(%{jobs_days: 0, ledger_ids_days: 0, ledger_days: 0, delete_bucket_objects: true, private_outputs_hours: 24}, Map.get(config, :retention, %{}))
     }
   end
 

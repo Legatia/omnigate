@@ -276,6 +276,60 @@ class, are in [SECURITY.md](SECURITY.md#past-advisories).
 
 ### Added
 
+**Privacy mode (the commit after 8421df7).** A setting per gateway key
+(`"privacy": true`, or part by part), which a request can add to with
+`x-omnigate-privacy` and never take from. What each part does and does not
+do is in [docs/privacy.md](docs/privacy.md); what an installation notices is
+in [docs/upgrading.md](docs/upgrading.md#the-privacy-mode-commit).
+
+- **Redaction** (`redact`; data plane, `dataplane/src/redact.zig`): e-mail
+  addresses, phone numbers, payment card numbers (Luhn-checked), IPv4 and
+  IPv6 addresses and common secret formats (provider keys by prefix, AWS
+  keys, JWTs, bearer tokens, PEM private keys) in the text of a request to
+  the six text endpoints are replaced by placeholders (`[EMAIL_1]`, stable
+  per request, numbered in order of appearance) before a provider sees
+  them. The originals are put back in the answer: whole answers, event
+  streams (a placeholder cut across events is held until its other half
+  arrives; nothing else waits), tool-call arguments, translated answers and
+  quoted errors. One pass over the client's bytes, no tree; every detector
+  is bounded, and the unit tests hold the scanner to linear work on text
+  built to be expensive. At most 16,384 distinct values per request
+  (`400 too_many_redactions` beyond). Names are not detected. Counted per
+  key and class: `omnigate_redactions_total`.
+- **No retention** (`no_store`): no response cache for the key; OpenAI's
+  `"store": false` on chat completions and Responses (upstreams on
+  `api.openai.com`, or marked `privacy_store_flag`). A private media job
+  keeps its input and metadata out of the job log (in files of their own),
+  erases them when it ends, before its webhook goes out, keeps only the
+  kind of a provider's failure, uses no job cache, and has its outputs
+  deleted `retention.private_outputs_hours` (24) after it finished.
+- **Encrypted job outputs** (`encrypt_to`): outputs are encrypted to an age
+  X25519 recipient (age v1 format, implemented on `:crypto` in
+  `OmnigateControl.Age`) before they reach local storage or the bucket; a
+  download is encrypted as it arrives, so its temporary file holds only
+  ciphertext. The job reports `"encryption": "age"`, the hash and size of
+  the stored file and of the plaintext. Decryption by an independent
+  implementation (pyrage) is part of the end-to-end suite.
+- **Unlinking** (`unlink`): `user`, `safety_identifier`, `prompt_cache_key`
+  and `metadata` (OpenAI), `metadata` and `diagnostics` (Anthropic) are
+  removed from a request, under any spelling a provider's parser could read
+  as those names.
+- The setting on file keys and managed keys (`privacy` in the config file,
+  `POST`/`PATCH /admin/keys`, a button and two form fields on the
+  dashboard), in the config snapshot (without the recipient), in
+  `GET /admin/keys` (`privacy`, `privacy_summary`) and in the audit log
+  (what the setting became, never the recipient). `omnigate_key_private`.
+- Responses to a text request name the parts that applied:
+  `x-omnigate-privacy: no-store, redact, unlink`.
+- `tools/mock_upstream.py`: `echo-1` models that answer with what they were
+  sent, in three-character pieces when streaming, and `GET /__last` to read
+  back what a mock received. `tools/e2e.py`, `tools/malformed_test.py` and
+  `tools/sdk_compat.py` gained privacy sections; the end-to-end suite ends
+  by searching every file the two processes wrote for the private prompt.
+- `config/omnigate.example.json`: a key with privacy mode, and the two
+  media settings of the third-review commit (`max_outputs_per_job`,
+  `max_job_output_bytes`).
+
 **Close-out (the commit after 55a294d).** What an installation has to do
 is in [docs/upgrading.md](docs/upgrading.md#the-close-out-commit).
 

@@ -82,8 +82,9 @@ defmodule OmnigateControl.Audit do
 
   @doc """
   Record an action taken through `conn`. `extra` may carry `:auth` (to
-  override what the connection shows, e.g. `"password"` for a login) and
-  `:fields`. Returns once the entry is on disk.
+  override what the connection shows, e.g. `"password"` for a login),
+  `:fields`, and `:privacy` (a key's privacy mode after the change, in a few
+  words). Returns once the entry is on disk.
   """
   def record(conn, action, target, outcome, extra \\ []) do
     GenServer.call(__MODULE__, {:record, entry(conn, action, target, outcome, extra)})
@@ -141,6 +142,7 @@ defmodule OmnigateControl.Audit do
     |> put_if("peer", if(peer != counted, do: peer))
     |> put_if("forwarded_for", forwarded_for(conn))
     |> put_if("fields", extra[:fields])
+    |> put_if("privacy", extra[:privacy])
   end
 
   # -- server -------------------------------------------------------------------

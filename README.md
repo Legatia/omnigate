@@ -53,6 +53,17 @@ One async API in front of providers that each have a different one: `POST /v1/jo
 - **One ledger.** Per-job, per-output, per-second and per-character prices land in the same ledger and budgets as tokens, computed from what the adapter sent to the provider. A route can set a default, minimum and maximum duration, list the input fields it accepts and multiply the price by the value of a field.
 - **Limits where the work starts.** Job creation is rate-limited in the control plane as well as the data plane, with caps on unfinished jobs per key, jobs per key per day and the size of a job's input. Provider output URLs are fetched only from public addresses, every outbound response (webhook receivers included) is read through a size cap, and stored outputs are served as downloads, never as pages.
 
+### Privacy mode
+
+A setting per gateway key, or per request with `x-omnigate-privacy`; each part can be used alone. [docs/privacy.md](docs/privacy.md) says what each part does and, as plainly, what it does not.
+
+- **Redaction before the provider.** E-mail addresses, phone numbers, payment card numbers, IP addresses and common secret formats in a text request are replaced by placeholders (`[EMAIL_1]`) before the request leaves, and the originals are put back in the answer, also when a stream cuts a placeholder in two and inside tool-call arguments. Pattern matching: it does not find names, and the provider still reads everything else.
+- **No retention at the gateway.** No response cache for the key; a media job's input and metadata never enter the job log and are erased when the job ends, and its outputs are deleted a day later; OpenAI is told `"store": false`.
+- **Encrypted job outputs.** Outputs are encrypted to the key owner's [age](https://age-encryption.org) recipient before they are stored on disk or in the bucket; the gateway cannot read them afterwards.
+- **Unlinking.** The request fields that name an end user to the provider (`user`, `safety_identifier`, `prompt_cache_key`, `metadata`) are removed.
+
+This is not zero-knowledge inference and does not claim to be: a hosted model has to read the prompt it answers.
+
 ### Operations and admin
 
 - **Dashboard and admin API** behind one admin token (a bearer token for scripts, a signed session cookie with CSRF protection for the browser). Never open by default: without `OMNIGATE_ADMIN_TOKEN` a random one is generated and logged, and one shorter than 16 characters is refused. Wrong tokens and failed sign-ins are throttled per client address.
@@ -197,6 +208,8 @@ Through the gateway, over TLS, with real keys (November 2026):
 
 Not verified against anything real:
 
+- Privacy mode. Everything in it runs against the mock providers in the test suites (which assert on what the mock received and on what the client got back), and files the gateway encrypted are decrypted by an independent age implementation there. No real provider has been sent a redacted request or `"store": false` by this code, and how well real models repeat placeholders has not been measured.
+
 - The fal adapter (a mock written from public documentation; expect details to differ), and S3-compatible storage other than Cloudflare R2, including deleting bucket objects under retention.
 - Everything the status paragraph lists as added later. In particular, the structured-output mapping onto Anthropic's `output_config.format` has not been sent to the live Anthropic API, and prompt-cache token accounting has not been compared with a real provider bill.
 - The security fixes against anything but the project's own tests: no external penetration test, no real hostile traffic, and neither the figures billed for an abandoned stream after reading the provider's answer to its end nor the estimate have been compared with what a provider charged for one.
@@ -228,6 +241,6 @@ The security model is in [SECURITY.md](SECURITY.md); the detail behind each line
 
 ## Documentation and license
 
-[Quickstart](docs/quickstart.md) · [Configuration](docs/configuration.md) (every config field and environment variable) · [API reference](docs/api.md) (endpoints, errors, jobs, webhooks, the official SDKs) · [Admin](docs/admin.md) (dashboard, managed keys, budgets, audit log) · [Providers](docs/providers.md) · [Deployment](docs/deployment.md) · [Upgrading](docs/upgrading.md) (what changes on disk, changed defaults, the order to upgrade) · [Security hardening](docs/security.md) (what to expose, where each credential lives, backups, logs) · [Operations](docs/operations.md) (metrics, limits, retention, logs, troubleshooting) · [Architecture](docs/architecture.md) · [Migrating from LiteLLM](docs/migrating-from-litellm.md) · [Releasing](docs/releasing.md) · [docs index](docs/README.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) · [CHANGELOG.md](CHANGELOG.md)
+[Quickstart](docs/quickstart.md) · [Configuration](docs/configuration.md) (every config field and environment variable) · [API reference](docs/api.md) (endpoints, errors, jobs, webhooks, the official SDKs) · [Admin](docs/admin.md) (dashboard, managed keys, budgets, audit log) · [Providers](docs/providers.md) · [Deployment](docs/deployment.md) · [Upgrading](docs/upgrading.md) (what changes on disk, changed defaults, the order to upgrade) · [Security hardening](docs/security.md) (what to expose, where each credential lives, backups, logs) · [Privacy mode](docs/privacy.md) (redaction, no retention, encrypted outputs, and what none of it does) · [Operations](docs/operations.md) (metrics, limits, retention, logs, troubleshooting) · [Architecture](docs/architecture.md) · [Migrating from LiteLLM](docs/migrating-from-litellm.md) · [Releasing](docs/releasing.md) · [docs index](docs/README.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) · [CHANGELOG.md](CHANGELOG.md)
 
 omnigate is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE): free to self-host for personal and other noncommercial use. Business or commercial use needs a paid license; see [COMMERCIAL.md](COMMERCIAL.md) or write to hello@legatia.solutions.

@@ -12,7 +12,7 @@ HTTP client and the data plane's response reader: the control plane's new
 HTTP client and the data plane's new response reader were each run against
 the real hosts of OpenAI, Anthropic, Gemini, xAI, ElevenLabs, Replicate and
 fal with deliberately invalid keys; every provider's own auth error came
-back intact. The successful paths were then re-run with real keys on 11 November 2026, at commit 809b96f, and all passed: OpenAI and Anthropic text (direct, streamed, translated both ways, tool calls, failover, metering), Gemini text, xAI text, an OpenAI image job, Gemini image, speech and video jobs, an xAI image job and a one-second xAI video, a Replicate image job, ElevenLabs speech with a cache hit, and output storage in a Cloudflare R2 bucket. fal has still only returned an auth error, never a completed job.
+back intact. The successful paths were then re-run with real keys on 11 November 2026, at commit 809b96f, and all passed: OpenAI and Anthropic text (direct, streamed, translated both ways, tool calls, failover, metering), Gemini text, xAI text, an OpenAI image job, Gemini image, speech and video jobs, an xAI image job and a one-second xAI video, a Replicate image job, ElevenLabs speech with a cache hit, and output storage in a Cloudflare R2 bucket. fal has still only returned an auth error, never a completed job. The Sume adapter was added after all of this and has only met a mock.
 
 Read every "Status: verified" line on this page, and the status column of
 the media table, with that in mind: each records a check made before those
@@ -23,7 +23,7 @@ the fal adapter is still not verified.
 - [Text providers](#text-providers): OpenAI, Anthropic, Gemini, xAI, other
   OpenAI-compatible services
 - [Media providers](#media-providers): Replicate, fal, OpenAI images,
-  ElevenLabs, Gemini image and speech, Gemini video, xAI video
+  ElevenLabs, Gemini image and speech, Gemini video, xAI video, Sume
 - [Not reachable](#not-reachable)
 
 Model ids in the examples marked `<...>` are placeholders: use an id your
@@ -348,6 +348,7 @@ None of them has been used with a real provider.
 | `gemini` | Gemini `generateContent` (image, speech) | one call | verified |
 | `gemini_interactions` | Gemini Interactions API (video) | one call, or submit and poll | verified in the foreground; background polling mock only |
 | `xai_video` | xAI video generation | submit and poll | verified |
+| `sume` | Sume image and video routers | submit and poll | mock only |
 
 ### Replicate
 
@@ -656,6 +657,105 @@ submitted, polled to completion, copied off xAI and downloaded from the
 gateway as an MP4, billed per second, webhook delivered; an unknown model
 failed with xAI's reason. Not verified: an input image, and the failed and
 expired states.
+
+### Sume
+
+[Sume](https://www.sume.com/docs) is an aggregator: one key reaches image
+and video models of many makers through two generate endpoints, and every
+request is a job that is polled.
+
+```json
+{ "name": "sume", "kind": "sume", "api_key_env": "SUME_API_KEY" }
+```
+
+`base_url` may be left out for this kind; it defaults to
+`https://api.sume.com`.
+
+```json
+{
+  "model": "veo-fast",
+  "timeout_s": 900,
+  "targets": [
+    {
+      "upstream": "sume",
+      "model": "<sume video model id>",
+      "router": "video",
+      "max_seconds": 8,
+      "price": {
+        "variants": [
+          { "when": { "resolution": "720p", "generate_audio": false }, "per_second_usd": 0.0 },
+          { "when": { "resolution": "720p", "generate_audio": true }, "per_second_usd": 0.0 }
+        ]
+      }
+    }
+  ]
+},
+{
+  "model": "sume-image",
+  "targets": [
+    { "upstream": "sume", "model": "<sume image model id>", "router": "image", "price": { "per_output_usd": 0.0 } }
+  ]
+}
+```
+
+- **`router` is required** on every Sume target: `"image"` for models on
+  Sume's Image Router, `"video"` for those on its Video Router (video,
+  lip-sync, captions). The config is refused without it; the gateway does
+  not guess from a model's name. Sume's model list says which is which.
+- `input` is sent as Sume's request body with `model` filled in:
+  `prompt`, `duration`, `resolution`, `aspect_ratio`, `image_url`,
+  `num_images` and whatever else the model takes. Sume refuses a field the
+  model does not take, and the job then moves on with
+  `sume_invalid_request`.
+- `mode` is always sent as `"async"`, and an `input.webhook_url`,
+  `input.metadata` or `input.wait_timeout_seconds` is never forwarded. The
+  job's own `webhook_url` and `metadata` stay with the gateway, as for
+  every provider.
+- **One charge per job.** Every submit carries an `Idempotency-Key`
+  derived from the gateway's job id and the attempt. If the answer to a
+  submit is lost, or the gateway restarts before it has recorded Sume's job
+  id, the submit is sent again with the same key and Sume answers with the
+  original job instead of starting a second one.
+- **Polling** follows what Sume asks for: `next_poll_after_seconds` (or the
+  `x-sume-poll-after` header) when it is longer than
+  `media.poll_interval_ms`, up to 60 seconds, and `retry-after` on a 429,
+  which is treated as a request to wait rather than a failed poll. Repeated
+  5xx answers give the job up to the next target.
+- **Outputs** are the `url` of each artifact in the job's result, fetched
+  from Sume's media host under the same address checks as every provider
+  output, and stored by the gateway.
+- **Prices.** Sume charges per second or per image, and the rate depends on
+  the request (resolution, for some models whether audio is generated).
+  Use [`price.variants`](configuration.md#price-variants) to say so; a
+  request with no variant is refused when the job is created. For a job
+  priced per second, the seconds are those Sume reports for the artifact
+  (`duration_ms`) when it reports them, otherwise the `input.duration`
+  asked for. Images are billed per artifact stored (`per_output_usd`).
+  The rates themselves are yours to enter, from Sume's pricing page or its
+  catalog (`GET https://api.sume.com/v1/catalog`); nothing in this
+  repository tracks them, and what Sume charges has not been compared with
+  what the gateway records.
+- **Failures.** A refusal or a failed job is recorded as `sume_<code>`
+  with Sume's message, where the code is Sume's own (`sume_insufficient_funds`,
+  `sume_rate_limited`, `sume_unauthorized`), or `sume_<public_reason>` for
+  a job that failed (`sume_content_policy_rejected`). For a private job
+  only that word is kept. A refusal Sume marks retryable with a wait of at
+  most 10 seconds is retried once on Sume, with the same key; every other
+  refusal moves the job to the route's next target, **including
+  insufficient funds**: another provider may still be able to run it. Sume
+  says a refused submit and a failed job are not charged.
+- **Cancel.** Sume can stop a job only until generation starts. While it
+  reports the job as cancelable, canceling the gateway's job cancels it
+  there and nothing is owed. After that, the gateway's job is canceled at
+  once but Sume's keeps running: the gateway keeps polling it and records
+  its price if it completes, as it does for a provider with no cancel at
+  all ([API](api.md#cancel-a-job)).
+
+Status: **not verified.** The adapter was written from Sume's public
+documentation (read on 11 November 2026) and has only run against the
+project's mock of it; no request has been made with a Sume key. Expect
+details to differ. Its public endpoints were reached without a key: the
+catalog answers, and a submit is refused with the documented error object.
 
 ### Failover across media providers
 

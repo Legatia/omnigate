@@ -33,8 +33,9 @@ defmodule OmnigateControl.Jobs.Runner do
       stored is deleted;
     * the provider can be told to stop: it is told, asked once more how the
       job ended, and billed only if it had finished anyway;
-    * the provider cannot be told to stop: it is polled on, to the route's
-      timeout, to see whether it finishes;
+    * the provider cannot be told to stop (it has no cancel, or its adapter
+      answers `:not_canceled` because generation has started): it is polled
+      on, to the route's timeout, to see whether it finishes;
     * the attempt failed, or timed out: nothing is owed.
   """
   require Logger
@@ -84,17 +85,38 @@ defmodule OmnigateControl.Jobs.Runner do
   defp after_cancel(job, index, t) do
     run = job["run"]
 
-    if function_exported?(t.adapter, :cancel, 5) do
-      cancel_provider(job)
+    stopped =
+      can_cancel?(t) and
+        apply(t.adapter, :cancel, [t.upstream, t.target.model, run["provider_id"], run["provider_state"] || %{}, t.ctx]) != :not_canceled
 
+    if stopped do
       # Told to stop. If it had finished before that, it has been paid for.
-      case apply(t.adapter, :poll, [t.upstream, t.target.model, run["provider_id"], run["provider_state"] || %{}, t.ctx]) do
-        {:done, [_ | _] = outputs} -> settle_canceled(job["id"], completed(job, t, length(outputs)))
+      case done(apply(t.adapter, :poll, [t.upstream, t.target.model, run["provider_id"], run["provider_state"] || %{}, t.ctx])) do
+        {:done, [_ | _] = outputs, measured} -> settle_canceled(job["id"], completed(job, Map.put(t, :measured, measured), length(outputs)))
         _ -> settle_canceled(job["id"], %{})
       end
     else
-      # It cannot be stopped: see whether it finishes.
-      poll_loop(job, index, t, 0)
+      # It cannot be stopped (no cancel at this provider, or too late for
+      # one): see whether it finishes.
+      poll_loop(job, index, Map.put(t, :cannot_cancel, true), 0)
+    end
+  end
+
+  defp can_cancel?(t), do: function_exported?(t.adapter, :cancel, 5) and not Map.get(t, :cannot_cancel, false)
+
+  # An adapter's "done", with what the provider measured (nothing, as a rule).
+  defp done({:done, outputs}), do: {:done, outputs, %{}}
+  defp done({:done, outputs, %{} = measured}), do: {:done, outputs, measured}
+  defp done(other), do: other
+
+  # What the job is billed for: the request as the adapter sends it, and the
+  # seconds the provider says it made in place of those asked for.
+  defp billable(t, input) do
+    billable = t.adapter.billable(input)
+
+    case Map.get(t, :measured, %{}) do
+      %{seconds: s} when is_number(s) and s > 0 -> Map.put(billable, :seconds, s)
+      _ -> billable
     end
   end
 
@@ -109,7 +131,7 @@ defmodule OmnigateControl.Jobs.Runner do
     %{
       "upstream" => t.upstream.name,
       "target_model" => t.target.model,
-      "cost_usd" => Jobs.job_cost(t.route, t.target, t.adapter.billable(input), input, count),
+      "cost_usd" => Jobs.job_cost(t.route, t.target, billable(t, input), input, count),
       "attempts" =>
         ((with_store(fn -> Store.get(job["id"]) end) || %{})["attempts"] || []) ++ [%{"upstream" => t.upstream.name, "outcome" => "completed_after_cancel"}]
     }
@@ -177,8 +199,16 @@ defmodule OmnigateControl.Jobs.Runner do
         target = Enum.at(route.targets, index)
 
         case resolve(target, route) do
-          {:ok, t} -> run_target(job, index, Map.merge(t, %{route: route, target: target, timeout_ms: route.timeout_s * 1000}))
-          {:error, outcome} -> next(job, index, target.upstream, outcome)
+          {:ok, t} ->
+            # A target whose price has no rate for this request is not sent
+            # the job: it would run, and be recorded at a price nobody set.
+            case Jobs.price_for(target, Jobs.input!(job)) do
+              {:ok, _price} -> run_target(job, index, Map.merge(t, %{route: route, target: target, timeout_ms: route.timeout_s * 1000}))
+              :unmatched -> next(job, index, target.upstream, "unpriced_variant: the price of this target has no variant for this request")
+            end
+
+          {:error, outcome} ->
+            next(job, index, target.upstream, outcome)
         end
     end
   end
@@ -189,10 +219,18 @@ defmodule OmnigateControl.Jobs.Runner do
     api_key = upstream && System.get_env(upstream.api_key_env)
 
     cond do
-      upstream == nil -> {:error, "unknown_upstream"}
-      adapter == nil -> {:error, "unsupported_kind:#{upstream.kind}"}
-      api_key in [nil, ""] -> {:error, "missing_api_key_env:#{upstream.api_key_env}"}
-      true -> {:ok, %{upstream: upstream, adapter: adapter, ctx: %{api_key: api_key, timeout_ms: route.timeout_s * 1000, max_inline_bytes: inline_cap()}}}
+      upstream == nil ->
+        {:error, "unknown_upstream"}
+
+      adapter == nil ->
+        {:error, "unsupported_kind:#{upstream.kind}"}
+
+      api_key in [nil, ""] ->
+        {:error, "missing_api_key_env:#{upstream.api_key_env}"}
+
+      true ->
+        ctx = %{api_key: api_key, timeout_ms: route.timeout_s * 1000, max_inline_bytes: inline_cap(), router: Map.get(target, :router)}
+        {:ok, %{upstream: upstream, adapter: adapter, ctx: ctx}}
     end
   end
 
@@ -215,7 +253,7 @@ defmodule OmnigateControl.Jobs.Runner do
         end)
 
       with {:ok, job} <- started do
-        case t.adapter.submit(t.upstream, t.target.model, Jobs.input!(job), t.ctx) do
+        case done(t.adapter.submit(t.upstream, t.target.model, Jobs.input!(job), Map.merge(t.ctx, %{job_id: job["id"], attempt: index}))) do
           {:async, provider_id, state} ->
             # Recorded also for a job canceled while the submit was in flight:
             # its account is still open, and closing it takes the id.
@@ -236,8 +274,8 @@ defmodule OmnigateControl.Jobs.Runner do
               _ -> cancel_provider(put_in(job, ["run", "provider_id"], provider_id))
             end
 
-          {:done, outputs} ->
-            rehost(job, index, t, outputs)
+          {:done, outputs, measured} ->
+            rehost(job, index, Map.put(t, :measured, measured), outputs)
 
           {:error, reason} ->
             next(job, index, t.upstream.name, reason)
@@ -256,7 +294,7 @@ defmodule OmnigateControl.Jobs.Runner do
         cancel_provider(job)
 
       # Canceled by the client just now, on a provider that can be told so.
-      Jobs.provider_pending?(current) and function_exported?(t.adapter, :cancel, 5) ->
+      Jobs.provider_pending?(current) and can_cancel?(t) ->
         after_cancel(current, index, t)
 
       # Finished some other way. (A canceled job on a provider that cannot be
@@ -269,9 +307,9 @@ defmodule OmnigateControl.Jobs.Runner do
         next(job, index, t.upstream.name, "timeout")
 
       true ->
-        case apply(t.adapter, :poll, [t.upstream, t.target.model, run["provider_id"], run["provider_state"] || %{}, t.ctx]) do
+        case done(apply(t.adapter, :poll, [t.upstream, t.target.model, run["provider_id"], run["provider_state"] || %{}, t.ctx])) do
           :pending -> poll_loop(job, index, t, 0)
-          {:done, outputs} -> rehost(job, index, t, outputs)
+          {:done, outputs, measured} -> rehost(job, index, Map.put(t, :measured, measured), outputs)
           {:error, reason} -> next(job, index, t.upstream.name, reason)
           {:transient, reason} when errors + 1 >= @max_transient_poll_errors -> next(job, index, t.upstream.name, reason)
           {:transient, _reason} -> poll_loop(job, index, t, errors + 1)
@@ -407,7 +445,7 @@ defmodule OmnigateControl.Jobs.Runner do
               "outputs" => records,
               "upstream" => t.upstream.name,
               "target_model" => t.target.model,
-              "cost_usd" => Jobs.job_cost(t.route, t.target, t.adapter.billable(input), input, length(records)),
+              "cost_usd" => Jobs.job_cost(t.route, t.target, billable(t, input), input, length(records)),
               "attempts" => ((Store.get(job["id"]) || %{})["attempts"] || []) ++ [%{"upstream" => t.upstream.name, "outcome" => "ok"}]
             })
           end)
@@ -443,7 +481,7 @@ defmodule OmnigateControl.Jobs.Runner do
   # budget. That may be meant (a local model), but it is also what a
   # forgotten `price` looks like, so it is counted and said once per target.
   defp unpriced(job, t) do
-    if not Enum.any?(Map.values(t.target.price), &(is_number(&1) and &1 > 0)) do
+    if not Jobs.priced?(t.target.price) do
       Counters.bump(:ledger_unpriced_events, 1)
 
       if Counters.once({:unpriced_job, job["model"], t.upstream.name, t.target.model}) do

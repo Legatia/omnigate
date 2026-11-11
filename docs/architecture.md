@@ -737,8 +737,10 @@ goes out as `application/octet-stream`. The data plane passes those
 headers on to the client.
 
 **Adapters** are small modules implementing `submit` and `billable`, and
-optionally `poll` and `cancel`. There are seven: `replicate`, `fal`, `openai_images`,
-`elevenlabs`, `gemini`, `gemini_interactions`, `xai_video`. See
+optionally `poll` and `cancel`. There are eight: `replicate`, `fal`, `openai_images`,
+`elevenlabs`, `gemini`, `gemini_interactions`, `xai_video`, `sume`. A `cancel`
+may answer that it came too late (`:not_canceled`), and a result may carry
+the seconds of media the provider says it made. See
 [Providers](providers.md#media-providers).
 
 ## State on disk

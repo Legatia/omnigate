@@ -42,6 +42,7 @@ KEY_MAIN = "og-e2e-main"
 KEY_BUDGET = "og-e2e-budget"
 KEY_RPM = "og-e2e-rpm"
 KEY_OTHER = "og-e2e-other"
+KEY_SUME = "og-e2e-sume"
 KEY_LIMITED = "og-e2e-limited"
 # Privacy mode: everything on; redaction of two classes only; job outputs
 # encrypted to an age recipient.
@@ -269,6 +270,7 @@ def text_config():
             {"name": "budget", "key": KEY_BUDGET, "budget_usd": 0.01},
             {"name": "rpm", "key": KEY_RPM, "rpm": 3},
             {"name": "other", "key": KEY_OTHER},
+            {"name": "sume", "key": KEY_SUME},
             # May use the "direct" route and nothing else.
             {"name": "limited", "key": KEY_LIMITED, "models": ["direct"]},
             {"name": "private", "key": KEY_PRIVATE, "privacy": True, "webhook_secret": WEBHOOK_SECRET},
@@ -777,11 +779,11 @@ def text_checks(stack):
 # media jobs
 # --------------------------------------------------------------------------
 
-MEDIA_PORTS = [9101, 9102, 9103, 9104, 9105, 9106, 9107, 9108, 9109]
+MEDIA_PORTS = [9101, 9102, 9103, 9104, 9105, 9106, 9107, 9108, 9109, 9110]
 MEDIA_MOCK_ARGS = []
 MOCK = {name: f"http://127.0.0.1:{port}" for name, port in [
     ("replicate", 9101), ("replicate_broken", 9102), ("fal", 9103), ("openai_images", 9104),
-    ("elevenlabs", 9105), ("s3", 9106), ("webhooks", 9107), ("gemini", 9108), ("xai_video", 9109)]}
+    ("elevenlabs", 9105), ("s3", 9106), ("webhooks", 9107), ("gemini", 9108), ("xai_video", 9109), ("sume", 9110)]}
 TERMINAL = ("succeeded", "failed", "canceled")
 
 
@@ -1051,6 +1053,7 @@ def media_config(work, storage="local"):
             up("gemini", "gemini", MOCK["gemini"]),
             up("xai-video", "xai_video", MOCK["xai_video"]),
             up("gemini-interactions", "gemini_interactions", MOCK["gemini"]),
+            up("sume", "sume", MOCK["sume"]),
         ],
         "routes": [
             {"model": "image", "targets": [
@@ -1068,6 +1071,16 @@ def media_config(work, storage="local"):
                 {"upstream": "gemini", "model": "mock-flash-image", "price": {"per_output_usd": 0.02}}]},
             {"model": "gemini-speech", "targets": [
                 {"upstream": "gemini", "model": "mock-flash-tts", "price": {"per_input_char_usd": 0.00001}}]},
+            # Sume: which router a model is on is said; the image route fails
+            # over to another provider, the video one is priced by request.
+            {"model": "sume-image", "timeout_s": 60, "targets": [
+                {"upstream": "sume", "model": "mock-image", "router": "image", "price": {"per_output_usd": 0.04}},
+                {"upstream": "replicate", "model": "mock/image", "price": {"per_output_usd": 0.003}}]},
+            {"model": "sume-video", "timeout_s": 60, "targets": [
+                {"upstream": "sume", "model": "mock-video", "router": "video", "price": {"variants": [
+                    {"when": {"resolution": "720p", "generate_audio": False}, "per_second_usd": 0.08},
+                    {"when": {"resolution": "720p", "generate_audio": True}, "per_second_usd": 0.10},
+                    {"when": {"resolution": "720p", "generate_audio": None}, "per_second_usd": 0.10}]}}]},
             {"model": "tts", "cache_ttl_s": 3600, "targets": [
                 {"upstream": "elevenlabs", "model": "mock_multilingual_v2", "price": {"per_input_char_usd": 0.00003}}]},
         ],
@@ -1095,6 +1108,99 @@ def stats(name):
 
 def close(a, b):
     return a is not None and abs(a - b) < 1e-9
+
+
+def sume_checks():
+    """The Sume adapter against tools/mock_media.py, which follows Sume's
+    public documentation. None of this has met the real service."""
+    def run(body, key=KEY_SUME, timeout=30):
+        status, _, job = create_job(body, key=key)
+        return status, wait_job(job.get("id", "missing"), timeout, key=key) if status == 202 else job
+    outcome = lambda job, i=0: ((job.get("attempts") or [{}] * (i + 1))[i]).get("outcome", "")
+
+    section("Sume: image and video routers, prices that follow the request")
+    before = stats("sume")
+    status, job = run({"model": "sume-image", "input": {"prompt": "a ceramic cup", "num_images": 2, "mode": "sync", "webhook_url": "https://example.com/hook"},
+                       "metadata": {"order": "S-1"}})
+    check("an image job runs on Sume's image router and is billed per image",
+          status == 202 and job.get("status") == "succeeded" and job.get("upstream") == "sume" and len(job.get("outputs") or []) == 2
+          and close(job.get("cost_usd"), 0.08), job)
+    last = jcall("GET", MOCK["sume"] + "/_last")[2]
+    check("Sume was sent the input with the model filled in, always async, without a webhook or metadata",
+          last.get("path") == "/v1/image-router/generate"
+          and last.get("body") == {"prompt": "a ceramic cup", "num_images": 2, "model": "mock-image", "mode": "async"}
+          and str(last.get("idempotency_key", "")).startswith("og-") and stats("sume")["leaked_fields"] == before["leaked_fields"], last)
+    st, _, data = call("GET", (job.get("outputs") or [{}])[0].get("url", GATEWAY))
+    check("its output was fetched from Sume's media host and re-hosted", st == 200 and data[:8] == b"\x89PNG\r\n\x1a\n", (st, data[:40]))
+
+    status, job = run({"model": "sume-video", "input": {"prompt": "short clip of steam", "duration": 6, "resolution": "720p", "generate_audio": False}})
+    check("a video job is billed for the seconds Sume reports (3 of the 6 asked for), at the rate of its resolution without audio",
+          job.get("status") == "succeeded" and close(job.get("cost_usd"), 3 * 0.08)
+          and jcall("GET", MOCK["sume"] + "/_last")[2].get("path") == "/v1/video-router/generate", job)
+    status, job = run({"model": "sume-video", "input": {"prompt": "steam with sound", "duration": 4, "resolution": "720p", "generate_audio": True}})
+    check("with audio, the same resolution costs its own rate", job.get("status") == "succeeded" and close(job.get("cost_usd"), 4 * 0.10), job)
+    submits = stats("sume")["submits"]
+    status, _, refused = create_job({"model": "sume-video", "input": {"prompt": "x", "duration": 4, "resolution": "1080p"}}, key=KEY_SUME)
+    check("a combination the operator has set no price for is refused before anything is sent",
+          status == 400 and "no price for this combination" in json.dumps(refused) and stats("sume")["submits"] == submits, (status, refused))
+
+    section("Sume: one charge per job, failover, failures")
+    before = stats("sume")
+    status, job = run({"model": "sume-image", "input": {"prompt": "drop first answer"}})
+    after = stats("sume")
+    check("a submit whose answer is lost is sent again with the same Idempotency-Key: one provider job, billed once",
+          job.get("status") == "succeeded" and job.get("upstream") == "sume" and close(job.get("cost_usd"), 0.04)
+          and after["jobs_created"] == before["jobs_created"] + 1 and after["idempotency_hits"] == before["idempotency_hits"] + 1, (job, before, after))
+    status, job = run({"model": "sume-image", "input": {"prompt": "busy once please"}})
+    check("a refusal Sume calls retryable, with a short wait, is retried on Sume", job.get("status") == "succeeded" and job.get("upstream") == "sume", job)
+    status, job = run({"model": "sume-image", "input": {"prompt": "no funds today"}})
+    check("insufficient funds at Sume moves the job to the route's next provider",
+          job.get("status") == "succeeded" and job.get("upstream") == "replicate" and outcome(job).startswith("sume_insufficient_funds")
+          and close(job.get("cost_usd"), 0.003), job)
+    status, job = run({"model": "sume-image", "input": {"prompt": "rate limited for long"}})
+    check("so does a rate limit that asks for a long wait",
+          job.get("status") == "succeeded" and job.get("upstream") == "replicate" and outcome(job).startswith("sume_rate_limited"), job)
+    status, job = run({"model": "sume-video", "input": {"prompt": "fail this one", "duration": 4, "resolution": "720p"}})
+    check("a job Sume fails is reported with Sume's reason and is not billed",
+          job.get("status") == "failed" and outcome(job).startswith("sume_content_policy_rejected: ") and not job.get("cost_usd"), job)
+    status, job = run({"model": "sume-video", "input": {"prompt": "throttle slowpoll", "duration": 4, "resolution": "720p"}})
+    check("a 429 on a poll and a longer poll interval asked for by Sume are honoured, and the job still finishes",
+          job.get("status") == "succeeded" and close(job.get("cost_usd"), 0.40), job)
+
+    section("Sume: cancel, before and after generation starts")
+    before = stats("sume")
+    _, _, queued = create_job({"model": "sume-image", "input": {"prompt": "long queue ahead"}}, key=KEY_SUME)
+    wait_until(lambda: (get_job(queued.get("id", "missing"), KEY_SUME).get("status") == "running" and stats("sume")["polls"] > before["polls"]) or None, 10)
+    jcall("POST", f"{GATEWAY}/v1/jobs/{queued.get('id')}/cancel", key=KEY_SUME, body={})
+    done = wait_until(lambda: (lambda j: j if j.get("status") == "canceled" and not j.get("provider_pending") else None)(get_job(queued.get("id", "missing"), KEY_SUME)), 10) or {}
+    check("while Sume says the job is cancelable, a cancel stops it there and nothing is owed",
+          done.get("status") == "canceled" and not done.get("cost_usd") and wait_until(lambda: stats("sume")["canceled"] == before["canceled"] + 1 or None, 5), (done, stats("sume")))
+    before = stats("sume")
+    _, _, started = create_job({"model": "sume-image", "input": {"prompt": "slow render"}}, key=KEY_SUME)
+    wait_job(started.get("id", "missing"), 10, until=("running",) + TERMINAL, key=KEY_SUME)
+    time.sleep(1.0)  # past the queue: generation has started
+    _, _, at_once = jcall("POST", f"{GATEWAY}/v1/jobs/{started.get('id')}/cancel", key=KEY_SUME, body={})
+    billed = wait_until(lambda: (lambda j: j if close(j.get("cost_usd"), 0.04) else None)(get_job(started.get("id", "missing"), KEY_SUME)), 15) or {}
+    after = stats("sume")
+    check("once generation has started the job is canceled here at once, and billed when Sume completes it; nothing is fetched",
+          at_once.get("status") == "canceled" and billed.get("status") == "canceled" and close(billed.get("cost_usd"), 0.04) and billed.get("outputs") == []
+          and after["canceled"] == before["canceled"] and after["downloads"] == before["downloads"], (at_once, billed, before, after))
+    # 0.08 + 0.24 + 0.40 + 0.04 + 0.04 + 0.003 + 0.003 + 0.40 + 0.04
+    row = wait_until(lambda: (lambda r: r if close(r.get("cost_usd"), 1.246) else None)(usage_row("sume")), 10) or usage_row("sume")
+    check("the key's ledger holds exactly what these jobs cost", close(row.get("cost_usd"), 1.246), row)
+
+    section("Sume: privacy mode")
+    status, _, job = create_job({"model": "sume-video", "input": {"prompt": f"{CANARY} fail", "duration": 4, "resolution": "720p"}}, key=KEY_PRIVATE)
+    job = wait_job(job.get("id", "missing"), key=KEY_PRIVATE)
+    check("a private job that fails at Sume keeps Sume's reason and none of the provider's words",
+          job.get("status") == "failed" and outcome(job) == "sume_content_policy_rejected" and job.get("input_erased") is True, job)
+    status, _, job = create_job({"model": "sume-image", "input": {"prompt": "a sealed cup"}}, key=KEY_SEALED)
+    job = wait_job(job.get("id", "missing"), key=KEY_SEALED)
+    out = (job.get("outputs") or [{}])[0]
+    st, _, sealed = call("GET", out.get("url", GATEWAY))
+    check("a key with encrypt_to gets a Sume output as an age file",
+          job.get("status") == "succeeded" and job.get("upstream") == "sume" and out.get("encryption") == "age"
+          and st == 200 and sealed.startswith(b"age-encryption.org/v1\n") and b"\x89PNG" not in sealed, (job, sealed[:40]))
 
 
 def media_checks(stack):
@@ -1307,6 +1413,8 @@ def media_checks(stack):
     row = wait_until(lambda: (lambda r: r if close((r.get("cost_usd") or 0.0) - spent, 0.05) else None)(usage_row("other")), 10) or usage_row("other")
     check("... the key's spend in the ledger went up by the job's price, and nothing was fetched or stored",
           close((row.get("cost_usd") or 0.0) - spent, 0.05) and stats("openai_images").get("downloads", 0) == files_before, (row, spent))
+
+    sume_checks()
 
     section("control-plane restart in the middle of a job")
     submits_before = stats("fal")["submits"]

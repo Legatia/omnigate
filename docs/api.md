@@ -919,8 +919,12 @@ the price. Anything else than what this list allows answers
   that are.
 - **On a route with `price_multipliers`**, a field that has factors may
   only carry one of the listed values. The error lists them.
+- **On a route whose price has `variants`**, the request must be one of
+  the priced combinations (a resolution, with or without audio, and so
+  on). The error names the fields and lists the combinations that have a
+  price.
 
-The last three are the operator's settings
+The last four are the operator's settings
 ([Configuration](configuration.md#mediaroutes)); a route that sets none of
 them accepts what it accepted before.
 
@@ -1056,8 +1060,8 @@ Whether a canceled job costs anything depends on what the provider did:
 | When the cancel arrives | What happens | `cost_usd` |
 |---|---|---|
 | Before any provider was asked (the job was `queued`, or between two targets) | Nothing more | `0` |
-| The provider has the job and can be told to stop (Replicate-style, fal-style) | It is told, and asked once more how the job ended | `0`, or the route's price if it had already finished |
-| The provider cannot be told to stop (xAI video, Gemini's Interactions API), or answers a request with the result (images, speech) | The call runs on at the provider; the gateway waits for its end (at most the route's `timeout_s`), fetches nothing and keeps nothing | The route's price if the call completed; `0` if it failed or timed out |
+| The provider has the job and can be told to stop (Replicate-style, fal-style; Sume while the job is still queued there) | It is told, and asked once more how the job ended | `0`, or the route's price if it had already finished |
+| The provider cannot be told to stop (xAI video, Gemini's Interactions API; Sume once generation has started), or answers a request with the result (images, speech) | The call runs on at the provider; the gateway waits for its end (at most the route's `timeout_s`), fetches nothing and keeps nothing | The route's price if the call completed; `0` if it failed or timed out |
 | While the outputs are being fetched and stored | What was stored is deleted | The route's price |
 
 Until that is known the job, though `canceled`, has `cost_usd` `0`, still
@@ -1117,7 +1121,7 @@ shape, with the reason in `error.code` (see [Shape](#shape)), and the same
 |---|---|---|
 | 400 | `missing_model` | `"model"` is not a string. |
 | 400 | `invalid_json` | The body is not valid JSON. |
-| 400 | `invalid_request` | `input` is missing or not an object; `metadata` is not an object; `input.duration` or `input.seconds` is negative or not a duration; `input.n`, `input.num_outputs` or `input.num_images` is not a whole number of 0 or more; the route is priced per second and the job names no duration (and the route has no default), or more than the route's `max_seconds`; `input` has a field the route's `allowed_input` does not list, or a value the route's `price_multipliers` do not list; the `Idempotency-Key` is empty, longer than 255 bytes or not printable text; or the request path contains a percent-encoded character (job ids and file names never need one). The data plane refuses most odd paths and idempotency keys before the control plane sees them. |
+| 400 | `invalid_request` | `input` is missing or not an object; `metadata` is not an object; `input.duration` or `input.seconds` is negative or not a duration; `input.n`, `input.num_outputs` or `input.num_images` is not a whole number of 0 or more; the route is priced per second and the job names no duration (and the route has no default), or more than the route's `max_seconds`; `input` has a field the route's `allowed_input` does not list, or a value the route's `price_multipliers` do not list, or is a combination the route's price `variants` do not cover; the `Idempotency-Key` is empty, longer than 255 bytes or not printable text; or the request path contains a percent-encoded character (job ids and file names never need one). The data plane refuses most odd paths and idempotency keys before the control plane sees them. |
 | 401 | `invalid_api_key` | The control plane no longer knows the key the data plane accepted: it was deleted, disabled or rotated within the last poll interval. |
 | 413 | `payload_too_large` | `input` and `metadata` together are larger than `media.max_input_bytes` (1 MiB by default); `metadata` alone is larger than 16 KiB; or the whole body is larger than 8,000,000 bytes, the limit of the control plane's JSON parser, which the data plane applies to job requests itself so that both give the same answer. |
 | 429 | `rate_limit_exceeded` | Create: the control plane's own count of the key's `rpm` (a token bucket, like the data plane's) is used up. List: the key is listing jobs too often (its `rpm`, or 600 per minute when it has none). |

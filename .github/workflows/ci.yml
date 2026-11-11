@@ -182,7 +182,7 @@ jobs:
       - name: Install pyrage
         run: python -m pip install "pyrage==${PYRAGE_VERSION}"
 
-      # Listens on 127.0.0.1 only: 9001-9005 and 9101-9109 (mocks), 14000
+      # Listens on 127.0.0.1 only: 9001-9005 and 9101-9110 (mocks), 14000
       # (control plane), 18080 (gateway). State and logs go to a directory
       # named omnigate-e2e-* under TMPDIR.
       - name: End-to-end test

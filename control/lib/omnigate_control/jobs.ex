@@ -63,6 +63,7 @@ defmodule OmnigateControl.Jobs do
          :ok <- fields_allowed(input, route),
          :ok <- quantities_ok(input, route),
          :ok <- multipliers_ok(input, route),
+         :ok <- variants_ok(input, route),
          {:ok, webhook_url} <- webhook_url(params["webhook_url"], key_sha256),
          :ok <- idempotency_key_ok(idempotency_key) do
       now = DateTime.utc_now()
@@ -503,14 +504,71 @@ defmodule OmnigateControl.Jobs do
       highest factor of its field.
   """
   def job_cost(route, target, billable, input, output_count) do
-    billable =
-      if is_number(target.price.per_second_usd) and target.price.per_second_usd > 0 do
-        Map.put(billable, :seconds, billed_seconds(target, Map.get(billable, :seconds, 0)))
-      else
-        billable
+    prices =
+      case price_for(target, input) do
+        {:ok, price} -> [price]
+        # No variant for this request (possible only if the config changed
+        # after the job was accepted): charged at the dearest variant.
+        :unmatched -> Enum.map(variants(target.price), &Map.merge(target.price, &1.rates))
       end
 
-    cost(target.price, billable, output_count) * multiplier(route, input)
+    prices
+    |> Enum.map(fn price ->
+      billable =
+        if is_number(price.per_second_usd) and price.per_second_usd > 0 do
+          Map.put(billable, :seconds, billed_seconds(target, Map.get(billable, :seconds, 0)))
+        else
+          billable
+        end
+
+      cost(price, billable, output_count) * multiplier(route, input)
+    end)
+    |> Enum.max(fn -> 0.0 end)
+  end
+
+  @doc """
+  The price a target charges for `input`.
+
+  A target's `price` may carry `variants`: rates that depend on fields of
+  the request (`{"when": {"resolution": "720p", "generate_audio": true},
+  "per_second_usd": 0.1}`). The first variant whose every `when` field
+  equals the request's value applies, and its rates replace those of the
+  same name in the base price. A field the request does not send equals
+  `null`. With variants and no match the answer is `:unmatched`: such a
+  request is refused when the job is created, and a target is skipped
+  before anything is sent to its provider.
+  """
+  def price_for(target, input) do
+    case variants(target.price) do
+      [] ->
+        {:ok, target.price}
+
+      list ->
+        input = if is_map(input), do: input, else: %{}
+
+        case Enum.find(list, fn v -> Enum.all?(v.when, fn {field, value} -> same?(Map.get(input, field), value) end) end) do
+          nil -> :unmatched
+          variant -> {:ok, Map.merge(target.price, variant.rates)}
+        end
+    end
+  end
+
+  defp variants(price), do: Map.get(price, :variants) || []
+
+  # JSON scalars compared as JSON: 1 and 1.0 are one number, true is not "true".
+  defp same?(a, b) when is_number(a) and is_number(b), do: a == b
+  defp same?(a, b), do: a === b
+
+  @doc "Does this price charge anything at all, in its base rates or any variant?"
+  def priced?(price) do
+    positive = fn rates -> Enum.any?(Map.values(rates), &(is_number(&1) and &1 > 0)) end
+    positive.(price) or Enum.any?(variants(price), &positive.(&1.rates))
+  end
+
+  @doc "Can this price charge per second, in its base rates or any variant?"
+  def per_second?(price) do
+    positive = fn rates -> is_number(Map.get(rates, :per_second_usd)) and Map.get(rates, :per_second_usd) > 0 end
+    positive.(price) or Enum.any?(variants(price), &positive.(&1.rates))
   end
 
   @doc "Seconds a target bills for a request that asks for `requested` (0 = it names none)."
@@ -743,6 +801,28 @@ defmodule OmnigateControl.Jobs do
     end)
   end
 
+  # A target whose price has variants must have one for this request. (Any
+  # target of the route: a job may end up on each of them.)
+  defp variants_ok(input, route) do
+    Enum.find_value(route.targets, :ok, fn target ->
+      case price_for(target, input) do
+        {:ok, _} ->
+          nil
+
+        :unmatched ->
+          fields = target.price.variants |> Enum.flat_map(&Map.keys(&1.when)) |> Enum.uniq() |> Enum.sort()
+
+          priced =
+            target.price.variants
+            |> Enum.take(12)
+            |> Enum.map_join("; ", fn v -> v.when |> Enum.sort() |> Enum.map_join(", ", fn {f, value} -> "#{f}=#{JSON.encode!(value)}" end) end)
+
+          {:error, 400, "invalid_request",
+           "this model has no price for this combination of #{Enum.map_join(fields, ", ", &"\"input.#{&1}\"")}; priced: #{Text.line(priced, 600)}"}
+      end
+    end)
+  end
+
   @durations ~w(duration seconds)
   @counts ~w(n num_outputs num_images)
 
@@ -751,7 +831,14 @@ defmodule OmnigateControl.Jobs do
   # priced per second needs a duration to price: from the request, or from
   # the target's `default_seconds`.
   defp quantities_ok(input, route) do
-    per_second = Enum.filter(route.targets, &(is_number(&1.price.per_second_usd) and &1.price.per_second_usd > 0))
+    # The price that applies to this request (its variant, when there are any).
+    per_second =
+      Enum.filter(route.targets, fn target ->
+        case price_for(target, input) do
+          {:ok, price} -> is_number(price.per_second_usd) and price.per_second_usd > 0
+          :unmatched -> per_second?(target.price)
+        end
+      end)
 
     shape =
       Enum.find_value(@durations ++ @counts, :ok, fn field ->

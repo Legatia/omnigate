@@ -143,6 +143,12 @@
         "kind": "gemini_interactions",
         "base_url": "https://generativelanguage.googleapis.com",
         "api_key_env": "GEMINI_API_KEY"
+      },
+      {
+        "name": "sume",
+        "kind": "sume",
+        "base_url": "https://api.sume.com",
+        "api_key_env": "SUME_API_KEY"
       }
     ],
     "routes": [
@@ -278,6 +284,49 @@
             "model": "<gemini omni model id>",
             "price": {
               "per_job_usd": 0.0
+            }
+          }
+        ]
+      },
+      {
+        "model": "sume-video",
+        "timeout_s": 900,
+        "targets": [
+          {
+            "upstream": "sume",
+            "model": "<sume video model id>",
+            "router": "video",
+            "max_seconds": 8,
+            "price": {
+              "variants": [
+                {
+                  "when": {
+                    "resolution": "720p",
+                    "generate_audio": false
+                  },
+                  "per_second_usd": 0.0
+                },
+                {
+                  "when": {
+                    "resolution": "720p",
+                    "generate_audio": true
+                  },
+                  "per_second_usd": 0.0
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "model": "sume-image",
+        "targets": [
+          {
+            "upstream": "sume",
+            "model": "<sume image model id>",
+            "router": "image",
+            "price": {
+              "per_output_usd": 0.0
             }
           }
         ]

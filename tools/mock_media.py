@@ -16,6 +16,7 @@ Servers (all on 127.0.0.1):
     9107  Webhook receiver that verifies Standard Webhooks signatures
     9108  Gemini-style generateContent (image, speech) and Interactions API (video)
     9109  xAI-style video generation (submit, then poll by request id)
+    9110  Sume-style model API (image and video routers, jobs, cancel)
 
 Every server answers GET /_stats with its counters. Provider mocks insist on
 a non-empty API key in the header the real service uses.
@@ -45,6 +46,7 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import struct
 import sys
 import threading
@@ -69,6 +71,7 @@ PORTS = {
     "webhooks": 9107,
     "gemini": 9108,
     "xai_video": 9109,
+    "sume": 9110,
 }
 
 # Placeholder shared with config/omnigate.dev.json. Not a real secret.
@@ -774,6 +777,239 @@ class XaiVideo(Base):
                         "video": {"url": "%s/files/%s.mp4" % (self.base_url(), rid), "duration": r["req"].get("duration", 5)}})
 
 
+# --------------------------------------------------------------------------
+# Sume-style model API (https://www.sume.com/docs), as documented in
+# November 2026. Written from the public docs; never compared with the real
+# service. What a test wants is steered by words in the prompt, because the
+# real API refuses fields it does not know:
+#
+#   "no funds"       402 insufficient_funds
+#   "rate limited"   429 rate_limited with retry-after: 30, every time
+#   "busy once"      503 provider_capacity_exceeded (retry-after: 1) on the
+#                    first submit of an Idempotency-Key, then accepted
+#   "drop first"     the first submit of a key creates the job and then the
+#                    connection is closed without an answer
+#   "fail"           the job fails (public_reason content_policy_rejected)
+#   "long queue"     the job stays queued (and cancelable) for 6 s
+#   "slow"           generation takes 3 s instead of 1 s
+#   "short"          the video artifact reports 3000 ms, whatever was asked
+#   "slowpoll"       status answers ask for 1 s between polls
+#   "throttle"       the first status poll answers 429 with retry-after: 1
+# --------------------------------------------------------------------------
+
+class Sume(Base):
+    stats = {"submits": 0, "jobs_created": 0, "idempotency_hits": 0, "polls": 0, "results": 0, "cancels": 0,
+             "canceled": 0, "downloads": 0, "leaked_fields": 0}
+    jobs: dict = {}
+    by_key: dict = {}
+    seen_keys: set = set()
+    throttled: set = set()
+    last: dict = {}
+    ROUTERS = {"/v1/image-router/generate": "image", "/v1/video-router/generate": "video"}
+
+    def error(self, status, code, message, retryable=False, retry_after=None, public_reason=None, details=None):
+        rid = "req_" + uuid.uuid4().hex
+        body = {"error": {"code": code, "message": message, "request_id": rid, "category": "mock", "stage": "mock",
+                          "retryable": retryable, "retry_after_seconds": retry_after,
+                          "public_reason": public_reason or code, "next_action": "retry_later" if retryable else "fix_input",
+                          "details": details or {}}}
+        headers = {"x-sume-request-id": rid}
+        if retry_after is not None:
+            headers["retry-after"] = str(retry_after)
+        self.send(status, body, headers=headers)
+
+    def authed(self) -> bool:
+        value = self.headers.get("authorization") or ""
+        if value.startswith("Bearer ") and len(value) > 7:
+            return True
+        self.error(401, "unauthorized", "Missing API key. Send x-api-key or Authorization: Bearer.")
+        return False
+
+    def state(self, job) -> str:
+        if job["final"]:
+            return job["final"]
+        now = time.time()
+        if now < job["starts_at"]:
+            return "queued"
+        if now < job["ready_at"]:
+            return "processing"
+        return "failed" if "fail" in job["prompt"] else "completed"
+
+    def envelope(self, jid, job):
+        state = self.state(job)
+        terminal = state in ("completed", "failed", "canceled")
+        base = "%s/v1/jobs/%s" % (self.base_url(), jid)
+        return {
+            "request_id": jid, "job_id": jid,
+            "status": {"queued": "IN_QUEUE", "processing": "IN_PROGRESS", "completed": "COMPLETED",
+                       "failed": "FAILED", "canceled": "CANCELED"}[state],
+            "sume_status": state,
+            "status_url": base + "/status", "result_url": base + "/result",
+            "cancel_url": base + "/cancel" if state == "queued" else None,
+            "cancelable": state == "queued",
+            "next_action": "fetch_result" if state == "completed" else ("inspect_events" if terminal else "poll_status"),
+            "next_poll_after_seconds": 1 if "slowpoll" in job["prompt"] else 0,
+            "result_ready": state == "completed", "terminal": terminal,
+        }
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        raw = self.body()
+        if not self.authed():
+            return
+        if path.startswith("/v1/jobs/") and path.endswith("/cancel"):
+            return self.cancel(path[len("/v1/jobs/"):-len("/cancel")])
+        router = self.ROUTERS.get(path)
+        if router is None:
+            return self.error(404, "not_found", "No such route.")
+        try:
+            req = json.loads(raw or b"{}")
+        except ValueError:
+            return self.error(400, "bad_request", "The body is not valid JSON.")
+        if not isinstance(req, dict):
+            return self.error(400, "bad_request", "The body is not valid JSON.")
+        self.bump("submits")
+        with LOCK:
+            Sume.last = {"path": path, "body": req, "idempotency_key": self.headers.get("idempotency-key")}
+        # The gateway must not pass these on: the job's webhook and metadata are its own.
+        if req.get("mode") != "async" or any(k in req for k in ("webhook_url", "metadata", "wait_timeout_seconds")):
+            self.bump("leaked_fields")
+            return self.error(400, "invalid_request", "mock: mode must be async and webhook_url/metadata must not be forwarded.")
+        model, prompt = req.get("model"), req.get("prompt")
+        if not isinstance(model, str) or not model.startswith("mock-"):
+            return self.error(404, "not_found", "No such model in your workspace.")
+        if ("video" in model) != (router == "video"):
+            return self.error(400, "invalid_request", "This model is not on this router.",
+                              details={"errors": [{"path": "model", "message": "wrong router"}]})
+        if router == "image" and not isinstance(prompt, str):
+            return self.error(400, "invalid_request", "Invalid request body.",
+                              details={"errors": [{"path": "prompt", "message": "must have required property 'prompt'"}]})
+        prompt = prompt if isinstance(prompt, str) else ""
+        key = self.headers.get("idempotency-key")
+        digest = hashlib.sha256(json.dumps(req, sort_keys=True).encode()).hexdigest()
+        with LOCK:
+            known = self.by_key.get(key) if key else None
+            first_time = key not in self.seen_keys
+            if key:
+                self.seen_keys.add(key)
+        if known:
+            if known["digest"] != digest:
+                return self.error(409, "idempotency_conflict", "The Idempotency-Key was used for a different request.")
+            self.bump("idempotency_hits")
+            return self.accepted(known["id"], True)
+        if "no funds" in prompt:
+            return self.error(402, "insufficient_funds", "The balance cannot cover the price.",
+                              details={"required_usd": 0.5, "available_usd": 0.0})
+        if "rate limited" in prompt:
+            return self.error(429, "rate_limited", "Too many requests for this key in the window.", True, 30)
+        if "busy once" in prompt and first_time:
+            return self.error(503, "provider_capacity_exceeded", "The model is at capacity right now.", True, 1)
+        jid = "job_" + str(uuid.uuid4())
+        now = time.time()
+        queue = 6.0 if "long queue" in prompt else 0.3
+        with LOCK:
+            self.jobs[jid] = {"router": router, "req": req, "prompt": prompt, "starts_at": now + queue,
+                              "ready_at": now + queue + (3.0 if "slow" in prompt and "slowpoll" not in prompt else 1.0), "final": None}
+            if key:
+                self.by_key[key] = {"id": jid, "digest": digest}
+        self.bump("jobs_created")
+        if "drop first" in prompt and first_time:
+            # The job exists, the client never learns its id.
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+        self.accepted(jid, False)
+
+    def accepted(self, jid, hit):
+        with LOCK:
+            job = self.jobs[jid]
+        env = self.envelope(jid, job)
+        env.pop("job_id")
+        env.pop("result_ready")
+        env.pop("status")
+        env.pop("sume_status")
+        env.update({"job": {"id": jid, "type": job["router"] + "_generation", "status": self.state(job),
+                            "model": job["req"]["model"], "created_at": "2026-11-11T00:00:00.000Z", "result": None, "error": None},
+                    "events_url": "%s/v1/jobs/%s/events" % (self.base_url(), jid), "idempotency_hit": hit})
+        self.send(202, {"data": env})
+
+    def cancel(self, jid):
+        self.bump("cancels")
+        with LOCK:
+            job = self.jobs.get(jid)
+            state = self.state(job) if job else None
+            if state == "queued":
+                job["final"] = "canceled"
+        if job is None:
+            return self.error(404, "not_found", "No such job.")
+        if state == "queued":
+            self.bump("canceled")
+            return self.send(200, {"data": self.envelope(jid, job)})
+        if state == "processing":
+            return self.error(409, "job_generation_already_started", "Generation has already started and can no longer be canceled.",
+                              details={"status": "processing", "cancelable": False, "reason": "generation_started"})
+        self.error(409, "job_not_cancelable", "The job has already ended.")
+
+    def do_GET(self):
+        if self.maybe_stats():
+            return
+        path = self.path.split("?")[0]
+        if path == "/_last":
+            with LOCK:
+                return self.send(200, dict(Sume.last))
+        if path.startswith("/artifacts/"):
+            self.bump("downloads")
+            if path.endswith(".mp4"):
+                return self.send(200, fake_mp4(path), "video/mp4")
+            return self.send(200, png(int(hashlib.sha256(path.encode()).hexdigest()[:6], 16)), "image/png")
+        if not self.authed():
+            return
+        parts = path.split("/")
+        if len(parts) != 5 or parts[:3] != ["", "v1", "jobs"] or parts[4] not in ("status", "result"):
+            return self.error(404, "not_found", "No such route.")
+        jid = parts[3]
+        with LOCK:
+            job = self.jobs.get(jid)
+        if job is None:
+            return self.error(404, "not_found", "No such job.")
+        state = self.state(job)
+        if parts[4] == "status":
+            self.bump("polls")
+            if "throttle" in job["prompt"]:
+                with LOCK:
+                    first = jid not in self.throttled
+                    self.throttled.add(jid)
+                if first:
+                    return self.error(429, "rate_limited", "Too many requests for this key in the window.", True, 1)
+            env = self.envelope(jid, job)
+            return self.send(200, {"data": env}, headers={"x-sume-poll-after": str(env["next_poll_after_seconds"])})
+        self.bump("results")
+        if state in ("queued", "processing"):
+            return self.error(409, "job_not_completed", "The job is still queued or processing.", True, 2)
+        if state == "failed":
+            return self.error(409, "job_failed", "mock: the model refused this prompt (secret detail)", public_reason="content_policy_rejected")
+        if state == "canceled":
+            return self.error(409, "job_canceled", "The job was canceled.")
+        req = job["req"]
+        if job["router"] == "video":
+            asked = req.get("duration", 5)
+            ms = 3000 if "short" in job["prompt"] else int(float(asked) * 1000)
+            artifacts = [{"id": "artf_" + jid[4:12], "type": "video", "url": "%s/artifacts/%s/video.mp4" % (self.base_url(), jid),
+                          "content_type": "video/mp4", "visibility": "public_by_link", "size_bytes": 1024,
+                          "width": None, "height": None, "duration_ms": ms}]
+        else:
+            count = req.get("num_images", 1)
+            count = count if isinstance(count, int) and 1 <= count <= 4 else 1
+            artifacts = [{"id": "artf_%s_%d" % (jid[4:12], i), "type": "image",
+                          "url": "%s/artifacts/%s/image-%d.png" % (self.base_url(), jid, i), "content_type": "image/png",
+                          "visibility": "public_by_link", "size_bytes": 1024, "width": None, "height": None, "duration_ms": None}
+                         for i in range(count)]
+        self.send(200, {"data": {"request_id": jid, "job_id": jid, "status": "COMPLETED", "result": {"artifacts": artifacts}}})
+
+
 def main():
     servers = [
         ("replicate_ok", replicate_handler(False)),
@@ -785,6 +1021,7 @@ def main():
         ("webhooks", Webhooks),
         ("gemini", Gemini),
         ("xai_video", XaiVideo),
+        ("sume", Sume),
     ]
     for name, handler in servers:
         httpd = ThreadingHTTPServer((BIND, PORTS[name]), handler)

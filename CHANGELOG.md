@@ -17,6 +17,34 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Added
+
+- **Sume as a media provider** (kind `sume`): one adapter for Sume's image
+  and video routers. A target says which router its model is on
+  (`"router": "image"` or `"video"`). Submits carry an idempotency key
+  derived from the job, so a submit that is sent twice starts one job at
+  Sume; polls follow the interval Sume asks for; a job is canceled at Sume
+  only while Sume says it can be, and otherwise polled on and billed if it
+  completes. Written from Sume's public documentation and run only against
+  a mock: no request has been made with a Sume key. See
+  [docs/providers.md](docs/providers.md#sume).
+- **Price variants** (`price.variants` on a media target, any kind): rates
+  per second, per output, per job or per character that depend on fields
+  of the request, such as resolution or audio. A request with no priced
+  variant is refused with `400 invalid_request` when the job is created.
+  Prices without variants work as before. See
+  [docs/configuration.md](docs/configuration.md#price-variants).
+- A per-second price is applied to the seconds the provider reports for
+  its result, where an adapter reports them (today: `sume`), instead of
+  the seconds requested.
+
+### Changed
+
+- An adapter's cancel may now report that the provider can no longer stop
+  the job; the runner then treats the job as on a provider without cancel
+  (polled to the route's timeout, billed if it completes). No existing
+  adapter does so.
+
 ### Verified
 
 - Re-ran the real-provider checks with real keys on the rewritten HTTP client and response reader (11 November 2026): OpenAI, Anthropic, Gemini, xAI, Replicate, ElevenLabs and Cloudflare R2 all pass. fal has still not completed a job.

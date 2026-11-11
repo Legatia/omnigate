@@ -41,7 +41,7 @@ python tools/e2e.py
 ```
 
 It starts the mock providers, the control plane and the gateway on their own
-ports (control plane 14000, gateway 18080, mocks 9001-9005 and 9101-9109),
+ports (control plane 14000, gateway 18080, mocks 9001-9005 and 9101-9110),
 keeps its state in a temporary directory, and exits non-zero if any check
 fails. It needs those ports to be free, so run it before you start the pieces
 by hand, not at the same time.
@@ -72,7 +72,7 @@ python tools/mock_upstream.py
 ```
 
 Terminal 2, mock media providers, object store and webhook receiver (ports
-9101-9109):
+9101-9110):
 
 ```bash
 python tools/mock_media.py

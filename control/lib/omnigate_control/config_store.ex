@@ -414,7 +414,7 @@ defmodule OmnigateControl.ConfigStore do
 
   # Media (async job) config. Never sent to data planes.
   defp normalize_media(m) do
-    m |> build_media() |> check_per_second_prices!()
+    m |> build_media() |> check_per_second_prices!() |> check_routers!()
   end
 
   # A per-second price needs seconds to multiply. Video providers take them
@@ -427,9 +427,8 @@ defmodule OmnigateControl.ConfigStore do
 
     for route <- media.routes, target <- route.targets do
       kind = kinds[target.upstream]
-      per_second = target.price.per_second_usd
 
-      if is_number(per_second) and per_second > 0 and is_binary(kind) and
+      if OmnigateControl.Jobs.per_second?(target.price) and is_binary(kind) and
            not OmnigateControl.Jobs.Adapter.takes_duration?(kind) and is_nil(target.default_seconds) do
         raise ArgumentError,
               "media route #{inspect(route.model)}: the target on #{inspect(target.upstream)} has \"per_second_usd\", " <>
@@ -439,6 +438,74 @@ defmodule OmnigateControl.ConfigStore do
     end
 
     media
+  end
+
+  # Sume has two generate endpoints; which one a target uses is said, not
+  # guessed from a model name. No other kind has such a setting.
+  defp check_routers!(media) do
+    kinds = Map.new(media.upstreams, &{&1.name, &1.kind})
+
+    for route <- media.routes, target <- route.targets do
+      router = Map.get(target, :router)
+
+      case kinds[target.upstream] do
+        "sume" ->
+          if router not in OmnigateControl.Jobs.Adapters.Sume.routers() do
+            raise ArgumentError,
+                  "media route #{inspect(route.model)}: a target on a sume upstream needs \"router\": \"image\" or \"video\" " <>
+                    "(which of Sume's two generate endpoints the model is on), got #{inspect(router)}"
+          end
+
+        kind when is_binary(kind) ->
+          if router != nil do
+            raise ArgumentError,
+                  "media route #{inspect(route.model)}: \"router\" is a setting of sume targets; the target on #{inspect(target.upstream)} is #{kind}"
+          end
+
+        _ ->
+          :ok
+      end
+    end
+
+    media
+  end
+
+  @rate_names ~w(per_job_usd per_output_usd per_input_char_usd per_second_usd)
+
+  # `price.variants`: rates that depend on fields of the request.
+  defp price_variants!(nil, _model), do: []
+
+  defp price_variants!(list, model) when is_list(list) and length(list) <= 500 do
+    variants =
+      Enum.map(list, fn v ->
+        conditions = is_map(v) && v["when"]
+
+        ok =
+          is_map(v) and is_map(conditions) and map_size(conditions) <= 8 and
+            Enum.all?(conditions, fn {field, value} ->
+              is_binary(field) and field != "" and (is_binary(value) or is_number(value) or is_boolean(value) or is_nil(value))
+            end)
+
+        rates = if ok, do: Map.delete(v, "when"), else: %{}
+
+        if not ok or map_size(rates) == 0 or Enum.any?(Map.keys(rates), &(&1 not in @rate_names)) do
+          raise ArgumentError,
+                "media route #{inspect(model)}: each entry of \"price\".\"variants\" must be {\"when\": {input field: value, ...}, <rate>: dollars, ...} " <>
+                  "with at most 8 fields in \"when\" (strings, numbers, true, false or null) and one or more of #{Enum.join(@rate_names, ", ")}, got #{inspect(v)}"
+        end
+
+        %{when: conditions, rates: Map.new(rates, fn {name, value} -> {String.to_existing_atom(name), media_price!(value, model)} end)}
+      end)
+
+    if length(Enum.uniq_by(variants, & &1.when)) != length(variants) do
+      raise ArgumentError, "media route #{inspect(model)}: two entries of \"price\".\"variants\" have the same \"when\"; the second could never apply"
+    end
+
+    variants
+  end
+
+  defp price_variants!(other, model) do
+    raise ArgumentError, "media route #{inspect(model)}: \"price\".\"variants\" must be a list of at most 500 entries, got #{inspect(other)}"
   end
 
   defp build_media(m) do
@@ -469,7 +536,7 @@ defmodule OmnigateControl.ConfigStore do
           %{
             name: Map.fetch!(u, "name"),
             kind: Map.fetch!(u, "kind"),
-            base_url: u |> Map.fetch!("base_url") |> String.trim_trailing("/"),
+            base_url: String.trim_trailing(u["base_url"] || default_base_url!(u), "/"),
             api_key_env: Map.fetch!(u, "api_key_env")
           }
         end),
@@ -490,14 +557,23 @@ defmodule OmnigateControl.ConfigStore do
                 %{
                   upstream: Map.fetch!(t, "upstream"),
                   model: Map.fetch!(t, "model"),
-                  price: %{
-                    per_job_usd: media_price!(price["per_job_usd"], r["model"]),
-                    per_output_usd: media_price!(price["per_output_usd"], r["model"]),
-                    per_input_char_usd: media_price!(price["per_input_char_usd"], r["model"]),
-                    per_second_usd: media_price!(price["per_second_usd"], r["model"])
-                  }
+                  price:
+                    %{
+                      per_job_usd: media_price!(price["per_job_usd"], r["model"]),
+                      per_output_usd: media_price!(price["per_output_usd"], r["model"]),
+                      per_input_char_usd: media_price!(price["per_input_char_usd"], r["model"]),
+                      per_second_usd: media_price!(price["per_second_usd"], r["model"])
+                    }
+                    # Rates that depend on the request; absent when there are none.
+                    |> then(fn base ->
+                      case price_variants!(price["variants"], r["model"]) do
+                        [] -> base
+                        variants -> Map.put(base, :variants, variants)
+                      end
+                    end)
                 }
                 |> Map.merge(seconds!(t, r["model"]))
+                |> then(&if(Map.has_key?(t, "router"), do: Map.put(&1, :router, t["router"]), else: &1))
               end)
           }
         end),
@@ -516,6 +592,10 @@ defmodule OmnigateControl.ConfigStore do
       }
     }
   end
+
+  # Only a kind with one public endpoint has a default.
+  defp default_base_url!(%{"kind" => "sume"}), do: OmnigateControl.Jobs.Adapters.Sume.default_base_url()
+  defp default_base_url!(u), do: Map.fetch!(u, "base_url")
 
   defp retry_schedule!(nil), do: @default_retry_schedule_ms
 

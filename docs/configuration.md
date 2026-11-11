@@ -328,8 +328,8 @@ plane (apart from the route names, which data planes list in
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | required | Referenced by media route targets. |
-| `kind` | string | required | One of `replicate`, `fal`, `openai_images`, `elevenlabs`, `gemini`, `gemini_interactions`, `xai_video`. See [Providers](providers.md#media-providers). |
-| `base_url` | string | required | Provider API base, for example `https://api.replicate.com`. A trailing slash is ignored. |
+| `kind` | string | required | One of `replicate`, `fal`, `openai_images`, `elevenlabs`, `gemini`, `gemini_interactions`, `xai_video`, `sume`. See [Providers](providers.md#media-providers). |
+| `base_url` | string | required, except for `sume` | Provider API base, for example `https://api.replicate.com`. A trailing slash is ignored. For kind `sume` it defaults to `https://api.sume.com`. |
 | `api_key_env` | string | required | Environment variable, read by the **control plane**, holding the provider key. |
 
 An unknown `kind`, or a key variable that is not set, does not stop the file
@@ -349,7 +349,9 @@ the next target.
 | `targets` | list | required | Tried in order. |
 
 Each target has `upstream`, `model` (the provider's model id), an optional
-`price` object and, for per-second prices, three optional settings:
+`price` object, on a `sume` upstream a required `router` (`"image"` or
+`"video"`: which of Sume's two generate endpoints the model is on; refused
+on any other kind), and, for per-second prices, three optional settings:
 
 | Target field | Type | Default | Meaning |
 |---|---|---|---|
@@ -361,7 +363,7 @@ Each target has `upstream`, `model` (the provider's model id), an optional
 and a `default_seconds` of 0 are rejected when the file is loaded.
 
 **Per-second prices and providers that take no duration.** Only the video
-kinds (`replicate`, `fal`, `xai_video`) are sent a duration from the
+kinds (`replicate`, `fal`, `xai_video`, `sume`) are sent a duration from the
 request. An upstream of kind `openai_images`, `elevenlabs`, `gemini` or
 `gemini_interactions` never is, so there a `per_second_usd` price has
 nothing from the request to multiply: the job is billed
@@ -387,7 +389,8 @@ with no price at all records its jobs at $0, which is counted in
 |---|---|
 | `per_job_usd` | Once per successful job. |
 | `per_output_usd` | Per output file stored. |
-| `per_second_usd` | Times the seconds the adapter asks the provider for, or the target's `default_seconds` when the request names none; never less than `min_seconds`. |
+| `per_second_usd` | Times the seconds the adapter asks the provider for, or the target's `default_seconds` when the request names none; never less than `min_seconds`. Where the provider reports how long the media it made is (today: `sume`), those seconds are billed instead of the ones asked for. |
+| `variants` | Not a rate: a list of rates that depend on fields of the request. See [Price variants](#price-variants). |
 | `per_input_char_usd` | Times the characters of text the adapter sends to the provider. |
 
 Seconds and characters are counted from **what the adapter sends**, not
@@ -397,6 +400,7 @@ own price by moving its text or its duration into another field:
 | Adapter (`kind`) | Characters counted | Seconds counted |
 |---|---|---|
 | `replicate`, `fal`, `xai_video` | `input.prompt`, `input.text` and `input.input`, each when it is a string, added together (the whole `input` goes to the provider) | The larger of `input.duration` and `input.seconds` (a number, a string that is one, or a number followed by `s`: `5`, `"5"`, `"5s"`) |
+| `sume` | `input.prompt` | `input.duration`; replaced by the length Sume reports for the result, when it reports one |
 | `openai_images` | `input.prompt` | none |
 | `elevenlabs` | `input.text` | none |
 | `gemini` | Every `text` part of the request's `contents` and `systemInstruction`, whether it came from the short form (`prompt`, else `text`) or from a native body | none |
@@ -413,6 +417,60 @@ of 0 or more, is refused with `400 invalid_request` when it is created
 Cost is the configured price of the target that delivered, times the
 route's price multipliers. A failed or canceled job costs nothing in the
 ledger, and a cache hit costs nothing.
+
+##### Price variants
+
+Some providers charge a rate that depends on the request: a video model
+priced per second by resolution, more with audio than without. A target's
+`price` may carry `variants` for that:
+
+```json
+"price": {
+  "per_job_usd": 0.0,
+  "variants": [
+    { "when": { "resolution": "720p", "generate_audio": false }, "per_second_usd": 0.08 },
+    { "when": { "resolution": "720p", "generate_audio": true },  "per_second_usd": 0.10 },
+    { "when": { "resolution": "720p", "generate_audio": null },  "per_second_usd": 0.10 },
+    { "when": { "resolution": "1080p" }, "per_second_usd": 0.12 }
+  ]
+}
+```
+
+(The figures are an illustration of the shape, not anyone's price list:
+take yours from your provider.)
+
+- A variant applies when **every** field in its `when` equals the value of
+  that top-level `input` field. Values are JSON scalars compared as JSON:
+  strings, numbers (`24` equals `24.0`), `true`, `false`, and `null`, which
+  stands for a field the request does not send. `true` does not equal
+  `"true"`.
+- The **first** variant that applies is used. Its rates (`per_job_usd`,
+  `per_output_usd`, `per_second_usd`, `per_input_char_usd`) replace the
+  rates of the same name in the price around it; the others stay.
+- A request to which **no** variant applies is refused with
+  `400 invalid_request` when the job is created, naming the priced
+  combinations. This is checked against every target of the route that has
+  variants, because the job may end up on any of them. A price with
+  variants therefore never records a job at a rate nobody set. To price
+  "everything else", end the list with `{ "when": {}, ... }`.
+- If the config changes while a job waits and its target no longer has a
+  variant for it, that target is skipped (`unpriced_variant`) before
+  anything is sent to its provider. A job already running there is charged
+  the dearest of the target's variants.
+- A per-second rate in a variant follows the same rules as
+  `per_second_usd` outside one: the job needs a duration (from the request
+  or `default_seconds`), and on a kind that is never sent a duration
+  `default_seconds` is required.
+- At most 500 variants per price, at most 8 fields in a `when`. A variant
+  without `when`, without a rate, with a rate name that does not exist, or
+  with the same `when` as an earlier one is rejected when the file is
+  loaded.
+- Variants and the route's `price_multipliers` can be combined: the
+  multipliers apply to the price the variant gave.
+
+Variants are covered by the control plane's unit tests
+(`control/test/sume_test.exs`) and the end-to-end suite against mock
+providers. They are not specific to one kind of upstream.
 
 ##### Price multipliers
 

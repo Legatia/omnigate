@@ -125,7 +125,7 @@ python tools/e2e.py
 
 It starts the mock providers, the control plane and the gateway on their
 own ports (control plane 14000, gateway 18080, mocks 9001-9005 and
-9101-9109) with state in a temp directory, and exits non-zero if any check
+9101-9110) with state in a temp directory, and exits non-zero if any check
 fails. `--only text` or `--only media` runs one half; `--keep` leaves the
 logs and state in place. On failure it prints where the logs are.
 

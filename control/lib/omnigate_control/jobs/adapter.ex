@@ -15,15 +15,33 @@ defmodule OmnigateControl.Jobs.Adapter do
 
   @type upstream :: %{name: String.t(), kind: String.t(), base_url: String.t(), api_key_env: String.t()}
   @type output :: {:url, String.t()} | {:url, String.t(), String.t() | nil} | {:binary, binary(), String.t()}
+  @typedoc """
+  What the runner hands every call: the upstream's key and the route's
+  timeout, plus `:router` (the target's `"router"` setting, for kinds that
+  have one) and, on a submit, `:job_id` and `:attempt` (the index of the
+  target being tried), from which an adapter can derive an idempotency key.
+  """
   @type ctx :: %{api_key: String.t(), timeout_ms: pos_integer()}
 
+  @typedoc """
+  What the provider says it produced, when it says so: `%{seconds: n}` is
+  the length of the media made, and replaces the requested duration when
+  the job is priced per second.
+  """
+  @type measured :: %{optional(:seconds) => number()}
+
   @callback submit(upstream(), target_model :: String.t(), input :: map(), ctx()) ::
-              {:async, provider_id :: String.t(), state :: map()} | {:done, [output()]} | {:error, String.t()}
+              {:async, provider_id :: String.t(), state :: map()} | {:done, [output()]} | {:done, [output()], measured()} | {:error, String.t()}
 
   @callback poll(upstream(), target_model :: String.t(), provider_id :: String.t(), state :: map(), ctx()) ::
-              :pending | {:done, [output()]} | {:error, String.t()} | {:transient, String.t()}
+              :pending | {:done, [output()]} | {:done, [output()], measured()} | {:error, String.t()} | {:transient, String.t()}
 
-  @callback cancel(upstream(), target_model :: String.t(), provider_id :: String.t(), state :: map(), ctx()) :: :ok
+  @doc """
+  Tell the provider to stop. `:not_canceled` says that it cannot be stopped
+  any more (generation has started): the runner then treats the job like
+  one on a provider without cancel, and keeps asking whether it completes.
+  """
+  @callback cancel(upstream(), target_model :: String.t(), provider_id :: String.t(), state :: map(), ctx()) :: :ok | :not_canceled
 
   @typedoc "What a job is billed for: characters of text and seconds of media the adapter asks the provider for."
   @type billable :: %{chars: non_neg_integer(), seconds: number()}
@@ -81,7 +99,7 @@ defmodule OmnigateControl.Jobs.Adapter do
   ever apply to the target's `default_seconds`; the config loader insists
   that one is set.
   """
-  def takes_duration?(kind), do: kind in ~w(replicate fal xai_video)
+  def takes_duration?(kind), do: kind in ~w(replicate fal xai_video sume)
 
   @doc """
   Seconds requested by `input`: the largest of the given fields, never below
@@ -124,9 +142,10 @@ defmodule OmnigateControl.Jobs.Adapter do
   def for_kind("gemini"), do: Adapters.Gemini
   def for_kind("xai_video"), do: Adapters.XaiVideo
   def for_kind("gemini_interactions"), do: Adapters.GeminiInteractions
+  def for_kind("sume"), do: Adapters.Sume
   def for_kind(_), do: nil
 
-  def kinds, do: ~w(replicate fal openai_images elevenlabs gemini xai_video gemini_interactions)
+  def kinds, do: ~w(replicate fal openai_images elevenlabs gemini xai_video gemini_interactions sume)
 
   # -- helpers shared by adapters -------------------------------------------
 

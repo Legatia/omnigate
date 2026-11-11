@@ -1093,6 +1093,8 @@ A media job that ends `failed`:
 | `http_<status>: ...` | The provider refused the submit; its message follows. |
 | `provider_failed: ...`, `provider_canceled`, `provider_expired: ...` | The provider accepted the job and then reported this. |
 | `invalid_input: ...` | The adapter needs a field the job's `input` lacks; see [Providers](providers.md#media-providers). |
+| `sume_<code>: ...` | Sume refused the submit or failed the job; the code is Sume's own (`sume_insufficient_funds`: top up at Sume; `sume_unauthorized`: the key; `sume_invalid_request`: a field the model does not take; `sume_rate_limited`, `sume_queue_full`: Sume asked for a wait longer than the gateway retries a submit for; `sume_content_policy_rejected` and other reasons: Sume failed the job). `sume_router_not_set` cannot occur with a config that loaded. See [Providers](providers.md#sume). |
+| `unpriced_variant: ...` | The target's price has `variants` and none covers this job (the config changed after the job was accepted). Nothing was sent to the provider. |
 | `timeout` | The target did not finish within the route's `timeout_s`. |
 | `no_outputs`, `no_output: ...` | The provider finished without a file (for Gemini: a blocked prompt or an early stop). |
 | `too_many_outputs: ...` | The provider's answer listed more files than `media.max_outputs_per_job` (16). Nothing was downloaded. Raise the setting if the model really produces that many. |

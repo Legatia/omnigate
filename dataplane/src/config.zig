@@ -68,6 +68,9 @@ pub const Key = struct {
     blocked: bool = false,
     /// Requests per minute; 0 means unlimited.
     rpm: u32 = 0,
+    /// Requests in flight at once; 0 means the gateway's default
+    /// (OMNIGATE_MAX_CONCURRENT_PER_KEY).
+    max_concurrent: u32 = 0,
     /// Route models this key may use; null means all of them.
     models: ?[]const []const u8 = null,
 

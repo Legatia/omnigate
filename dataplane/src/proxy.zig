@@ -8,6 +8,19 @@
 //!
 //! `/v1/jobs*` and `/v1/files/*` (async media jobs) are authenticated here and
 //! handed to the control plane, which owns job state.
+//!
+//! What a request may cost before it is judged: the key's concurrency cap,
+//! its rate limit and the request-memory budget are all consulted before a
+//! byte of the body is read (limits.zig); the body is then walked in place
+//! for the three fields the gateway acts on, without building a tree of it
+//! (jsonscan.zig), and a same-protocol request goes upstream as the client's
+//! own bytes with the model name spliced. A tree is built only where one is
+//! needed (translation, the response cache, rewriting an existing
+//! `stream_options`), inside an allocator capped at a multiple of the body.
+//!
+//! What an upstream may do to us: its response body is framed and read by
+//! framing.zig, never by std, and the client's response is framed by us,
+//! never with a length the upstream claimed.
 
 const std = @import("std");
 const Io = std.Io;
@@ -17,8 +30,11 @@ const cache = @import("cache.zig");
 const config = @import("config.zig");
 const control = @import("control.zig");
 const errors = @import("errors.zig");
+const framing = @import("framing.zig");
 const guard_mod = @import("guard.zig");
 const headers_mod = @import("headers.zig");
+const jsonscan = @import("jsonscan.zig");
+const limits = @import("limits.zig");
 const models = @import("models.zig");
 const logging = @import("logging.zig");
 const quirks = @import("quirks.zig");
@@ -40,10 +56,12 @@ const default_anthropic_version = "2023-06-01";
 /// How long the control plane gets to answer a jobs/files request.
 const control_timeout_ms = 30_000;
 /// Cap on an upstream response that must be buffered to be translated.
-const max_translated_body = 64 * 1024 * 1024;
-/// After the client has gone, at most this much more of the upstream's
-/// answer is read to find the final usage.
-const max_abort_drain_bytes = 8 * 1024 * 1024;
+const max_translated_body = 16 * 1024 * 1024;
+/// An answer that is not a stream and no longer than this is buffered and
+/// sent with its real length; anything else goes out chunked.
+const small_body_max = 64 * 1024;
+/// A relayed `content-type` longer than this is not one.
+const max_content_type_len = 256;
 /// How long, and how much, to keep reading from a client after answering it
 /// early and before closing (see `lingerClose`).
 const linger_ms = 2_000;
@@ -111,10 +129,15 @@ pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
             switch (head_check) {
                 .ok => unreachable, // checked on the line above
                 .bad => |why| return refuseHead(app, &request, .bad_request, "invalid_request", why),
-                .length_required => return refuseHead(app, &request, .length_required, "invalid_request", "a request with a body needs a content-length"),
+                .length_required => return refuseHead(app, &request, .length_required, "invalid_request", "a request with a body needs a content-length (chunked request bodies are not accepted)"),
                 .expectation_failed => return refuseHead(app, &request, .expectation_failed, "invalid_request", "the only supported expectation is 100-continue"),
             }
         }
+        // The check above took `100-continue` in any letter case, as the
+        // header is defined. std compares it byte for byte and, when it
+        // differs, fails every attempt to answer: the client got nothing.
+        // Give std the one spelling it knows.
+        if (request.head.expect != null) request.head.expect = "100-continue";
 
         var acc: logging.Access = .{};
         const started = Io.Timestamp.now(app.io, .awake);
@@ -122,7 +145,7 @@ pub fn handleConnection(app: *App, guard: *watchdog.Conn) void {
         acc.latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds();
         if (outcome) |_| {} else |err| {
             // The watchdog cancels the task; say what that meant.
-            acc.aborted = if (err == error.ClientDisconnected or !guard.timedOut()) err else if (acc.status == 0) error.ClientTimeout else error.StreamIdleTimeout;
+            acc.aborted = if (err == error.ClientDisconnected or err == error.ClientStalled or !guard.timedOut()) err else if (acc.status == 0) error.ClientTimeout else error.StreamIdleTimeout;
             if (acc.status == 0 and guard.timedOut()) acc.status = 408;
         }
         // Requests the gateway refused itself never become usage events;
@@ -270,8 +293,9 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         return respondError(acc, request, .bad_request, "invalid_request", "invalid anthropic-version header");
     if (hdrs.anthropic_beta) |v| if (!guard_mod.safeHeaderValue(v, "-._, ", 512))
         return respondError(acc, request, .bad_request, "invalid_request", "invalid anthropic-beta header");
-    if (hdrs.idempotency_key) |v| if (!guard_mod.safeHeaderValue(v, "-._:", 255))
-        return respondError(acc, request, .bad_request, "invalid_request", "invalid idempotency-key header: use up to 255 letters, digits, '-', '.', '_' or ':'");
+    // `idempotency-key` is looked at where it is used: on job requests,
+    // below. Elsewhere it is not forwarded, so what it contains is the
+    // client's business (SDKs send one of their own on every call).
 
     const snapshot = app.store.get(app.io) orelse
         return respondError(acc, request, .service_unavailable, "gateway_not_ready", "no config from control plane yet");
@@ -281,7 +305,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
 
     // A signed output URL carries its own proof; the control plane checks it.
     if (is_files and method == .GET and hdrs.api_key == null and hasQueryParam(query, "sig")) {
-        return forwardToControl(app, acc, arena, request, guard, method, path, query, null, hdrs, null);
+        return forwardToControl(app, acc, arena, request, guard, method, path, query, null, null, null);
     }
 
     // --- authentication -------------------------------------------------
@@ -313,6 +337,18 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     if (is_jobs or is_files) {
         if (method != .GET and method != .POST)
             return respondError(acc, request, .method_not_allowed, "method_not_allowed", "use GET or POST");
+        // Forwarded to the control plane as a header, so nothing in it may
+        // be able to end one: visible ASCII, which is what UUIDs, base64
+        // and every other key a client is likely to generate are made of.
+        if (hdrs.idempotency_key) |v| if (!guard_mod.visibleToken(v, 255))
+            return respondError(acc, request, .bad_request, "invalid_request", "invalid idempotency-key header: use up to 255 visible ASCII characters, without spaces");
+        // Before the body is read: how many requests this key has in flight
+        // and how much memory they hold, then its rate limit.
+        var hold: Hold = .{};
+        defer hold.release(app, &key_hash);
+        if (method == .POST) {
+            if (!try admit(app, acc, request, &key_hash, key, max_job_body, &hold)) return;
+        }
         // Only requests that start work count against the rate limit;
         // polling a job does not.
         if (is_job_create) {
@@ -326,12 +362,25 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         guard.arm(app.io, app.stream_idle_timeout_ms);
         if (job_body) |b| if (!guard_mod.jsonDepthOk(b, guard_mod.max_client_json_depth))
             return respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply");
-        return forwardToControl(app, acc, arena, request, guard, method, path, query, job_body, hdrs, &key_hash);
+        return forwardToControl(app, acc, arena, request, guard, method, path, query, job_body, hdrs.idempotency_key, &key_hash);
     }
 
     const ep = endpoint orelse
         return respondError(acc, request, .not_found, "not_found", "unsupported endpoint");
     const kind = ep.kind;
+
+    // --- limits, before the body is read ------------------------------------
+    // Nothing a request costs comes before these: the key's requests in
+    // flight and the memory they hold (limits.zig), then its rate limit. A
+    // request refused by its model limits or for being malformed has
+    // therefore been counted against the rate limit; that is the price of
+    // not reading eight megabytes to find out.
+    var hold: Hold = .{};
+    defer hold.release(app, &key_hash);
+    if (!try admit(app, acc, request, &key_hash, key, max_request_body, &hold)) return;
+    if (ep.metered) {
+        if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(acc, request, secs);
+    }
 
     // --- body -------------------------------------------------------------
     const body = (try readBody(arena, request, guard, max_request_body)) orelse
@@ -339,35 +388,46 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     guard.arm(app.io, app.stream_idle_timeout_ms);
 
     // Bounded nesting, before anything parses it: the serialiser this body
-    // goes through again indexes past a fixed stack beyond 256 levels.
+    // may go through again indexes past a fixed stack beyond 256 levels.
     if (!guard_mod.jsonDepthOk(body, guard_mod.max_client_json_depth))
         return respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply");
 
-    var parsed = std.json.parseFromSlice(std.json.Value, arena, body, .{}) catch
-        return respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON");
-    if (parsed.value != .object)
-        return respondError(acc, request, .bad_request, "invalid_json", "request body must be a JSON object");
-    const obj = &parsed.value.object;
+    // One pass over the body, in place, nothing allocated: is it JSON, what
+    // model does it name, is it a stream (jsonscan.zig).
+    const top = jsonscan.scan(body, .{ .max_depth = guard_mod.max_client_json_depth }) catch |err| {
+        const first = std.mem.findNone(u8, body, " \t\r\n");
+        return switch (err) {
+            error.InvalidJson => if (first != null and body[first.?] != '{' and std.json.validate(arena, body) catch false)
+                respondError(acc, request, .bad_request, "invalid_json", "request body must be a JSON object")
+            else
+                respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON"),
+            error.TooDeep => respondError(acc, request, .bad_request, "invalid_json", "request body is nested too deeply"),
+            error.TooManyMembers => respondError(acc, request, .bad_request, "invalid_request", "a JSON object in the request body has too many members"),
+            error.KeyTooLong => respondError(acc, request, .bad_request, "invalid_request", "a key in the request body is too long"),
+            error.DuplicateField => respondError(acc, request, .bad_request, "invalid_request", "\"model\", \"stream\" and \"stream_options\" may each appear only once"),
+            error.EscapedFieldName => respondError(acc, request, .bad_request, "invalid_request", "\"model\", \"stream\" and \"stream_options\" must be spelled without escapes"),
+        };
+    };
 
-    const model_val = obj.get("model") orelse
+    const model_span = top.model orelse
         return respondError(acc, request, .bad_request, "missing_model", "request has no \"model\" field");
-    if (model_val != .string)
+    const model_text = body[model_span.start..model_span.end];
+    if (model_text.len < 2 or model_text[0] != '"')
         return respondError(acc, request, .bad_request, "missing_model", "\"model\" must be a string");
-    const route_model = try arena.dupe(u8, model_val.string);
+    const route_model: []const u8 = if (std.mem.findScalar(u8, model_text, '\\') == null)
+        model_text[1 .. model_text.len - 1]
+    else
+        // Written with escapes (a slash as `\/`, say): decode this one string.
+        std.json.parseFromSliceLeaky([]const u8, arena, model_text, .{}) catch
+            return respondError(acc, request, .bad_request, "missing_model", "\"model\" is not a valid string");
     acc.model.set(route_model);
-    const is_stream = if (obj.get("stream")) |s| s == .bool and s.bool else false;
+    const is_stream = top.stream;
 
     // --- model limits -------------------------------------------------------
-    // Checked before the rate limit, so a refused model costs the key nothing,
-    // and before the route lookup, so the answer does not reveal which other
+    // Before the route lookup, so the answer does not reveal which other
     // models exist.
     if (!key.allows(route_model))
         return respondError(acc, request, .forbidden, "model_not_allowed", "this key may not use this model");
-
-    // --- rate limit ---------------------------------------------------------
-    if (ep.metered) {
-        if (rateLimited(app, &key_hash, key)) |secs| return respondRateLimited(acc, request, secs);
-    }
 
     const route = snapshot.findRoute(route_model) orelse
         return respondError(acc, request, .not_found, "model_not_found", "no route for this model");
@@ -378,14 +438,19 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     // Only for routes that ask for it, and never for streams. The lookup comes
     // after authentication, model limits, the budget and the rate limit, so a
     // cached answer is subject to all of them.
-    var extras: ForwardExtras = .{};
+    var extras: ForwardExtras = .{ .key_hash = &key_hash };
+    // An exchange `forward` handed back and nobody took over is closed here.
+    defer if (extras.parked) |*left| left.req.deinit();
     var capture: Capture = .{ .limit = app.cache.maxEntryBytes() };
     var cache_key: ?cache.Key = null;
     const cache_ttl_ms: i64 = if (ep.metered and !is_stream and app.cache.max_bytes > 0) @as(i64, route.cache_ttl_s) * 1000 else 0;
-    if (cache_ttl_ms > 0) {
-        // The request as the client sent it: nothing below has changed it yet.
-        const ck = try cache.keyFor(arena, route_model, path, &key_hash, parsed.value);
-        if (app.cache.get(app.io, arena, &ck, started.toMilliseconds())) |hit| {
+    // The key is the request in canonical form, which takes a tree of it. A
+    // body too costly to parse (see `cacheKeyFor`) is simply not cached.
+    if (cache_ttl_ms > 0) if (cacheKeyFor(app, route_model, path, &key_hash, body, top)) |ck| {
+        const cached = app.cache.get(app.io, arena, &ck, started.toMilliseconds());
+        // (The stored content type was checked when it was stored; checked
+        // again, because it is about to be a header line.)
+        if (cached) |hit| if (framing.plainHeaderValue(hit.content_type, max_content_type_len)) {
             acc.status = hit.status;
             acc.cache_hit = true;
             // Counted, not billed: no tokens, and marked as served from cache.
@@ -414,27 +479,37 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     .{ .name = "request-id", .value = &req_id },
                 },
             });
-        }
+        };
         cache_key = ck;
         extras.cache_note = "miss";
         extras.capture = &capture;
-    }
+    };
 
     // OpenAI only reports usage on streams when asked to. If the client did
     // not ask, we do (to meter the call) and hide the extra chunk from it.
-    const client_wants_usage = blk: {
-        const so = obj.get("stream_options") orelse break :blk false;
-        if (so != .object) break :blk false;
-        const iu = so.object.get("include_usage") orelse break :blk false;
-        break :blk iu == .bool and iu.bool;
-    };
-    var injected_usage = false;
-    if (ep.inject_stream_usage and is_stream and !client_wants_usage) {
-        var so: std.json.ObjectMap = if (obj.get("stream_options")) |v| (if (v == .object) v.object else .empty) else .empty;
-        try so.put(arena, "include_usage", .{ .bool = true });
-        try obj.put(arena, "stream_options", .{ .object = so });
-        injected_usage = true;
+    const client_wants_usage = top.stream_options != null and top.stream_options_plain and top.include_usage;
+    const injected_usage = ep.inject_stream_usage and is_stream and !client_wants_usage;
+    // What goes upstream when no translation is needed: the client's own
+    // bytes, with the model name replaced per target (and, when usage has to
+    // be asked for and the client sent no `stream_options` at all, that
+    // member added). Only a request that already carries `stream_options`
+    // without the flag needs it rewritten, which takes a tree.
+    var plain_body: []const u8 = body;
+    var plain_top = top;
+    if (injected_usage and top.stream_options != null) {
+        if (top.max_members > guard_mod.max_tree_members) return respondTreeRefusal(acc, request, .too_complex);
+        var refusal: ?TreeRefusal = null;
+        const rewritten = try inTree(app, arena, &key_hash, body.len, &refusal, requestUsage, .{body});
+        if (refusal != null) return respondTreeRefusal(acc, request, refusal);
+        plain_body = rewritten orelse
+            return respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON");
+        plain_top = jsonscan.scan(plain_body, .{ .max_depth = guard_mod.max_client_json_depth + 1 }) catch
+            return respondError(acc, request, .bad_request, "invalid_json", "request body is not valid JSON");
+        // (It was there before the rewrite; `jsonscan.rewrite` relies on it.)
+        if (plain_top.model == null)
+            return respondError(acc, request, .bad_request, "missing_model", "request has no \"model\" field");
     }
+    const add_usage_member = injected_usage and plain_top.stream_options == null;
 
     // --- failover loop ----------------------------------------------------
     var attempts: std.ArrayList(Attempt) = .empty;
@@ -491,18 +566,19 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             continue;
         };
 
-        var out_body: []u8 = if (xlate) |x|
-            translate.translateRequest(arena, x.dir, body, t.model) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    try attempts.append(arena, .{ .upstream = up.name, .outcome = "untranslatable_request" });
-                    continue;
-                },
-            }
-        else blk: {
-            try obj.put(arena, "model", .{ .string = t.model });
-            break :blk try std.json.Stringify.valueAlloc(arena, parsed.value, .{});
-        };
+        var refusal: ?TreeRefusal = null;
+        var out_body: []u8 = if (xlate) |x| translated: {
+            // The other protocol: the one place a tree of the request is
+            // unavoidable. Bounded in members per object (hash collisions)
+            // and in memory (a multiple of the body), see limits.zig.
+            if (top.max_members > guard_mod.max_tree_members) return respondTreeRefusal(acc, request, .too_complex);
+            const converted = try inTree(app, arena, &key_hash, body.len, &refusal, translate.translateRequest, .{ x.dir, body, t.model });
+            if (refusal != null) return respondTreeRefusal(acc, request, refusal);
+            break :translated converted orelse {
+                try attempts.append(arena, .{ .upstream = up.name, .outcome = "untranslatable_request" });
+                continue;
+            };
+        } else try jsonscan.rewrite(arena, plain_body, plain_top, try std.json.Stringify.valueAlloc(arena, t.model, .{}), add_usage_member);
         const upstream_path: []const u8 = if (xlate == null) path else switch (up.kind) {
             .openai => "/v1/chat/completions",
             .anthropic => "/v1/messages",
@@ -517,13 +593,14 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         // A model already known to reject sampling parameters (see quirks.zig)
         // gets the translated request without them from the start.
         if (mode == .translate and app.quirks.rejectsSampling(app.io, &key_hash, up.name, t.model)) {
-            if (try quirks.stripSampling(arena, out_body)) |stripped| out_body = stripped;
+            if (try inTree(app, arena, &key_hash, out_body.len, &refusal, quirks.stripSampling, .{out_body})) |stripped| out_body = stripped;
             mode.translate.sampling_stripped = true;
         }
         if (mode == .translate and app.quirks.needsThoughtSignature(app.io, &key_hash, up.name, t.model)) {
-            if (try quirks.addThoughtSignatures(arena, out_body)) |signed| out_body = signed;
+            if (try inTree(app, arena, &key_hash, out_body.len, &refusal, quirks.addThoughtSignatures, .{out_body})) |signed| out_body = signed;
             mode.translate.signatures_added = true;
         }
+        if (refusal != null) return respondTreeRefusal(acc, request, refusal);
 
         tried += 1;
         var committed = false;
@@ -538,7 +615,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     // and send the same request once more without them.
                     app.quirks.noteRejectsSampling(app.gpa, app.io, &key_hash, up.name, t.model);
                     mode.translate.sampling_stripped = true;
-                    if (try quirks.stripSampling(arena, out_body)) |stripped| {
+                    if (try inTree(app, arena, &key_hash, out_body.len, &refusal, quirks.stripSampling, .{out_body})) |stripped| {
                         log.info("{s}/{s} rejects sampling parameters; retrying without them", .{ up.name, t.model });
                         out_body = stripped;
                     }
@@ -551,7 +628,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     // with the placeholder the provider documents for this.
                     app.quirks.noteNeedsThoughtSignature(app.gpa, app.io, &key_hash, up.name, t.model);
                     mode.translate.signatures_added = true;
-                    if (try quirks.addThoughtSignatures(arena, out_body)) |signed| {
+                    if (try inTree(app, arena, &key_hash, out_body.len, &refusal, quirks.addThoughtSignatures, .{out_body})) |signed| {
                         log.info("{s}/{s} requires thought signatures on tool calls; retrying with placeholders", .{ up.name, t.model });
                         out_body = signed;
                     }
@@ -570,7 +647,8 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     // what it generated, so bill an estimate rather than
                     // nothing; never less than what was metered.
                     const estimated = !usage.final_seen;
-                    const used = if (estimated) usage.estimated(up.kind, body.len) else usage.normalized(up.kind);
+                    const input_estimate = usage_mod.estimateInput(body);
+                    const used = if (estimated) usage.estimated(up.kind, input_estimate) else usage.normalized(up.kind);
                     acc.status = 499;
                     acc.upstream.set(up.name);
                     acc.attempts = tried;
@@ -578,7 +656,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     acc.input_tokens = used.input_tokens;
                     acc.cached_input_tokens = used.cached_input_tokens +| used.cache_write_input_tokens;
                     acc.output_tokens = used.output_tokens;
-                    if (ep.metered) report(app, arena, .{
+                    const event: UsageReport = .{
                         .id = &req_id,
                         .key_sha256 = &key_hash,
                         .route_model = route_model,
@@ -593,7 +671,22 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                         .estimated = estimated,
                         .latency_ms = started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds(),
                         .attempts = attempts.items,
-                    });
+                    };
+                    // It was the client that went (or stopped reading) and
+                    // the upstream is still answering: its answer is read to
+                    // the end in the background, and what that finds is what
+                    // gets billed (see `Drains`). The request's place in the
+                    // key's allowance goes with it.
+                    if (extras.parked) |taken| {
+                        var parked = taken;
+                        extras.parked = null;
+                        if (ep.metered and startDrain(app, &parked, &usage, up.kind, input_estimate, event, &key_hash, hold, started)) {
+                            hold.held = false;
+                            return err;
+                        }
+                        parked.req.deinit();
+                    }
+                    if (ep.metered) report(app, arena, event);
                     return err;
                 }
                 // A pooled keep-alive connection may have been closed by the
@@ -734,6 +827,137 @@ fn rateLimited(app: *App, key_hash: *const [64]u8, key: *const config.Key) ?u32 
     };
 }
 
+/// A request's place in its key's allowance of concurrent requests and
+/// request memory (limits.zig), from `admit` until it is released.
+const Hold = struct {
+    held: bool = false,
+    bytes: u64 = 0,
+
+    fn release(h: *Hold, app: *App, key_hash: *const [64]u8) void {
+        if (h.held) app.gate.leave(app.io, key_hash, h.bytes);
+        h.held = false;
+    }
+};
+
+/// Count this request against its key's concurrency cap and the memory
+/// budget, before its body is read. False when it was refused (and
+/// answered): 429 for the key's own limits, 503 when the gateway as a whole
+/// is holding all it may.
+fn admit(
+    app: *App,
+    acc: *logging.Access,
+    request: *http.Server.Request,
+    key_hash: *const [64]u8,
+    key: *const config.Key,
+    body_limit: u64,
+    hold: *Hold,
+) !bool {
+    // A body is held twice while its request is forwarded: as received and
+    // as sent on. (One longer than the limit is refused unread, below.)
+    const declared = request.head.content_length orelse 0;
+    const bytes = 2 * @min(declared, body_limit);
+    switch (app.gate.enter(app.gpa, app.io, key_hash, key.max_concurrent, bytes)) {
+        .ok => {
+            hold.* = .{ .held = true, .bytes = bytes };
+            return true;
+        },
+        .concurrency => try respondRetryLater(acc, request, .too_many_requests, "concurrency_limit_exceeded", "this key has too many requests in flight; retry when some have finished"),
+        .key_share => try respondRetryLater(acc, request, .too_many_requests, "request_memory_exceeded", "the requests this key has in flight are too large together; retry when some have finished"),
+        .budget => try respondRetryLater(acc, request, .service_unavailable, "overloaded", "the gateway is holding as many requests as it has memory for; retry shortly"),
+    }
+    return false;
+}
+
+/// Why a step that needs a JSON value tree was not carried out.
+const TreeRefusal = enum {
+    /// The tree would pass its cap: the text is too expensive for its size.
+    too_complex,
+    /// The key has its share of the tree budget reserved already.
+    key_share,
+    /// The tree budget as a whole is reserved.
+    budget,
+};
+
+/// Run `f(allocator, args...)`, a step that parses JSON into a value tree,
+/// inside an arena capped by the size of the text (`limits.treeCap`), with
+/// that cap reserved against the tree budget for as long as the tree lives;
+/// its result is copied into `arena` and the tree is gone when this returns.
+/// Null with `refusal` set when a limit stopped it; null without when `f`
+/// itself said no (or failed on the JSON).
+fn inTree(
+    app: *App,
+    arena: std.mem.Allocator,
+    key_hash: *const [64]u8,
+    text_len: usize,
+    refusal: *?TreeRefusal,
+    comptime f: anytype,
+    args: anytype,
+) error{OutOfMemory}!?[]u8 {
+    if (refusal.* != null) return null;
+    const cap = limits.treeCap(text_len);
+    switch (app.gate.reserveTree(app.io, key_hash, cap)) {
+        .ok => {},
+        .key_share => {
+            refusal.* = .key_share;
+            return null;
+        },
+        .budget, .concurrency => {
+            refusal.* = .budget;
+            return null;
+        },
+    }
+    defer app.gate.releaseTree(app.io, key_hash, cap);
+    var tree: limits.Tree = undefined;
+    tree.init(app.gpa, cap);
+    defer tree.deinit();
+    // Both `![]u8` and `!?[]u8` are accepted.
+    const out: ?[]u8 = @call(.auto, f, .{tree.allocator()} ++ args) catch |err| switch (err) {
+        error.OutOfMemory => {
+            if (!tree.refused()) return error.OutOfMemory;
+            refusal.* = .too_complex;
+            return null;
+        },
+        else => return null,
+    };
+    return if (out) |bytes| try arena.dupe(u8, bytes) else null;
+}
+
+/// `body` with `stream_options.include_usage` set, for a request that
+/// already has a `stream_options` (one without is spliced, see jsonscan).
+fn requestUsage(a: std.mem.Allocator, body: []const u8) ![]u8 {
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+    if (value != .object) return error.InvalidJson;
+    var so: std.json.ObjectMap = if (value.object.get("stream_options")) |v| (if (v == .object) v.object else .empty) else .empty;
+    try so.put(a, "include_usage", .{ .bool = true });
+    try value.object.put(a, "stream_options", .{ .object = so });
+    return std.json.Stringify.valueAlloc(a, value, .{});
+}
+
+/// The response-cache key of a request, or null when the request is not
+/// worth the tree its canonical form takes (too many members in one object,
+/// or more memory than its cap): such a request is served, just not cached.
+fn cacheKeyFor(app: *App, route_model: []const u8, path: []const u8, key_hash: *const [64]u8, body: []const u8, top: jsonscan.Top) ?cache.Key {
+    if (top.max_members > guard_mod.max_tree_members) return null;
+    const cap = limits.treeCap(body.len);
+    if (app.gate.reserveTree(app.io, key_hash, cap) != .ok) return null;
+    defer app.gate.releaseTree(app.io, key_hash, cap);
+    var tree: limits.Tree = undefined;
+    tree.init(app.gpa, cap);
+    defer tree.deinit();
+    const a = tree.allocator();
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return null;
+    return cache.keyFor(a, route_model, path, key_hash, value) catch null;
+}
+
+/// Answer a request whose conversion was stopped by a cap in limits.zig.
+fn respondTreeRefusal(acc: *logging.Access, request: *http.Server.Request, refusal: ?TreeRefusal) !void {
+    return switch (refusal orelse .too_complex) {
+        .too_complex => respondError(acc, request, .bad_request, "request_too_complex", "the request body is too complex to convert for this model's provider: an object with more than 1024 members, or far more values than its size suggests"),
+        .key_share => respondRetryLater(acc, request, .too_many_requests, "request_memory_exceeded", "this key is converting as many large requests as it may at once; retry shortly"),
+        .budget => respondRetryLater(acc, request, .service_unavailable, "overloaded", "the gateway is converting as many requests as it has memory for; retry shortly"),
+    };
+}
+
 fn noteFailure(app: *App, upstream: []const u8) void {
     const now_ms = Io.Timestamp.now(app.io, .awake).toMilliseconds();
     if (app.health.recordFailure(app.gpa, app.io, upstream, now_ms)) {
@@ -745,6 +969,8 @@ fn noteFailure(app: *App, upstream: []const u8) void {
 /// The client timeout armed on `guard` covers the read and ends with it.
 fn readBody(arena: std.mem.Allocator, request: *http.Server.Request, guard: *watchdog.Conn, limit: usize) !?[]u8 {
     defer guard.disarm();
+    // A length that is already too long is refused without reading any of it.
+    if (request.head.content_length) |declared| if (declared > limit) return null;
     var body_buf: [8 * 1024]u8 = undefined;
     const body_reader = try request.readerExpectContinue(&body_buf);
     return body_reader.allocRemaining(arena, .limited(limit)) catch |err| switch (err) {
@@ -856,8 +1082,10 @@ const Capture = struct {
     }
 };
 
-/// Optional inputs and outputs of `forward` that most calls do not use.
+/// Further inputs and outputs of `forward`.
 const ForwardExtras = struct {
+    /// Whose request this is (for the tree budget, see `inTree`).
+    key_hash: *const [64]u8,
     /// Where to copy a non-streaming answer for the response cache.
     capture: ?*Capture = null,
     /// Value for `x-omnigate-cache` on the response ("miss"), if any.
@@ -865,6 +1093,16 @@ const ForwardExtras = struct {
     /// Out: the upstream's `retry-after` when it answered with a status we
     /// fail over on.
     retry_after: ?[]const u8 = null,
+    /// Out: set when `forward` failed because the client went away (or
+    /// stopped reading) while the upstream was still answering. The open
+    /// exchange is handed to the caller, who owns it from then on.
+    parked: ?Parked = null,
+};
+
+/// An upstream exchange whose response body is still being read.
+const Parked = struct {
+    req: http.Client.Request,
+    body: framing.BodyReader,
 };
 
 const ForwardResult = union(enum) {
@@ -897,7 +1135,12 @@ const UpstreamCall = struct {
     req_live: bool = false,
 
     fn deinit(call: *UpstreamCall) void {
-        if (call.req_live) call.req.deinit();
+        if (call.req_live) {
+            // Whatever is left of the response body is not for std to read
+            // (see framing.zig): the connection is closed instead.
+            framing.disown(&call.req);
+            call.req.deinit();
+        }
         call.req_live = false;
     }
 
@@ -988,6 +1231,7 @@ fn worthRetrying(err: anyerror) bool {
         error.UpstreamTimeout,
         error.StreamIdleTimeout,
         error.UpstreamUnparseable,
+        error.UpstreamTruncated,
         error.ConnectionRefused,
         error.OutOfMemory,
         error.Canceled,
@@ -1016,6 +1260,7 @@ fn forward(
     extras: *ForwardExtras,
 ) !ForwardResult {
     if (extras.capture) |c| c.reset();
+    extras.parked = null;
     // A fresh reader for this attempt's response.
     usage.* = .{};
     // While waiting for the upstream its own timeout applies, not the
@@ -1067,12 +1312,17 @@ fn forward(
     const timeout_ms = if (up.timeout_ms != 0) up.timeout_ms else app.upstream_timeout_ms;
     var response = try call.openWithTimeout(app.io, timeout_ms);
 
-    // From here on bytes have to keep moving: if the upstream goes silent, or
-    // the client stops reading, for the idle timeout, the watchdog cancels
-    // this task and the read or write below fails.
+    // From here on bytes have to keep moving: if the upstream goes silent for
+    // the idle timeout, or the client takes nothing for the (shorter) stall
+    // timeout, the watchdog cancels this task and the read or write below
+    // fails. The deadline is set before each of them.
     guard.arm(app.io, app.stream_idle_timeout_ms);
 
     const status = response.head.status;
+    // A final answer is 200 or above. (std has dealt with `100 Continue`;
+    // any other 1xx here is not an answer, and std asserts if asked to send
+    // a 100 as one.)
+    if (@backingInt(status) < 200) return error.UpstreamUnparseable;
     // Copy what we need from the head before the body reader invalidates it:
     // first the provider headers that are meant for the caller (headers.zig).
     const relayed = try headers_mod.collect(arena, response.head.bytes);
@@ -1081,12 +1331,15 @@ fn forward(
         return .{ .retry = status };
     }
 
-    const content_type = try arena.dupe(u8, response.head.content_type orelse "application/json");
-    const content_length = response.head.content_length;
+    const content_type = try relayedContentType(arena, response.head.content_type);
     const is_sse = std.ascii.startsWithIgnoreCase(content_type, "text/event-stream");
 
-    var transfer_buf: [64]u8 = undefined;
-    const upstream_body = response.reader(&transfer_buf);
+    // The body is framed and read by framing.zig from here on, never by
+    // std: a head with two framings is refused, a chunk size is bounded, and
+    // a body that ends before its promised length is an error, not an end.
+    // (Everything wanted from the head has been copied: reading the body
+    // reuses its buffer.)
+    var upstream_body = framing.takeBody(&call.req, &response) catch return error.UpstreamUnparseable;
     var chunk: [16 * 1024]u8 = undefined;
 
     // Response headers: ours, then the provider's that passed the allowlist.
@@ -1114,11 +1367,12 @@ fn forward(
     // --- translated, not a stream: buffer, convert, answer in one piece -----
     if (mode == .translate and !is_sse) {
         const x = mode.translate;
-        const raw = upstream_body.allocRemaining(arena, .limited(max_translated_body)) catch |err| switch (err) {
-            error.ReadFailed => return if (guard.timedOut()) error.StreamIdleTimeout else (response.bodyErr() orelse error.ReadFailed),
+        const raw = upstream_body.readAlloc(arena, max_translated_body) catch |err| switch (err) {
+            error.ReadFailed => return if (guard.timedOut()) error.StreamIdleTimeout else error.ReadFailed,
             error.StreamTooLong => return error.UpstreamUnparseable,
             else => |e| return e,
         };
+        framing.release(&call.req, &upstream_body);
         // Translation re-serialises this; refuse what the serialiser cannot take.
         if (!guard_mod.jsonDepthOk(raw, guard_mod.max_upstream_json_depth)) return error.UpstreamUnparseable;
         if (@backingInt(status) == 400 and !x.sampling_stripped and quirks.mentionsSampling(raw)) return .drop_sampling;
@@ -1126,11 +1380,11 @@ fn forward(
             quirks.mentionsThoughtSignature(raw)) return .add_thought_signature;
         usage.feed(raw);
         const now_s = @divTrunc(Io.Timestamp.now(app.io, .real).toMilliseconds(), 1000);
-        const converted = translate.translateResponseAt(arena, x.dir, @backingInt(status), raw, x.route_model, now_s) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            // Not the shape its protocol promises: treat like a failed upstream.
-            else => return error.UpstreamUnparseable,
-        };
+        // A tree of the upstream's answer, capped like one of a request: an
+        // answer that needs more is not the shape its protocol promises.
+        var refusal: ?TreeRefusal = null;
+        const converted = (try inTree(app, arena, extras.key_hash, raw.len, &refusal, translate.translateResponseAt, .{ x.dir, @backingInt(status), raw, x.route_model, now_s })) orelse
+            return error.UpstreamUnparseable;
         if (extras.capture) |c| {
             c.add(arena, converted);
             c.content_type = "application/json";
@@ -1138,15 +1392,48 @@ fn forward(
         }
         committed.* = true;
         out_headers.items[0].value = "application/json";
+        guard.arm(app.io, app.client_stall_timeout_ms);
         try request.respond(converted, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
         return .{ .done = status };
     }
 
+    // --- not a stream: a small answer is buffered and sent with its length ---
+    // The length is counted here, not taken from the upstream. If the body
+    // is cut short there is still time to fail over: nothing has been sent.
+    var head_start: []const u8 = "";
+    if (!is_sse) {
+        var small: std.ArrayList(u8) = .empty;
+        const ended = while (small.items.len <= small_body_max) {
+            const n = upstream_body.read(&chunk) catch |err| return upstreamReadError(err, guard);
+            if (n == 0) break true;
+            try small.appendSlice(arena, chunk[0..n]);
+            guard.arm(app.io, app.stream_idle_timeout_ms);
+        } else false;
+        if (ended) {
+            framing.release(&call.req, &upstream_body);
+            usage.feed(small.items);
+            if (extras.capture) |c| {
+                c.add(arena, small.items);
+                c.content_type = content_type;
+                c.complete = !c.overflow;
+            }
+            committed.* = true;
+            guard.arm(app.io, app.client_stall_timeout_ms);
+            try request.respond(small.items, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
+            return .{ .done = status };
+        }
+        head_start = small.items;
+    }
+
+    // --- a stream, or a long answer: chunked ----------------------------------
+    // Never with a length: what the upstream declared is a claim, and std
+    // asserts when a response ends with a different number of bytes than its
+    // own head promised. If the upstream fails part way, the client's
+    // connection is dropped without the closing chunk, which is how a
+    // chunked response says "this was cut short".
     committed.* = true;
     var resp_buf: [8 * 1024]u8 = undefined;
     var body_writer = try request.respondStreaming(&resp_buf, .{
-        // Only an untouched body keeps the upstream's length.
-        .content_length = if (mode == .passthrough) content_length else null,
         .respond_options = .{
             .status = status,
             .extra_headers = out_headers.items,
@@ -1165,34 +1452,30 @@ fn forward(
     var usage_filter: usage_mod.UsageChunkFilter = .{};
     defer usage_filter.deinit(arena);
 
-    // Once the client has gone, the upstream is still read for a while: the
-    // usage that says what this cost usually arrives at the very end.
-    var client_gone = false;
-    var drained: usize = 0;
+    var pending: []const u8 = head_start;
     while (true) {
-        var vec = [_][]u8{&chunk};
-        const n = upstream_body.readVec(&vec) catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.ReadFailed => {
-                if (client_gone) return error.ClientDisconnected;
-                return if (guard.timedOut()) error.StreamIdleTimeout else (response.bodyErr() orelse error.ReadFailed);
-            },
+        const data: []const u8 = if (pending.len > 0) first: {
+            const d = pending;
+            pending = "";
+            break :first d;
+        } else next: {
+            guard.arm(app.io, app.stream_idle_timeout_ms);
+            const n = upstream_body.read(&chunk) catch |err| return upstreamReadError(err, guard);
+            if (n == 0) break;
+            break :next chunk[0..n];
         };
-        if (n == 0) continue;
-        usage.feed(chunk[0..n]);
-        if (client_gone) {
-            drained += n;
-            if (usage.final_seen or drained > max_abort_drain_bytes) return error.ClientDisconnected;
-            continue;
-        }
+        usage.feed(data);
+        // A client that is connected but takes nothing gets the stall
+        // timeout, not the (much longer) one for a silent upstream.
+        guard.arm(app.io, app.client_stall_timeout_ms);
         const sent: anyerror!void = sent: {
             if (translator) |*tr| {
-                tr.feed(chunk[0..n], &body_writer.writer) catch |e| break :sent e;
+                tr.feed(data, &body_writer.writer) catch |e| break :sent e;
             } else if (mode == .hide_usage_chunk and is_sse) {
-                usage_filter.feed(arena, chunk[0..n], &body_writer.writer) catch |e| break :sent e;
+                usage_filter.feed(arena, data, &body_writer.writer) catch |e| break :sent e;
             } else {
-                if (capturing) |c| c.add(arena, chunk[0..n]);
-                body_writer.writer.writeAll(chunk[0..n]) catch |e| break :sent e;
+                if (capturing) |c| c.add(arena, data);
+                body_writer.writer.writeAll(data) catch |e| break :sent e;
             }
             // Flush per chunk so SSE tokens reach the client immediately: first
             // our body buffer into the HTTP framing, then the framing to the socket
@@ -1201,20 +1484,23 @@ fn forward(
             body_writer.flush() catch |e| break :sent e;
         };
         sent catch |err| {
-            // Nothing more can reach the client. If this task was cancelled
-            // (the client stopped reading until the idle timeout), or draining
-            // is off, or the figures are already in, stop here.
-            if (err == error.OutOfMemory) return err;
-            if (guard.timedOut()) return error.StreamIdleTimeout;
-            if (usage.final_seen or app.abort_drain_ms == 0) return error.ClientDisconnected;
-            client_gone = true;
-            // One allowance for the whole drain; it is not renewed per read.
-            guard.arm(app.io, app.abort_drain_ms);
-            continue;
+            if (err == error.OutOfMemory or err == error.EventTooLarge) return err;
+            // Nothing more can reach the client: it hung up, or it stopped
+            // reading and the watchdog cancelled the write. The upstream is
+            // still answering, and the usage that says what this cost
+            // usually comes last. Unless the figures are already in (or
+            // draining is off), hand the open exchange to the caller, who
+            // has it read to its end in the background.
+            const stalled = guard.timedOut();
+            if (!usage.final_seen and app.abort_drain_ms != 0) {
+                extras.parked = .{ .req = call.req, .body = upstream_body };
+                call.req_live = false;
+            }
+            return if (stalled) error.ClientStalled else error.ClientDisconnected;
         };
-        guard.arm(app.io, app.stream_idle_timeout_ms);
     }
-    if (client_gone) return error.ClientDisconnected;
+    framing.release(&call.req, &upstream_body);
+    guard.arm(app.io, app.client_stall_timeout_ms);
     if (translator) |*tr| try tr.finish(&body_writer.writer);
     if (mode == .hide_usage_chunk and is_sse) try usage_filter.finish(&body_writer.writer);
     try body_writer.end();
@@ -1223,6 +1509,209 @@ fn forward(
         c.complete = !c.overflow;
     }
     return .{ .done = status };
+}
+
+/// What a failed read of an upstream's body means for the request.
+fn upstreamReadError(err: framing.BodyReader.Error, guard: *const watchdog.Conn) anyerror {
+    return switch (err) {
+        // The watchdog cancelled the read: the upstream went silent.
+        error.ReadFailed => if (guard.timedOut()) error.StreamIdleTimeout else error.ReadFailed,
+        error.UpstreamTruncated => error.UpstreamTruncated,
+        error.UpstreamUnparseable => error.UpstreamUnparseable,
+    };
+}
+
+/// The `content-type` to put on our response for one an upstream (or the
+/// control plane) sent: the same rule as for every other relayed header,
+/// nothing with a control byte in it. std's head parser splits lines on CRLF
+/// only, so a value can arrive here with a bare line feed inside, which
+/// written out again would start a header line of the peer's choosing.
+fn relayedContentType(arena: std.mem.Allocator, value: ?[]const u8) ![]const u8 {
+    const raw = value orelse return "application/json";
+    if (!framing.plainHeaderValue(raw, max_content_type_len)) return error.UpstreamUnparseable;
+    return arena.dupe(u8, raw);
+}
+
+// ---------------------------------------------------------------------------
+// Reading on after the client has gone
+// ---------------------------------------------------------------------------
+
+/// Upstream answers that are being read to their end without a client.
+///
+/// When a client hangs up (or stops reading) in the middle of a stream, the
+/// provider goes on generating and charges for it, and the usage that says
+/// how much arrives at the very end. So the open exchange is taken off the
+/// client's connection, which is finished with, and read on by a task of its
+/// own: to the provider's closing usage, or the end of the answer, or until
+/// OMNIGATE_ABORT_DRAIN_MS or OMNIGATE_ABORT_DRAIN_MAX_MB is reached. Only
+/// then is the upstream connection closed (which is what makes a provider
+/// stop), and the request is billed: the provider's figures if they came, an
+/// estimate marked as one if they did not.
+///
+/// Each of these still counts against its key's concurrency cap, so leaving
+/// and coming back is not a way around it.
+pub const Drains = struct {
+    group: Io.Group = .init,
+    /// Guards `group` (adding to it and stopping it) and `stopping`.
+    mutex: Io.Mutex = .init,
+    stopping: bool = false,
+    active: std.atomic.Value(u32) = .init(0),
+
+    /// More than this at once are not read on: they are billed by estimate
+    /// at once, as with draining switched off.
+    pub const max_active = 256;
+
+    /// At shutdown: cancel what is running (each bills what it has) and wait.
+    pub fn stop(d: *Drains, io: Io) void {
+        d.mutex.lockUncancelable(io);
+        d.stopping = true;
+        d.mutex.unlock(io);
+        d.group.cancel(io);
+    }
+};
+
+const DrainJob = struct {
+    app: *App,
+    /// Owns the strings in `event`.
+    arena: std.heap.ArenaAllocator,
+    req: http.Client.Request,
+    body: framing.BodyReader,
+    usage: Usage,
+    kind: config.Kind,
+    input_estimate: u64,
+    event: UsageReport,
+    key_hash: [64]u8,
+    hold: Hold,
+    started: Io.Timestamp,
+    drained: u64 = 0,
+
+    fn destroy(job: *DrainJob) void {
+        const app = job.app;
+        // Not at a message boundary (or it would have been released): closes.
+        job.req.deinit();
+        job.hold.release(app, &job.key_hash);
+        job.arena.deinit();
+        app.gpa.destroy(job);
+        _ = app.drains.active.fetchSub(1, .acq_rel);
+    }
+};
+
+/// Take over `parked` and read it to its end in the background; `event` is
+/// what would be billed now, and is billed with the final figures then.
+/// False when that was not possible: nothing was taken, and the caller
+/// bills `event` itself.
+fn startDrain(
+    app: *App,
+    parked: *Parked,
+    usage: *const Usage,
+    kind: config.Kind,
+    input_estimate: u64,
+    event: UsageReport,
+    key_hash: *const [64]u8,
+    hold: Hold,
+    started: Io.Timestamp,
+) bool {
+    const d = app.drains;
+    if (d.active.fetchAdd(1, .acq_rel) >= Drains.max_active) {
+        _ = d.active.fetchSub(1, .acq_rel);
+        return false;
+    }
+    const job = app.gpa.create(DrainJob) catch {
+        _ = d.active.fetchSub(1, .acq_rel);
+        return false;
+    };
+    job.* = .{
+        .app = app,
+        .arena = .init(app.gpa),
+        .req = parked.req,
+        .body = parked.body,
+        .usage = usage.*,
+        .kind = kind,
+        .input_estimate = input_estimate,
+        .event = event,
+        .key_hash = key_hash.*,
+        .hold = hold,
+        .started = started,
+    };
+    const started_ok = ok: {
+        // The event's strings belong to the request that is about to end.
+        const a = job.arena.allocator();
+        job.event.id = a.dupe(u8, event.id) catch break :ok false;
+        job.event.key_sha256 = &job.key_hash;
+        job.event.route_model = a.dupe(u8, event.route_model) catch break :ok false;
+        job.event.upstream = if (event.upstream) |u| a.dupe(u8, u) catch break :ok false else null;
+        job.event.target_model = if (event.target_model) |m| a.dupe(u8, m) catch break :ok false else null;
+        const attempts = a.alloc(Attempt, event.attempts.len) catch break :ok false;
+        for (attempts, event.attempts) |*to, from| {
+            to.* = from;
+            to.upstream = a.dupe(u8, from.upstream) catch break :ok false;
+            to.outcome = a.dupe(u8, from.outcome) catch break :ok false;
+        }
+        job.event.attempts = attempts;
+
+        d.mutex.lockUncancelable(app.io);
+        defer d.mutex.unlock(app.io);
+        if (d.stopping) break :ok false;
+        d.group.concurrent(app.io, drainTask, .{job}) catch break :ok false;
+        break :ok true;
+    };
+    if (!started_ok) {
+        // Give everything back except the exchange and the hold, which are
+        // still the caller's.
+        job.arena.deinit();
+        app.gpa.destroy(job);
+        _ = d.active.fetchSub(1, .acq_rel);
+        return false;
+    }
+    return true;
+}
+
+fn drainTask(job: *DrainJob) Io.Cancelable!void {
+    const app = job.app;
+    defer job.destroy();
+
+    // The reading runs as a task of its own so that it can be cancelled
+    // while blocked: by the timer here, or by shutdown through this task.
+    const Race = union(enum) { read: void, timer: Io.Cancelable!void };
+    var results: [2]Race = undefined;
+    var race: Io.Select(Race) = .init(app.io, &results);
+    if (race.concurrent(.read, drainRead, .{job})) |_| {
+        // Without a timer there is no bound on how long this may take, so
+        // without one (no spare concurrency) the reading is stopped at once.
+        if (race.concurrent(.timer, sleepMs, .{ app.io, app.abort_drain_ms })) |_| {
+            _ = race.await() catch {};
+        } else |_| {}
+        race.cancelDiscard();
+    } else |_| {
+        // No spare concurrency: bill what is known.
+    }
+
+    const estimated = !job.usage.final_seen;
+    const used = if (estimated) job.usage.estimated(job.kind, job.input_estimate) else job.usage.normalized(job.kind);
+    job.event.input_tokens = used.input_tokens;
+    job.event.cached_input_tokens = used.cached_input_tokens;
+    job.event.cache_write_input_tokens = used.cache_write_input_tokens;
+    job.event.output_tokens = used.output_tokens;
+    job.event.estimated = estimated;
+    job.event.latency_ms = job.started.durationTo(Io.Timestamp.now(app.io, .awake)).toMilliseconds();
+    if (job.body.atBoundary()) framing.release(&job.req, &job.body);
+    log.info("request {s}: read {d} more bytes from {s} after the client left; billing {s} usage (in={d} out={d})", .{
+        job.event.id,                                     job.drained,       job.event.upstream orelse "-",
+        if (estimated) "ESTIMATED" else "the provider's", used.input_tokens, used.output_tokens,
+    });
+    report(app, job.arena.allocator(), job.event);
+}
+
+/// Read the rest of the upstream's answer, metering it, until its closing
+/// usage has been seen, it ends, it fails, or the byte cap is reached.
+fn drainRead(job: *DrainJob) void {
+    var chunk: [16 * 1024]u8 = undefined;
+    while (!job.usage.final_seen and job.drained <= job.app.abort_drain_max_bytes) {
+        const n = job.body.read(&chunk) catch return;
+        if (n == 0) return;
+        job.usage.feed(chunk[0..n]);
+        job.drained += n;
+    }
 }
 
 /// Hand a `/v1/jobs*` or `/v1/files/*` request to the control plane at
@@ -1240,7 +1729,8 @@ fn forwardToControl(
     /// ... and plain (see `guard.safeQuery`): both were checked by the caller.
     query: []const u8,
     body: ?[]u8,
-    hdrs: ClientHeaders,
+    /// Checked by the caller (`guard.visibleToken`).
+    idempotency_key: ?[]const u8,
     key_sha256: ?[]const u8,
 ) !void {
     // The control plane's address comes from our own configuration; the
@@ -1263,7 +1753,7 @@ fn forwardToControl(
     var extra: std.ArrayList(http.Header) = .empty;
     try extra.append(arena, .{ .name = control.internal_header, .value = app.internal_token });
     if (key_sha256) |k| try extra.append(arena, .{ .name = "x-omnigate-key-sha256", .value = k });
-    if (hdrs.idempotency_key) |k| try extra.append(arena, .{ .name = "idempotency-key", .value = k });
+    if (idempotency_key) |k| if (guard_mod.visibleToken(k, 255)) try extra.append(arena, .{ .name = "idempotency-key", .value = k });
     // Our id for this request, so that the control plane's log lines (and
     // the `request_id` in a 500 from it) match what the client was given.
     try extra.append(arena, .{ .name = "x-omnigate-request-id", .value = acc.request_id.get() });
@@ -1301,14 +1791,21 @@ fn forwardToControl(
     guard.arm(app.io, app.stream_idle_timeout_ms);
 
     const status = response.head.status;
-    acc.status = @backingInt(status);
-    const content_type = try arena.dupe(u8, response.head.content_type orelse "application/json");
-    const content_length = response.head.content_length;
+    // The control plane is ours, but what answers on its address is a
+    // network peer like any other: same rules as for an upstream.
+    const malformed = "the control plane sent an answer the gateway could not read";
+    if (@backingInt(status) < 200) return respondError(acc, request, .bad_gateway, "control_plane_unavailable", malformed);
+    const content_type = relayedContentType(arena, response.head.content_type) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return respondError(acc, request, .bad_gateway, "control_plane_unavailable", malformed),
+    };
 
     // What the control plane says about the answer that the client needs:
     // how a stored file is to be handled, where a bucket-stored one is, when
     // to retry (headers.zig has the list).
     const relayed = try headers_mod.collectFromControl(arena, response.head.bytes);
+    var control_body = framing.takeBody(&call.req, &response) catch
+        return respondError(acc, request, .bad_gateway, "control_plane_unavailable", malformed);
 
     const request_id = acc.request_id.get();
     var out_headers: std.ArrayList(http.Header) = .empty;
@@ -1319,30 +1816,56 @@ fn forwardToControl(
         .{ .name = "request-id", .value = request_id },
     });
     try out_headers.appendSlice(arena, relayed);
+
+    // Every JSON answer is small: buffered, counted, and sent with its real
+    // length (never the one the peer declared). A cut-short one is a 502
+    // instead of half an answer.
+    var chunk: [16 * 1024]u8 = undefined;
+    var small: std.ArrayList(u8) = .empty;
+    const ended = while (small.items.len <= small_body_max) {
+        const n = control_body.read(&chunk) catch |err| {
+            log.warn("control plane answer to {s} could not be read: {t}", .{ path, err });
+            return respondError(acc, request, .bad_gateway, "control_plane_unavailable", malformed);
+        };
+        if (n == 0) break true;
+        try small.appendSlice(arena, chunk[0..n]);
+        guard.arm(app.io, app.stream_idle_timeout_ms);
+    } else false;
+    acc.status = @backingInt(status);
+    if (ended) {
+        guard.arm(app.io, app.client_stall_timeout_ms);
+        return request.respond(small.items, .{ .status = status, .keep_alive = reusable(request), .extra_headers = out_headers.items });
+    }
+
+    // A file: streamed, chunked. If the control plane fails part way the
+    // connection is dropped without the closing chunk.
     var resp_buf: [8 * 1024]u8 = undefined;
     var body_writer = try request.respondStreaming(&resp_buf, .{
-        .content_length = content_length,
         .respond_options = .{
             .status = status,
             .extra_headers = out_headers.items,
         },
     });
-
-    var transfer_buf: [64]u8 = undefined;
-    const upstream_body = response.reader(&transfer_buf);
-    var chunk: [16 * 1024]u8 = undefined;
+    var pending: []const u8 = small.items;
     while (true) {
-        var vec = [_][]u8{&chunk};
-        const n = upstream_body.readVec(&vec) catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+        const data: []const u8 = if (pending.len > 0) first: {
+            const d = pending;
+            pending = "";
+            break :first d;
+        } else next: {
+            guard.arm(app.io, app.stream_idle_timeout_ms);
+            const n = control_body.read(&chunk) catch |err| return upstreamReadError(err, guard);
+            if (n == 0) break;
+            break :next chunk[0..n];
         };
-        if (n == 0) continue;
-        try body_writer.writer.writeAll(chunk[0..n]);
+        // A client that asks for a large file and then stops reading must
+        // not hold this connection for ever.
+        guard.arm(app.io, app.client_stall_timeout_ms);
+        try body_writer.writer.writeAll(data);
         try body_writer.writer.flush();
         try body_writer.flush();
-        guard.arm(app.io, app.stream_idle_timeout_ms);
     }
+    guard.arm(app.io, app.client_stall_timeout_ms);
     try body_writer.end();
 }
 
@@ -1370,6 +1893,28 @@ fn respondRateLimited(acc: *logging.Access, request: *http.Server.Request, retry
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
             .{ .name = "retry-after", .value = secs },
+            .{ .name = "x-omnigate-request-id", .value = id },
+            .{ .name = "x-request-id", .value = id },
+            .{ .name = "request-id", .value = id },
+        },
+    });
+}
+
+/// A refusal that is about load, not about the request: 429 or 503 with
+/// `retry-after: 1`, so that SDKs back off and try again by themselves.
+fn respondRetryLater(acc: *logging.Access, request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) !void {
+    acc.status = @backingInt(status);
+    acc.rejected = code;
+    const id = acc.request_id.get();
+    var buf: [768]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    errors.write(&w, protocolOf(acc), .{ .status = @backingInt(status), .reason = code, .message = message, .request_id = id }) catch {};
+    try request.respond(w.buffered(), .{
+        .status = status,
+        .keep_alive = reusable(request),
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "retry-after", .value = "1" },
             .{ .name = "x-omnigate-request-id", .value = id },
             .{ .name = "x-request-id", .value = id },
             .{ .name = "request-id", .value = id },

@@ -192,6 +192,8 @@ fn writeAccessJson(w: *Io.Writer, a: *const Access) Io.Writer.Error!void {
     try w.print(",\"input_tokens\":{d},\"output_tokens\":{d},\"latency_ms\":{d}", .{ a.input_tokens, a.output_tokens, a.latency_ms });
     if (a.cached_input_tokens != 0) try w.print(",\"cached_input_tokens\":{d}", .{a.cached_input_tokens});
     if (a.cache_hit) try w.writeAll(",\"cache\":\"hit\"");
+    // Same fact as ` usage=estimated` in the text form.
+    if (a.estimated) try w.writeAll(",\"estimated\":true");
     if (a.request_id.len > 0) {
         try w.writeAll(",\"request_id\":");
         try std.json.Stringify.value(a.request_id.get(), .{}, w);
@@ -276,6 +278,28 @@ test "access line: text and JSON carry the same fields, and never the key itself
     try std.testing.expectEqual(@as(i64, 200), o.get("status").?.integer);
     try std.testing.expectEqual(@as(i64, 2), o.get("attempts").?.integer);
     try std.testing.expectEqual(@as(i64, 6), o.get("output_tokens").?.integer);
+    // Only present when it is true.
+    try std.testing.expect(o.get("estimated") == null);
+}
+
+test "an estimated bill is marked as one in both log formats" {
+    var a: Access = .{ .method = "POST", .status = 499, .attempts = 1, .input_tokens = 40, .output_tokens = 7, .latency_ms = 3, .estimated = true };
+    a.path.set("/v1/chat/completions");
+    a.upstream.set("mock-ok");
+
+    var buf: [1024]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try writeAccessText(&w, &a);
+    try std.testing.expect(std.mem.find(u8, w.buffered(), " usage=estimated ") != null);
+
+    var jbuf: [1024]u8 = undefined;
+    var jw: Io.Writer = .fixed(&jbuf);
+    try jw.writeAll("{\"x\":1");
+    try writeAccessJson(&jw, &a);
+    try jw.writeAll("}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, jw.buffered(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(true, parsed.value.object.get("estimated").?.bool);
 }
 
 test "a long path is cut, not overflowed" {

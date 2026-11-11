@@ -7,11 +7,16 @@ const std = @import("std");
 const Io = std.Io;
 const http = std.http;
 const config = @import("config.zig");
+const framing = @import("framing.zig");
 const App = @import("main.zig").App;
 
 const log = std.log.scoped(.control);
 
 pub const internal_header = "x-omnigate-internal";
+
+/// No answer from the control plane is larger than this (a config snapshot
+/// with tens of thousands of keys is a few megabytes).
+const max_response_bytes = 256 * 1024 * 1024;
 
 /// One request to the control plane.
 ///
@@ -35,7 +40,11 @@ fn call(app: *App, method: http.Method, path: []const u8, payload: ?[]const u8, 
         },
         .extra_headers = &extra,
     });
-    defer req.deinit();
+    defer {
+        // The response body is read here, never by std (see framing.zig).
+        framing.disown(&req);
+        req.deinit();
+    }
 
     if (payload) |p| {
         req.transfer_encoding = .{ .content_length = p.len };
@@ -50,17 +59,18 @@ fn call(app: *App, method: http.Method, path: []const u8, payload: ?[]const u8, 
     var response = try req.receiveHead(&.{});
     const status = response.head.status;
 
-    var transfer_buf: [64]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
-    if (out) |w| {
-        _ = reader.streamRemaining(w) catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
-            else => |e| return e,
-        };
-    } else {
-        _ = reader.discardRemaining() catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
-        };
+    // The control plane is ours, but what answers on its address is still
+    // a network peer: its body is read with the same bounded reader as an
+    // upstream's, and a body that ends early is a failed call.
+    var body = try framing.takeBody(&req, &response);
+    var chunk: [16 * 1024]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try body.read(&chunk);
+        if (n == 0) break;
+        total += n;
+        if (total > max_response_bytes) return error.ResponseTooLarge;
+        if (out) |w| try w.writeAll(chunk[0..n]);
     }
     return status;
 }

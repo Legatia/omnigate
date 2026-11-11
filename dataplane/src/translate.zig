@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const guard = @import("guard.zig");
+const limits = @import("limits.zig");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const json = std.json;
@@ -28,6 +29,12 @@ const default_max_tokens = 4096;
 const json_object_instruction = "Respond with a single valid JSON object and nothing else: no prose, no code fences.";
 /// Upper bound on one buffered SSE line / event.
 const max_event_bytes = 4 * 1024 * 1024;
+/// Upper bound on the memory for parsing one event into a tree. Real events
+/// are a few hundred bytes; an upstream that sends megabytes of tiny values
+/// in one event ends its stream instead of taking gigabytes.
+const max_event_tree_bytes = 32 * 1024 * 1024;
+/// Parse memory kept between events (the rest is returned after each).
+const event_tree_retained_bytes = 256 * 1024;
 
 pub const Direction = enum {
     /// Client speaks OpenAI chat completions; upstream is Anthropic messages.
@@ -94,6 +101,10 @@ fn parseObject(a: Allocator, body: []const u8) error{ OutOfMemory, InvalidJson }
     // Everything parsed here is serialised again, and the serialiser indexes
     // past a fixed stack on values nested deeper than 256.
     if (!guard.jsonDepthOk(body, guard.max_upstream_json_depth)) return error.InvalidJson;
+    // ... and the tree it is parsed into keeps each object in a hash map
+    // with a fixed seed: keys chosen to collide cost the square of their
+    // number, so that number is bounded first.
+    if (!guard.jsonMembersOk(body, guard.max_tree_members)) return error.InvalidJson;
     const v = json.parseFromSliceLeaky(Value, a, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidJson,
@@ -405,7 +416,8 @@ fn parseToolInput(a: Allocator, arguments: []const u8) !Value {
     if (trimmed.len == 0) return .{ .object = .empty };
     // JSON inside a string is not covered by the depth check on the body it
     // came in; too deep, and it is kept as the string it arrived as.
-    const parsed: ?Value = if (!guard.jsonDepthOk(trimmed, guard.max_client_json_depth))
+    const parsed: ?Value = if (!guard.jsonDepthOk(trimmed, guard.max_client_json_depth) or
+        !guard.jsonMembersOk(trimmed, guard.max_tree_members))
         null
     else
         json.parseFromSliceLeaky(Value, a, trimmed, .{}) catch |err| switch (err) {
@@ -866,6 +878,15 @@ pub fn translateError(arena: Allocator, dir: Direction, status: u16, upstream_bo
         error.InvalidJson => {},
     }
     if (message.len == 0) message = try std.fmt.allocPrint(arena, "upstream returned HTTP {d}", .{status});
+    // A body that is not text (compressed, binary, another encoding) cannot
+    // be a JSON string; the serialiser would write it as an array of
+    // numbers, which no client reads as a message.
+    if (!std.unicode.utf8ValidateSlice(message)) {
+        message = try std.fmt.allocPrint(arena, "upstream returned HTTP {d} with a body that is not valid text", .{status});
+    }
+    if (upstream_type) |t| if (!std.unicode.utf8ValidateSlice(t)) {
+        upstream_type = null;
+    };
 
     return switch (dir) {
         .openai_to_anthropic => json.Stringify.valueAlloc(arena, .{
@@ -898,15 +919,19 @@ pub const StreamOptions = struct {
 /// Incremental SSE translation: upstream event stream in, client-protocol
 /// event stream out.
 ///
-/// Do not copy after the first `feed`: it owns a scratch arena. Memory held is
+/// Do not copy after the first `feed`: it owns a scratch arena (set up on
+/// first use, because it points back into this struct). Memory held is
 /// bounded by the largest single event, not by the length of the stream.
 pub const StreamTranslator = struct {
     arena: Allocator,
     dir: Direction,
     route_model: []const u8,
     opts: StreamOptions,
-    /// Per-event parse memory, reset after every event.
-    scratch: std.heap.ArenaAllocator,
+    /// Per-event parse memory, reset after every event, and capped: what
+    /// one event may cost is not for the upstream to decide.
+    scratch: std.heap.ArenaAllocator = undefined,
+    scratch_cap: limits.Capped = undefined,
+    scratch_ready: bool = false,
     /// Partial line carried over between chunks.
     line: std.ArrayList(u8) = .empty,
     /// `data:` payload of the event being assembled.
@@ -933,6 +958,9 @@ pub const StreamTranslator = struct {
     blocks_opened: usize = 0,
     upstream_tool_index: i64 = -1,
     upstream_tool_id: []const u8 = "",
+    /// Holds `upstream_tool_id`. One buffer reused for every tool call, so a
+    /// stream with many of them does not keep every id it ever saw.
+    tool_id_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(arena: Allocator, dir: Direction, route_model: []const u8, opts: StreamOptions) StreamTranslator {
         return .{
@@ -940,7 +968,6 @@ pub const StreamTranslator = struct {
             .dir = dir,
             .route_model = route_model,
             .opts = opts,
-            .scratch = .init(arena),
         };
     }
 
@@ -1013,7 +1040,7 @@ pub const StreamTranslator = struct {
         defer {
             self.data.clearRetainingCapacity();
             self.has_data = false;
-            _ = self.scratch.reset(.retain_capacity);
+            if (self.scratch_ready) _ = self.scratch.reset(.{ .retain_with_limit = event_tree_retained_bytes });
         }
         if (self.done) return;
         const payload = std.mem.trim(u8, self.data.items, " \t\r\n");
@@ -1027,6 +1054,11 @@ pub const StreamTranslator = struct {
     /// Parse one event payload; `null` for anything that is not a JSON object
     /// (skipped rather than aborting a live stream).
     fn parseEvent(self: *StreamTranslator, payload: []const u8) error{OutOfMemory}!?ObjectMap {
+        if (!self.scratch_ready) {
+            self.scratch_cap = .{ .child = self.arena, .left = max_event_tree_bytes };
+            self.scratch = .init(self.scratch_cap.allocator());
+            self.scratch_ready = true;
+        }
         return parseObject(self.scratch.allocator(), payload) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidJson => null,
@@ -1282,10 +1314,14 @@ pub const StreamTranslator = struct {
         const same = self.block == .tool and self.upstream_tool_index == index and
             (id.len == 0 or eql(id, self.upstream_tool_id));
         if (!same) {
-            const block_id = if (id.len > 0)
-                try self.arena.dupe(u8, id)
-            else
-                try std.fmt.allocPrint(self.arena, "toolu_omnigate_{d}", .{self.blocks_opened});
+            self.tool_id_buf.clearRetainingCapacity();
+            if (id.len > 0) {
+                try self.tool_id_buf.appendSlice(self.arena, id);
+            } else {
+                var generated: [40]u8 = undefined;
+                try self.tool_id_buf.appendSlice(self.arena, std.fmt.bufPrint(&generated, "toolu_omnigate_{d}", .{self.blocks_opened}) catch unreachable);
+            }
+            const block_id = self.tool_id_buf.items;
             const name = if (function) |f| getStr(f, "name") orelse "" else "";
             try self.anOpenBlock(out, .{
                 .type = "tool_use",
@@ -1898,6 +1934,12 @@ test "error envelopes" {
     const empty = try parseTest(a, try translateError(a, .openai_to_anthropic, 503, ""));
     try expectStrAt(empty, .{ "error", "type" }, "server_error");
     try expectStrAt(empty, .{ "error", "message" }, "upstream returned HTTP 503");
+
+    // A body that is not text used to come out as an array of numbers.
+    for ([_]Direction{ .openai_to_anthropic, .anthropic_to_openai }) |dir| {
+        const binary = try parseTest(a, try translateError(a, dir, 502, "\x1f\x8b\x08\x00\xff\xfe gzip, probably"));
+        try expectStrAt(binary, .{ "error", "message" }, "upstream returned HTTP 502 with a body that is not valid text");
+    }
     try testing.expect(at(empty, .{ "error", "code" }).? == .null);
     const str = try parseTest(a, try translateError(a, .anthropic_to_openai, 500, "{\"error\":\"boom\"}"));
     try expectStrAt(str, .{ "error", "type" }, "api_error");
@@ -2568,6 +2610,125 @@ const fuzz_error_bodies = [_][]const u8{
 fn fuzzOnce(a: Allocator, random: std.Random, sample: []const u8) ![]u8 {
     const v = try json.parseFromSliceLeaky(Value, a, sample, .{});
     return json.Stringify.valueAlloc(a, try fuzzMutate(a, random, v, 0), .{});
+}
+
+test "a stream with many tool calls does not keep every id it saw" {
+    // The translator's long-lived memory, with room for a few ids but not
+    // for thousands: before the fix each tool call left its id behind.
+    const backing = try testing.allocator.alloc(u8, 512 * 1024);
+    defer testing.allocator.free(backing);
+    var fixed: std.heap.FixedBufferAllocator = .init(backing);
+    var t: StreamTranslator = .init(fixed.allocator(), .anthropic_to_openai, "route-model", .{});
+
+    var sink_buf: [4096]u8 = undefined;
+    var sink: Writer.Discarding = .init(&sink_buf);
+    var event_buf: [512]u8 = undefined;
+    const long_id: [200]u8 = @splat('i');
+    for (0..20_000) |i| {
+        const event = try std.fmt.bufPrint(&event_buf, "data: {{\"id\":\"c\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{d},\"id\":\"{s}{d}\",\"function\":{{\"name\":\"f\",\"arguments\":\"{{}}\"}}}}]}}}}]}}\n\n", .{ i, &long_id, i });
+        try t.feed(event, &sink.writer);
+    }
+    try testing.expect(std.mem.endsWith(u8, t.upstream_tool_id, "19999"));
+}
+
+test "objects with too many members are not parsed into a tree" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var big: std.ArrayList(u8) = .empty;
+    try big.appendSlice(a, "{\"model\":\"m\",\"max_tokens\":5,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"metadata\":{");
+    for (0..guard.max_tree_members + 1) |i| {
+        if (i > 0) try big.append(a, ',');
+        try big.print(a, "\"k{d}\":1", .{i});
+    }
+    try big.appendSlice(a, "}}");
+    try testing.expectError(error.InvalidJson, translateRequest(a, .anthropic_to_openai, big.items, "real"));
+    try testing.expectError(error.InvalidJson, translateRequest(a, .openai_to_anthropic, big.items, "real"));
+
+    // Hidden in a tool call's arguments string, it is kept as the string it
+    // came as instead of being parsed.
+    var args: std.ArrayList(u8) = .empty;
+    try args.append(a, '{');
+    for (0..guard.max_tree_members + 1) |i| {
+        if (i > 0) try args.append(a, ',');
+        try args.print(a, "\"k{d}\":1", .{i});
+    }
+    try args.append(a, '}');
+    const input = try parseToolInput(a, args.items);
+    try testing.expect(input.object.get("_raw_arguments") != null);
+    try testing.expectEqual(@as(usize, 1), input.object.count());
+}
+
+test "keys chosen to collide in the JSON object's hash map never reach it" {
+    // The review's attack: std's JSON object is a hash map with a fixed seed
+    // (Wyhash, seed 0), so keys that share their low hash bits make every
+    // insertion walk all the earlier ones. Its input, generated the same way.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const count = 6000;
+    var keys: std.ArrayList(u8) = .empty;
+    var found: usize = 0;
+    var n: u64 = 0;
+    while (found < count) : (n += 1) {
+        var key: [10]u8 = undefined;
+        var x = n;
+        for (&key) |*c| {
+            c.* = 'a' + @as(u8, @intCast(x & 15));
+            x >>= 4;
+        }
+        const h: u32 = @truncate(std.hash.Wyhash.hash(0, &key));
+        if (h & 0x3ff != 0) continue;
+        if (found > 0) try keys.append(a, ',');
+        try keys.print(a, "\"{s}\":0", .{&key});
+        found += 1;
+    }
+
+    // As a client request: refused before a tree is built ...
+    const request = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":5,\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}],\"x\":{{{s}}}}}", .{keys.items});
+    try testing.expect(!guard.jsonMembersOk(request, guard.max_tree_members));
+    try testing.expectError(error.InvalidJson, translateRequest(a, .openai_to_anthropic, request, "tm"));
+    try testing.expectError(error.InvalidJson, translateRequest(a, .anthropic_to_openai, request, "tm"));
+    // ... as an upstream's answer ...
+    const answer = try std.fmt.allocPrint(a, "{{\"id\":\"c\",\"choices\":[],\"x\":{{{s}}}}}", .{keys.items});
+    try testing.expectError(error.InvalidJson, translateResponse(a, .anthropic_to_openai, 200, answer, "route"));
+    // ... and as one event of an upstream's stream, which is skipped.
+    const event = try std.fmt.allocPrint(a, "data: {{\"type\":\"ping\",\"x\":{{{s}}}}}\n\n", .{keys.items});
+    var sink_buf: [1024]u8 = undefined;
+    var sink: Writer.Discarding = .init(&sink_buf);
+    var t: StreamTranslator = .init(a, .openai_to_anthropic, "route", .{});
+    try t.feed(event, &sink.writer);
+    try testing.expect(!t.started);
+}
+
+test "one event of an upstream's stream cannot take more than its cap to parse" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Two megabytes of zeros in one event: a tree of it is 180 MiB.
+    var event: std.ArrayList(u8) = .empty;
+    try event.appendSlice(a, "data: {\"type\":\"ping\",\"x\":[0");
+    for (0..1024 * 1024) |_| try event.appendSlice(a, ",0");
+    try event.appendSlice(a, "]}");
+    try event.append(a, 10);
+    try event.append(a, 10);
+
+    var sink_buf: [1024]u8 = undefined;
+    var sink: Writer.Discarding = .init(&sink_buf);
+    var t: StreamTranslator = .init(a, .openai_to_anthropic, "route", .{});
+    try testing.expectError(error.OutOfMemory, t.feed(event.items, &sink.writer));
+    try testing.expect(t.scratch_cap.refused);
+    try testing.expect(t.scratch_cap.held <= max_event_tree_bytes);
+
+    // An ordinary stream is unaffected, and gives its parse memory back.
+    var ok: StreamTranslator = .init(a, .openai_to_anthropic, "route", .{});
+    try ok.feed("data: {\"type\":\"ping\"}", &sink.writer);
+    try ok.feed(&.{ 10, 10 }, &sink.writer);
+    try testing.expect(!ok.scratch_cap.refused);
+    try testing.expect(ok.scratch_cap.held <= event_tree_retained_bytes);
 }
 
 test "fuzz: malformed requests and responses are errors, never panics" {

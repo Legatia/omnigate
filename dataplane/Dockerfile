@@ -53,4 +53,8 @@ ENV OMNIGATE_LISTEN=0.0.0.0:8080 \
     OMNIGATE_CONTROL_URL=http://control:4000
 EXPOSE 8080
 
+# The image has no shell and no curl, so the binary checks itself: it asks
+# the address in OMNIGATE_LISTEN for /healthz and exits 0 on a 200.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 CMD ["/omnigate-dp", "healthcheck"]
+
 ENTRYPOINT ["/omnigate-dp"]

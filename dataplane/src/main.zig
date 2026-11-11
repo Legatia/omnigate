@@ -1,5 +1,11 @@
 //! omnigate data plane: OpenAI/Anthropic-compatible streaming proxy.
 //!
+//!   omnigate-dp               serve
+//!   omnigate-dp healthcheck   ask the instance configured by OMNIGATE_LISTEN
+//!                             for /healthz; exit 0 if it answers 200 within
+//!                             three seconds, else 1 (for container health
+//!                             checks: the image has no shell and no curl)
+//!
 //! Environment:
 //!   OMNIGATE_LISTEN          host:port to listen on        (default 127.0.0.1:8080)
 //!   OMNIGATE_CONTROL_URL     control plane base URL        (default http://127.0.0.1:4000)
@@ -22,15 +28,41 @@
 //!                            (head and body), and how long an idle keep-alive
 //!                            connection is kept (default 30000; 0 = no limit)
 //!   OMNIGATE_STREAM_IDLE_TIMEOUT_MS  abort a response that is being streamed
-//!                            when the upstream sends nothing, or the client
-//!                            reads nothing, for this long (default 300000;
-//!                            0 = no limit)
+//!                            when the upstream sends nothing for this long
+//!                            (default 300000; 0 = no limit)
+//!   OMNIGATE_CLIENT_STALL_TIMEOUT_MS  give up on a client that takes none of
+//!                            a response for this long while staying
+//!                            connected; the upstream is then read to its end
+//!                            without it, as for a client that left (default
+//!                            30000; 0 = use the stream idle timeout)
 //!   OMNIGATE_MAX_CONNECTIONS  client connections served at once; further ones
 //!                            get an immediate 503 (default 4096)
-//!   OMNIGATE_ABORT_DRAIN_MS  when a client leaves mid-stream, keep reading the
-//!                            upstream this long to learn the final usage
-//!                            before billing an estimate (default 5000; 0 =
-//!                            bill the estimate at once)
+//!   OMNIGATE_MAX_CONCURRENT_PER_KEY  requests one gateway key may have in
+//!                            flight at once; further ones get 429 (default
+//!                            512; 0 = no cap; a key's `max_concurrent` in the
+//!                            config overrides it)
+//!   OMNIGATE_REQUEST_MEMORY_MB  memory all request bodies in flight may take
+//!                            together (each counted twice: as received and as
+//!                            sent on); one key may hold a quarter of it.
+//!                            Beyond it requests get 503, or 429 for the key's
+//!                            share (default 1024; 0 = no cap)
+//!   OMNIGATE_PARSE_MEMORY_MB  memory that may be reserved at once for
+//!                            parsing JSON into trees, which only translation
+//!                            between protocols, the response cache and
+//!                            rewriting an existing stream_options need. One
+//!                            tree may take 128 times its text plus 1 MiB, at
+//!                            most 96 MiB (a request that needs more gets
+//!                            400); one key may reserve half the budget.
+//!                            Beyond it requests get 503, or 429 for the
+//!                            key's share (default 1024; 0 = no budget, the
+//!                            per-tree cap still applies)
+//!   OMNIGATE_ABORT_DRAIN_MS  when a client leaves (or stalls) mid-stream, the
+//!                            upstream is read on without it to learn the
+//!                            final usage; after this long it is cut off and
+//!                            an estimate is billed (default 120000; 0 = bill
+//!                            the estimate at once)
+//!   OMNIGATE_ABORT_DRAIN_MAX_MB  ... or after this much more of the answer
+//!                            (default 64)
 //!   OMNIGATE_SHUTDOWN_GRACE_MS  on SIGINT/SIGTERM (Ctrl-C/Ctrl-Break on
 //!                            Windows): how long requests in flight may take
 //!                            to finish before the process exits (default 10000)
@@ -49,6 +81,7 @@ const config = @import("config.zig");
 const control = @import("control.zig");
 const counters = @import("counters.zig");
 const health = @import("health.zig");
+const limits = @import("limits.zig");
 const logging = @import("logging.zig");
 const proxy = @import("proxy.zig");
 const quirks = @import("quirks.zig");
@@ -113,6 +146,10 @@ pub const App = struct {
     counters: *counters.Counters,
     /// Answers remembered for routes that opt in with `cache_ttl_s`.
     cache: *cache.Cache,
+    /// Per-key concurrency, request memory and tree memory (see limits.zig).
+    gate: *limits.Gate,
+    /// Upstream answers being read to their end after their client left.
+    drains: *proxy.Drains,
     /// Client connections being served right now.
     active_connections: std.atomic.Value(u32) = .init(0),
     /// Set once a stop was requested: finish what is in flight, start nothing new.
@@ -125,7 +162,10 @@ pub const App = struct {
     upstream_timeout_ms: u32,
     client_timeout_ms: u32,
     stream_idle_timeout_ms: u32,
+    /// How long one write to a client may take nothing (never 0).
+    client_stall_timeout_ms: u32,
     abort_drain_ms: u32,
+    abort_drain_max_bytes: u64,
     max_connections: u32,
     config_cache_path: ?[]const u8,
     /// When this process started (Unix seconds); reported as the creation
@@ -238,6 +278,72 @@ test "numeric settings are parsed strictly" {
     try std.testing.expectEqual(@as(?u16, null), parseSetting(u16, "65536"));
 }
 
+/// Where to listen, and where to connect to reach that listener from this
+/// machine (the wildcard addresses are not connectable everywhere).
+const Listen = struct { bind: Io.net.IpAddress, local: Io.net.IpAddress };
+
+fn parseListen(listen: []const u8) !Listen {
+    const colon = std.mem.findScalarLast(u8, listen, ':') orelse {
+        log.err("OMNIGATE_LISTEN must be host:port, got \"{s}\"", .{listen});
+        return error.InvalidListenAddress;
+    };
+    const port = parseSetting(u16, listen[colon + 1 ..]) orelse {
+        log.err("OMNIGATE_LISTEN has no valid port: \"{s}\"", .{listen});
+        return error.InvalidListenAddress;
+    };
+    const host = listen[0..colon];
+    const local_host = if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else if (std.mem.eql(u8, host, "::")) "::1" else host;
+    return .{ .bind = try Io.net.IpAddress.parse(host, port), .local = try Io.net.IpAddress.parse(local_host, port) };
+}
+
+test "the listen address and how to reach it locally" {
+    const any = try parseListen("0.0.0.0:8080");
+    try std.testing.expectEqual(@as(u16, 8080), any.bind.getPort());
+    try std.testing.expect(any.local.eql(&try Io.net.IpAddress.parse("127.0.0.1", 8080)));
+    const one = try parseListen("127.0.0.1:9");
+    try std.testing.expect(one.local.eql(&one.bind));
+    try std.testing.expect((try parseListen("::1:8080")).local.eql(&try Io.net.IpAddress.parse("::1", 8080)));
+}
+
+const healthcheck_timeout_ms = 3000;
+
+/// `omnigate-dp healthcheck`: is the instance on OMNIGATE_LISTEN answering?
+/// Returns the process exit status.
+fn healthcheck(io: Io, listen: []const u8) u8 {
+    const where = parseListen(listen) catch return 1;
+    const Race = union(enum) { probe: bool, timer: Io.Cancelable!void };
+    var results: [2]Race = undefined;
+    var race: Io.Select(Race) = .init(io, &results);
+    race.concurrent(.probe, probeHealth, .{ io, where.local }) catch return 1;
+    race.concurrent(.timer, sleepMs, .{ io, healthcheck_timeout_ms }) catch {};
+    const first = race.await() catch {
+        race.cancelDiscard();
+        return 1;
+    };
+    race.cancelDiscard();
+    return switch (first) {
+        .probe => |healthy| if (healthy) 0 else 1,
+        .timer => 1,
+    };
+}
+
+fn sleepMs(io: Io, ms: u32) Io.Cancelable!void {
+    return io.sleep(.fromMilliseconds(ms), .awake);
+}
+
+fn probeHealth(io: Io, address: Io.net.IpAddress) bool {
+    const stream = address.connect(io, .{ .mode = .stream }) catch return false;
+    defer stream.close(io);
+    var out_buf: [128]u8 = undefined;
+    var out = stream.writer(io, &out_buf);
+    out.interface.writeAll("GET /healthz HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n") catch return false;
+    out.interface.flush() catch return false;
+    var in_buf: [256]u8 = undefined;
+    var in = stream.reader(io, &in_buf);
+    const status_line = in.interface.takeDelimiterInclusive('\n') catch return false;
+    return std.mem.startsWith(u8, status_line, "HTTP/1.1 200 ");
+}
+
 pub fn main(init: std.process.Init) !void {
     // In safe builds std hands main its checking allocator: one global lock,
     // and bookkeeping that costs several times the size of a small allocation.
@@ -248,12 +354,22 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const env = init.environ_map;
 
+    const listen = env.get("OMNIGATE_LISTEN") orelse "127.0.0.1:8080";
+
+    // The one subcommand. Before logging is set up: it prints nothing.
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 1) {
+        if (args.len == 2 and std.mem.eql(u8, args[1], "healthcheck")) {
+            std.process.exit(healthcheck(io, listen));
+        }
+        log.err("unknown argument \"{s}\" (the only subcommand is: healthcheck)", .{args[1]});
+        std.process.exit(2);
+    }
+
     logging.configure(io, env.get("OMNIGATE_LOG_LEVEL"), env.get("OMNIGATE_LOG_FORMAT")) catch |err| {
         log.err("bad OMNIGATE_LOG_LEVEL or OMNIGATE_LOG_FORMAT: {t}", .{err});
         return err;
     };
-
-    const listen = env.get("OMNIGATE_LISTEN") orelse "127.0.0.1:8080";
     const control_url = env.get("OMNIGATE_CONTROL_URL") orelse "http://127.0.0.1:4000";
     // `.env.example` ships the variable empty; an empty secret would let the
     // process start and then fail every call to the control plane.
@@ -267,7 +383,12 @@ pub fn main(init: std.process.Init) !void {
     const upstream_timeout_ms = try envInt(env, u32, "OMNIGATE_UPSTREAM_TIMEOUT_MS", 600_000);
     const client_timeout_ms = try envInt(env, u32, "OMNIGATE_CLIENT_TIMEOUT_MS", 30_000);
     const stream_idle_timeout_ms = try envInt(env, u32, "OMNIGATE_STREAM_IDLE_TIMEOUT_MS", 300_000);
-    const abort_drain_ms = try envInt(env, u32, "OMNIGATE_ABORT_DRAIN_MS", 5_000);
+    const client_stall_timeout_ms = try envInt(env, u32, "OMNIGATE_CLIENT_STALL_TIMEOUT_MS", 30_000);
+    const abort_drain_ms = try envInt(env, u32, "OMNIGATE_ABORT_DRAIN_MS", 120_000);
+    const abort_drain_max_mb = try envInt(env, u32, "OMNIGATE_ABORT_DRAIN_MAX_MB", 64);
+    const max_concurrent_per_key = try envInt(env, u32, "OMNIGATE_MAX_CONCURRENT_PER_KEY", 512);
+    const request_memory_mb = try envInt(env, u32, "OMNIGATE_REQUEST_MEMORY_MB", 1024);
+    const parse_memory_mb = try envInt(env, u32, "OMNIGATE_PARSE_MEMORY_MB", 1024);
     const max_connections = try envInt(env, u32, "OMNIGATE_MAX_CONNECTIONS", 4096);
     const shutdown_grace_ms = try envInt(env, u32, "OMNIGATE_SHUTDOWN_GRACE_MS", 10_000);
     const cache_max_mb = try envInt(env, u32, "OMNIGATE_CACHE_MAX_MB", 64);
@@ -277,19 +398,10 @@ pub fn main(init: std.process.Init) !void {
     const cache_env = env.get("OMNIGATE_CONFIG_CACHE") orelse "omnigate-config.cache.json";
     const config_cache_path: ?[]const u8 = if (std.mem.eql(u8, cache_env, "off")) null else cache_env;
 
-    const colon = std.mem.findScalarLast(u8, listen, ':') orelse {
-        log.err("OMNIGATE_LISTEN must be host:port, got \"{s}\"", .{listen});
-        return error.InvalidListenAddress;
-    };
-    const port = parseSetting(u16, listen[colon + 1 ..]) orelse {
-        log.err("OMNIGATE_LISTEN has no valid port: \"{s}\"", .{listen});
-        return error.InvalidListenAddress;
-    };
-    const host = listen[0..colon];
-    const address = try Io.net.IpAddress.parse(host, port);
+    const where = try parseListen(listen);
+    const address = where.bind;
     // Where to connect to reach our own listener (see `stopWatcher`).
-    const wake_host = if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else if (std.mem.eql(u8, host, "::")) "::1" else host;
-    const wake_address = try Io.net.IpAddress.parse(wake_host, port);
+    const wake_address = where.local;
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -327,6 +439,14 @@ pub fn main(init: std.process.Init) !void {
     var response_cache: cache.Cache = .init(gpa, @as(usize, cache_max_mb) * 1024 * 1024);
     defer response_cache.deinit();
 
+    var gate: limits.Gate = .{
+        .max_concurrent = max_concurrent_per_key,
+        .memory_budget = @as(u64, request_memory_mb) * 1024 * 1024,
+        .tree_budget = @as(u64, parse_memory_mb) * 1024 * 1024,
+    };
+    defer gate.deinit(gpa);
+    var drains: proxy.Drains = .{};
+
     var app: App = .{
         .gpa = gpa,
         .io = io,
@@ -340,6 +460,8 @@ pub fn main(init: std.process.Init) !void {
         .watchdog = &sockets,
         .counters = &rejections,
         .cache = &response_cache,
+        .gate = &gate,
+        .drains = &drains,
         .env = env,
         .control_url = control_url,
         .internal_token = internal_token,
@@ -348,7 +470,9 @@ pub fn main(init: std.process.Init) !void {
         .upstream_timeout_ms = upstream_timeout_ms,
         .client_timeout_ms = client_timeout_ms,
         .stream_idle_timeout_ms = stream_idle_timeout_ms,
+        .client_stall_timeout_ms = if (client_stall_timeout_ms != 0) client_stall_timeout_ms else stream_idle_timeout_ms,
         .abort_drain_ms = abort_drain_ms,
+        .abort_drain_max_bytes = @as(u64, abort_drain_max_mb) * 1024 * 1024,
         .max_connections = max_connections,
         .config_cache_path = config_cache_path,
         .started_unix_s = @divTrunc(Io.Timestamp.now(io, .real).toMilliseconds(), 1000),
@@ -374,6 +498,7 @@ pub fn main(init: std.process.Init) !void {
     errdefer {
         background.cancel(io);
         _ = sockets.cancelAll(io);
+        drains.stop(io);
     }
 
     try background.concurrent(io, control.pollLoop, .{&app});
@@ -430,6 +555,9 @@ pub fn main(init: std.process.Init) !void {
     if (cut_off > 0) log.warn("{d} request(s) still running after the grace period; cutting them off", .{cut_off});
     background.cancel(io);
     _ = sockets.cancelAll(io);
+    // Answers still being read for clients that left: each bills what it
+    // has (an estimate) and ends.
+    drains.stop(io);
 
     // The flush task is gone; make one last attempt to hand over usage.
     // Whatever stays behind is in the spool file for the next start.
@@ -455,6 +583,9 @@ test {
     _ = counters;
     _ = @import("headers.zig");
     _ = @import("guard.zig");
+    _ = @import("framing.zig");
+    _ = @import("jsonscan.zig");
+    _ = limits;
     _ = @import("errors.zig");
     _ = @import("models.zig");
     _ = quirks;

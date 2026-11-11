@@ -5,7 +5,9 @@
   :9003  Anthropic-shaped, works (JSON and SSE)
   :9004  OpenAI-shaped, works but waits 3 s before answering (forces a timeout)
   :9005  OpenAI-shaped, starts a stream, sends one chunk, then goes silent
-         (forces the gateway's stream idle timeout)
+         (forces the gateway's stream idle timeout); with the model names
+         below it is a provider that goes on without its client, or a
+         hostile one
 
 Special model names, on the working mocks (9002 and 9003):
 
@@ -13,6 +15,26 @@ Special model names, on the working mocks (9002 and 9003):
   rid-1            answers carry the provider's own request id header
                    (`x-request-id` on 9002, `request-id` on 9003)
   sig-1            (9002) earlier tool calls must carry a thought signature
+
+Special model names on the stalling mock (9005), by prefix:
+
+  drip             streams on for a minute and never reports usage
+  late-usage       streams for about 2.5 s whoever is listening, then reports
+                   usage (prompt 21, completion 34) and ends properly
+  flood            sends about 16 MiB of stream as fast as it is taken, then
+                   usage (prompt 55, completion 4242) and a proper end
+  hostile-chunk-json   a chunked JSON answer whose chunk size is sixteen F's
+  hostile-chunk-sse    the same in an event stream, after one good event
+  hostile-chunk17      a chunk size of seventeen F's
+  hostile-short-json   content-length 500, 20 bytes of body, then a clean close
+  hostile-short-sse    an event stream with content-length 5000, two events,
+                       then a clean close
+  hostile-both         both content-length and transfer-encoding: chunked
+  hostile-ctype        a content-type with a bare line feed that smuggles a
+                       header (`x-injected: 1`)
+  hostile-status       an interim status (103) presented as the final answer
+  hostile-long         nothing hostile: a 200 kB JSON answer with a correct
+                       content-length (the gateway re-frames it)
 
 A request that offers tools and whose last user message contains the words
 "use the tool" is answered with a call to the first tool (JSON or stream);
@@ -330,9 +352,79 @@ class Slow(OpenAIOk):
         super().do_POST()
 
 
+CHUNK = 'data: {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "%s"}}]}\n\n'
+
+
 class Stall(Base):
+    def raw(self, data, close=True):
+        """Bytes straight onto the socket: for answers no HTTP library would write."""
+        self.wfile.write(data)
+        self.wfile.flush()
+        if close:
+            self.close_connection = True
+
+    def hostile(self, model):
+        ok_json = json.dumps({"id": "chatcmpl-mock", "object": "chat.completion", "model": model,
+                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}],
+                              "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
+        event = (CHUNK % "Hel").encode()
+        chunked_event = b"%x\r\n%s\r\n" % (len(event), event)
+        if model.startswith("hostile-chunk-json"):
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n"
+                            b"FFFFFFFFFFFFFFFF\r\n" + ok_json + b"\r\n0\r\n\r\n")
+        if model.startswith("hostile-chunk-sse"):
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n" +
+                            chunked_event + b"FFFFFFFFFFFFFFFF\r\n" + event + b"\r\n0\r\n\r\n")
+        if model.startswith("hostile-chunk17"):
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n"
+                            b"FFFFFFFFFFFFFFFFF\r\n" + ok_json + b"\r\n0\r\n\r\n")
+        if model.startswith("hostile-short-json"):
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n" + ok_json[:20])
+        if model.startswith("hostile-short-sse"):
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 5000\r\n\r\n" + event + event)
+        if model.startswith("hostile-both"):
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\ntransfer-encoding: chunked\r\n\r\n" % len(ok_json) +
+                            b"%x\r\n%s\r\n0\r\n\r\n" % (len(ok_json), ok_json))
+        if model.startswith("hostile-ctype"):
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\nx-injected: 1\r\ncontent-length: %d\r\n\r\n" % len(ok_json) + ok_json)
+        if model.startswith("hostile-status"):
+            return self.raw(b"HTTP/1.1 103 Early Hints\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n" % len(ok_json) + ok_json)
+        if model.startswith("hostile-long"):
+            long_json = json.dumps({"id": "chatcmpl-mock", "object": "chat.completion", "model": model,
+                                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "y" * 200_000}, "finish_reason": "stop"}],
+                                    "usage": {"prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}}).encode()
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n" % len(long_json) + long_json, close=False)
+        return self.send_json(400, {"error": {"message": f"unknown hostile mode {model}"}})
+
     def do_POST(self):
         body = self.read_json()
+        model = str(body.get("model", "")) if isinstance(body, dict) else ""
+        if model.startswith("hostile-"):
+            return self.hostile(model)
+        if model.startswith("late-usage") or model.startswith("flood"):
+            # A provider that finishes its answer whether or not anyone is
+            # still reading, and reports usage at the very end.
+            flood = model.startswith("flood")
+            usage = {"prompt_tokens": 55, "completion_tokens": 4242} if flood else {"prompt_tokens": 21, "completion_tokens": 34}
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+            self.start_sse()
+            try:
+                if flood:
+                    event = (CHUNK % ("w" * 900)).encode()
+                    framed = b"%x\r\n%s\r\n" % (len(event), event)
+                    for _ in range(16 * 1024):
+                        self.wfile.write(framed)
+                    self.wfile.flush()
+                else:
+                    for _ in range(12):
+                        self.sse(CHUNK % "lo ")
+                        time.sleep(0.15)
+                self.sse('data: %s\n\n' % json.dumps({"id": "chatcmpl-mock", "object": "chat.completion.chunk", "choices": [], "usage": usage}))
+                self.sse("data: [DONE]\n\n")
+                self.end_sse()
+            except OSError:
+                self.close_connection = True
+            return
         self.start_sse()
         self.sse('data: {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "Hel"}}]}\n\n')
         if isinstance(body, dict) and str(body.get("model", "")).startswith("drip"):

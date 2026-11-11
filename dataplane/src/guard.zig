@@ -19,6 +19,11 @@ pub const max_client_json_depth = 64;
 pub const max_upstream_json_depth = 128;
 /// Header lines accepted in one request head.
 pub const max_request_headers = 100;
+/// Members of any one object in JSON that is parsed into a value tree.
+/// std's JSON object is a hash map with a fixed seed: N keys chosen to
+/// collide cost N squared probes, so N is kept small wherever a tree is
+/// built from bytes a peer chose.
+pub const max_tree_members = 1024;
 
 /// True when no array or object in `bytes` is nested deeper than `max`.
 /// One pass, no allocation. It does not validate the JSON: it only makes sure
@@ -45,6 +50,49 @@ pub fn jsonDepthOk(bytes: []const u8, max: usize) bool {
                 if (depth > max) return false;
             },
             '}', ']' => depth -|= 1,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// True when no object in `bytes` has more than `max` members. Like
+/// `jsonDepthOk` it validates nothing and allocates nothing; it counts the
+/// commas between an object's braces, which is one less than its members
+/// in anything a JSON parser accepts. Nesting beyond its fixed stack is a
+/// "no" (callers bound the depth first).
+pub fn jsonMembersOk(bytes: []const u8, max: u32) bool {
+    const levels = 257;
+    // Commas seen so far at each open level; arrays are not counted.
+    var commas: [levels]u32 = undefined;
+    var is_object: [levels]bool = undefined;
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    for (bytes) |c| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '{', '[' => {
+                if (depth == levels) return false;
+                commas[depth] = 0;
+                is_object[depth] = c == '{';
+                depth += 1;
+            },
+            '}', ']' => depth -|= 1,
+            ',' => if (depth > 0 and is_object[depth - 1]) {
+                commas[depth - 1] += 1;
+                if (commas[depth - 1] >= max) return false;
+            },
             else => {},
         }
     }
@@ -82,7 +130,8 @@ pub const HeadVerdict = union(enum) {
     ok,
     /// Not a request this server will touch; the text says why.
     bad: []const u8,
-    /// A method that carries a body, with nothing saying how long it is.
+    /// A method that carries a body, with no `content-length` saying how
+    /// long it is (chunked request bodies are not accepted).
     length_required,
     expectation_failed,
 };
@@ -167,7 +216,10 @@ pub fn checkRequestHead(head: []const u8, has_body: bool) HeadVerdict {
         if (chunked or (content_length orelse 0) != 0) return .{ .bad = "this method does not take a body" };
         return .ok;
     }
-    if (!chunked and content_length == null) return .length_required;
+    // A chunked request body would be decoded by std's chunked reader,
+    // which overflows on a chunk size that does not fit its integer. Every
+    // client the gateway is for sends a length; ask the others to.
+    if (content_length == null) return .length_required;
     return .ok;
 }
 
@@ -203,6 +255,15 @@ pub fn safeQuery(query: []const u8) bool {
     return true;
 }
 
+/// An opaque token a client chose (an idempotency key): any visible ASCII,
+/// which covers UUIDs, base64 and the separators people put in such keys,
+/// and nothing that could end a header line or be read as two values.
+pub fn visibleToken(value: []const u8, max_len: usize) bool {
+    if (value.len == 0 or value.len > max_len) return false;
+    for (value) |c| if (c <= 0x20 or c >= 0x7f) return false;
+    return true;
+}
+
 /// A header value the gateway is willing to copy into a request of its own:
 /// letters, digits and `extra`, at most `max_len` long.
 pub fn safeHeaderValue(value: []const u8, extra: []const u8, max_len: usize) bool {
@@ -233,11 +294,28 @@ test "json depth is bounded without being fooled by strings" {
     try testing.expect(!jsonDepthOk(deep[235..365], max_client_json_depth));
 }
 
+test "members per object are bounded without building anything" {
+    try testing.expect(jsonMembersOk("{\"a\":1,\"b\":2,\"c\":3}", 3));
+    try testing.expect(!jsonMembersOk("{\"a\":1,\"b\":2,\"c\":3}", 2));
+    // Each object on its own account; arrays are not objects.
+    try testing.expect(jsonMembersOk("{\"a\":{\"x\":1,\"y\":2},\"b\":[1,2,3,4,5,6,7,8],\"c\":{\"x\":1,\"y\":2}}", 3));
+    try testing.expect(!jsonMembersOk("{\"a\":[{\"x\":1,\"y\":2,\"z\":3}]}", 2));
+    // Commas inside strings are text.
+    try testing.expect(jsonMembersOk("{\"a\":\",,,,,,\\\",,,,\"}", 1));
+    try testing.expect(jsonMembersOk("", 1));
+    try testing.expect(jsonMembersOk("]]}},,,", 1));
+    // Deeper than its stack is a no, not an overrun.
+    var deep: [600]u8 = undefined;
+    @memset(deep[0..300], '[');
+    @memset(deep[300..], ']');
+    try testing.expect(!jsonMembersOk(&deep, 1000));
+    try testing.expect(jsonMembersOk(deep[44..556], 1000));
+}
+
 test "well-formed heads pass" {
     try testing.expectEqual(HeadVerdict.ok, checkRequestHead("GET /healthz HTTP/1.1\r\nHost: a\r\n\r\n", false));
     try testing.expectEqual(HeadVerdict.ok, checkRequestHead("GET / HTTP/1.1\r\n\r\n", false));
     try testing.expectEqual(HeadVerdict.ok, checkRequestHead("POST /v1/chat/completions HTTP/1.1\r\nHost: a\r\nContent-Length: 12\r\nAuthorization: Bearer x y\r\n\r\n", true));
-    try testing.expectEqual(HeadVerdict.ok, checkRequestHead("POST /v1/jobs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", true));
     try testing.expectEqual(HeadVerdict.ok, checkRequestHead("GET /a?b=c HTTP/1.1\r\nContent-Length: 0\r\nX-Empty:\r\n\r\n", false));
     // Two equal lengths are one length.
     try testing.expectEqual(HeadVerdict.ok, checkRequestHead("POST / HTTP/1.1\r\nContent-Length: 3\r\ncontent-length: 3\r\n\r\n", true));
@@ -251,6 +329,11 @@ test "heads the std parser accepts but must not be iterated are refused" {
     try testing.expectEqual(HeadVerdict.ok, checkRequestHead("POST / HTTP/1.1\r\nContent-Length: 3\r\nExpect: 100-Continue\r\n\r\n", true));
     try testing.expectEqual(HeadVerdict.length_required, checkRequestHead("POST / HTTP/1.1\r\n\r\n", true));
     try testing.expectEqual(HeadVerdict.length_required, checkRequestHead("PUT /x HTTP/1.1\r\nHost: a\r\n\r\n", true));
+    // A chunked request body: its decoder is std's, which a chunk size of
+    // sixteen F's overflows. Asked for a length instead, in any spelling.
+    try testing.expectEqual(HeadVerdict.length_required, checkRequestHead("POST /v1/jobs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", true));
+    try testing.expectEqual(HeadVerdict.length_required, checkRequestHead("POST /v1/chat/completions HTTP/1.1\r\nHost: a\r\ntransfer-encoding: CHUNKED\r\n\r\n", true));
+    try testing.expect(checkRequestHead("POST / HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n", true) == .bad);
 
     for ([_][]const u8{
         "",
@@ -338,6 +421,17 @@ test "queries and copied header values are plain" {
     try testing.expect(safeQuery("exp=1794328324&sig=118b5c035ee0e041"));
     try testing.expect(safeQuery("limit=20"));
     for ([_][]const u8{ "a=1 HTTP/1.1", "a=%0d%0a", "a=b#c", "a=\"", "a=<b>", "a=b/c", "x=\\" }) |q| try testing.expect(!safeQuery(q));
+
+    // Idempotency keys as real clients write them.
+    for ([_][]const u8{ "order-A17:retry.2", "3f2b8c1e-9d4a-4b7e-8f6a-1c2d3e4f5a6b", "dGhpcyBpcyBhIGtleQ==", "a+b/c=", "job_42|attempt#3", "{\"k\":1}" }) |k| {
+        try testing.expect(visibleToken(k, 255));
+    }
+    for ([_][]const u8{ "", "a b", "a\tb", "a\r\nx-omnigate-internal: t", "a\nb", "a\x00b", "a\x7fb", "caf\xc3\xa9" }) |k| {
+        try testing.expect(!visibleToken(k, 255));
+    }
+    const long_key: [256]u8 = @splat('k');
+    try testing.expect(visibleToken(long_key[0..255], 255));
+    try testing.expect(!visibleToken(&long_key, 255));
 
     try testing.expect(safeHeaderValue("2023-06-01", "-.", 32));
     try testing.expect(safeHeaderValue("tools-2024-04-04,prompt-caching-2024-07-31", "-._, ", 512));

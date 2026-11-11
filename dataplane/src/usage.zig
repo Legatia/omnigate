@@ -45,6 +45,38 @@ pub const max_count: u64 = 1 << 40;
 /// body this errs on the high side.
 pub const estimate_bytes_per_token = 4;
 
+/// Tokens allowed for one non-text part of a request (an image, a document,
+/// audio) when the input has to be estimated. Such a part is often a URL of
+/// a few dozen bytes that the provider turns into hundreds or thousands of
+/// tokens, so the size of the request says nothing about it.
+pub const estimate_tokens_per_media_part = 1600;
+
+/// A stand-in for the input token count of a request whose provider never
+/// reported one: its size at four bytes a token (generous for JSON), plus an
+/// allowance for every image, document or audio part it names. Deliberately
+/// on the high side: it is only used when the real figure is lost, and the
+/// provider charges for the request either way.
+pub fn estimateInput(request_body: []const u8) u64 {
+    const text: u64 = request_body.len / estimate_bytes_per_token;
+    // The `type` values the two protocols use for parts that are not text.
+    // (`image_url` also names the field next to it, so OpenAI images count
+    // twice; that is in keeping with erring high.)
+    var parts: u64 = 0;
+    for ([_][]const u8{ "\"image_url\"", "\"image\"", "\"input_image\"", "\"document\"", "\"file\"", "\"input_file\"", "\"input_audio\"" }) |needle| {
+        parts += std.mem.count(u8, request_body, needle);
+    }
+    return @min(max_count, text +| parts *| estimate_tokens_per_media_part);
+}
+
+/// Is `name` a field whose string value is generated text (as opposed to an
+/// id, a role or a type)? Used only to size an estimate.
+fn isContentKey(name: []const u8) bool {
+    for ([_][]const u8{ "content", "text", "delta", "arguments", "partial_json", "thinking", "reasoning_content", "reasoning", "refusal" }) |k| {
+        if (std.mem.eql(u8, name, k)) return true;
+    }
+    return false;
+}
+
 const Field = enum { input, output, cached, cache_read, cache_write };
 
 const KeyId = enum {
@@ -107,6 +139,9 @@ pub const Usage = struct {
     /// Bytes fed, and SSE `data:` lines among them.
     bytes: u64 = 0,
     events: u64 = 0,
+    /// Bytes of generated text seen: string values of the fields that carry
+    /// it (`isContentKey`), at any depth. For estimates only.
+    content_bytes: u64 = 0,
 
     // --- where the reader is -------------------------------------------
     framing: enum { unknown, json, sse } = .unknown,
@@ -126,6 +161,17 @@ pub const Usage = struct {
     number_plain: bool = true,
     number_field: ?Field = null,
     number_final: bool = false,
+    // The start of the string being read or last read, to recognise it as a
+    // content key when a colon follows.
+    recent: [20]u8 = undefined,
+    recent_len: u8 = 0,
+    recent_plain: bool = true,
+    /// The last token was a string (so a colon now makes it a key).
+    after_string: bool = false,
+    /// The value that comes next belongs to a content key.
+    value_is_content: bool = false,
+    /// Inside a string that is such a value.
+    counting: bool = false,
 
     const tracked = 4;
 
@@ -154,15 +200,20 @@ pub const Usage = struct {
     /// provider still charges the operator for what it generated, so billing
     /// nothing would make every aborted stream free.
     ///
-    /// Never less than what was actually metered. Missing input is estimated
-    /// from the size of the request; missing output from what came back: one
-    /// token per SSE event (providers send roughly a token per event), or the
-    /// body size for anything that was not a stream.
-    pub fn estimated(u: *const Usage, kind: Kind, request_bytes: usize) Normalized {
+    /// Never less than what was actually metered. Missing input is
+    /// `input_estimate` (see `estimateInput`). Missing output is taken from
+    /// what came back, whichever is larger: one token per SSE event, or the
+    /// generated text at four bytes a token (providers that send several
+    /// tokens per event would otherwise be billed at a fraction); for
+    /// anything that was not a stream, the body size.
+    pub fn estimated(u: *const Usage, kind: Kind, input_estimate: u64) Normalized {
         var n = u.normalized(kind);
         const input_known = n.input_tokens + n.cached_input_tokens + n.cache_write_input_tokens;
-        if (input_known == 0) n.input_tokens = @min(max_count, request_bytes / estimate_bytes_per_token);
-        const produced = if (u.framing == .sse) u.events else u.bytes / estimate_bytes_per_token;
+        if (input_known == 0) n.input_tokens = @min(max_count, input_estimate);
+        const produced = if (u.framing == .sse)
+            @max(u.events, u.content_bytes / estimate_bytes_per_token)
+        else
+            u.bytes / estimate_bytes_per_token;
         n.output_tokens = @min(max_count, @max(n.output_tokens, produced));
         return n;
     }
@@ -223,11 +274,23 @@ pub const Usage = struct {
         u.state = .idle;
         u.escaped = false;
         u.depth = 0;
+        u.after_string = false;
+        u.value_is_content = false;
+        u.counting = false;
     }
 
     fn jsonByte(u: *Usage, c: u8) void {
         switch (u.state) {
             .key, .string => {
+                if (u.escaped or c != '"') {
+                    if (u.counting) u.content_bytes +|= 1;
+                    if (u.escaped or c == '\\' or u.recent_len == u.recent.len) {
+                        u.recent_plain = false;
+                    } else {
+                        u.recent[u.recent_len] = c;
+                        u.recent_len += 1;
+                    }
+                }
                 if (u.escaped) {
                     u.escaped = false;
                     // None of the names we look for needs an escape.
@@ -239,6 +302,8 @@ pub const Usage = struct {
                         u.keys[u.depth - 1] = if (u.key_plain) KeyId.of(u.key_buf[0..u.key_len]) else .other;
                     }
                     u.state = .idle;
+                    u.counting = false;
+                    u.after_string = true;
                 } else if (u.state == .key) {
                     if (u.key_len < u.key_buf.len) {
                         u.key_buf[u.key_len] = c;
@@ -264,6 +329,28 @@ pub const Usage = struct {
                 // Fall through: this byte ends the number and means something itself.
             },
             .idle => {},
+        }
+
+        // For the estimate: which string values are generated text. Unlike
+        // the usage fields this is not tied to a path, so it works at any
+        // depth (tool-call arguments sit seven levels down).
+        switch (c) {
+            '"' => {
+                u.counting = u.value_is_content;
+                u.value_is_content = false;
+                u.after_string = false;
+                u.recent_len = 0;
+                u.recent_plain = true;
+            },
+            ':' => {
+                u.value_is_content = u.after_string and u.recent_plain and isContentKey(u.recent[0..u.recent_len]);
+                u.after_string = false;
+            },
+            ' ', '\t', '\r', '\n' => {},
+            else => {
+                u.after_string = false;
+                u.value_is_content = false;
+            },
         }
 
         const level: ?usize = if (u.depth >= 1 and u.depth <= tracked) u.depth - 1 else null;
@@ -641,7 +728,7 @@ test "arbitrary bytes never upset the reader" {
         for (buf[0..len]) |*b| b.* = if (random.boolean()) alphabet[random.uintLessThan(usize, alphabet.len)] else random.int(u8);
         feedSplit(&u, buf[0..len], 1 + random.uintLessThan(usize, 40));
         _ = u.normalized(.openai);
-        _ = u.estimated(.anthropic, len);
+        _ = u.estimated(.anthropic, estimateInput(buf[0..len]));
     }
 }
 
@@ -651,14 +738,14 @@ test "a cut-off stream is billed by estimate, never below what was metered" {
     for (0..40) |_| u.feed("data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"content\":\"word\"}}]}\n\n");
     try std.testing.expect(!u.final_seen);
     try std.testing.expectEqual(Normalized{}, u.normalized(.openai));
-    try std.testing.expectEqual(Normalized{ .input_tokens = 250, .output_tokens = 40 }, u.estimated(.openai, 1000));
+    try std.testing.expectEqual(Normalized{ .input_tokens = 250, .output_tokens = 40 }, u.estimated(.openai, 250));
 
     // Anthropic: the input side is known from message_start and is kept.
     var a: Usage = .{};
     a.feed("event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":25,\"cache_read_input_tokens\":999,\"output_tokens\":1}}}\n\n");
     for (0..9) |_| a.feed("event: content_block_delta\ndata: {\"delta\":{\"text\":\"word\"}}\n\n");
     try std.testing.expect(!a.final_seen);
-    try std.testing.expectEqual(Normalized{ .input_tokens = 25, .cached_input_tokens = 999, .output_tokens = 10 }, a.estimated(.anthropic, 100_000));
+    try std.testing.expectEqual(Normalized{ .input_tokens = 25, .cached_input_tokens = 999, .output_tokens = 10 }, a.estimated(.anthropic, 25_000));
 
     // Once the closing figures arrive they are final, and an estimate adds nothing below them.
     a.feed("event: message_delta\ndata: {\"usage\":{\"output_tokens\":500}}\n\n");
@@ -668,4 +755,56 @@ test "a cut-off stream is billed by estimate, never below what was metered" {
     var whole: Usage = .{};
     whole.feed("{\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":6}}");
     try std.testing.expect(whole.final_seen);
+}
+
+test "an estimate is floored by the text that came back, not only by the event count" {
+    // A provider that sends a paragraph per event: 3 events, 1200 bytes of text.
+    const paragraph: [400]u8 = @splat('w');
+    var u: Usage = .{};
+    for (0..3) |_| {
+        u.feed("data: {\"id\":\"chatcmpl-0123456789\",\"model\":\"some-long-model-name\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"");
+        u.feed(&paragraph);
+        u.feed("\"}}]}\n\n");
+    }
+    try std.testing.expectEqual(@as(u64, 3), u.events);
+    // Only the content counts: not the id, the model name or the keys.
+    try std.testing.expectEqual(@as(u64, 1200), u.content_bytes);
+    try std.testing.expectEqual(@as(u64, 300), u.estimated(.openai, 0).output_tokens);
+
+    // The other shapes generated text arrives in, however the bytes are split.
+    const shapes = [_]struct { []const u8, u64 }{
+        .{ "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"twelve bytes\"}}\n\n", 12 },
+        .{ "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n", 10 },
+        .{ "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n", 3 },
+        .{ "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1234567\"}}]}}]}\n\n", 7 },
+        .{ "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"abcd\"}\n\n", 4 },
+        .{ "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"abcde\",\"content\":null}}]}\n\n", 5 },
+        // Not text: a role, a type that happens to be called text, an empty
+        // array of content, a key that merely contains the word.
+        .{ "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\"}]}\n\n", 0 },
+        .{ "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\"}}\n\n", 0 },
+        .{ "data: {\"message\":{\"content\":[],\"content_type\":\"x\",\"my_text\":\"nope\"}}\n\n", 0 },
+        // A string that is a value of nothing (an array element) after a content key.
+        .{ "data: {\"content\":[\"not counted\"],\"text\":7}\n\n", 0 },
+    };
+    for (shapes) |shape| {
+        for ([_]usize{ 1, 2, 3, 7, 1000 }) |piece| {
+            var s: Usage = .{};
+            feedSplit(&s, shape[0], piece);
+            try std.testing.expectEqual(shape[1], s.content_bytes);
+        }
+    }
+}
+
+test "the input estimate allows for parts that are not text" {
+    try std.testing.expectEqual(@as(u64, 250), estimateInput(&@as([1000]u8, @splat('x'))));
+    // An image by URL: a few dozen bytes that the provider counts as many tokens.
+    const openai = "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://x/y.png\"}}]}]}";
+    try std.testing.expect(estimateInput(openai) >= 2 * estimate_tokens_per_media_part);
+    const anthropic = "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"https://x/y.png\"}},{\"type\":\"document\",\"source\":{\"type\":\"url\",\"url\":\"https://x/y.pdf\"}}]}]}";
+    try std.testing.expectEqual(anthropic.len / 4 + 2 * estimate_tokens_per_media_part, estimateInput(anthropic));
+    // Plain text mentioning images is just text.
+    const prose = "{\"content\":\"an image of a document: file it\"}";
+    try std.testing.expectEqual(@as(u64, prose.len / 4), estimateInput(prose));
+    try std.testing.expectEqual(@as(u64, 0), estimateInput(""));
 }

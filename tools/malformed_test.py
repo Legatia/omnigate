@@ -10,10 +10,19 @@ the gateway through the end-to-end harness (tools/e2e.py), on that harness's
 ports and with state in a temp dir, and stops them at the end. With --gateway
 it tests an instance you started yourself.
 
-Sends, over raw sockets, every request from the security review that used to
+Sends, over raw sockets, every request from the security reviews that used to
 crash the data plane or slip past a check, a few hundred generated variations
 of broken request heads (seeded, so a failure can be replayed with --seed),
 deeply nested JSON, request-smuggling attempts and non-canonical paths.
+
+When it started the stack itself it also plays the other side: an upstream
+that answers with chunk sizes that overflow, bodies shorter than their
+content-length, both framings at once and a header smuggled into the content
+type (special model names of tools/mock_upstream.py on :9005), and a control
+plane that does the same (a stand-in inside this script on :4300, with a
+second gateway on :8190 pointed at it). And it checks the limits that apply
+before a request body is read: the per-key concurrency cap, the rate limit,
+the size limit.
 
 After EVERY case it asks /healthz on a fresh connection. A panic anywhere in
 the gateway ends the whole process, so "still answering" is the property
@@ -21,8 +30,9 @@ under test; where a case has one right answer (400, 411, ...) that is checked
 too. Exit code 0 only if the gateway survived everything and every expected
 status matched.
 
-It also checks that a client which reads the start of a stream and hangs up
-is still billed: always when it started the stack itself (it then reads the
+It also checks that a client which reads the start of a stream and hangs up,
+or stops reading without hanging up, is still billed, with the provider's
+own figures when the provider goes on to report them: always when it started the stack itself (it then reads the
 ledger through the control plane's admin API), and against your own instance
 when --events-url names a URL that lists the usage events received.
 
@@ -30,15 +40,19 @@ Standard library only. Point it at a test instance, never at production.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 results = []
 ARGS = None
@@ -46,7 +60,14 @@ ARGS = None
 OVERVIEW = None
 
 
+# Set while the cases run against the second gateway (the one whose control
+# plane is this script's stand-in).
+TARGET = None
+
+
 def host_port():
+    if TARGET:
+        return TARGET
     host, _, port = ARGS.gateway.rpartition(":")
     return host or "127.0.0.1", int(port)
 
@@ -87,7 +108,11 @@ def exchange(data, read_timeout=0.4, chunks=None, keep_reading=1.5):
 
 
 def complete(raw):
-    """Is this one whole response with a declared length? Then there is nothing more to wait for."""
+    """Is this one whole response (declared length, or chunked to its end)? Then there is nothing more to wait for."""
+    if raw.startswith(b"HTTP/1.1 100 "):
+        # An interim answer; the real one follows.
+        skip = raw.find(b"\r\n\r\n")
+        return skip >= 0 and complete(raw[skip + 4:])
     end = raw.find(b"\r\n\r\n")
     if end < 0:
         return False
@@ -95,6 +120,8 @@ def complete(raw):
         name, _, value = line.partition(b":")
         if name.strip().lower() == b"content-length" and value.strip().isdigit():
             return len(raw) - end - 4 >= int(value.strip())
+        if name.strip().lower() == b"transfer-encoding" and value.strip().lower() == b"chunked":
+            return raw.endswith(b"\r\n0\r\n\r\n") or raw[end + 4:] == b"0\r\n\r\n"
     return False
 
 
@@ -105,6 +132,47 @@ def status_of(raw):
         return int(raw[9:12])
     except ValueError:
         return None
+
+
+def final_status(raw):
+    """The status after any `100 Continue`."""
+    if raw and raw.startswith(b"HTTP/1.1 100 "):
+        skip = raw.find(b"\r\n\r\n")
+        return status_of(raw[skip + 4:]) if skip >= 0 else None
+    return status_of(raw)
+
+
+def body_of(raw):
+    """The body of one response, de-chunked if it is chunked; None if it is not whole."""
+    end = raw.find(b"\r\n\r\n")
+    if end < 0:
+        return None
+    head, rest = raw[:end].lower(), raw[end + 4:]
+    if b"transfer-encoding: chunked" not in head:
+        return rest
+    out = b""
+    while True:
+        line_end = rest.find(b"\r\n")
+        if line_end < 0:
+            return None
+        try:
+            size = int(rest[:line_end].split(b";")[0], 16)
+        except ValueError:
+            return None
+        if size == 0:
+            return out
+        chunk = rest[line_end + 2:line_end + 2 + size]
+        if len(chunk) < size:
+            return None
+        out += chunk
+        rest = rest[line_end + 2 + size + 2:]
+
+
+def record(name, ok, detail=""):
+    results.append((name, ok))
+    if not ok or ARGS.verbose:
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"   [{detail}]" if detail and not ok else ""), flush=True)
+    return ok
 
 
 def alive():
@@ -214,8 +282,6 @@ def smuggling():
     case("a query string trying to name another endpoint", b"GET /v1/files/job_1/a.png?sig=1&x=/../../internal/config HTTP/1.1\r\nHost: t\r\n\r\n", expect=400)
     case("a query string with an encoded line break", b"GET /v1/files/job_1/a.png?sig=1%0d%0ax-omnigate-internal:%20t HTTP/1.1\r\nHost: t\r\n\r\n", expect=400)
 
-    def one_response(raw, status):
-        return None if raw.count(b"HTTP/1.1 ") <= 1 else f"{raw.count(b'HTTP/1.1 ')} responses to one request: the body was read as a second request"
     hidden = b"GET /v1/models HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer " + ARGS.key.encode() + b"\r\n\r\n"
     case("a body on a GET is not read as the next request",
          b"GET /healthz HTTP/1.1\r\nHost: t\r\nContent-Length: " + str(len(hidden)).encode() + b"\r\n\r\n" + hidden, expect=400, check=one_response)
@@ -246,6 +312,366 @@ def paths():
         ok = all(c == 400 for c in codes)
         results.append(("the trailing-slash spelling cannot be used to create jobs past the rate limit", ok))
         print(f"  {'PASS' if ok else 'FAIL'}  the trailing-slash spelling cannot be used to create jobs past the rate limit" + ("" if ok else f"   [{codes}]"), flush=True)
+
+
+def one_response(raw, status):
+    return None if raw.count(b"HTTP/1.1 ") <= 1 else f"{raw.count(b'HTTP/1.1 ')} responses to one request: the body was read as a second request"
+
+
+def second_review():
+    section("second review: chunked request bodies, Expect, idempotency keys")
+    body = chat_body().encode()
+    head = (b"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer " + ARGS.key.encode() +
+            b"\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n")
+    case("a chunked request body whose chunk size is sixteen F's (std's chunked reader overflowed)",
+         head + b"FFFFFFFFFFFFFFFF\r\n" + body + b"\r\n0\r\n\r\n", expect=411, check=one_response)
+    case("... seventeen F's", head + b"FFFFFFFFFFFFFFFFF\r\n" + body + b"\r\n0\r\n\r\n", expect=411, check=one_response)
+    case("... and a well-formed chunked body is asked for a length as well",
+         head + b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body), expect=411, check=one_response)
+    case("... on a job request", b"POST /v1/jobs HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer " + ARGS.key.encode() +
+         b"\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\n{}\r\n0\r\n\r\n", expect=411, check=one_response)
+
+    def continued(raw, status):
+        if b"HTTP/1.1 100 Continue\r\n\r\n" not in raw:
+            return "no 100 Continue"
+        return None if final_status(raw) == 200 else f"final status {final_status(raw)}"
+    for spelling in (b"100-continue", b"100-Continue", b"100-CONTINUE"):
+        case(f"Expect: {spelling.decode()} is honoured (other letter cases used to get no answer at all)",
+             post("/v1/chat/completions", chat_body(), extra=b"Expect: " + spelling + b"\r\n"), expect=100, check=continued, read_timeout=5, keep_reading=8)
+    case("... also when the request is refused before its body is read",
+         b"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer not-a-key\r\nContent-Length: 5\r\nExpect: 100-Continue\r\n\r\n",
+         expect={100, 401}, check=lambda raw, status: None if final_status(raw) == 401 else f"final status {final_status(raw)}")
+
+    idem = b"Idempotency-Key: dGhpcyBpcyBhIGtleQ+/aGk=\r\n"
+    case("a base64 Idempotency-Key on chat completions is the client's business (it used to be a 400)",
+         post("/v1/chat/completions", chat_body(), extra=idem), expect=200, read_timeout=5, keep_reading=8)
+    case("... any bytes at all there, as long as the head is well-formed",
+         post("/v1/chat/completions", chat_body(), extra=b"Idempotency-Key: a b;c \xc3\xa9\r\n"), expect=200, read_timeout=5, keep_reading=8)
+    case("... and on a job request a base64 key is accepted",
+         post("/v1/jobs", '{"model":"m","input":{}}', extra=idem), forbid={None, 500}, read_timeout=5, keep_reading=8,
+         check=lambda raw, status: "refused for its idempotency key" if b"idempotency-key" in raw.lower() else None)
+
+
+def limits_before_body():
+    section("limits that apply before a body is read")
+    host, port = host_port()
+
+    def head_only(key, declared, model=None):
+        return (b"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer " + key.encode() +
+                b"\r\nContent-Type: application/json\r\nContent-Length: " + str(declared).encode() + b"\r\n\r\n")
+
+    def answer_without_body(key, declared, wait=3.0):
+        """Send only a head that promises `declared` bytes; what comes back without sending any of them?"""
+        s = socket.create_connection((host, port), timeout=5)
+        try:
+            s.sendall(head_only(key, declared))
+            s.settimeout(wait)
+            try:
+                return s.recv(65536)
+            except (socket.timeout, OSError):
+                return b""
+        finally:
+            s.close()
+
+    raw = answer_without_body(ARGS.key, 9 * 1024 * 1024)
+    record("a body declared larger than the limit is refused (413) before any of it is sent", status_of(raw) == 413, raw[:120])
+
+    if ARGS.rpm_key:
+        # Three requests of a 3-per-minute key, none of which ever sends its body ...
+        waiting = []
+        for _ in range(3):
+            s = socket.create_connection((host, port), timeout=5)
+            s.sendall(head_only(ARGS.rpm_key, 8_000_000))
+            waiting.append(s)
+        time.sleep(0.5)
+        # ... and the fourth is told no without the gateway reading eight megabytes first.
+        started = time.time()
+        raw = answer_without_body(ARGS.rpm_key, 8_000_000)
+        took = time.time() - started
+        record("a key over its rate limit is refused (429) before its body is read",
+               status_of(raw) == 429 and b"rate_limit_exceeded" in raw and took < 2.5, (status_of(raw), round(took, 1), raw[-160:]))
+        for s in waiting:
+            s.close()
+
+    cap = ARGS.concurrency_cap
+    if cap:
+        # `cap` requests in flight (each stuck sending its body) ...
+        waiting = []
+        for _ in range(cap):
+            s = socket.create_connection((host, port), timeout=5)
+            s.sendall(head_only(ARGS.key, 1000) + b'{"model":"')
+            waiting.append(s)
+        time.sleep(0.6)
+        raw, _ = exchange(post("/v1/chat/completions", chat_body()), read_timeout=3, keep_reading=5)
+        record(f"with {cap} requests in flight the key's next one is refused (429 concurrency_limit_exceeded, retry-after)",
+               status_of(raw) == 429 and b"concurrency_limit_exceeded" in raw and b"retry-after: 1" in raw.lower(), (status_of(raw), (raw or b"")[-200:]))
+        raw, _ = exchange(b"GET /v1/models HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer " + ARGS.key.encode() + b"\r\n\r\n", read_timeout=3, keep_reading=5)
+        record("... reading (the model list) is not counted", status_of(raw) == 200, status_of(raw))
+        if ARGS.other_key:
+            raw, _ = exchange(post("/v1/chat/completions", chat_body(), key=ARGS.other_key), read_timeout=5, keep_reading=8)
+            record("... and another key is unaffected", status_of(raw) == 200, status_of(raw))
+        for s in waiting:
+            s.close()
+        ok = False
+        for _ in range(20):
+            time.sleep(0.25)
+            raw, _ = exchange(post("/v1/chat/completions", chat_body()), read_timeout=5, keep_reading=8)
+            if status_of(raw) == 200:
+                ok = True
+                break
+        record("... once they are gone the key is served again", ok, status_of(raw))
+    if not alive():
+        print("the gateway stopped answering")
+        sys.exit(1)
+
+
+def expensive_bodies():
+    section("bodies that are cheap to send and used to be expensive to parse")
+    served = {"read_timeout": 30, "keep_reading": 40}
+
+    def big(model, filler):
+        prefix = '{"model":"%s","messages":[{"role":"user","content":"hi"}],"max_tokens":16,"x":' % model
+        return prefix + filler + "}"
+
+    zeros = "[" + "0," * (4 * 1024 * 1024 - 64) + "0]"  # just under 8 MiB of text; a tree of it took 2.3 GB
+    case("8 MiB of tiny values, same protocol: forwarded as it is, no tree built",
+         post("/v1/chat/completions", big(ARGS.model, zeros)), expect=200, **served)
+    many = "{" + ",".join('"k%d":0' % i for i in range(70_000)) + "}"
+    case("an object with 70,000 members is refused outright",
+         post("/v1/chat/completions", big(ARGS.model, many)), expect=400, read_timeout=10, keep_reading=15)
+    some = "{" + ",".join('"k%d":0' % i for i in range(2_000)) + "}"
+    case("an object with 2,000 members is fine when nothing has to parse it",
+         post("/v1/chat/completions", big(ARGS.model, some)), expect=200, **served)
+    case("a `model` written with an escaped slash still routes",
+         post("/v1/chat/completions", '{"model":"no\\/such","messages":[]}'), expect=404, read_timeout=5, keep_reading=8)
+    case("`model` given twice is refused (parsers disagree on which one counts)",
+         post("/v1/chat/completions", '{"model":"%s","messages":[],"model":"other"}' % ARGS.model), expect=400)
+    case("`model` spelled with an escape is refused",
+         post("/v1/chat/completions", '{"mod\\u0065l":"%s","messages":[]}' % ARGS.model), expect=400)
+    if ARGS.translated_model:
+        def too_complex(raw, status):
+            return None if b"request_too_complex" in raw else "not refused as too complex"
+        started = time.time()
+        case("8 MiB of tiny values to a model of the other protocol: refused (400), the tree is never completed",
+             post("/v1/chat/completions", big(ARGS.translated_model, zeros)), expect=400, check=too_complex, read_timeout=30, keep_reading=40)
+        took = time.time() - started
+        record("... within a few seconds", took < 8, round(took, 1))
+        case("an object with 2,000 members to a model of the other protocol: refused (hash collisions are bounded by count)",
+             post("/v1/chat/completions", big(ARGS.translated_model, some)), expect=400, check=too_complex, read_timeout=10, keep_reading=15)
+        ordinary = "{" + ",".join('"k%d":{"a":[1,2,3],"b":"text"}' % i for i in range(900)) + "}"
+        case("an ordinary large request to a model of the other protocol is still translated",
+             post("/v1/chat/completions", big(ARGS.translated_model, ordinary)), expect=200, **served)
+        image = '[{"type":"text","text":"%s"}]' % ("A" * (8 * 1024 * 1024 - 400))
+        case("... and so is one of the largest size there is (8 MiB), mostly one long string",
+             post("/v1/chat/completions", '{"model":"%s","max_tokens":16,"messages":[{"role":"user","content":%s}]}' % (ARGS.translated_model, image)),
+             expect=200, **served)
+
+
+def hostile_upstream():
+    section("an upstream that answers like an attacker")
+    def ask(model, stream=False):
+        return post("/v1/chat/completions", json.dumps({"model": model, "stream": stream, "messages": [{"role": "user", "content": "hi"}]}))
+
+    def cut_short(raw, status):
+        if b"0\r\n\r\n" in raw[-7:]:
+            return "the response was ended properly, as if it were complete"
+        return None
+
+    def no_injection(raw, status):
+        return "the smuggled header reached the client" if b"x-injected" in raw.lower() else None
+
+    case("a chunk size of sixteen F's in a JSON answer (std's reader overflowed): a failed upstream, 502",
+         ask("hostile-chunk-json"), expect=502, read_timeout=5, keep_reading=8)
+    case("... of seventeen F's", ask("hostile-chunk17"), expect=502, read_timeout=5, keep_reading=8)
+    case("... in the middle of a stream: the client's stream is cut, never ended as if complete",
+         ask("hostile-chunk-sse", stream=True), expect=200, check=cut_short, read_timeout=3, keep_reading=6)
+    case("a JSON answer shorter than its content-length, then a clean close (std asserted): 502, not half an answer",
+         ask("hostile-short-json"), expect=502, read_timeout=5, keep_reading=8)
+    case("... a stream shorter than its content-length: cut, not ended",
+         ask("hostile-short-sse", stream=True), expect=200, check=cut_short, read_timeout=3, keep_reading=6)
+    case("both content-length and transfer-encoding: refused, 502", ask("hostile-both"), expect=502, read_timeout=5, keep_reading=8)
+    case("a content-type with a bare line feed carrying another header: 502, and the header goes nowhere",
+         ask("hostile-ctype"), expect=502, check=no_injection, read_timeout=5, keep_reading=8)
+
+    case("an interim status (103) presented as the final answer: 502", ask("hostile-status"), expect=502, read_timeout=5, keep_reading=8)
+
+    def whole(raw, status):
+        body = body_of(raw)
+        if body is None:
+            return "the body is not whole"
+        try:
+            text = json.loads(body)["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            return "the body is not the JSON that was sent"
+        if len(text) != 200_000:
+            return f"{len(text)} characters of 200000"
+        head = raw[:raw.find(b"\r\n\r\n")].lower()
+        return None if b"transfer-encoding: chunked" in head and b"content-length" not in head else "the upstream's length was passed on"
+    case("a long honest answer arrives whole, framed by the gateway and not with the upstream's length",
+         ask("hostile-long"), expect=200, check=whole, read_timeout=10, keep_reading=15)
+
+    def counted(raw, status):
+        end = raw.find(b"\r\n\r\n")
+        head = raw[:end].lower()
+        for line in head.split(b"\r\n"):
+            if line.startswith(b"content-length:"):
+                return None if int(line.split(b":")[1]) == len(raw) - end - 4 else "content-length does not match the body"
+        return "a short answer should carry a length"
+    case("a short answer carries a length the gateway counted itself", ask(ARGS.model), expect=200, check=counted, read_timeout=5, keep_reading=8)
+
+
+# --------------------------------------------------------------------------
+# a hostile control plane: a stand-in here, and a second gateway that uses it
+
+STANDIN_PORT = 4300
+SECOND_GATEWAY_PORT = 8190
+STANDIN_KEY = "og-standin-key"
+STANDIN_TOKEN = "standin-internal-token"
+STANDIN = {"config_mode": "ok"}
+
+
+class StandIn(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def raw(self, data):
+        self.wfile.write(data)
+        self.wfile.flush()
+        self.close_connection = True
+
+    def good(self, status, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def hostile(self, mode):
+        ok = json.dumps({"id": "job_1", "status": "succeeded"}).encode()
+        if mode == "chunk":
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\n" + ok + b"\r\n0\r\n\r\n")
+        if mode == "short":
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n" + ok[:10])
+        if mode == "both":
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\ntransfer-encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n" % (len(ok), len(ok), ok))
+        if mode == "ctype":
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\nx-injected: 1\r\ncontent-length: %d\r\n\r\n" % len(ok) + ok)
+        if mode == "long":
+            data = b"\x89PNG" + b"p" * 300_000
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: %d\r\n\r\n" % len(data) + data)
+        if mode == "longshort":
+            return self.raw(b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 300000\r\n\r\n" + b"p" * 100_000)
+        return self.good(200, {"id": "job_1", "status": "succeeded"})
+
+    def do_GET(self):
+        if self.path == "/internal/config":
+            if STANDIN["config_mode"] != "ok":
+                return self.hostile(STANDIN["config_mode"])
+            return self.good(200, {
+                "version": "standin-1",
+                "keys": [{"key_sha256": hashlib.sha256(STANDIN_KEY.encode()).hexdigest(), "name": "standin"}],
+                "upstreams": [], "routes": [],
+            })
+        if self.path.startswith("/internal/v1/jobs/"):
+            return self.hostile(self.path.rsplit("/", 1)[1])
+        self.good(200, {})
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length") or 0))
+        self.good(200, {"accepted": 0})
+
+
+def hostile_control(stack):
+    global TARGET
+    section("a control plane that answers like an attacker (stand-in on :%d, second gateway on :%d)" % (STANDIN_PORT, SECOND_GATEWAY_PORT))
+    server = ThreadingHTTPServer(("127.0.0.1", STANDIN_PORT), StandIn)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    exe = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dataplane", "zig-out", "bin",
+                       "omnigate-dp" + (".exe" if os.name == "nt" else ""))
+    work = os.path.join(stack.work, "second")
+    os.makedirs(work, exist_ok=True)
+    stack.start("gateway2", [exe], cwd=work, env={
+        "OMNIGATE_LISTEN": f"127.0.0.1:{SECOND_GATEWAY_PORT}", "OMNIGATE_CONTROL_URL": f"http://127.0.0.1:{STANDIN_PORT}",
+        "OMNIGATE_INTERNAL_TOKEN": STANDIN_TOKEN, "OMNIGATE_POLL_MS": "200", "OMNIGATE_FLUSH_MS": "200",
+        "OMNIGATE_SPOOL": "off", "OMNIGATE_CONFIG_CACHE": "off",
+    })
+    TARGET = ("127.0.0.1", SECOND_GATEWAY_PORT)
+    try:
+        models = b"GET /v1/models HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer " + STANDIN_KEY.encode() + b"\r\n\r\n"
+        ready = False
+        for _ in range(60):
+            raw, _ = exchange(models, read_timeout=1, keep_reading=2)
+            if status_of(raw) == 200:
+                ready = True
+                break
+            time.sleep(0.25)
+        if not record("the second gateway took its config from the stand-in", ready):
+            return
+
+        def job(mode):
+            return b"GET /v1/jobs/" + mode.encode() + b" HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer " + STANDIN_KEY.encode() + b"\r\n\r\n"
+
+        def no_injection(raw, status):
+            return "the smuggled header reached the client" if b"x-injected" in raw.lower() else None
+
+        def cut_short(raw, status):
+            return "the response was ended properly, as if it were complete" if b"0\r\n\r\n" in raw[-7:] else None
+
+        def whole_file(raw, status):
+            body = body_of(raw)
+            return None if body is not None and len(body) == 300_004 else "the file did not arrive whole"
+
+        case("an honest job answer is relayed, with a length the gateway counted", job("fine"), expect=200, read_timeout=5, keep_reading=8,
+             check=lambda raw, status: None if b"content-length: " in raw.lower() and b'"job_1"' in raw else "not relayed as it was")
+        case("a chunk size of sixteen F's from the control plane: 502", job("chunk"), expect=502, read_timeout=5, keep_reading=8)
+        case("an answer shorter than its content-length: 502, not half an answer", job("short"), expect=502, read_timeout=5, keep_reading=8)
+        case("both framings: 502", job("both"), expect=502, read_timeout=5, keep_reading=8)
+        case("a content-type that smuggles a header: 502, and the header goes nowhere", job("ctype"), expect=502, check=no_injection, read_timeout=5, keep_reading=8)
+        case("a long honest answer (a file) arrives whole", job("long"), expect=200, check=whole_file, read_timeout=10, keep_reading=15)
+        case("a long answer cut short by the control plane is cut for the client too, not ended", job("longshort"), expect=200, check=cut_short, read_timeout=3, keep_reading=6)
+
+        # The config poll itself (every 200 ms) gets the same treatment.
+        for mode in ("chunk", "short", "both"):
+            STANDIN["config_mode"] = mode
+            time.sleep(0.9)
+            raw, _ = exchange(models, read_timeout=2, keep_reading=3)
+            record(f"a config poll answered with '{mode}' is a failed poll: the gateway keeps its config and keeps serving",
+                   alive() and status_of(raw) == 200, status_of(raw))
+        STANDIN["config_mode"] = "ok"
+    finally:
+        TARGET = None
+        stack.stop("gateway2")
+        server.shutdown()
+        server.server_close()
+
+
+def healthcheck_command():
+    section("the healthcheck subcommand")
+    exe = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dataplane", "zig-out", "bin",
+                       "omnigate-dp" + (".exe" if os.name == "nt" else ""))
+
+    def run_it(listen, *args):
+        env = dict(os.environ, OMNIGATE_LISTEN=listen)
+        started = time.time()
+        code = subprocess.run([exe, *args], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20).returncode
+        return code, time.time() - started
+    code, took = run_it(ARGS.gateway, "healthcheck")
+    record("exit 0 against a gateway that answers", code == 0 and took < 3, (code, round(took, 1)))
+    code, took = run_it("127.0.0.1:1", "healthcheck")
+    record("exit 1 when nothing listens", code == 1 and took < 5, (code, round(took, 1)))
+    # Something that accepts and then says nothing: the check gives up by itself.
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen(4)
+    code, took = run_it("127.0.0.1:%d" % silent.getsockname()[1], "healthcheck")
+    silent.close()
+    record("exit 1, after about three seconds, when the listener never answers", code == 1 and 2 < took < 8, (code, round(took, 1)))
+    code, took = run_it(ARGS.gateway, "no-such-command")
+    record("an unknown subcommand is an error, not a second server", code == 2, code)
 
 
 BASES = None
@@ -336,6 +762,9 @@ def events():
         return json.load(r)
 
 
+OWN_CONCURRENCY_CAP = 8
+
+
 def start_own_stack():
     """Mocks, control plane and gateway through the end-to-end harness. Returns the stack to stop."""
     global OVERVIEW
@@ -347,13 +776,17 @@ def start_own_stack():
     # The mock on :9005 starts a stream and then either goes on for ever
     # without reporting usage (model names starting with "drip") or goes silent.
     config["upstreams"].append({"name": "mock-stall", "kind": "openai", "base_url": "http://127.0.0.1:9005", "api_key_env": "MOCK_API_KEY"})
-    config["routes"].append({"model": "drip", "targets": [dict(upstream="mock-stall", model="drip-1", **price)]})
-    config["routes"].append({"model": "stall", "targets": [dict(upstream="mock-stall", model="stall-1", **price)]})
+    for name in ("drip", "stall", "late-usage", "flood", "hostile-chunk-json", "hostile-chunk-sse", "hostile-chunk17",
+                 "hostile-short-json", "hostile-short-sse", "hostile-both", "hostile-ctype", "hostile-status", "hostile-long"):
+        config["routes"].append({"model": name, "targets": [dict(upstream="mock-stall", model=name + "-1", **price)]})
 
     work = tempfile.mkdtemp(prefix="omnigate-malformed-")
     stack = e2e.Stack(work, config, False)
-    # Short enough that the two "estimated" cases finish within the default wait.
-    stack.gateway_env = {"OMNIGATE_STREAM_IDLE_TIMEOUT_MS": "4000", "OMNIGATE_ABORT_DRAIN_MS": "1500"}
+    # Short enough that the "estimated" cases finish within the default wait
+    # (and long enough for the provider that reports late); a small cap on
+    # concurrent requests, so that reaching it takes a handful of sockets.
+    stack.gateway_env = {"OMNIGATE_STREAM_IDLE_TIMEOUT_MS": "4000", "OMNIGATE_ABORT_DRAIN_MS": "5000",
+                         "OMNIGATE_CLIENT_STALL_TIMEOUT_MS": "1500", "OMNIGATE_MAX_CONCURRENT_PER_KEY": str(OWN_CONCURRENCY_CAP)}
     stack.start_mocks()
     stack.start_control()
     stack.start_gateway()
@@ -362,7 +795,8 @@ def start_own_stack():
 
     ARGS.gateway = f"127.0.0.1:{e2e.GATEWAY_PORT}"
     ARGS.key, ARGS.model, ARGS.rpm_key = e2e.KEY_MAIN, "direct", e2e.KEY_RPM
-    ARGS.drip_model, ARGS.stall_model = "drip", "stall"
+    ARGS.other_key, ARGS.translated_model, ARGS.concurrency_cap = e2e.KEY_OTHER, "claude", OWN_CONCURRENCY_CAP
+    ARGS.drip_model, ARGS.stall_model, ARGS.late_model, ARGS.flood_model = "drip", "stall", "late-usage", "flood"
     OVERVIEW = (e2e.CONTROL + "/admin/overview", e2e.ADMIN_TOKEN)
     return stack, work
 
@@ -412,6 +846,37 @@ def billing_on_disconnect():
         results.append((name, ok))
         print(f"  {'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"   [{e}]"), flush=True)
 
+    if ARGS.late_model:
+        # The provider goes on for 2.5 s after we left, then says what it cost.
+        rid = start_and_leave(ARGS.late_model)
+        e = event_for(rid, ARGS.drain_wait) or {}
+        ok = e.get("output_tokens") == 34 and e.get("input_tokens") == 21 and not e.get("estimated")
+        record("left a stream whose provider reports usage seconds later: read to its end, billed the provider's real figures", ok, e)
+
+    if ARGS.flood_model:
+        # Stay connected, read the start, then take nothing more: the kernel
+        # buffers fill, the gateway's write stalls, and after the stall
+        # timeout the answer is read on without us.
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        s.settimeout(5)
+        s.connect((host, port))
+        s.sendall(post("/v1/chat/completions", json.dumps({"model": ARGS.flood_model, "stream": True, "messages": [{"role": "user", "content": "hi"}]})))
+        got = b""
+        while b"data:" not in got:
+            more = s.recv(2048)
+            if not more:
+                break
+            got += more
+        rid = None
+        for line in got.split(b"\r\n"):
+            if line.lower().startswith(b"x-omnigate-request-id:"):
+                rid = line.split(b":", 1)[1].strip().decode()
+        e = event_for(rid, ARGS.drain_wait) or {}
+        s.close()
+        ok = e.get("output_tokens") == 4242 and e.get("input_tokens") == 55 and not e.get("estimated")
+        record("stopped reading without hanging up: given up on after the stall timeout, the answer read to its end, billed the real figures", ok, e)
+
     if ARGS.drip_model:
         estimated_case(ARGS.drip_model, "left a stream that goes on without ever reporting usage: billed an estimate, marked as one")
     if ARGS.stall_model:
@@ -427,7 +892,12 @@ def main():
     ap.add_argument("--gateway", help="host:port of a data plane you started; without it the script starts its own stack")
     ap.add_argument("--key", help="a valid gateway key (with --gateway)")
     ap.add_argument("--model", help="a text route that key may use (with --gateway)")
-    ap.add_argument("--rpm-key", help="a rate-limited key, to check the trailing-slash bypass")
+    ap.add_argument("--rpm-key", help="a rate-limited key (3 per minute), to check the trailing-slash bypass and the limit before the body")
+    ap.add_argument("--other-key", help="a second valid key, to check that one key's concurrency cap leaves others alone")
+    ap.add_argument("--concurrency-cap", type=int, default=0, help="the instance's OMNIGATE_MAX_CONCURRENT_PER_KEY, if it is small enough to reach with sockets")
+    ap.add_argument("--translated-model", help="a chat route served by an Anthropic-style upstream (so the request is translated)")
+    ap.add_argument("--late-model", help="a route whose upstream finishes its stream and reports usage whoever is listening")
+    ap.add_argument("--flood-model", help="a route whose upstream sends megabytes of stream at once, then usage (prompt 55, completion 4242)")
     ap.add_argument("--seed", type=int, default=20261110)
     ap.add_argument("--count", type=int, default=None, help="generated cases (default 250, or 1500 with --thorough)")
     ap.add_argument("--thorough", action="store_true", help="many more generated cases; takes several minutes")
@@ -444,11 +914,13 @@ def main():
 
     stack = work = None
     if ARGS.gateway is None:
+        ARGS.late_model = ARGS.flood_model = None
         stack, work = start_own_stack()
     elif not (ARGS.key and ARGS.model):
         ap.error("--gateway needs --key and --model")
+    good = False
     try:
-        good = run()
+        good = run(stack)
     finally:
         if stack:
             stack.stop_all()
@@ -465,7 +937,7 @@ def good_enough_to_clean(stack):
     return not failed
 
 
-def run():
+def run(stack=None):
     if not alive():
         raise SystemExit(f"nothing answers /healthz at {ARGS.gateway}")
     raw, _ = exchange(post("/v1/chat/completions", chat_body()), read_timeout=5, keep_reading=8)
@@ -475,8 +947,15 @@ def run():
     started = time.time()
     known_crashers()
     smuggling()
+    second_review()
     paths()
+    expensive_bodies()
     generated(random.Random(ARGS.seed), ARGS.count)
+    limits_before_body()
+    if stack:
+        hostile_upstream()
+        hostile_control(stack)
+        healthcheck_command()
     if ARGS.events_url or OVERVIEW:
         billing_on_disconnect()
 

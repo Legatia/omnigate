@@ -348,7 +348,7 @@ None of them has been used with a real provider.
 | `gemini` | Gemini `generateContent` (image, speech) | one call | verified |
 | `gemini_interactions` | Gemini Interactions API (video) | one call, or submit and poll | verified in the foreground; background polling mock only |
 | `xai_video` | xAI video generation | submit and poll | verified |
-| `sume` | Sume image and video routers | submit and poll | mock only |
+| `sume` | Sume image and video routers | submit and poll | real image and video job; cancel and refusals mock only |
 
 ### Replicate
 
@@ -751,11 +751,8 @@ request is a job that is polled.
   its price if it completes, as it does for a provider with no cancel at
   all ([API](api.md#cancel-a-job)).
 
-Status: **not verified.** The adapter was written from Sume's public
-documentation (read on 11 November 2026) and has only run against the
-project's mock of it; no request has been made with a Sume key. Expect
-details to differ. Its public endpoints were reached without a key: the
-catalog answers, and a submit is refused with the documented error object.
+Status: **partly verified.** The adapter was written from Sume's public
+documentation (read on 11 November 2026). Checked against the real service on 11 November 2026 with one image job (`gpt-image-2`, low quality) and one 3-second video job (`gemini-omni-flash-1.2`, 360p): submit, polling, the result and the download worked as written, and the video was billed from the duration Sume reported (3.029 s for a 3 s request). Cancel, refusals such as insufficient funds, idempotent replay and failed jobs have only met the mock.
 
 ### Failover across media providers
 

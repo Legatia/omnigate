@@ -25,8 +25,8 @@ only met a mock, is tracked in the README's
   derived from the job, so a submit that is sent twice starts one job at
   Sume; polls follow the interval Sume asks for; a job is canceled at Sume
   only while Sume says it can be, and otherwise polled on and billed if it
-  completes. Written from Sume's public documentation and run only against
-  a mock: no request has been made with a Sume key. See
+  completes. Written from Sume's public documentation; one real image job
+  and one real video job have run through it, the rest only against a mock. See
   [docs/providers.md](docs/providers.md#sume).
 - **Price variants** (`price.variants` on a media target, any kind): rates
   per second, per output, per job or per character that depend on fields

@@ -45,10 +45,12 @@ defmodule OmnigateControl.Jobs.Adapters.Sume do
   stopped. The runner then keeps asking how the job ends, and bills it if it
   completes.
 
-  Written from Sume's public documentation (read 11 November 2026) and
-  exercised only against this repository's mock (`tools/mock_media.py`).
-  Not yet exercised against the real service: no request has been made with
-  a Sume key.
+  Written from Sume's public documentation (read 11 November 2026).
+  Checked against the real service the same day with one image job
+  (`gpt-image-2`) and one 3-second video job (`gemini-omni-flash-1.2`):
+  submit, polling, the result and the download worked as written. Cancel,
+  refusals, idempotent replay and failed jobs have only met the mock
+  (`tools/mock_media.py`).
   """
   @behaviour OmnigateControl.Jobs.Adapter
 

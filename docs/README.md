@@ -18,6 +18,7 @@ exercised against a mock, or not at all, the page says so.
 | Write or change the config file, or look up an environment variable | [Configuration](configuration.md) |
 | Call the gateway from an application, with plain HTTP or the official SDKs | [API reference](api.md) |
 | Use the dashboard, create and revoke gateway keys, set budgets, read the audit log | [Admin](admin.md) |
+| Build something around the gateway: a payment service that credits keys, a billing tool that reads usage, an agent on its own key; which interfaces are stable | [Building on omnigate](building-on-omnigate.md) |
 | Connect OpenAI, Anthropic, Gemini, xAI or a media provider | [Providers](providers.md) |
 | Put it on a server with TLS | [Deployment](deployment.md) |
 | Upgrade an installation that runs an earlier commit: what changes on disk, which defaults changed, what clients will notice, the order to upgrade the two processes, and going back | [Upgrading](upgrading.md) |

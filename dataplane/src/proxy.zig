@@ -234,7 +234,25 @@ const ClientHeaders = struct {
     /// `x-omnigate-dry-run`, as sent.
     dry_run: ?[]const u8 = null,
     dry_run_repeated: bool = false,
+    /// `x-omnigate-tag`, as sent.
+    tag: ?[]const u8 = null,
+    tag_repeated: bool = false,
 };
+
+/// A tag is a label the caller attaches to a request for its own books (a
+/// tenant, an end user's id in the caller's system). It is recorded with the
+/// request's usage and goes nowhere else: no provider sees it, and it is in
+/// no metric. Short and plain, because it ends up in a ledger line.
+const max_tag_len = 64;
+
+fn validTag(tag: []const u8) bool {
+    if (tag.len == 0 or tag.len > max_tag_len) return false;
+    for (tag) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '.', '_', ':', '-' => {},
+        else => return false,
+    };
+    return true;
+}
 
 /// What privacy mode does to one request: the key's setting, plus whatever
 /// the request's own header added (it can add, never take away).
@@ -364,6 +382,9 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         } else if (std.ascii.eqlIgnoreCase(h.name, "x-omnigate-dry-run")) {
             if (hdrs.dry_run != null) hdrs.dry_run_repeated = true;
             hdrs.dry_run = try arena.dupe(u8, h.value);
+        } else if (std.ascii.eqlIgnoreCase(h.name, "x-omnigate-tag")) {
+            if (hdrs.tag != null) hdrs.tag_repeated = true;
+            hdrs.tag = try arena.dupe(u8, h.value);
         }
     }
 
@@ -399,6 +420,16 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             return respondError(acc, request, .bad_request, "invalid_request", "invalid x-omnigate-privacy header: use \"on\", or a comma-separated list of no-store, redact, unlink, attested (it can only switch protections on)")
     else
         .{};
+    // A tag that would be dropped or cut is refused instead: the caller's
+    // books would otherwise miss requests without anyone being told.
+    if (hdrs.tag_repeated)
+        return respondError(acc, request, .bad_request, "invalid_request", "x-omnigate-tag was sent more than once");
+    const tag: ?[]const u8 = if (hdrs.tag) |v| blk: {
+        const t = std.mem.trim(u8, v, " \t");
+        if (!validTag(t))
+            return respondError(acc, request, .bad_request, "invalid_request", "invalid x-omnigate-tag header: 1 to 64 characters of letters, digits, '.', '_', ':' and '-'");
+        break :blk t;
+    } else null;
     // A dry run sends nothing anywhere. One kind exists; a value that is not
     // it is refused, because a request meant to stay here must not be sent
     // on for a spelling mistake.
@@ -421,7 +452,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
 
     // A signed output URL carries its own proof; the control plane checks it.
     if (is_files and method == .GET and hdrs.api_key == null and hasQueryParam(query, "sig")) {
-        return forwardToControl(app, acc, arena, request, guard, method, path, query, null, null, null, false);
+        return forwardToControl(app, acc, arena, request, guard, method, path, query, null, null, null, false, null);
     }
 
     // --- authentication -------------------------------------------------
@@ -485,7 +516,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             return respondError(acc, request, .service_unavailable, "attestation_unverified", "this request may only go to an attested provider, and no media provider is attested");
         // (The key's own setting is the control plane's to apply; the
         // header's wish for this one job is passed on.)
-        return forwardToControl(app, acc, arena, request, guard, method, path, query, job_body, hdrs.idempotency_key, &key_hash, is_job_create and privacy_request.no_store);
+        return forwardToControl(app, acc, arena, request, guard, method, path, query, job_body, hdrs.idempotency_key, &key_hash, is_job_create and privacy_request.no_store, if (is_job_create) tag else null);
     }
 
     const ep = endpoint orelse
@@ -680,6 +711,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             // Counted, not billed: no tokens, and marked as served from cache.
             report(app, arena, .{
                 .id = &req_id,
+                .tag = tag,
                 .key_sha256 = &key_hash,
                 .route_model = route_model,
                 .upstream = null,
@@ -916,6 +948,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                     acc.output_tokens = used.output_tokens;
                     const event: UsageReport = .{
                         .id = &req_id,
+                        .tag = tag,
                         .key_sha256 = &key_hash,
                         .route_model = route_model,
                         .upstream = up.name,
@@ -1011,6 +1044,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 }
                 if (ep.metered) report(app, arena, .{
                     .id = &req_id,
+                    .tag = tag,
                     .key_sha256 = &key_hash,
                     .route_model = route_model,
                     .upstream = up.name,
@@ -1064,6 +1098,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     const final_status: u16 = if (rate_limited) 429 else 502;
     if (ep.metered) report(app, arena, .{
         .id = &req_id,
+        .tag = tag,
         .key_sha256 = &key_hash,
         .route_model = route_model,
         .upstream = null,
@@ -1327,6 +1362,8 @@ const UsageReport = struct {
     attempts: []const Attempt,
     /// Unique per client request; the ledger dedups on it.
     id: []const u8,
+    /// The caller's own label for the request (`x-omnigate-tag`), if any.
+    tag: ?[]const u8 = null,
     /// Filled in by `report`.
     ts_ms: i64 = 0,
 };
@@ -2073,6 +2110,7 @@ fn startDrain(
         // The event's strings belong to the request that is about to end.
         const a = job.arena.allocator();
         job.event.id = a.dupe(u8, event.id) catch break :ok false;
+        job.event.tag = if (event.tag) |t| a.dupe(u8, t) catch break :ok false else null;
         job.event.key_sha256 = &job.key_hash;
         job.event.route_model = a.dupe(u8, event.route_model) catch break :ok false;
         job.event.upstream = if (event.upstream) |u| a.dupe(u8, u) catch break :ok false else null;
@@ -2170,6 +2208,8 @@ fn forwardToControl(
     key_sha256: ?[]const u8,
     /// The request asked (`x-omnigate-privacy`) for nothing of it to be kept.
     private: bool,
+    /// The caller's label for a new job (`x-omnigate-tag`, checked by the caller).
+    tag: ?[]const u8,
 ) !void {
     // The control plane's address comes from our own configuration; the
     // client contributes a path and a query that were validated character by
@@ -2193,6 +2233,7 @@ fn forwardToControl(
     if (key_sha256) |k| try extra.append(arena, .{ .name = "x-omnigate-key-sha256", .value = k });
     if (idempotency_key) |k| if (guard_mod.visibleToken(k, 255)) try extra.append(arena, .{ .name = "idempotency-key", .value = k });
     if (private) try extra.append(arena, .{ .name = "x-omnigate-privacy", .value = "no-store" });
+    if (tag) |t| try extra.append(arena, .{ .name = "x-omnigate-tag", .value = t });
     // Our id for this request, so that the control plane's log lines (and
     // the `request_id` in a 500 from it) match what the client was given.
     try extra.append(arena, .{ .name = "x-omnigate-request-id", .value = acc.request_id.get() });
@@ -2448,4 +2489,11 @@ fn respondModels(
             .{ .name = "request-id", .value = request_id },
         },
     });
+}
+
+test "validTag: short, plain labels only" {
+    const longest: [max_tag_len]u8 = @splat('A');
+    const too_long: [max_tag_len + 1]u8 = @splat('A');
+    for ([_][]const u8{ "t", "tenant-42", "org:acme.user_7", &longest }) |ok| try std.testing.expect(validTag(ok));
+    for ([_][]const u8{ "", &too_long, "a b", "a@b.c", "a/b", "caf\xc3\xa9", "a\nb", "a\x00b", "a,b", "\"a\"" }) |bad| try std.testing.expect(!validTag(bad));
 }

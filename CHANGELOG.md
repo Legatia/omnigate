@@ -57,8 +57,31 @@ only met a mock, is tracked in the README's
   and `OmnigateControl.Attestation.Live` (the check alone, from the command
   line).
 
+- **Built to be built around** ([docs/building-on-omnigate.md](docs/building-on-omnigate.md)).
+  Three additions for programs that stand next to the gateway, and a page
+  that says which interfaces they can rely on:
+  - `POST /admin/keys/{name}/topup` adds `amount_usd` to a managed key's
+    total budget once per `reference` (a payment id). The budget and the
+    reference are written together; the same call again adds nothing and
+    says `"replayed": true`; the reference with another key or amount is
+    `409 reference_conflict`; a key without a total budget is
+    `409 not_prepaid`. Audited as `key.topup`.
+  - `GET /admin/events?after=&limit=&key=` is a usage feed: every recorded
+    text request and media job, oldest first, by cursor, by key name, with
+    no content and no key hash. It says so (`"gap": true`) when retention
+    deleted events a reader had not reached.
+  - `x-omnigate-tag` on a text request or `POST /v1/jobs` is the caller's
+    label for it, recorded in the ledger and shown in the feed; never sent
+    to a provider, in no metric. A value outside 1 to 64 letters, digits,
+    `.`, `_`, `:`, `-` is refused with 400 rather than dropped.
+  - `examples/`: a tool-calling agent client, a prepaid top-up service
+    with a file as its payment source, and a usage exporter to CSV, each
+    run by `tools/e2e.py` against the mock providers.
+
 ### Changed
 
+- `tools/e2e.py` keeps the managed keys and the audit log of a run in the
+  run's own directory (they were in `control/data/`, shared between runs).
 - `GET /admin/keys` and the config snapshot: a key's `privacy` object has a
   fifth field, `attested`. A target in the snapshot may carry
   `attestation`.

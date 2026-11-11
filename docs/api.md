@@ -427,6 +427,7 @@ Request headers the gateway acts on:
 | `Idempotency-Key` | Jobs API only. |
 | `x-omnigate-privacy` | Switches parts of [privacy mode](privacy.md#the-request-header) on for this one request: `on` (`no-store`, `redact` and `unlink`), or a comma-separated list of `no-store`, `redact`, `unlink`, `attested`. It can only add to the key's setting; any other value, or the header sent twice, answers `400 invalid_request`. Never forwarded. |
 | `x-omnigate-dry-run` | `privacy`: answer with the request as privacy mode left it (`{"object": "omnigate.privacy_dry_run", "sent_upstream": false, "body": "...", ...}`) and send nothing to any provider. Any other value, or the header twice, answers `400 invalid_request`. See [Seeing what a provider would be sent](attestation.md#seeing-what-a-provider-would-be-sent). Never forwarded. |
+| `x-omnigate-tag` | The caller's own label for the request (a tenant, a run, an end user's id in its system): 1 to 64 letters, digits, `.`, `_`, `:` or `-`. Recorded with the request's usage and shown in the [usage feed](building-on-omnigate.md#reading-usage); never sent to a provider, in no metric. Also taken on `POST /v1/jobs`. Anything else, or the header sent twice, is `400 invalid_request`. |
 
 Other request headers are not forwarded to the provider. The values of
 the first three are restricted to plain characters; see
@@ -1422,7 +1423,9 @@ check, then the endpoint.
 | `POST /admin/keys` | Create a managed key. The answer is the only one that contains the key itself. |
 | `PATCH /admin/keys/{name}` | Change a managed key's budget, period, rate limit, models, open-job limit, jobs-per-day limit, webhook secret or disabled flag. |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. |
+| `POST /admin/keys/{name}/topup` | Add `amount_usd` to a managed key's total budget, once per `reference` (a payment id): the same call again adds nothing. |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
+| `GET /admin/events?after=CURSOR&limit=N&key=NAME` | The usage feed: every recorded text request and media job, oldest first, with a cursor to continue from. No content. See [Building on omnigate](building-on-omnigate.md#reading-usage). |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
 | `GET /admin/overview` | Everything the dashboard shows, as JSON. |
 | `GET /admin/audit?limit=N` | The newest entries of the admin audit log. |

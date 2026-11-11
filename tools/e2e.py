@@ -13,6 +13,7 @@ Exit code 0 only when every check passes.
 """
 
 import argparse
+import csv
 import base64
 import hashlib
 import hmac
@@ -592,6 +593,117 @@ def key_checks():
           status == 200 and all(k in overview for k in ("totals", "today", "keys", "requests", "jobs", "config")), list(overview)[:8])
 
 
+def example(script, *args, env=None):
+    """Run one of examples/*.py against this stack. Returns (exit code, stdout, stderr)."""
+    full_env = dict(os.environ, OMNIGATE_CONTROL=CONTROL, OMNIGATE_GATEWAY=GATEWAY, OMNIGATE_ADMIN_TOKEN=ADMIN_TOKEN, **(env or {}))
+    done = subprocess.run([sys.executable, os.path.join(ROOT, "examples", script), *args], env=full_env, capture_output=True, text=True, timeout=120)
+    return done.returncode, done.stdout, done.stderr
+
+
+def build_around_checks(work):
+    """What outside tools build on: top-ups by payment reference, the usage feed, the request tag; and examples/ run for real."""
+    section("building around: prepaid keys and top-ups")
+    name = "e2e-prepaid"
+    status, _, created = admin("POST", "/admin/keys", {"name": name, "budget_usd": 0})
+    secret = created.get("key", "")
+    blocked = wait_until(lambda: chat("direct", key=secret)[0] == 402, 6, 0.2)
+    check("a key created with an empty prepaid budget is known to the gateway and answered 402", status == 201 and bool(blocked), status)
+
+    payments = os.path.join(work, "payments.jsonl")
+    with open(payments, "w") as f:
+        f.write(json.dumps({"reference": "e2e-pay-1", "key": name, "amount_usd": 0.01}) + "\n")
+    code, out, err = example("prepaid_topup.py", "--payments", payments, "--once")
+    check("examples/prepaid_topup.py credits the payment", code == 0 and "credited: e2e-pay-1" in out and "already" not in out, (code, out, err))
+    unblocked = wait_until(lambda: chat("direct", key=secret)[0] == 200, 6, 0.2)
+    check("... and the blocked key works again within seconds, without a restart", bool(unblocked))
+
+    # The same payment seen again (a restarted watcher that lost its place): credited once.
+    os.remove(payments + ".state")
+    code, out, err = example("prepaid_topup.py", "--payments", payments, "--once")
+    _, _, listing = admin("GET", "/admin/keys")
+    row = next((k for k in listing.get("keys", []) if k.get("name") == name), {})
+    check("the same payment seen a second time is not credited twice", code == 0 and "already credited: e2e-pay-1" in out and row.get("budget_usd") == 0.01, (code, out, row.get("budget_usd")))
+    status, _, body = admin("POST", f"/admin/keys/{name}/topup", {"amount_usd": 5, "reference": "e2e-pay-1"})
+    check("... and its reference cannot be reused for another amount (409)", status == 409 and body.get("error", {}).get("code") == "reference_conflict", (status, body))
+
+    spent = wait_until(lambda: chat("direct", key=secret)[0] == 402, 15, 0.2)
+    status, _, topped = admin("POST", f"/admin/keys/{name}/topup", {"amount_usd": 0.01, "reference": "e2e-pay-2"})
+    again = wait_until(lambda: chat("direct", key=secret)[0] == 200, 6, 0.2)
+    check("spent again, topped up again: 402, then 200", bool(spent) and status == 200 and topped.get("topup", {}).get("budget_usd") == 0.02 and bool(again), (spent, status, topped.get("topup")))
+    status, _, body = admin("POST", "/admin/keys/main/topup", {"amount_usd": 1, "reference": "e2e-pay-3"})
+    check("a key from the config file takes no top-up (409)", status == 409, (status, body))
+
+    with open(payments, "a") as f:
+        f.write(json.dumps({"reference": "e2e-pay-4", "key": "e2e-customer", "amount_usd": 5}) + "\n")
+        f.write("not a payment\n")
+        f.write(json.dumps({"reference": "e2e-pay-5", "key": "main", "amount_usd": 1}) + "\n")
+    code, out, err = example("prepaid_topup.py", "--payments", payments, "--once", "--create-keys")
+    customer = next((line.rsplit(" ", 1)[-1] for line in out.splitlines() if line.startswith("created key e2e-customer")), "")
+    rejected = open(payments + ".rejected").read() if os.path.exists(payments + ".rejected") else ""
+    check("a first payment for a new customer creates their prepaid key; payments that cannot be credited are set aside, not retried forever",
+          code == 0 and customer.startswith("og-") and "credited: e2e-pay-4" in out and "not a payment" in rejected and "e2e-pay-5" in rejected and "e2e-pay-4" not in rejected,
+          (code, out, err, rejected))
+    status, _, audit = admin("GET", "/admin/audit?limit=100")
+    topups = [e.get("topup", {}) for e in audit.get("entries", []) if e.get("action") == "key.topup"]
+    check("every top-up is in the audit log with its reference and amount, replays marked",
+          status == 200 and any(t.get("reference") == "e2e-pay-1" and t.get("replayed") is True for t in topups)
+          and any(t.get("reference") == "e2e-pay-4" and t.get("amount_usd") == 5 and t.get("replayed") is False for t in topups), topups[:6])
+
+    section("building around: an agent on its own key, tagged, and the usage feed")
+    usable = wait_until(lambda: chat("direct", key=customer)[0] == 200, 6, 0.2)
+    agent_env = {"OMNIGATE_KEY": customer, "OMNIGATE_MODEL": "direct", "OMNIGATE_TAG": "run:e2e-1"}
+    code, out, err = example("agent_client.py", "Multiply 6 by 7, use the tool", env=agent_env)
+    check("examples/agent_client.py runs its tool loop through the gateway: a tool call, its result, a final answer",
+          bool(usable) and code == 0 and out.strip() != "" and "tool multiply(" in err, (code, out, err))
+    code, out, err = example("agent_client.py", "hello", env=dict(agent_env, OMNIGATE_KEY=empty_prepaid_key()))
+    check("... and stops with a clear message on a key whose budget is spent", code != 0 and "budget is spent" in err, (code, out, err))
+    status, _, body = jcall("POST", GATEWAY + "/v1/chat/completions", key=customer, body=dict(CHAT, model="direct"), headers={"x-omnigate-tag": "two words"})
+    check("a tag that would not be recorded as sent is refused (400), not dropped", status == 400 and "x-omnigate-tag" in json.dumps(body), (status, body))
+
+    out_csv = os.path.join(work, "usage.csv")
+
+    def exported():
+        code, out, err = example("usage_export.py", "--out", out_csv, "--key", "e2e-customer")
+        if code != 0:
+            return None
+        with open(out_csv, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        # The probe call above, then the agent's two model calls.
+        return rows if len([r for r in rows if r["tag"] == "run:e2e-1"]) >= 2 else None
+    rows = wait_until(exported, 15, 0.5) or []
+    tagged = [r for r in rows if r["tag"] == "run:e2e-1"]
+    check("examples/usage_export.py writes the key's events to CSV: the agent's two calls with their tag, tokens and cost, and nothing of other keys",
+          len(tagged) == 2 and all(r["key"] == "e2e-customer" and r["kind"] == "text" and r["model"] == "direct" and r["upstream"] == "mock-ok"
+                                   and int(r["input_tokens"]) > 0 and float(r["cost_usd"]) > 0 and r["status"] == "200" for r in tagged)
+          and all(r["key"] == "e2e-customer" for r in rows) and len({r["id"] for r in rows}) == len(rows), rows[:4])
+    code, out, err = example("usage_export.py", "--out", out_csv, "--key", "e2e-customer")
+    with open(out_csv, newline="", encoding="utf-8") as f:
+        after = list(csv.DictReader(f))
+    check("... and a second run continues from its saved cursor: nothing is exported twice", code == 0 and "0 event(s)" in out and len(after) == len(rows), (code, out, len(after), len(rows)))
+
+    status, _, first = admin("GET", "/admin/events?limit=3")
+    status2, _, second = admin("GET", "/admin/events?limit=1000&after=" + str(first.get("next")))
+    ids = [e.get("id") for e in first.get("events", [])] + [e.get("id") for e in second.get("events", [])]
+    text = json.dumps([first, second])
+    check("GET /admin/events pages through every key's events in order, with no key hash and no content in it",
+          status == 200 and status2 == 200 and len(first.get("events", [])) == 3 and first.get("more") is True and len(ids) == len(set(ids))
+          and sha(customer) not in text and "key_sha256" not in text and not any(f in e for e in first.get("events", []) + second.get("events", []) for f in ("messages", "content", "prompt", "input")),
+          (status, status2, len(ids)))
+    status, _, body = admin("GET", "/admin/events?after=nonsense")
+    check("a cursor that is not one is refused (400 invalid_cursor)", status == 400 and body.get("error", {}).get("code") == "invalid_cursor", (status, body))
+    for key in (name, "e2e-customer", "e2e-empty"):
+        admin("DELETE", f"/admin/keys/{key}")
+
+
+def empty_prepaid_key():
+    """A managed key with nothing in its prepaid budget, known to the gateway."""
+    admin("DELETE", "/admin/keys/e2e-empty")
+    _, _, created = admin("POST", "/admin/keys", {"name": "e2e-empty", "budget_usd": 0})
+    secret = created.get("key", "")
+    wait_until(lambda: chat("direct", key=secret)[0] == 402, 6, 0.2)
+    return secret
+
+
 def text_checks(stack):
     section("basics")
     status, _, raw = call("GET", GATEWAY + "/healthz")
@@ -973,13 +1085,19 @@ def privacy_text_checks():
     check("private requests are metered like any other", row.get("requests", 0) >= 10 and row.get("cost_usd", 0) > 0, row)
 
 
+def wait_private_job(job_id, key):
+    """A private job once it is terminal AND erased: the erasing is a second write, a moment after the first."""
+    done = wait_job(job_id, key=key)
+    return wait_until(lambda: (lambda j: j if j.get("input_erased") else None)(get_job(job_id, key)), 5, 0.1) or done
+
+
 def privacy_media_checks():
     section("privacy mode: media jobs")
     prompt = f"{CANARY} a private lighthouse"
     body = {"model": "image", "input": {"prompt": prompt}, "metadata": {"order": CANARY + "-order"}, "webhook_url": MOCK["webhooks"] + "/hook"}
     status, _, job = jcall("POST", GATEWAY + "/v1/jobs", key=KEY_PLAIN, body=body, headers={"x-omnigate-privacy": "no-store"})
     check("x-omnigate-privacy: no-store makes one job private", status == 202 and job.get("private") is True, (status, job))
-    done = wait_job(job.get("id", "missing"), key=KEY_PLAIN)
+    done = wait_private_job(job.get("id", "missing"), KEY_PLAIN)
     check("when it ends, its input and metadata are erased; the result stays",
           done.get("status") == "succeeded" and done.get("input") is None and done.get("metadata") is None
           and done.get("input_erased") is True and len(done.get("outputs") or []) == 1, done)
@@ -993,7 +1111,7 @@ def privacy_media_checks():
     check("nor does the list of jobs", CANARY not in json.dumps(listed), json.dumps(listed)[:200])
 
     status, _, job = create_job({"model": "image", "input": {"prompt": prompt}}, key=KEY_PRIVATE)
-    done = wait_job(job.get("id", "missing"), key=KEY_PRIVATE)
+    done = wait_private_job(job.get("id", "missing"), KEY_PRIVATE)
     check("every job of a private key is private", status == 202 and job.get("private") is True and done.get("input_erased") is True, (status, done))
     status, _, refused = jcall("POST", GATEWAY + "/v1/jobs", key=KEY_PLAIN, body=body, headers={"x-omnigate-privacy": "never"})
     check("a privacy header the gateway does not understand is refused for jobs too", status == 400, (status, refused))
@@ -1266,6 +1384,10 @@ def leftovers(work):
 def control_env(work):
     return {
         "OMNIGATE_JOBS": os.path.join(work, "jobs.jsonl"),
+        # Managed keys (with the top-up references) and the audit log of this
+        # run only: a payment reference used here must not be known already.
+        "OMNIGATE_KEYS": os.path.join(work, "keys.json"),
+        "OMNIGATE_AUDIT_LOG": os.path.join(work, "audit.jsonl"),
         # Where the control plane reaches the data plane (the Private chat page).
         "OMNIGATE_GATEWAY_URL": GATEWAY,
         "E2E_S3_ACCESS_KEY": "mock-access-key",
@@ -1328,8 +1450,10 @@ def media_config(work, storage="local"):
     }
 
 
-def create_job(body, key=KEY_MAIN, idem=None):
-    headers = {"idempotency-key": idem} if idem else None
+def create_job(body, key=KEY_MAIN, idem=None, tag=None):
+    headers = {"idempotency-key": idem} if idem else {}
+    if tag:
+        headers["x-omnigate-tag"] = tag
     return jcall("POST", GATEWAY + "/v1/jobs", key=key, body=body, headers=headers)
 
 
@@ -1448,7 +1572,7 @@ def media_checks(stack):
     before = {n: stats(n) for n in ("replicate", "replicate_broken")}
     body = {"model": "image", "input": {"prompt": "a lighthouse at dusk"},
             "webhook_url": MOCK["webhooks"] + "/hook/fail/2", "metadata": {"order": "A-17"}}
-    status, _, job = create_job(body, idem="e2e-image-1")
+    status, _, job = create_job(body, idem="e2e-image-1", tag="order:A-17")
     check("job is accepted with 202", status == 202 and str(job.get("id", "")).startswith("job_")
           and job.get("status") in ("queued", "running"), (status, job))
     job_id = job.get("id", "missing")
@@ -1462,6 +1586,14 @@ def media_checks(stack):
     check("job succeeds on the second provider after the first one fails",
           job.get("status") == "succeeded" and job.get("upstream") == "replicate"
           and len(outcomes) == 2 and outcomes[0][0] == "replicate-broken" and outcomes[0][1] != "ok", job)
+
+    def job_event():
+        _, _, feed = admin("GET", "/admin/events?key=main&limit=1000")
+        return next((e for e in feed.get("events", []) if e.get("id") == job_id), None)
+    event = wait_until(job_event, 10) or {}
+    check("the job is in the usage feed as a media event, with its tag (x-omnigate-tag) and its cost",
+          event.get("kind") == "media" and event.get("tag") == "order:A-17" and event.get("key") == "main" and event.get("upstream") == "replicate"
+          and event.get("cost_usd") == job.get("cost_usd") and event.get("outputs") == len(job.get("outputs", [])), event)
     check("each provider was submitted to exactly once",
           stats("replicate")["submits"] - before["replicate"]["submits"] == 1
           and stats("replicate_broken")["submits"] - before["replicate_broken"]["submits"] == 1)
@@ -1736,6 +1868,7 @@ def main():
         login_checks()
         key_checks()
         if run_text:
+            build_around_checks(work)
             privacy_text_checks()
             attestation_checks(stack)
         if run_media:

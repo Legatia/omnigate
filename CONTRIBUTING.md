@@ -382,6 +382,9 @@ config/
   omnigate.example.json   template for real providers
   omnigate.near.json      NEAR AI Cloud as an attested upstream (tools/near_live.py)
 
+examples/             Python, standard library only: what outside programs look like (docs/building-on-omnigate.md)
+  agent_client.py, prepaid_topup.py, usage_export.py   each is run by tools/e2e.py; keep them working when an interface they use changes
+
 tools/                Python, standard library only (sdk_compat.py excepted; e2e.py uses pyrage if it is there)
   mock_upstream.py, mock_media.py   mock providers, object store, webhook receiver
   e2e.py, container_test.py         the two system tests

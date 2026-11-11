@@ -229,7 +229,9 @@ current budget period reaches the budget.
   key unblocks by itself when the period turns, at 00:00 UTC. A total key
   stays blocked until you raise or remove its budget, in the config file
   for a file key or with a `PATCH` for a managed key
-  ([Admin](admin.md#budgets-and-periods)).
+  ([Admin](admin.md#budgets-and-periods)). A managed key's total budget can
+  also be added to, once per payment reference
+  ([top-ups](admin.md#top-ups)): that is how prepaid credit is sold.
 - **An event counts in the period of its own time**: when the request
   finished on the data plane (for a media job, when the job finished), not
   when the event reached the ledger. Usage spooled through an outage

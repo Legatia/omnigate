@@ -238,6 +238,144 @@ defmodule OmnigateControl.Ledger.Files do
     end
   end
 
+  @doc """
+  One page of events for a reader outside the process, oldest first.
+
+  `cursor` is a position `{segment, byte offset}` on a line boundary, or
+  `nil` for the oldest event still on disk. `active` is `{seq, size}` of the
+  active segment as the writer knows it, so a line being appended is never
+  read. At most `limit` events for which `keep.(event)` holds are returned,
+  and at most `max_bytes` are read: a page can be short, or empty, with more
+  to come.
+
+  Returns `{:ok, %{events: [{position_after, event}], next: position,
+  gap: boolean, more: boolean}}`. `gap` is true when the cursor pointed into
+  a segment that retention has deleted since: reading resumes at the oldest
+  one left, and what lay between is gone. `{:error, :invalid_cursor}` for a
+  position no cursor handed out could have.
+  """
+  def read_events(path, cursor, {active_seq, active_size}, limit, max_bytes, keep) do
+    segments = for({seq, file} <- sealed(path), seq < active_seq, do: {seq, file, file_size(file)}) ++ [{active_seq, path, active_size}]
+    {oldest, _, _} = hd(segments)
+
+    {start, gap} =
+      case cursor do
+        nil -> {{oldest, 0}, false}
+        {seq, _} when seq < oldest -> {{oldest, 0}, true}
+        position -> {position, false}
+      end
+
+    case position_ok(segments, start) do
+      true ->
+        {events, next} = read_pages(Enum.drop_while(segments, fn {seq, _, _} -> seq < elem(start, 0) end), elem(start, 1), limit, max_bytes, keep, [])
+        {last_seq, _, last_size} = List.last(segments)
+        {:ok, %{events: Enum.reverse(events), next: next, gap: gap, more: next != {last_seq, last_size}}}
+
+      false ->
+        {:error, :invalid_cursor}
+    end
+  end
+
+  defp file_size(file) do
+    case File.stat(file) do
+      {:ok, %{size: size}} -> size
+      _ -> 0
+    end
+  end
+
+  # In a segment that exists, not past its end, and at the start of a line.
+  defp position_ok(segments, {seq, offset}) do
+    case Enum.find(segments, fn {s, _, _} -> s == seq end) do
+      {_, file, size} when offset >= 0 and offset <= size -> offset == 0 or bytes_at(file, offset - 1, 1) == "
+"
+      _ -> false
+    end
+  end
+
+  defp bytes_at(file, at, n) do
+    case :file.open(file, [:read, :binary, :raw]) do
+      {:ok, io} ->
+        bytes = read_at(io, at, n)
+        :file.close(io)
+        bytes
+
+      _ ->
+        ""
+    end
+  end
+
+  defp read_pages([{seq, file, size} | rest], offset, limit, budget, keep, acc) do
+    chunk = bytes_at(file, offset, min(size - offset, budget))
+    # Whole lines only: what follows the last newline is read next time.
+    whole =
+      case :binary.matches(chunk, "
+") do
+        [] -> 0
+        matches -> matches |> List.last() |> elem(0) |> Kernel.+(1)
+      end
+
+    {acc, used, left} = take_lines(binary_part(chunk, 0, whole), seq, offset, limit, keep, acc)
+    position = offset + used
+    budget = budget - max(used, 1)
+
+    cond do
+      # The page is full, or nothing more may be read now.
+      left == 0 or budget <= 0 ->
+        {acc, normalize(seq, position, size, rest)}
+
+      # This segment is read to its end: on to the next one.
+      position >= size and rest != [] ->
+        read_pages(rest, 0, left, budget, keep, acc)
+
+      position >= size ->
+        {acc, {seq, position}}
+
+      # A megabyte without a line end is not an event (none is that long, by
+      # far): step over it rather than stay in front of it forever.
+      whole == 0 and byte_size(chunk) >= 1_048_576 ->
+        read_pages([{seq, file, size} | rest], offset + byte_size(chunk), left, budget - byte_size(chunk), keep, acc)
+
+      # What is left of this call's allowance ends inside a line.
+      whole == 0 ->
+        {acc, {seq, position}}
+
+      true ->
+        read_pages([{seq, file, size} | rest], position, left, budget, keep, acc)
+    end
+  end
+
+  # The end of a sealed segment and the start of the next are the same place;
+  # hand out the one that stays valid when the sealed one is deleted.
+  defp normalize(seq, position, size, rest) do
+    case rest do
+      [{next_seq, _, _} | _] when position >= size -> {next_seq, 0}
+      _ -> {seq, position}
+    end
+  end
+
+  # Lines of `text` (all complete) from byte `offset` of segment `seq`, until
+  # `limit` events are kept. Returns `{acc, bytes consumed, limit left}`.
+  defp take_lines(text, seq, offset, limit, keep, acc), do: take_lines(text, seq, offset, 0, limit, keep, acc)
+
+  defp take_lines(_text, _seq, _offset, used, 0, _keep, acc), do: {acc, used, 0}
+  defp take_lines("", _seq, _offset, used, limit, _keep, acc), do: {acc, used, limit}
+
+  defp take_lines(text, seq, offset, used, limit, keep, acc) do
+    [line, rest] = :binary.split(text, "
+")
+    used = used + byte_size(line) + 1
+
+    case JSON.decode(line) do
+      {:ok, %{} = event} ->
+        if keep.(event),
+          do: take_lines(rest, seq, offset, used, limit - 1, keep, [{{seq, offset + used}, event} | acc]),
+          else: take_lines(rest, seq, offset, used, limit, keep, acc)
+
+      _ ->
+        take_lines(rest, seq, offset, used, limit, keep, acc)
+    end
+  end
+
   # -- snapshots ---------------------------------------------------------------
 
   @doc "Fingerprint of the first and last bytes of `file` before `offset`."

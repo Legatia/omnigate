@@ -143,6 +143,7 @@ defmodule OmnigateControl.Audit do
     |> put_if("forwarded_for", forwarded_for(conn))
     |> put_if("fields", extra[:fields])
     |> put_if("privacy", extra[:privacy])
+    |> put_if("topup", extra[:topup])
   end
 
   # -- server -------------------------------------------------------------------

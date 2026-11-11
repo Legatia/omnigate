@@ -210,7 +210,10 @@ defmodule OmnigateControl.Router do
       # Privacy mode: the key's setting, and what this request added to it.
       privacy = %{no_store: Privacy.no_store?(key) or asked_private, encrypt_to: Privacy.recipient(key)}
 
-      case Jobs.create(key.key_sha256, conn.body_params, idempotency_key, [{:privacy, privacy} | caps]) do
+      # The caller's label for the job (`x-omnigate-tag`), for the usage feed.
+      tag = conn |> get_req_header("x-omnigate-tag") |> List.first() |> Ledger.tag()
+
+      case Jobs.create(key.key_sha256, conn.body_params, idempotency_key, [{:privacy, privacy}, {:tag, tag} | caps]) do
         {:ok, job} ->
           send_json(conn, 202, Jobs.view(job))
 
@@ -345,6 +348,60 @@ defmodule OmnigateControl.Router do
     case result do
       {:ok, key, raw} -> send_json(conn, 200, key |> Admin.key_view() |> Map.put(:key, raw))
       {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  # Credit bought in advance, once per payment reference (see `Keys.topup/2`).
+  post "/admin/keys/:name/topup" do
+    attrs = json_object(conn)
+    result = Keys.topup(name, attrs)
+
+    Audit.record(conn, "key.topup", audit_name(name), outcome(result),
+      topup:
+        case result do
+          {:ok, _key, done} -> Map.take(done, ["reference", "amount_usd", "budget_usd", "replayed"])
+          # What was asked, cut to what an audit line should hold.
+          _ -> %{"reference" => audit_name(attrs["reference"]), "amount_usd" => if(is_number(attrs["amount_usd"]), do: attrs["amount_usd"])}
+        end
+    )
+
+    case result do
+      {:ok, key, done} -> send_json(conn, 200, %{key: Admin.key_view(key), topup: done})
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  # The usage feed: every ledger event, oldest first, by cursor.
+  get "/admin/events" do
+    conn = fetch_query_params(conn)
+    q = conn.query_params
+
+    limit =
+      case Integer.parse(q["limit"] || "") do
+        {n, ""} -> n |> max(1) |> min(1000)
+        _ -> 100
+      end
+
+    cursor =
+      case q["after"] do
+        empty when empty in [nil, ""] -> {:ok, nil}
+        text -> Admin.parse_cursor(text)
+      end
+
+    with {:ok, position} <- cursor,
+         {:ok, page} <- Admin.events(position, limit, if(q["key"] in [nil, ""], do: nil, else: q["key"])) do
+      send_json(conn, 200, page)
+    else
+      {:error, :key_not_found} ->
+        send_error(conn, 404, "key_not_found", "no key named #{inspect(String.slice(to_string(q["key"]), 0, 64))}")
+
+      _ ->
+        send_error(
+          conn,
+          400,
+          "invalid_cursor",
+          "\"after\" must be a cursor from an earlier page (the \"next\" field, or an event's \"cursor\"); leave it out to start at the oldest event"
+        )
     end
   end
 

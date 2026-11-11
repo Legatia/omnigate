@@ -535,7 +535,8 @@ defmodule OmnigateControl.Wave2Test do
         {:ok, _} = Supervisor.restart_child(OmnigateControl.Supervisor, Audit)
       end)
 
-      assert [%{"target" => "restart-probe"} | _] = Audit.recent(5)
+      # Somewhere among the newest, not at their head: other tests audit too.
+      assert Enum.any?(Audit.recent(50), &(&1["target"] == "restart-probe"))
     end
   end
 

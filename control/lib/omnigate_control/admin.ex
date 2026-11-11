@@ -90,6 +90,80 @@ defmodule OmnigateControl.Admin do
     }
   end
 
+  @doc """
+  One page of the usage feed (`GET /admin/events`): every recorded event,
+  text requests and media jobs alike, oldest first, each with the cursor to
+  continue after it. `key` limits the page to one key (by name, across its
+  rotations). No content of any request is in the ledger, so none is here.
+
+  Returns `{:ok, %{events, next, more, gap}}`, `{:error, :invalid_cursor}`
+  or `{:error, :key_not_found}`.
+  """
+  def events(cursor, limit, key_name \\ nil) do
+    all = ConfigStore.get().keys ++ ConfigStore.shadowed_keys()
+    names = key_names(all)
+
+    keep =
+      case key_name do
+        nil -> {:ok, fn _ -> true end}
+        name -> if Enum.any?(all, &(&1.name == name)), do: {:ok, fn e -> Map.get(names, e["key_sha256"]) == name end}, else: {:error, :key_not_found}
+      end
+
+    with {:ok, keep} <- keep,
+         {:ok, page} <- Ledger.events(cursor, limit, keep) do
+      {:ok,
+       %{
+         events: Enum.map(page.events, fn {position, e} -> event_view(e, names, position) end),
+         next: cursor_text(page.next),
+         more: page.more,
+         gap: page.gap
+       }}
+    end
+  end
+
+  @doc "A feed position as the text clients send back, and the reverse (`:error` for anything else)."
+  def cursor_text({segment, offset}), do: "#{segment}-#{offset}"
+
+  def parse_cursor(text) when is_binary(text) do
+    case Regex.run(~r/\A(\d{1,9})-(\d{1,15})\z/, text) do
+      [_, segment, offset] -> {:ok, {String.to_integer(segment), String.to_integer(offset)}}
+      _ -> :error
+    end
+  end
+
+  def parse_cursor(_), do: :error
+
+  defp event_view(e, names, position) do
+    media = e["kind"] == "media"
+
+    %{
+      cursor: cursor_text(position),
+      # A text request's id is the `x-omnigate-request-id` its client got; a
+      # media job's is the job id.
+      id: e["id"],
+      kind: if(media, do: "media", else: "text"),
+      ts: e["ts"],
+      received_at: e["received_at"],
+      # null for a key that has been deleted since.
+      key: Map.get(names, e["key_sha256"]),
+      tag: if(is_binary(e["tag"]), do: e["tag"]),
+      model: e["route_model"],
+      upstream: e["upstream"],
+      target_model: e["target_model"],
+      status: e["status"],
+      stream: e["stream"] == true,
+      input_tokens: e["input_tokens"] || 0,
+      cached_input_tokens: e["cached_input_tokens"] || 0,
+      cache_write_input_tokens: e["cache_write_input_tokens"] || 0,
+      output_tokens: e["output_tokens"] || 0,
+      outputs: if(media, do: e["outputs"] || 0),
+      cached: e["cached"] == true,
+      estimated: e["estimated"] == true,
+      latency_ms: e["latency_ms"],
+      cost_usd: e["cost_usd"] || 0.0
+    }
+  end
+
   # hash (current or from before a rotation) -> key name
   defp key_names(keys), do: for(k <- keys, hash <- Keys.hashes(k), into: %{}, do: {hash, k.name})
 

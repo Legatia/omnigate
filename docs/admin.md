@@ -408,6 +408,39 @@ budget period** reaches the budget.
 What spend is made of, including prompt-cache token prices, is in
 [Operations](operations.md#budgets).
 
+### Top-ups
+
+A `total` budget is credit bought in advance, and `POST
+/admin/keys/{name}/topup` adds to it:
+
+```bash
+curl http://127.0.0.1:4000/admin/keys/my-app/topup -H "Authorization: Bearer dev-admin-token-change-me" -H "Content-Type: application/json" -d '{"amount_usd":5,"reference":"invoice-1042"}'
+```
+
+The answer is `200` with `{"key": <the key as in a listing>, "topup":
+{"reference", "key", "amount_usd", "budget_usd", "at", "replayed"}}`.
+
+- `amount_usd` is a number above 0, at most 1e9. `reference` is the
+  caller's name for the payment: 1 to 200 printable ASCII characters
+  without spaces.
+- **The same reference again adds nothing** and answers with what the first
+  call did, `"replayed": true`. The budget and the reference are written in
+  one file write, so a top-up is applied and remembered, or neither. The
+  same reference with another key or another amount is `409
+  reference_conflict`.
+- Only a managed key with a `total` budget takes one. A key without a
+  budget, or with a `monthly` or `daily` one, answers `409 not_prepaid`: set
+  `budget_usd` (0 is fine) first. A config-file key answers `409
+  read_only_key`.
+- The newest 10,000 references, across all keys, are kept in the key store
+  file; a reference older than that would be credited again.
+- The audit entry (`key.topup`) has a `topup` field: the reference, the
+  amount, the budget after it and whether it was a replay.
+- The blocked key works again when the data plane has polled the config.
+
+The flow around it, for a payment service, is in
+[Building on omnigate](building-on-omnigate.md#taking-payments-prepaid-keys-and-top-ups).
+
 ## The audit log
 
 Every state-changing admin action appends one JSON line to
@@ -423,7 +456,7 @@ summed up, as described [below](#failed-and-throttled-sign-ins).
 | Field | Meaning |
 |---|---|
 | `ts` | UTC time, to the second. |
-| `action` | `key.create`, `key.update`, `key.rotate`, `key.delete`, `login`, `logout`. |
+| `action` | `key.create`, `key.update`, `key.rotate`, `key.topup`, `key.delete`, `attestation.verify`, `login`, `logout`. |
 | `target` | The key name as it was sent, cut to 64 characters, or `null`. |
 | `auth` | How the caller was authenticated: `token` (bearer), `session` (dashboard), `password` (a login attempt) or `none`. A key action can no longer be recorded with `none`: the admin API is not reachable without a credential. An older entry that says so was made through the bypass described in [SECURITY.md](../SECURITY.md#past-advisories). |
 | `address` | The address the caller is counted under, the same one the lockouts use, on every line, summary lines included: the peer of the connection, or with `OMNIGATE_TRUST_FORWARDED` (which `compose.yaml` sets) the last hop of `X-Forwarded-For`; an IPv6 address by its /64 (`2001:db8:1:2::`). Until the close-out commit an ordinary line had the peer here, which behind the Compose proxy was always the proxy. |
@@ -432,6 +465,7 @@ summed up, as described [below](#failed-and-throttled-sign-ins).
 | `outcome` | `ok`, or the error's reason, its `error.code` (`invalid_request`, `key_exists`, `read_only_key`, `key_not_found`, ...). For logins: `ok`, `denied` or `throttled`. |
 | `fields` | For `key.update`: the names of the fields that were sent (sorted, at most 20), never their values. |
 | `privacy` | For a `key.create` or `key.update` that set the key's [privacy mode](privacy.md): what it became, in a few words (`no-store, redact, unlink, encrypt`), or `off`. The `encrypt_to` recipient itself is never written. |
+| `topup` | For `key.topup`: `reference`, `amount_usd`, and for one that was applied `budget_usd` (the budget after it) and `replayed` (true when the reference had been applied before and nothing was added). For a refused one: the reference and amount as sent. |
 | `repeats` | Only on a summary line: how many more sign-in attempts with this outcome the address made in that minute, beyond the one that has its own line. |
 
 What is and is not recorded:
@@ -562,7 +596,9 @@ All on the control plane's port, all behind the admin token or a session.
 | `POST /admin/keys` | Create a managed key. `201`, with the key itself. |
 | `PATCH /admin/keys/{name}` | Change a managed key: `budget_usd`, `budget_period`, `rpm`, `max_concurrent`, `models`, `max_open_jobs`, `max_jobs_per_day`, `webhook_secret`, `disabled`, `privacy` ([Privacy mode](privacy.md#switching-it-on)). |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. `200`, with the new key. |
+| `POST /admin/keys/{name}/topup` | Add to a managed key's total budget, once per payment reference: `{"amount_usd": 5, "reference": "..."}`. See [Top-ups](#top-ups). |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
+| `GET /admin/events?after=CURSOR&limit=N&key=NAME` | The usage feed: every recorded text request and media job, oldest first, by cursor. See [Building on omnigate](building-on-omnigate.md#reading-usage). |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
 | `GET /admin/overview` | Everything the dashboard shows, as one JSON document. |
 | `GET /admin/audit?limit=N` | The newest audit entries. |

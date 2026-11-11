@@ -207,6 +207,19 @@ defmodule OmnigateControl.Ledger do
   @doc "Most recent events, newest first."
   def recent, do: GenServer.call(__MODULE__, :recent)
 
+  @events_scan_bytes 4 * 1_048_576
+
+  @doc """
+  One page of recorded events, oldest first, for readers outside (the admin
+  API's events feed): see `OmnigateControl.Ledger.Files.read_events/6`.
+  `cursor` is `nil` or a `{segment, offset}` position from an earlier page;
+  `keep` picks the events wanted. Read inside the ledger process, so a page
+  never sees half a batch; at most #{div(@events_scan_bytes, 1_048_576)} MiB are read per call.
+  """
+  def events(cursor, limit, keep \\ fn _ -> true end, server \\ __MODULE__) when is_integer(limit) and limit > 0 do
+    GenServer.call(server, {:events, cursor, limit, keep}, 120_000)
+  end
+
   @doc "Cost of a usage event given USD-per-1M-token prices."
   def cost(input_tokens, output_tokens, {price_in, price_out}) do
     (input_tokens * price_in + output_tokens * price_out) / 1_000_000
@@ -496,6 +509,10 @@ defmodule OmnigateControl.Ledger do
 
   def handle_call(:recent, _from, state), do: {:reply, state.recent, state}
 
+  def handle_call({:events, cursor, limit, keep}, _from, state) do
+    {:reply, Files.read_events(state.path, cursor, {state.segment, state.offset}, limit, @events_scan_bytes, keep), state}
+  end
+
   def handle_call({:prune_periods, now}, _from, state), do: {:reply, prune_periods(now), state}
 
   # Whole days only: a day goes once its last millisecond is at or before the
@@ -674,11 +691,29 @@ defmodule OmnigateControl.Ledger do
       end
   end
 
+  @doc """
+  A caller's label for a request (`x-omnigate-tag`) as the ledger keeps it:
+  the text itself when it is 1 to 64 letters, digits, `.`, `_`, `:` or `-`,
+  else nil. The data plane refuses anything else before it gets here; this
+  is the same rule for whatever reaches the ledger another way.
+  """
+  def tag(text) when is_binary(text), do: if(text =~ ~r/\A[A-Za-z0-9._:-]{1,64}\z/, do: text)
+  def tag(_), do: nil
+
+  # An event with its tag in that shape, or without the field.
+  defp tagged(event) do
+    case tag(event["tag"]) do
+      nil -> Map.delete(event, "tag")
+      _ -> event
+    end
+  end
+
   # Media job events are priced by the job runner; only timestamps are added.
   defp enrich(event, :media) do
     cost = if is_number(event["cost_usd"]) and event["cost_usd"] >= 0 and event["cost_usd"] <= 1.0e12, do: event["cost_usd"] * 1.0, else: 0.0
 
     event
+    |> tagged()
     |> Map.merge(%{"kind" => "media", "cost_usd" => cost})
     |> stamp()
   end
@@ -686,6 +721,10 @@ defmodule OmnigateControl.Ledger do
   defp enrich(usage, :text) do
     # Only the control plane may mark an event as media.
     usage = Map.delete(usage, "kind")
+
+    # The caller's label (`x-omnigate-tag`): kept only in the shape the data
+    # plane lets through, whoever sent the event.
+    usage = tagged(usage)
 
     tokens = %{
       input: usage["input_tokens"] || 0,

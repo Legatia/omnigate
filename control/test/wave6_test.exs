@@ -519,7 +519,8 @@ defmodule OmnigateControl.Wave6Test do
       # The same through an authenticated action, which waits for its entry.
       conn = conn(:post, "/x") |> put_req_header("x-forwarded-for", <<0xFF, 0xFE>>)
       assert :ok = Audit.record(conn, "key.create", <<"name", 0xFF>>, "ok", auth: "token")
-      assert [%{"target" => target} | _] = Audit.recent(1)
+      # (Found by what it is, not by being the newest: other tests audit too.)
+      assert %{"target" => target} = Enum.find(Audit.recent(50), &(&1["action"] == "key.create" and String.starts_with?(to_string(&1["target"]), "name")))
       assert String.valid?(target)
       assert Process.whereis(Audit) == audit
     end
@@ -1796,11 +1797,13 @@ defmodule OmnigateControl.Wave6Test do
       end
 
       :ok = action.()
-      assert %{"target" => "co-probe", "address" => ^client, "peer" => "10.72.0.7", "forwarded_for" => ^client} = hd(Audit.recent(1))
+      # The newest entry for this target; other tests may have audited since.
+      newest = fn -> Enum.find(Audit.recent(50), &(&1["target"] == "co-probe")) end
+      assert %{"target" => "co-probe", "address" => ^client, "peer" => "10.72.0.7", "forwarded_for" => ^client} = newest.()
       # ... and without the setting the address is the peer, with nothing to add to it.
       System.delete_env("OMNIGATE_TRUST_FORWARDED")
       :ok = action.()
-      assert %{"target" => "co-probe", "address" => "10.72.0.7", "forwarded_for" => ^client} = entry = hd(Audit.recent(1))
+      assert %{"target" => "co-probe", "address" => "10.72.0.7", "forwarded_for" => ^client} = entry = newest.()
       refute Map.has_key?(entry, "peer")
     end
   end

@@ -87,6 +87,8 @@ defmodule OmnigateControl.Jobs do
         "input_file" => on_disk,
         "metadata" => if(metadata_on_disk, do: nil, else: metadata),
         "metadata_file" => metadata_on_disk,
+        # The caller's label (`x-omnigate-tag`); goes into the job's ledger event.
+        "tag" => Keyword.get(opts, :tag),
         # Privacy mode, fixed when the job is created.
         "private" => private,
         "encrypt_to" => encrypt_to,
@@ -675,6 +677,7 @@ defmodule OmnigateControl.Jobs do
       Ledger.record_media(%{
         "id" => job["id"],
         "key_sha256" => job["key_sha256"],
+        "tag" => job["tag"],
         "route_model" => job["model"],
         "upstream" => job["upstream"],
         "target_model" => job["target_model"],

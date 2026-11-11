@@ -17,6 +17,16 @@ defmodule OmnigateControl.Keys do
   Rotating a key replaces its secret but keeps its record: the hashes of
   earlier secrets are remembered (never accepted again) so that the key's
   spend, budget and media jobs carry over.
+
+  ## Top-ups
+
+  `topup/2` adds an amount to a key's total budget under a caller-chosen
+  reference (a payment id, a transaction hash). The budget and the reference
+  are written in the same file write, so a top-up is either applied and
+  remembered or neither; the same reference sent again changes nothing and
+  answers with what the first call did. The newest #{10_000} references are
+  kept (in the same file, under `"topups"`); one older than that would be
+  credited again.
   """
   use GenServer
   require Logger
@@ -28,6 +38,11 @@ defmodule OmnigateControl.Keys do
   @name_format ~r/\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/
   @fields [:budget_usd, :budget_period, :rpm, :max_concurrent, :models, :max_open_jobs, :max_jobs_per_day, :webhook_secret, :disabled, :privacy]
   @max_old_hashes 50
+  @max_topups 10_000
+  @max_topup_usd 1.0e9
+  # Printable ASCII without spaces: fits a transaction hash, a payment
+  # provider's id, a UUID; goes into the audit log as it is.
+  @reference_format ~r/\A[!-~]{1,200}\z/
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -42,6 +57,13 @@ defmodule OmnigateControl.Keys do
 
   @doc "Give a managed key a new secret. Returns `{:ok, key, raw_key}`; the old secret stops working."
   def rotate(name), do: GenServer.call(__MODULE__, {:rotate, name})
+
+  @doc """
+  Add `amount_usd` to a managed key's total budget, once per `reference`.
+  Returns `{:ok, key, topup}`; `topup["replayed"]` is true when the reference
+  had been applied before and nothing was added now.
+  """
+  def topup(name, attrs) when is_map(attrs), do: GenServer.call(__MODULE__, {:topup, name, attrs})
 
   @doc "Remove a managed key. Its usage stays in the ledger."
   def delete(name), do: GenServer.call(__MODULE__, {:delete, name})
@@ -158,10 +180,11 @@ defmodule OmnigateControl.Keys do
   @impl true
   def init(opts) do
     path = Keyword.fetch!(opts, :path)
-    keys = load(path)
+    {keys, topups} = load(path)
     publish(keys)
     if keys != [], do: Logger.info("loaded #{length(keys)} managed keys from #{path}")
-    {:ok, %{path: path, keys: keys}}
+    # `topups`: newest first.
+    {:ok, %{path: path, keys: keys, topups: topups}}
   end
 
   @impl true
@@ -236,6 +259,29 @@ defmodule OmnigateControl.Keys do
     end
   end
 
+  def handle_call({:topup, name, attrs}, _from, state) do
+    with {:ok, key} <- managed_key(name, state),
+         {:ok, amount} <- validate_amount(attrs["amount_usd"]),
+         {:ok, reference} <- validate_reference(attrs["reference"]) do
+      case Enum.find(state.topups, &(&1["reference"] == reference)) do
+        # The same payment again (a retry, a watcher that restarted): what
+        # the first call did, and nothing added.
+        %{"key" => ^name, "amount_usd" => ^amount} = done ->
+          {:reply, {:ok, key, Map.put(done, "replayed", true)}, state}
+
+        %{} ->
+          {:reply,
+           {:error, 409, "reference_conflict", "the reference #{inspect(reference)} was already used for another key or another amount; nothing was added"},
+           state}
+
+        nil ->
+          apply_topup(state, key, amount, reference)
+      end
+    else
+      {:error, _, _, _} = error -> {:reply, error, state}
+    end
+  end
+
   def handle_call({:delete, name}, _from, state) do
     case managed_key(name, state) do
       {:ok, key} -> commit(state, Enum.reject(state.keys, &(&1.name == key.name)), :ok)
@@ -243,12 +289,35 @@ defmodule OmnigateControl.Keys do
     end
   end
 
+  # A top-up is credit bought in advance. Only a total budget is that: a
+  # monthly or daily budget is an allowance that starts over by itself, and a
+  # key without a budget has nothing to add to.
+  defp apply_topup(state, key, amount, reference) do
+    cond do
+      is_nil(key.budget_usd) or budget_period(key) != "total" ->
+        {:reply,
+         {:error, 409, "not_prepaid",
+          "top-ups add to a total budget: give the key \"budget_usd\" (0 is fine) with \"budget_period\": \"total\" first; nothing was added"}, state}
+
+      key.budget_usd + amount > 1.0e12 ->
+        {:reply, {:error, 400, "invalid_request", "the budget would exceed 1e12 dollars; nothing was added"}, state}
+
+      true ->
+        updated = %{key | budget_usd: key.budget_usd + amount}
+        done = %{"reference" => reference, "key" => key.name, "amount_usd" => amount, "budget_usd" => updated.budget_usd, "at" => now_iso()}
+        topups = Enum.take([done | state.topups], @max_topups)
+        commit(state, replace(state.keys, updated), {:ok, updated, Map.put(done, "replayed", false)}, topups)
+    end
+  end
+
   # Disk first: a change that cannot be saved is not applied.
-  defp commit(state, keys, reply) do
-    case save(state.path, keys) do
+  defp commit(state, keys, reply, topups \\ nil) do
+    topups = topups || state.topups
+
+    case save(state.path, keys, topups) do
       :ok ->
         publish(keys)
-        {:reply, reply, %{state | keys: keys}}
+        {:reply, reply, %{state | keys: keys, topups: topups}}
 
       {:error, reason} ->
         Logger.error("cannot write #{state.path}: #{inspect(reason)}")
@@ -379,6 +448,17 @@ defmodule OmnigateControl.Keys do
   defp validate(:webhook_secret, s) when is_binary(s) and byte_size(s) <= 256, do: {:ok, s}
   defp validate(:webhook_secret, _), do: invalid("webhook_secret must be a string of at most 256 characters")
 
+  defp validate_amount(n) when is_number(n) and n > 0 and n <= @max_topup_usd, do: {:ok, n * 1.0}
+  defp validate_amount(_), do: invalid("amount_usd must be a number of dollars above 0, at most #{trunc(@max_topup_usd)}")
+
+  defp validate_reference(r) when is_binary(r) do
+    if r =~ @reference_format,
+      do: {:ok, r},
+      else: invalid("reference must be 1-200 printable ASCII characters without spaces (a payment id or transaction hash)")
+  end
+
+  defp validate_reference(_), do: invalid("reference is required: a string that names the payment, so that sending it twice credits once")
+
   defp invalid(message), do: {:error, 400, "invalid_request", message}
 
   # -- persistence ----------------------------------------------------------------
@@ -389,31 +469,39 @@ defmodule OmnigateControl.Keys do
 
   defp load(path) do
     with {:ok, text} <- File.read(path),
-         {:ok, %{"keys" => list}} when is_list(list) <- JSON.decode(text) do
-      for %{"name" => name, "key_sha256" => hash} = k when is_binary(name) and is_binary(hash) <- list do
-        %{
-          name: name,
-          key_sha256: hash,
-          budget_usd: if(is_number(k["budget_usd"]), do: k["budget_usd"] * 1.0),
-          budget_period: if(k["budget_period"] in ConfigStore.budget_periods(), do: k["budget_period"], else: "total"),
-          # A file written before `rpm` was bounded may hold anything.
-          rpm: if(is_integer(k["rpm"]), do: k["rpm"] |> max(0) |> min(ConfigStore.limits().rpm), else: 0),
-          max_concurrent: if(is_integer(k["max_concurrent"]), do: k["max_concurrent"] |> max(0) |> min(ConfigStore.limits().max_concurrent), else: 0),
-          models: if(is_list(k["models"]), do: k["models"]),
-          max_open_jobs: if(is_integer(k["max_open_jobs"]) and k["max_open_jobs"] >= 0, do: k["max_open_jobs"]),
-          max_jobs_per_day: if(is_integer(k["max_jobs_per_day"]) and k["max_jobs_per_day"] >= 0, do: k["max_jobs_per_day"]),
-          webhook_secret: k["webhook_secret"],
-          disabled: k["disabled"] == true,
-          privacy: OmnigateControl.Privacy.load(k["privacy"]),
-          source: :managed,
-          created_at: k["created_at"],
-          old_hashes: if(is_list(k["old_hashes"]), do: k["old_hashes"], else: []),
-          carried_totals: if(is_map(k["carried_totals"]), do: Map.filter(k["carried_totals"], fn {f, v} -> is_binary(f) and is_number(v) end), else: %{})
-        }
-      end
+         {:ok, %{"keys" => list} = file} when is_list(list) <- JSON.decode(text) do
+      topups =
+        for %{"reference" => r, "key" => k, "amount_usd" => a} = t when is_binary(r) and is_binary(k) and is_number(a) <- List.wrap(file["topups"]) do
+          Map.put(t, "amount_usd", a * 1.0)
+        end
+
+      keys =
+        for %{"name" => name, "key_sha256" => hash} = k when is_binary(name) and is_binary(hash) <- list do
+          %{
+            name: name,
+            key_sha256: hash,
+            budget_usd: if(is_number(k["budget_usd"]), do: k["budget_usd"] * 1.0),
+            budget_period: if(k["budget_period"] in ConfigStore.budget_periods(), do: k["budget_period"], else: "total"),
+            # A file written before `rpm` was bounded may hold anything.
+            rpm: if(is_integer(k["rpm"]), do: k["rpm"] |> max(0) |> min(ConfigStore.limits().rpm), else: 0),
+            max_concurrent: if(is_integer(k["max_concurrent"]), do: k["max_concurrent"] |> max(0) |> min(ConfigStore.limits().max_concurrent), else: 0),
+            models: if(is_list(k["models"]), do: k["models"]),
+            max_open_jobs: if(is_integer(k["max_open_jobs"]) and k["max_open_jobs"] >= 0, do: k["max_open_jobs"]),
+            max_jobs_per_day: if(is_integer(k["max_jobs_per_day"]) and k["max_jobs_per_day"] >= 0, do: k["max_jobs_per_day"]),
+            webhook_secret: k["webhook_secret"],
+            disabled: k["disabled"] == true,
+            privacy: OmnigateControl.Privacy.load(k["privacy"]),
+            source: :managed,
+            created_at: k["created_at"],
+            old_hashes: if(is_list(k["old_hashes"]), do: k["old_hashes"], else: []),
+            carried_totals: if(is_map(k["carried_totals"]), do: Map.filter(k["carried_totals"], fn {f, v} -> is_binary(f) and is_number(v) end), else: %{})
+          }
+        end
+
+      {keys, Enum.take(topups, @max_topups)}
     else
       {:error, :enoent} ->
-        []
+        {[], []}
 
       other ->
         # Refuse to start over a file we cannot read: writing a fresh one would
@@ -423,10 +511,13 @@ defmodule OmnigateControl.Keys do
   end
 
   # Temp file, fsync, rename: a crash never leaves half a file in place.
-  defp save(path, keys) do
+  defp save(path, keys, topups) do
     body =
       JSON.encode!(%{
         "version" => 1,
+        # Applied top-ups, newest first (see "Top-ups" above). A reader that
+        # does not know the field ignores it.
+        "topups" => topups,
         "keys" => Enum.map(keys, fn k -> k |> Map.delete(:source) |> Map.new(fn {field, v} -> {Atom.to_string(field), v} end) end)
       })
 

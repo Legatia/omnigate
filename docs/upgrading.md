@@ -623,6 +623,37 @@ check a response's `x-omnigate-attestation` header and
 | The dashboard's top bar | | A link to the Private chat page. Using the page creates a managed key named `private-chat`; a config-file key of that name stops the page from working |
 | The control plane's outbound calls | | With an attested upstream only: the upstream's host, Intel's and NVIDIA's attestation services ([list](attestation.md#what-the-control-plane-calls)) |
 
+## The build-around commit
+
+The commit after the attestation one adds what outside tools build on
+([Building on omnigate](building-on-omnigate.md)): top-ups, the usage feed
+and the request tag. Nothing changes for an installation that uses none of
+them, with the exceptions below.
+
+**On disk (control plane)**
+
+| File | Change | Old code reading it afterwards |
+|---|---|---|
+| `keys.json` | A top-level `"topups"` list: the applied top-ups, newest first, at most 10,000. Written (empty) at the first key change after the upgrade. | Reads the keys and ignores the list. **Its next key change writes the file without it**, so the references are forgotten: a payment replayed after going back would be credited again. |
+| `ledger.jsonl` and its segments | An event may have a `"tag"`. | Ignores it. |
+| `jobs.jsonl` | A job may have a `"tag"`. | Ignores it. |
+| `audit.jsonl` | `key.topup` entries, with a `topup` object. | Shows them like any entry. |
+
+**Mixed versions**
+
+| Control plane | Data plane | What happens |
+|---|---|---|
+| new | old | An `x-omnigate-tag` header is **ignored without an error**: the request is served and its event has no tag. Top-ups and the usage feed work (they are the control plane's alone). |
+| old | new | A valid tag is accepted by the data plane and sent with the usage event; the old ledger stores the field as it is and shows it nowhere. `POST /admin/keys/{name}/topup` and `GET /admin/events` answer 404. |
+
+**What an installation can notice without using it**
+
+| Change | Before | Now |
+|---|---|---|
+| A request with an `x-omnigate-tag` header | Ignored | Recorded if it is 1 to 64 letters, digits, `.`, `_`, `:`, `-`; otherwise, or sent twice, `400 invalid_request` |
+| `POST /admin/keys/{name}/topup`, `GET /admin/events` | `404` | The new endpoints |
+| The audit log | | `key.topup` entries |
+
 ## Tested upgrades
 
 `tools/upgrade_test.py` builds an older commit, lets it write state, stops

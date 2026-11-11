@@ -269,8 +269,9 @@ jobs:
           echo "started, and 'omnigate-dp healthcheck' reported it healthy"
 
       # omnigate-dp-<version>-<target>.tar.gz (.zip for Windows), each holding
-      # one directory of the same name with the binary in it, and next to each
-      # archive a .sha256 file in `sha256sum -c` format.
+      # one directory of the same name with the binary, the license terms
+      # (LICENSE, COMMERCIAL.md) and a short README.txt in it, and next to
+      # each archive a .sha256 file in `sha256sum -c` format.
       - name: Package
         run: |
           set -euo pipefail
@@ -281,6 +282,9 @@ jobs:
           for target in $TARGETS; do
             name="omnigate-dp-${VERSION}-${target}"
             mkdir "$stage/$name"
+            # The license terms travel with every copy of the program.
+            cp LICENSE COMMERCIAL.md .github/release/README.txt "$stage/$name/"
+            chmod 0644 "$stage/$name"/*
             case "$target" in
               *-windows*)
                 cp "$out/$target/bin/omnigate-dp.exe" "$stage/$name/"
@@ -306,8 +310,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # What the image build needs: the two Linux binaries, laid out as
-      # .github/release/dataplane.Dockerfile expects them.
+      # What the image build needs: the two Linux binaries and the license
+      # files, laid out as .github/release/dataplane.Dockerfile expects them.
       - name: Lay out the Linux binaries for the image build
         run: |
           set -euo pipefail
@@ -315,6 +319,7 @@ jobs:
           mkdir -p "$context/bin/amd64" "$context/bin/arm64"
           cp "$RUNNER_TEMP/out/x86_64-linux-musl/bin/omnigate-dp" "$context/bin/amd64/omnigate-dp"
           cp "$RUNNER_TEMP/out/aarch64-linux-musl/bin/omnigate-dp" "$context/bin/arm64/omnigate-dp"
+          cp LICENSE COMMERCIAL.md .github/release/README.txt "$context/"
 
       - name: Upload the archives
         uses: actions/upload-artifact@v7
@@ -461,6 +466,7 @@ jobs:
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.version=$VERSION" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0" \
             --file .github/release/dataplane.Dockerfile "$RUNNER_TEMP/image-context"
 
       - name: Build the control plane image
@@ -475,7 +481,8 @@ jobs:
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.version=$VERSION" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            control
+            --label "org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0" \
+            --file control/Dockerfile .
 
       - name: What was pushed
         if: env.PUBLISH == 'true'
@@ -530,6 +537,9 @@ jobs:
             echo "docker pull ghcr.io/$owner/omnigate-dataplane:$VERSION"
             echo "docker pull ghcr.io/$owner/omnigate-control:$VERSION"
             echo '```'
+            echo
+            echo "Licensed under the PolyForm Noncommercial License 1.0.0: free for personal and other"
+            echo "noncommercial use; commercial use needs a license (see COMMERCIAL.md, in every archive and image)."
             echo
             echo "Data plane binaries are attached below, each with a \`.sha256\` file"
             echo "(\`sha256sum -c <archive>.sha256\`). The control plane is published as a container image only."

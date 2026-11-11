@@ -360,7 +360,7 @@ defmodule OmnigateControl.RetentionMetricsTest do
       for status <- ~w(queued running succeeded failed canceled), do: assert(body =~ ~r/^omnigate_jobs\{status="#{status}"\} \d+$/m)
       for state <- ~w(waiting pending retrying delivered failed), do: assert(body =~ ~r/^omnigate_webhooks\{state="#{state}"\} \d+$/m)
 
-      assert body =~ ~r/^omnigate_build_info\{version="\d+\.\d+\.\d+"\} 1$/m
+      assert body =~ ~r/^omnigate_build_info\{version="\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?"\} 1$/m
       assert body =~ ~r/^omnigate_uptime_seconds \d/m
       assert body =~ ~r/^omnigate_config_reloads_total \d+$/m
       assert body =~ ~r/^omnigate_config_last_reload_timestamp_seconds \d{10}(\.\d+)?$/m

@@ -1,6 +1,9 @@
 # omnigate data plane: a static binary on an empty image.
 #
-#   docker build -t omnigate-dataplane dataplane
+#   docker build -t omnigate-dataplane -f dataplane/Dockerfile .
+#
+# The build context is the repository root, so that the license files can be
+# copied into the image (.dockerignore keeps the context to what is needed).
 #
 # The build stage downloads the Zig compiler from ziglang.org and checks it
 # against the SHA-256 published in https://ziglang.org/download/index.json.
@@ -28,8 +31,8 @@ RUN set -eux; \
     rm /tmp/zig.tar.xz
 
 WORKDIR /src
-COPY build.zig build.zig.zon ./
-COPY src ./src
+COPY dataplane/build.zig dataplane/build.zig.zon ./
+COPY dataplane/src ./src
 
 # Unit tests run as part of the image build, then a static (musl) release build.
 RUN /opt/zig/zig build test --summary all \
@@ -38,12 +41,17 @@ RUN /opt/zig/zig build test --summary all \
 # The spool and config cache live in /data; make it writable by the runtime user.
 RUN mkdir /data && chown 10001:10001 /data
 
+# The license terms travel with every copy of the program.
+COPY LICENSE COMMERCIAL.md .github/release/README.txt /licenses/
+
 
 FROM scratch
 # Root certificates, for TLS to the providers.
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/bin/omnigate-dp /omnigate-dp
 COPY --from=build --chown=10001:10001 /data /data
+# License terms and where the documentation is.
+COPY --from=build /licenses /licenses
 
 USER 10001:10001
 WORKDIR /data

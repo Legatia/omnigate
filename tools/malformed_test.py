@@ -52,6 +52,7 @@ import os
 import random
 import select
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -983,6 +984,14 @@ class StandIn(BaseHTTPRequestHandler):
         if self.path == "/internal/config":
             if self.breaks("config"):
                 return
+            if STANDIN["config_mode"] == "silent":
+                # Takes the request and says nothing for a minute, or until the gateway hangs up.
+                STANDIN["served"]["config (silent)"] = STANDIN["served"].get("config (silent)", 0) + 1
+                deadline = time.time() + 60
+                while time.time() < deadline and not select.select([self.connection], [], [], 0.5)[0]:
+                    pass
+                self.close_connection = True
+                return
             if STANDIN["config_mode"] != "ok":
                 return self.hostile(STANDIN["config_mode"])
             return self.good(200, {
@@ -1174,6 +1183,54 @@ def hostile_control(stack):
         record("... and the same request right after it goes through, on a new connection", status_of(raw) == 202, (status_of(raw), (raw or b"")[-200:]))
         raw, _ = exchange(job("fine"), read_timeout=5, keep_reading=8)
         record("... as does the next read of a job", status_of(raw) == 200, status_of(raw))
+
+        # A control plane that takes a request and never answers. Calls to it had no time
+        # limit: one silent answer stopped the config poll (or the usage reporter) for as
+        # long as the peer kept the connection, and at start it kept the listener closed.
+        STANDIN["config_mode"] = "silent"
+        swallowed = served("config (silent)")
+        wait_for("config (silent)", swallowed, 5)
+        STANDIN["config_mode"] = "ok"
+        polls = served("config")
+        record("a config poll that is never answered is given up after ten seconds, and the polls after it arrive",
+               wait_for("config", polls, 14) and alive(), (swallowed, served("config (silent)"), polls, served("config")))
+
+        mute = socket.socket()
+        mute.bind(("127.0.0.1", 0))
+        mute.listen(8)
+        third_port = SECOND_GATEWAY_PORT + 1
+        started = time.time()
+        stack.start("gateway3", [exe], cwd=work, env={
+            "OMNIGATE_LISTEN": f"127.0.0.1:{third_port}", "OMNIGATE_CONTROL_URL": "http://127.0.0.1:%d" % mute.getsockname()[1],
+            "OMNIGATE_INTERNAL_TOKEN": STANDIN_TOKEN, "OMNIGATE_SPOOL": "off", "OMNIGATE_CONFIG_CACHE": "off"})
+        opened = None
+        while time.time() - started < 20 and opened is None:
+            try:
+                socket.create_connection(("127.0.0.1", third_port), timeout=0.5).close()
+                opened = time.time() - started
+            except OSError:
+                time.sleep(0.25)
+        record("a gateway whose control plane accepts and never answers still opens its listener, ten seconds after starting",
+               opened is not None and 8 <= opened <= 16, opened)
+        stack.stop("gateway3")
+        mute.close()
+
+        # Asked to stop while a call to the control plane is hanging: the cancellation
+        # reached the config poll (or the usage reporter) inside that call, was taken for
+        # an ordinary failure, and the loop slept again: the gateway never exited.
+        STANDIN["config_mode"] = "silent"
+        swallowed = served("config (silent)")
+        wait_for("config (silent)", swallowed, 5)
+        proc = stack.procs["gateway2"].p
+        started = time.time()
+        proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM)
+        try:
+            code = proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            code = None
+        record("a gateway asked to stop while its control plane is not answering exits by itself, with status 0, within seconds",
+               code == 0 and time.time() - started < 12, (code, round(time.time() - started, 1)))
+        STANDIN["config_mode"] = "ok"
     finally:
         STANDIN["reset"].clear()
         TARGET = None

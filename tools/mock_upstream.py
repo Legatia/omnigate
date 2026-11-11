@@ -24,6 +24,9 @@ Special model names, on the working mocks (9002 and 9003):
                    text>}. For tests of what comes back through the gateway.
   echo-err-1       (9002) 400 whose error message quotes that text
 
+With MOCK_WATCH=<a>,<b> in the environment, `GET /__watch` on a working mock
+says how many request bodies (on all ports) contained each of those strings.
+
 Every working mock remembers the last request it received per model name:
 `GET /__last?model=<name>` returns its path, headers and body, so a test can
 assert on what a provider was, and was not, sent.
@@ -97,6 +100,12 @@ ERR_EXACT = b'{ "error" : {"code":"context_length_exceeded","param":"messages", 
 LAST = {}
 LAST_LOCK = threading.Lock()
 ECHO_PREFIX = "You said: "
+# MOCK_WATCH: comma-separated strings to look for in every request body that
+# arrives, on any port. `GET /__watch` reports how many bodies held each, and
+# how many bodies arrived in all: a test under load uses it to prove that some
+# value never reached a provider (tools/privacy_soak.py).
+WATCH_FOR = [w.encode() for w in os.environ.get("MOCK_WATCH", "").split(",") if w]
+WATCH = {"requests": 0, "seen": {w.decode(): 0 for w in WATCH_FOR}}
 
 
 def echo_text(req):
@@ -130,6 +139,11 @@ class Base(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", 0))
         raw = self.rfile.read(length) or b"{}"
         req = json.loads(raw)
+        with LAST_LOCK:
+            WATCH["requests"] += 1
+            for needle in WATCH_FOR:
+                if needle in raw:
+                    WATCH["seen"][needle.decode()] += 1
         if isinstance(req, dict):
             with LAST_LOCK:
                 LAST[(self.server.server_port, str(req.get("model")))] = {
@@ -146,6 +160,9 @@ class Base(BaseHTTPRequestHandler):
             with LAST_LOCK:
                 entry = LAST.get((self.server.server_port, model))
             return self.send_json(200 if entry else 404, entry or {"error": "nothing received for this model"})
+        if path == "/__watch":
+            with LAST_LOCK:
+                return self.send_json(200, {"requests": WATCH["requests"], "seen": dict(WATCH["seen"])})
         self.send_json(404, {"error": {"message": "unknown path"}})
 
     def send_json(self, status, body, headers=None):

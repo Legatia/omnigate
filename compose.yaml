@@ -47,7 +47,9 @@
 
 services:
   control:
-    build: ./control
+    build:
+      context: .
+      dockerfile: control/Dockerfile
     restart: unless-stopped
     # The admin token, the internal token, media provider keys, webhook
     # secrets and bucket credentials.
@@ -66,7 +68,9 @@ services:
       - control-data:/data
 
   dataplane:
-    build: ./dataplane
+    build:
+      context: .
+      dockerfile: dataplane/Dockerfile
     restart: unless-stopped
     # The internal token and the keys of the text providers named in the
     # config (api_key_env). Nothing else belongs here.

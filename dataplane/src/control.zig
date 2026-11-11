@@ -18,13 +18,68 @@ pub const internal_header = "x-omnigate-internal";
 /// with tens of thousands of keys is a few megabytes).
 const max_response_bytes = 256 * 1024 * 1024;
 
-/// One request to the control plane.
+/// One request to the control plane, given up with `error.ControlTimeout`
+/// after `call_timeout_ms`.
 ///
 /// Deliberately not `http.Client.fetch`: in Zig 0.17 it unwraps
 /// `response.bodyErr().?` and panics when a pooled keep-alive connection was
 /// reset by the peer. We also skip the connection pool (`keep_alive = false`)
 /// so a restarted control plane never leaves us holding a dead socket.
-fn call(app: *App, method: http.Method, path: []const u8, payload: ?[]const u8, out: ?*Io.Writer) !http.Status {
+fn call(app: *App, method: http.Method, path: []const u8, payload: ?[]const u8, out: ?*Io.Writer) anyerror!http.Status {
+    const Race = union(enum) {
+        done: anyerror!http.Status,
+        timer: Io.Cancelable!void,
+    };
+    var results: [2]Race = undefined;
+    var race: Io.Select(Race) = .init(app.io, &results);
+
+    // No spare concurrency: better an untimed call than none.
+    race.concurrent(.done, callUntimed, .{ app, method, path, payload, out }) catch return callUntimed(app, method, path, payload, out);
+    race.concurrent(.timer, sleepMs, .{ app.io, call_timeout_ms.load(.acquire) }) catch {};
+
+    const first = race.await() catch |err| {
+        race.cancelDiscard();
+        return err;
+    };
+    switch (first) {
+        .done => |result| {
+            race.cancelDiscard();
+            return result;
+        },
+        .timer => {
+            // Cancel the exchange; if it finished in the meantime, use it.
+            var late: ?http.Status = null;
+            while (race.cancel()) |leftover| switch (leftover) {
+                .done => |result| {
+                    if (result) |status| {
+                        late = status;
+                    } else |_| {}
+                },
+                .timer => {},
+            };
+            return late orelse error.ControlTimeout;
+        },
+    }
+}
+
+/// How long one request to the control plane may take, connecting included.
+/// Without a limit, an address that swallows packets (a host that is down
+/// behind a firewall that drops) held the caller for as long as the
+/// operating system keeps trying: at start that was before the listener
+/// opened, so a data plane with a good cached config served nothing for
+/// minutes; later it stopped the config poll or the usage reporter.
+pub const default_call_timeout_ms: u32 = 10_000;
+/// The limit in force. Shortened once, at shutdown, for the last attempts to
+/// hand over usage and counters (`shutdown_call_timeout_ms`): a stop must not
+/// wait ten seconds twice for a control plane that is not there.
+pub var call_timeout_ms: std.atomic.Value(u32) = .init(default_call_timeout_ms);
+pub const shutdown_call_timeout_ms: u32 = 2_000;
+
+fn sleepMs(io: Io, ms: u32) Io.Cancelable!void {
+    return io.sleep(.fromMilliseconds(ms), .awake);
+}
+
+fn callUntimed(app: *App, method: http.Method, path: []const u8, payload: ?[]const u8, out: ?*Io.Writer) anyerror!http.Status {
     const url = try std.fmt.allocPrint(app.gpa, "{s}{s}", .{ app.control_url, path });
     defer app.gpa.free(url);
     const uri = try std.Uri.parse(url);
@@ -145,6 +200,11 @@ pub fn pollLoop(app: *App) Io.Cancelable!void {
             if (!healthy) log.info("control plane reachable again", .{});
             healthy = true;
         } else |err| {
+            // A cancellation is delivered once. Taken for an ordinary failure
+            // here, the loop would sleep again and never end: the data plane
+            // then never finished stopping when its control plane was slow
+            // to refuse or to answer.
+            if (err == error.Canceled) return error.Canceled;
             // Log once per outage, not every poll.
             if (healthy) log.warn("config sync failed ({t}); serving last good config", .{err});
             healthy = false;

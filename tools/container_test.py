@@ -27,12 +27,14 @@ and removed at the end.
 import argparse
 import hashlib
 import http.client
+import io
 import json
 import os
 import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 
@@ -366,6 +368,20 @@ def checks():
         user = docker("image", "inspect", image, "--format", "{{.Config.User}}")
         print(f"      {name}: {size:.1f} MB compressed, runs as user {user}", flush=True)
         check(f"{name} image does not run as root", user.startswith("10001"), user)
+        # The license terms travel with every copy: /licenses in the image
+        # holds the same LICENSE and COMMERCIAL.md as the repository.
+        same = []
+        for fname in ("LICENSE", "COMMERCIAL.md", "README.txt"):
+            r = subprocess.run(["docker", "cp", f"{cname(name)}:/licenses/{fname}", "-"], capture_output=True)
+            try:
+                got = tarfile.open(fileobj=io.BytesIO(r.stdout)).extractfile(fname).read()
+            except Exception:  # noqa: BLE001 - missing file, or not a tar stream
+                got = None
+            src = os.path.join(ROOT, ".github", "release", fname) if fname == "README.txt" else os.path.join(ROOT, fname)
+            with open(src, "rb") as f:
+                want = f.read().replace(b"\r\n", b"\n")
+            same.append(got is not None and got.replace(b"\r\n", b"\n") == want)
+        check(f"{name} image carries the license, the commercial terms and a pointer to the docs", all(same), same)
 
     section("gateway over TLS")
     s, _, raw = req("GET", API_HOST, "/healthz")
@@ -602,7 +618,7 @@ def main():
     if not args.no_build and not COMPOSE:
         for name, image in IMAGES.items():
             print(f"building {image} ...", flush=True)
-            r = subprocess.run(["docker", "build", "-q", "-t", image, os.path.join(ROOT, name)], capture_output=True, text=True)
+            r = subprocess.run(["docker", "build", "-q", "-t", image, "-f", os.path.join(ROOT, name, "Dockerfile"), ROOT], capture_output=True, text=True)
             if r.returncode != 0:
                 raise SystemExit(f"build of {name} failed:\n{(r.stdout + r.stderr)[-3000:]}")
 

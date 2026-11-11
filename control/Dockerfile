@@ -1,6 +1,9 @@
 # omnigate control plane: an Elixir release on Alpine.
 #
-#   docker build -t omnigate-control control
+#   docker build -t omnigate-control -f control/Dockerfile .
+#
+# The build context is the repository root, so that the license files can be
+# copied into the image (.dockerignore keeps the context to what is needed).
 
 FROM elixir:1.20.5-otp-29-alpine AS build
 ENV MIX_ENV=prod
@@ -9,11 +12,11 @@ WORKDIR /src
 RUN mix local.hex --force && mix local.rebar --force
 
 # Dependencies first, so they are cached until mix.exs or mix.lock change.
-COPY mix.exs mix.lock ./
+COPY control/mix.exs control/mix.lock ./
 RUN mix deps.get --only prod && mix deps.compile
 
-COPY config ./config
-COPY lib ./lib
+COPY control/config ./config
+COPY control/lib ./lib
 RUN mix release --path /out
 
 # Remember which Alpine the runtime was built against; the final stage must match.
@@ -28,6 +31,8 @@ RUN apk add --no-cache libstdc++ libgcc ncurses-libs openssl ca-certificates \
 
 COPY --from=build /out /app
 COPY --from=build /alpine-version /app/alpine-version
+# The license terms travel with every copy of the program.
+COPY LICENSE COMMERCIAL.md .github/release/README.txt /licenses/
 RUN test "$(cut -d. -f1,2 /etc/alpine-release)" = "$(cat /app/alpine-version)" \
  || { echo "runtime Alpine $(cat /etc/alpine-release) does not match build Alpine $(cat /app/alpine-version): change the FROM line" >&2; exit 1; }
 

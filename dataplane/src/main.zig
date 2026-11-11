@@ -354,12 +354,19 @@ fn probeHealth(io: Io, address: Io.net.IpAddress) bool {
 }
 
 pub fn main(init: std.process.Init) !void {
-    // In safe builds std hands main its checking allocator: one global lock,
-    // and bookkeeping that costs several times the size of a small allocation.
-    // That is right for debugging and wrong for serving traffic, so every
-    // optimized build (ReleaseSafe included, which is what ships) uses the
-    // multi-threaded allocator.
-    const gpa = if (builtin.mode == .debug) init.gpa else std.heap.smp_allocator;
+    // The allocator std hands main: in Debug and ReleaseSafe (which is what
+    // ships) its checking allocator, which gives memory back when it is freed
+    // and never reuses an address.
+    //
+    // Until 0.1.0-rc.1 optimized builds used `std.heap.smp_allocator` here.
+    // It keeps freed memory on the list of the thread that freed it, and a
+    // request's memory is allocated and freed on different threads all the
+    // time (the upstream exchange and the body pump run as their own tasks,
+    // so that they can be timed out). The lists of the freeing threads grew
+    // while the allocating ones mapped fresh memory: about half a kilobyte
+    // per request that was never used again, 40 MiB a minute at a thousand
+    // requests a second, with no leak in the program (tools/privacy_soak.py).
+    const gpa = init.gpa;
     const io = init.io;
     const env = init.environ_map;
 
@@ -569,7 +576,9 @@ pub fn main(init: std.process.Init) !void {
     drains.stop(io);
 
     // The flush task is gone; make one last attempt to hand over usage.
-    // Whatever stays behind is in the spool file for the next start.
+    // Whatever stays behind is in the spool file for the next start. Short
+    // waits: a control plane that is not there must not hold up the stop.
+    control.call_timeout_ms.store(control.shutdown_call_timeout_ms, .release);
     const undelivered = reporter.drain(&app, 20);
     // And the rejection counters, which have no spool: once, best effort.
     _ = counters.flushOnce(&app);

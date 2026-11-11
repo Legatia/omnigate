@@ -1,8 +1,8 @@
 # Changelog
 
 All notable changes to omnigate are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). There are no
-tagged releases yet; everything so far is under "Unreleased".
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The first
+tagged version is the pre-release 0.1.0-rc.1.
 
 When a release is cut, the "Unreleased" section is renamed to
 `## [<version>] - <date>` and a new, empty "Unreleased" section is started
@@ -17,7 +17,35 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0-rc.1] - 2026-11-11
+
+The first pre-release: the first version to be tagged and published. Nothing
+in it has run under production load.
+
 ### Added
+
+- **The license terms travel with every copy.** Each release archive holds
+  `LICENSE`, `COMMERCIAL.md` and a short `README.txt` next to the binary,
+  and both container images carry the same three files in `/licenses`
+  (checked by the container test) and the label
+  `org.opencontainers.image.licenses`.
+- **`tools/upgrade_test.py`**: builds an older commit in a temporary git
+  worktree, lets it write realistic state, stops or kills it, and checks
+  that the current build reads everything back exactly; `--mixed` runs old
+  and new processes side by side. Run from 10bc009 and 6d5ed6e; see
+  [Tested upgrades](docs/upgrading.md#tested-upgrades).
+- **`tools/privacy_soak.py`**: sustained mixed load with private and
+  ordinary keys side by side, every request with values of its own, with
+  checks for restored answers, cross-request leaks, what the providers
+  received, exact billing, memory and what is left on disk. `MOCK_WATCH`
+  and `GET /__watch` in `tools/mock_upstream.py` support it. Three
+  16-minute runs against ReleaseSafe builds (279,469, 816,757 and 798,604
+  requests) found no wrong answer, no value of another request in any
+  answer, no private value at the providers or on disk, and no billing
+  difference; the first two found the memory growth described under
+  "Fixed".
 
 - **Sume as a media provider** (kind `sume`): one adapter for Sume's image
   and video routers. A target says which router its model is on
@@ -40,10 +68,57 @@ only met a mock, is tracked in the README's
 
 ### Changed
 
+- **Both images are built from the repository root** (`docker build -f
+  dataplane/Dockerfile .`, and `build: {context: ., dockerfile: ...}` in
+  `compose.yaml`), so that the license files can be copied in. A root
+  `.dockerignore` replaces the two per-directory ones. Your own build
+  commands or Compose files need the same change
+  ([Upgrading](docs/upgrading.md#010-rc1)).
+- The version is `0.1.0-rc.1` in `control/mix.exs` and
+  `dataplane/build.zig.zon`.
 - An adapter's cancel may now report that the provider can no longer stop
   the job; the runner then treats the job as on a provider without cancel
   (polled to the route's timeout, billed if it completes). No existing
   adapter does so.
+
+### Fixed
+
+- **The data plane's memory grew with every request in optimized builds**
+  (the ReleaseSafe build that the images and the release binaries are).
+  It used Zig's `smp_allocator`, which keeps freed memory on the list of
+  the thread that freed it; a request's memory is allocated and freed on
+  different threads (the upstream exchange and the body pump run as their
+  own tasks so that they can be timed out), so the freeing threads' lists
+  grew while the allocating threads mapped fresh memory. Measured: about
+  0.3 to 0.6 kB per request that was never used again, 16 MiB a minute at
+  850 requests a second in a mixed load (246 to 565 MiB over 16 minutes and
+  still rising), 36 to 42 MiB a minute for two clients doing plain chat at
+  a thousand requests a second. Not a leak in the program: the Debug build
+  stayed at 11 MiB under the same load. Optimized builds now use the
+  allocator the Zig runtime hands a ReleaseSafe program, which returns
+  freed memory; the same mixed load then holds 212 MiB flat, at the same
+  throughput (798,604 requests in 16 minutes, 212 to 213 MiB throughout,
+  on Windows; the Linux release binary, run for 8 minutes inside WSL, held
+  304 to 317 MiB and about 2,300 memory mappings).
+  Earlier load tests were too short and too slow to show it.
+  Found by `tools/privacy_soak.py`.
+- **The data plane did not finish stopping when its control plane was
+  slow.** A stop request that arrived while a call to the control plane was
+  under way cancelled that call; the config poll, the usage reporter and
+  the counter flush each took the cancellation for an ordinary failure,
+  slept again, and the process never exited (under Docker: killed after
+  the stop timeout). Undelivered usage was in the spool either way. Seen on
+  Windows with the control plane stopped; on Linux it takes a control
+  plane that does not answer. Found by the upgrade test.
+- **Calls from the data plane to the control plane had no time limit.** A
+  control plane address that swallows packets, or a control plane that
+  accepts a request and never answers, held the caller indefinitely: a
+  data plane started in that state did not open its port (so it served
+  nothing from its cached config either), and one unanswered call stopped
+  the config poll or the usage reporter. Each call is now given up after
+  10 seconds, 2 seconds for the last attempts at a stop. Found while
+  trying the release build's smoke test on a machine where a closed port
+  does not refuse.
 
 ### Verified
 

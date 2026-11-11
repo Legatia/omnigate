@@ -323,6 +323,9 @@ pub fn flushLoop(app: *App) Io.Cancelable!void {
             defer app.gpa.free(batch.body);
 
             const outcome = control.postUsageBatch(app, batch.body) catch |err| {
+                // Delivered once: pass it on, or this loop outlives the stop
+                // (see control.pollLoop). The batch stays queued.
+                if (err == error.Canceled) return error.Canceled;
                 if (healthy) log.warn("usage delivery failed ({t}); spooling, {d} events queued", .{ err, r.pending() });
                 healthy = false;
                 delay_ms = @min(delay_ms * 2, max_backoff_ms);

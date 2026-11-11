@@ -18,7 +18,7 @@ Include, as far as you can:
 Please do not test against deployments you do not own, and do not include
 real provider keys, gateway keys or tokens in a report.
 
-No release has been tagged yet. Fixes are made on `main`. Whether fixes
+The only tagged version is the pre-release 0.1.0-rc.1. Fixes are made on `main`. Whether fixes
 will also be applied to earlier releases, once there are any, has not been
 decided; the release process is in [docs/releasing.md](docs/releasing.md).
 
@@ -450,12 +450,14 @@ vulnerabilities to report.
 
 ## Past advisories
 
-No release has been tagged, so these are identified by commit. All of them
+All of these predate the first tagged version (the pre-release 0.1.0-rc.1,
+which contains every fix), so they are identified by commit. All of them
 were found by three independent reviews of the code in November 2026, by
 reading and small proofs of concept: the first led to commits 97cf396,
 fde530c and 3a0b147, the second to e4e30e4 and d79406b, the third to the
-commit that follows 1cc721f ("the third-review commit" below). **None is
-known to have been exploited.**
+commit that follows 1cc721f ("the third-review commit" below). The last
+row was found by a soak test, not by a review. **None is known to have
+been exploited.**
 
 | Class | Fixed in | Needed | Worst case |
 |---|---|---|---|
@@ -476,6 +478,7 @@ known to have been exploited.**
 | [Provider calls made free by cancelling the job](#provider-calls-made-free-by-cancelling-the-job) | third-review commit | A gateway key that may create media jobs | Media the operator pays for and the key is not billed for; more provider calls at once than `max_open_jobs` |
 | [Disk exhaustion through a provider's answer](#disk-exhaustion-through-a-providers-answer) | third-review commit | Control of a media provider's answers | The control plane's disk fills with downloads |
 | [Other hardening from the third review](#other-hardening-from-the-third-review) | third-review commit | varies | varies |
+| [Data-plane memory that grew with every request](#data-plane-memory-that-grew-with-every-request) | 0.1.0-rc.1 | A gateway key and ordinary traffic; or no intent at all | The gateway process is killed for memory and restarted, for everyone |
 
 **For everyone who ran an earlier commit:** update both processes to
 d79406b or later; the fixes are on both sides. Read
@@ -1314,3 +1317,34 @@ Third-review commit. None needs action beyond updating.
   targets of webhooks and output downloads. Only `2000::/3` is public
   unicast; everything else is refused (NAT64 is still judged by the IPv4
   address inside).
+
+### Data-plane memory that grew with every request
+
+Fixed in 0.1.0-rc.1. Affected: every optimized build of the data plane
+before it, which includes every container image built from this
+repository.
+
+The data plane kept about 0.3 to 0.6 kB per request that it never used
+again. Nothing leaked in the program itself: optimized builds used an
+allocator (`std.heap.smp_allocator`) that keeps freed memory on the list of
+the thread that freed it, and the data plane allocates and frees a
+request's memory on different threads, so the freeing threads' lists grew
+while the allocating threads mapped fresh memory. Measured with
+`tools/privacy_soak.py` on a ReleaseSafe build: 246 to 565 MiB in 16
+minutes at 850 requests a second, still rising at 16 MiB a minute.
+
+**What it allowed.** Anyone with a gateway key, sending ordinary requests
+fast enough for long enough, brought the process to its memory limit; so
+did ordinary traffic, given time (at ten requests a second, about 20 MiB
+an hour). Under a container memory limit the process is killed and
+restarted: requests in flight fail, and usage not yet delivered is resent
+from the spool. No data is exposed and nothing is billed wrongly.
+
+**Who was affected.** Every installation, in proportion to its traffic. A
+data-plane container that restarted by itself now and then is the symptom.
+
+**The fix.** Optimized builds use the allocator the Zig runtime gives a
+ReleaseSafe program, which returns freed memory to the system. Under the
+same load the process holds about 210 MiB, flat, at the same throughput.
+Nothing to configure. Rate limits and the per-key concurrency cap never
+bounded this, since it did not depend on any one request being large.

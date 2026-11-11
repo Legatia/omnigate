@@ -33,10 +33,11 @@ of `CHANGELOG.md` as its notes and these files attached:
 | `omnigate-dp-<version>-x86_64-macos.tar.gz` | Data plane for Intel macOS |
 | `<each of the above>.sha256` | Its SHA-256, in `sha256sum -c` format |
 
-Each archive holds one directory named like the archive, with the binary in
-it and nothing else. All five are built with
-`zig build -Dtarget=<target> -Doptimize=ReleaseSafe` on one x86-64 Linux
-runner. The control plane has no standalone archive: it is released as a
+Each archive holds one directory named like the archive, with the binary,
+the license terms (`LICENSE`, `COMMERCIAL.md`) and a short `README.txt`
+that points at the documentation. All five are built with
+`zig build -Dtarget=<target> -Doptimize=ReleaseSafe -Dstrip=true` on one
+x86-64 Linux runner. The control plane has no standalone archive: it is released as a
 container image only.
 
 **Two container images** on GHCR, each for `linux/amd64` and `linux/arm64`:
@@ -44,10 +45,12 @@ container image only.
 | Image | Built from |
 |---|---|
 | `ghcr.io/<owner>/omnigate-dataplane` | The two Linux binaries above, assembled by `.github/release/dataplane.Dockerfile` |
-| `ghcr.io/<owner>/omnigate-control` | `control/Dockerfile` |
+| `ghcr.io/<owner>/omnigate-control` | `control/Dockerfile`, with the repository root as build context |
 
 `<owner>` is the repository owner in lower case. Both are tagged
-`<version>` and, unless the version is a pre-release, `latest`.
+`<version>` and, unless the version is a pre-release, `latest`. Both carry
+the same three files as the archives in `/licenses`, and the label
+`org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0`.
 
 To check a download:
 
@@ -93,7 +96,7 @@ One-time things to settle. None of them is done by the workflow.
 ## Cutting a release
 
 1. **Pick the version**, `<major>.<minor>.<patch>`. The source currently
-   says `0.1.0` in both places below.
+   says `0.1.0-rc.1` in both places below (the first pre-release).
 
 2. **Set the version in the source.** Both must be exactly the version you
    are about to tag; the workflow stops before building anything if they
@@ -224,8 +227,8 @@ with omnigate.
 Zig cross-compiles, and the release needs the arm64 Linux binary as an
 archive anyway. So the `binaries` job builds both Linux binaries natively,
 and `.github/release/dataplane.Dockerfile` only assembles an image around
-them: a CA bundle, the binary, a `/data` directory owned by the runtime
-user. Its one helper stage is pinned to the build machine's platform, so
+them: a CA bundle, the binary, the license files and a `/data` directory
+owned by the runtime user. Its one helper stage is pinned to the build machine's platform, so
 nothing in it runs under emulation. A side effect is that the published
 image contains exactly the binaries in the release archives.
 
@@ -245,7 +248,9 @@ stage pinned to `$BUILDPLATFORM` that passes `-Dtarget` according to
 
 An Elixir release bundles the Erlang runtime, which is native code, so the
 arm64 image has to be built by an arm64 toolchain. `control/Dockerfile` is
-used unchanged for both platforms, and buildx runs its arm64 build under
+used unchanged for both platforms (with the repository root as its build
+context, like `dataplane/Dockerfile`: that is how the license files get
+into the images, and `.dockerignore` keeps the context small), and buildx runs its arm64 build under
 QEMU. This is the slow part of a release and the part most likely to need
 attention; see below.
 
@@ -281,8 +286,15 @@ the right tool when nothing in the repository has to change.
 ## What may fail the first time
 
 The workflow file parses and its shell steps were tried locally where that
-was possible, but GitHub has never run it. Known uncertainties, most
-likely first:
+was possible, but GitHub has never run it. Tried on 11 November 2026, on
+the tree that became 0.1.0-rc.1: every step of `prepare` (as if the tag
+`v0.1.0-rc.1` had been pushed), the five cross-compiles (on Windows), and
+on Linux (WSL) the binary smoke test, the packaging step, the image
+context, and the data-plane image's build and two smoke tests with
+Docker's classic builder. Not tried, because the machine has neither
+buildx nor QEMU: the multi-platform builds, the control-plane image as the
+workflow builds it, the arm64 run, the push and the release itself. Known
+uncertainties, most likely first:
 
 1. **The control plane's arm64 build under QEMU.** It compiles Elixir and
    builds a release in an emulated arm64 Alpine container. Erlang's JIT has
@@ -302,15 +314,22 @@ likely first:
    `actions/checkout`, `actions/cache` and `actions/upload-artifact` at the
    versions used here have run in this repository's CI.
 4. **Cross-compiling on the runner.** All five targets were cross-compiled
-   with Zig 0.17.0 from the commit this page was written against
-   (`4781a56`), on a Windows machine; the runner is Linux, and later
-   commits may add code that does not build for every target. Only the
+   with Zig 0.17.0, most recently from the tree that became 0.1.0-rc.1
+   (11 November 2026), on a Windows machine, and the x86-64 Linux binary
+   was then put through the workflow's smoke test and packaging steps on
+   Linux (WSL); the runner itself has never done it. Only the
    Windows binary corresponds to a platform the data plane is known to run
    on besides x86-64 Linux.
 5. **The smoke tests' expectation.** They start the data plane without
    `OMNIGATE_INTERNAL_TOKEN` and expect it to exit by itself with an error
    status below 124. If the data plane's behaviour without a token ever
-   changes, those steps need to change with it.
+   changes, those steps need to change with it. The second half points the
+   data plane at `http://127.0.0.1:9` as a control plane that is not
+   there: on the runner that port refuses at once; on a machine where a
+   closed port swallows the connection instead (WSL with mirrored
+   networking does), the data plane becomes healthy only after its
+   10-second limit on the first config fetch, which the step's 30 tries
+   allow for.
 6. **The emulated arm64 run of the data-plane image.** Marked advisory: a
    failure is reported as a warning and does not stop the release.
 7. **`gh release create`.** Uses the `gh` command on the runner with the
@@ -327,15 +346,11 @@ first.
   download, not against a compromised release.
 - The macOS binaries are not signed with a developer identity or notarized,
   and the Windows binary is not code-signed.
-- The Linux binaries are not stripped: they carry debug information and
-  were about 10 MB each when this page was first written.
-  `dataplane/build.zig` has a `-Dstrip=true` option since commit 10bc009,
-  and `dataplane/Dockerfile` uses it for a locally built image, but the
-  release workflow does not pass it, so release binaries, and the release
-  images built from them, are unchanged. The Windows debug file (`.pdb`) is
-  not shipped.
+- The binaries are stripped (`-Dstrip=true`): about 1.3 to 1.9 MB each,
+  without debug information, so a crash report from one has addresses
+  rather than names. The Windows debug file (`.pdb`) is not shipped.
 - No packages for package managers, no Helm chart, and no archive of the
   control plane.
-- The archives and images do not yet contain the `LICENSE` file; the
-  license asks that recipients get the terms or their URL, so add it to
-  the packaging before the first release.
+- The control-plane image contains the Erlang runtime and the Alpine
+  packages it needs; their own license texts are those the base image
+  ships, and nothing here collects them into one notice file.

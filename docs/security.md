@@ -608,7 +608,8 @@ point of view:
 
 ## Staying current, and upgrade notes
 
-No release has been tagged, so "current" means a recent commit of `main`.
+The only tagged version is the pre-release 0.1.0-rc.1; there is no stable
+release, so "current" means a recent commit of `main`.
 
 - Read the "Security" section of [CHANGELOG.md](../CHANGELOG.md) before
   every update, and [SECURITY.md](../SECURITY.md#past-advisories) for what

@@ -1,7 +1,9 @@
 # Upgrading
 
 For someone who runs an earlier commit and wants to run the current one.
-No release has been tagged, so versions are named by commit. This page
+Versions before the first tag (the pre-release 0.1.0-rc.1) are named by
+commit. Upgrades from two of them, 10bc009 and 6d5ed6e, to 0.1.0-rc.1 have
+been run as a test ([Tested upgrades](#tested-upgrades)). This page
 covers the two security commits of 11 November 2026 in detail, and the
 close-out commit that followed them
 ([The close-out commit](#the-close-out-commit)):
@@ -26,6 +28,10 @@ Contents:
 - [What changes for clients](#what-changes-for-clients)
 - [What changes for operators](#what-changes-for-operators)
 - [The close-out commit](#the-close-out-commit)
+- [The third-review commit](#the-third-review-commit)
+- [The privacy mode commit](#the-privacy-mode-commit)
+- [0.1.0-rc.1](#010-rc1)
+- [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
 
@@ -68,9 +74,12 @@ each fixes a different process.
 commits**: the config snapshot has the same shape, usage events and
 refusal counts are sent the same way, and the forwarded jobs API is the
 same. A new process therefore works next to the other's previous commit
-(10bc009 or 76bba24) for the length of an upgrade. That follows from
-reading the code; a mixed pair has not been run as a test, so do not leave
-it that way for longer than the upgrade takes.
+(10bc009 or 76bba24) for the length of an upgrade. Both mixed pairs have
+since been run as a test, with the 0.1.0-rc.1 build on one side and 10bc009
+or 6d5ed6e on the other ([Tested upgrades](#tested-upgrades)): text
+requests, usage, media jobs and downloads worked in both. A few minutes of
+a test are not a soak, so do not leave it that way for longer than the
+upgrade takes.
 
 The recommended order is **control plane first, then the data planes**:
 
@@ -537,6 +546,99 @@ Upgrade both before telling anyone a key is private.
 | The retention sweep's log line | Ends with the ledger segments | Ends with "and the outputs of N private jobs" |
 | A job's `outputs[]` entries | `url`, `content_type`, `bytes`, `sha256` | The same for jobs that are not encrypted; four more fields for those that are |
 | `tools/e2e.py` | Standard library only | Uses `pyrage` when it is installed, to decrypt what the gateway encrypted; without it that one check is skipped and the run says so (`OMNIGATE_REQUIRE_PYRAGE=1` turns the skip into a failure, as CI does) |
+
+## 0.1.0-rc.1
+
+The first tagged version. Nothing changes on disk and nothing in the
+interface between the two processes; either can be upgraded first. What an
+installation can notice:
+
+- **Images are built from the repository root.** `compose.yaml` now says
+  `build: {context: ., dockerfile: control/Dockerfile}` (and the same for
+  the data plane), because the images carry the license terms in
+  `/licenses`. If you keep your own Compose file or build script, change
+  `docker build dataplane` to `docker build -f dataplane/Dockerfile .`, and
+  likewise for `control`; the old command fails at the first `COPY`. A new
+  `.dockerignore` at the root keeps the build context to what is needed.
+- **The data plane gives up on a call to the control plane after 10
+  seconds** (config poll, usage batch, refusal counts). Before, a control
+  plane address that swallowed packets, or a control plane that took a
+  request and never answered, held the caller for as long as the operating
+  system or the peer allowed: a data plane started in that state did not
+  open its port for minutes, and one unanswered call stopped the config
+  poll or the usage reporter. The log names it: `(ControlTimeout)`.
+- **The data plane finishes stopping when the control plane is slow.**
+  Asked to stop (SIGTERM, Ctrl-Break) while a call to the control plane was
+  under way, earlier builds logged `config sync failed (Canceled)` and then
+  never exited; under Docker that ended in a kill after the stop timeout.
+  Nothing was lost (undelivered usage stays in the spool), but the exit was
+  not clean. Seen on Windows with the control plane stopped, where a
+  refused connection takes about two seconds; on Linux it needs a control
+  plane that does not answer. The last attempts to hand over usage and
+  counts at a stop now wait at most 2 seconds each.
+- **The data plane's memory no longer grows with traffic.** Every
+  optimized build before this one (the container image included) kept
+  about half a kilobyte per request that it never used again: tens of
+  megabytes an hour at ten requests a second, and at a thousand a second
+  the 1 GiB limit of the Compose file within half an hour, after which the
+  container is killed and restarted. If your data-plane container has been
+  restarting under load, this is the likely reason. The fix is in the
+  choice of allocator ([changelog](../CHANGELOG.md)); nothing to configure.
+  Its resident memory now follows the number of open connections and
+  streams being read to their end (about 210 MiB with 890 threads in the
+  soak test, about 10 MiB idle), not the number of requests served.
+- **The version** in `omnigate_build_info`, in the data plane's outbound
+  `user-agent` and in the webhook `user-agent` is `0.1.0-rc.1`.
+
+**Going back** to 99dd04c needs nothing.
+
+## Tested upgrades
+
+`tools/upgrade_test.py` builds an older commit, lets it write state, stops
+or kills it, and starts the current build on the same files
+([Contributing](../CONTRIBUTING.md)). On 11 November 2026 it was run from
+two commits to the tree that became 0.1.0-rc.1, on Windows, against the
+mock providers:
+
+| From | On-disk format it starts from |
+|---|---|
+| 10bc009 | Ledger snapshot version 1, no `ledger.ids.*` files, no `jobs.jsonl.inputs/` |
+| 6d5ed6e | Ledger snapshot version 2 and id files; before `carried_totals`, `provider_pending`, privacy mode and price variants |
+
+Each was run twice: with the old processes asked to stop, and with both
+killed while a media job was running at the provider. In all four runs the
+current build then showed:
+
+- every key's requests, tokens and cost exactly as the old build reported
+  them, across a ledger of some twenty segments and a snapshot;
+- 24 requests that the old data plane had answered after its control plane
+  was gone, and held in its spool, counted once;
+- the key list unchanged (managed keys, one rotated twice, one disabled,
+  budgets and period spend), and every secret accepted or refused as
+  before;
+- finished, failed and cancelled jobs unchanged, and every stored output
+  downloading with its recorded hash;
+- the job that was running at the provider finished, stored and billed
+  once, without being submitted again;
+- a webhook that could not be delivered before the upgrade delivered once
+  after it, correctly signed;
+- the same totals after a further restart, and no file in either data
+  directory that this page does not name.
+
+The two mixed pairs (old data plane with the current control plane on the
+upgraded files; current data plane with the old control plane on fresh
+files) served text in both protocols, recorded usage once, ran a media job
+and logged no error on either side. The privacy rows of
+[the table above](#the-privacy-mode-commit) were checked the same way: a
+key made private is not private through an old data plane, and is as soon
+as the data plane is current; the request header redacts on a current data
+plane whatever the control plane.
+
+What this does not show: an upgrade under load, one with a large ledger
+(the test writes a few hundred events), bucket storage, Linux, or the
+container images. One thing it found is fixed in 0.1.0-rc.1 (the stop
+described above); the old data plane in these runs showed it, and had to be
+killed in the "asked to stop" variant.
 
 ## Going back
 

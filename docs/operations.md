@@ -517,7 +517,21 @@ with `503` `overloaded`, `retry-after: 1` and `connection: close`, and is
 counted as `overloaded` among the [refused requests](#refused-requests).
 The data plane uses one thread per connection, so the cap is also a cap on
 threads. The README records what has been tried: a soak at 94 connections
-for five minutes and a run at 550 for two; nothing beyond that.
+for five minutes, a run at 550 for two, and 16 minutes of mixed load at
+about 830 requests a second; nothing beyond that.
+
+**Memory.** Besides the budgets below, the data plane's resident memory
+follows its threads: about 10 MiB idle, 213 MiB with 890 threads in
+that last run (on Windows; the Linux binary held 304 to 317 MiB with as
+many threads in a shorter run), and flat for its length. The allocator
+asks the system for memory in many separate mappings and returns them:
+that Linux run stayed at about 2,300 mappings, far below the kernel's
+default limit of 65,530 per process (`vm.max_map_count`), but a data
+plane holding many thousands of connections on a host with that default
+is untried. Builds before 0.1.0-rc.1 grew by
+about half a kilobyte per request served and never gave it back
+([Upgrading](upgrading.md#010-rc1)); if a data plane of yours shows steadily
+rising memory, check its version first.
 
 **Per-key and memory limits.** A valid key is not allowed to decide how
 much the process holds. Before a request body is read, the data plane
@@ -734,6 +748,21 @@ The data plane is built to keep serving text traffic without it.
 | Running media jobs | Stopped with the control plane. On restart, a job a provider had accepted resumes polling; it is not submitted again. |
 | Restarting the data plane | It starts from the config cached on disk. With no cache (first start, or `OMNIGATE_CONFIG_CACHE=off`) it answers 503 `gateway_not_ready` until the control plane is reachable. |
 
+"Down" has two shapes, and the data plane handles both:
+
+- **The address refuses connections** (the process is stopped, the host is
+  up). Each call fails at once.
+- **The address swallows them** (the host is off, or a firewall drops the
+  packets), or the control plane takes a request and never answers. Each
+  call to the control plane (config poll, usage batch, refusal counts) is
+  given up after 10 seconds. A data plane started in that state opens its
+  port about 10 seconds after starting, once its first config fetch has
+  timed out, and then serves from the cached config. Before the
+  0.1.0-rc.1 commit these calls had no limit: such a start served nothing
+  for as long as the operating system kept trying to connect (minutes),
+  and one unanswered call stopped the config poll or the usage reporter
+  until the peer let go.
+
 Limits of the spool:
 
 - It holds at most 100,000 undelivered events, and at most 128 MiB of
@@ -888,7 +917,7 @@ Data plane:
 | `bad OMNIGATE_LOG_LEVEL or OMNIGATE_LOG_FORMAT: ...`, `<VARIABLE> is not a valid number: "<value>" (expected a whole number from <min> to <max>)`, `OMNIGATE_LISTEN must be host:port, got ...`, `OMNIGATE_LISTEN has no valid port: ...` | The data plane exited at startup over a bad setting. Every numeric variable is read strictly (digits only) and named in the message. |
 | `omnigate data plane listening on <address> (control plane <url>)` | Startup. |
 | `installed config version <id> (N routes, N keys)` | A new config snapshot is in force. |
-| `initial config sync failed (...)` | The control plane was unreachable at startup; the line says whether a cached config is being served. |
+| `initial config sync failed (...)` | The control plane was unreachable at startup; the line says whether a cached config is being served. `ControlTimeout` in it means the address took the connection, or the packets, and gave no answer within 10 seconds. |
 | `config fetch returned 401` | The two `OMNIGATE_INTERNAL_TOKEN` values differ. |
 | `config sync failed (...); serving last good config` | Logged once per outage. `control plane reachable again` ends it. |
 | `upstream <name> returned <status>, failing over` | A 429 or 5xx. |

@@ -255,7 +255,45 @@ python tools/load_test.py --gateway http://127.0.0.1:8080 --key og-unlimited-key
 
 Run it when you touch connection handling, timeouts, the usage queue or
 shutdown in the data plane; that is where it found the bugs it was written
-for. Run the hostile-input test as well when you touch request parsing,
+for.
+
+Two more long tests start their own stack and are not in CI or in
+`tools/check.py` either:
+
+```bash
+python tools/privacy_soak.py --duration 900 --gateway-exe <a ReleaseSafe omnigate-dp>
+python tools/upgrade_test.py 6d5ed6e --variant both --mixed
+```
+
+- **`tools/privacy_soak.py`** keeps private and ordinary keys busy side by
+  side: streamed and not, both protocols, translated, tool calls, many
+  values or none, clients that hang up or read slowly. Every request has
+  values no other request has, and the mock providers answer with what
+  they were sent, so the test can say that every answer had its own values
+  restored and nobody else's, that the providers never saw a private
+  value, that billed usage equals what the providers reported, and that
+  nothing private was left on disk. It also reports latency with and
+  without redaction and both processes' memory over time. Run it when you
+  touch `redact.zig`, the response path in `proxy.zig` or the allocator
+  use around them. Without `--gateway-exe` it tests `dataplane/zig-out`
+  (normally a Debug build); for memory and latency numbers build one with
+  `zig build -Doptimize=ReleaseSafe --prefix <dir>`. On Windows,
+  `--gateway-wsl <path>` runs a Linux build of the data plane inside WSL
+  instead (with WSL's mirrored networking) and reads its memory, threads
+  and number of memory mappings from `/proc`.
+- **`tools/upgrade_test.py <commit>`** checks out an older commit into a
+  temporary git worktree, builds it, lets it write realistic state (keys,
+  usage, ledger segments and a snapshot, finished, failed, cancelled and
+  running jobs, a webhook that cannot be delivered yet, spooled usage),
+  stops it (`--variant clean`) or kills it (`--variant hard`), and starts
+  the current build on the same files. It then checks that usage, keys,
+  jobs, outputs, the waiting webhook and the spool came across exactly.
+  `--mixed` also runs the old data plane with the current control plane
+  and the reverse. It needs the repository's history, `zig` and `mix`, and
+  an unchanged `control/mix.lock`; without them it says why and exits 0.
+  Building an old commit takes several minutes (`--build-dir <dir>` keeps
+  the build for the next run). Run it when you change anything either
+  process writes to disk, or the interface between the two. Run the hostile-input test as well when you touch request parsing,
 path handling, anything that forwards client bytes, or anything that reads
 a response from an upstream or the control plane.
 
@@ -338,6 +376,8 @@ tools/                Python, standard library only (sdk_compat.py excepted; e2e
   malformed_test.py                 hostile clients, upstreams and control plane against a gateway it starts (clients only against one you name)
   check.py                          runs every suite but the container test, with a summary
   load_test.py                      load and soak test against a running gateway
+  privacy_soak.py                   soak test of privacy mode on a stack it starts (long; not in check.py)
+  upgrade_test.py                   an older commit's files read by the current build, and mixed pairs (long; not in check.py)
   bench.py                          latency measurement
   import_litellm.py, test_import_litellm.py
 

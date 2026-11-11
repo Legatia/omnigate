@@ -145,6 +145,12 @@ pub fn encode(gpa: std.mem.Allocator, map: *const Map) ![]u8 {
 /// Send what has been counted. Returns false when the control plane did not
 /// take it (the counts are kept for the next attempt).
 pub fn flushOnce(app: *App) bool {
+    return flushOnceCancelable(app) catch false;
+}
+
+/// `flushOnce` for the background task: a cancellation that arrives during
+/// the call is passed on (the counts are kept), so that the task ends.
+fn flushOnceCancelable(app: *App) Io.Cancelable!bool {
     const c = app.counters;
     var taken = c.take(app.io);
     if (taken.count() == 0) {
@@ -157,8 +163,9 @@ pub fn flushOnce(app: *App) bool {
     };
     defer app.gpa.free(body);
 
-    control.postCounters(app, body) catch {
+    control.postCounters(app, body) catch |err| {
         c.restore(app.gpa, app.io, &taken);
+        if (err == error.Canceled) return error.Canceled;
         return false;
     };
     freeMap(app.gpa, &taken);
@@ -172,7 +179,7 @@ pub fn flushLoop(app: *App) Io.Cancelable!void {
     var healthy = true;
     while (true) {
         try app.io.sleep(.fromMilliseconds(delay_ms), .awake);
-        if (flushOnce(app)) {
+        if (try flushOnceCancelable(app)) {
             healthy = true;
             delay_ms = app.flush_interval_ms;
         } else {

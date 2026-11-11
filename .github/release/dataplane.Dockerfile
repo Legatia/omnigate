@@ -14,6 +14,7 @@
 #
 #   bin/amd64/omnigate-dp     the x86_64-linux-musl build
 #   bin/arm64/omnigate-dp     the aarch64-linux-musl build
+#   LICENSE, COMMERCIAL.md, README.txt   the terms that travel with every copy
 #
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     -f .github/release/dataplane.Dockerfile <context>
@@ -36,12 +37,17 @@ COPY --chmod=0755 bin/${TARGETARCH}/omnigate-dp /out/bin/omnigate-dp
 # The spool and config cache live in /data; make it writable by the runtime user.
 RUN mkdir /data && chown 10001:10001 /data
 
+# The license terms travel with every copy of the program.
+COPY LICENSE COMMERCIAL.md README.txt /licenses/
+
 
 FROM scratch
 # Root certificates, for TLS to the providers.
 COPY --from=files /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=files /out/bin/omnigate-dp /omnigate-dp
 COPY --from=files --chown=10001:10001 /data /data
+# License terms and where the documentation is.
+COPY --from=files /licenses /licenses
 
 USER 10001:10001
 WORKDIR /data

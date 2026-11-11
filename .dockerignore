@@ -1,0 +1,13 @@
+# Both images are built from the repository root (see the Dockerfiles), so
+# start from nothing and let in only what they copy.
+*
+!LICENSE
+!COMMERCIAL.md
+!.github/release/README.txt
+!dataplane/build.zig
+!dataplane/build.zig.zon
+!dataplane/src
+!control/mix.exs
+!control/mix.lock
+!control/config
+!control/lib

@@ -1,7 +1,0 @@
-_build
-deps
-data
-test
-Dockerfile
-.dockerignore
-erl_crash.dump

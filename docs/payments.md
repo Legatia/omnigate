@@ -83,7 +83,7 @@ complete example (a text route, a bonus rate, payments).
 | `provider` | required | `"near_intents"`. The only one there is. |
 | `recipient` | required | The operator's account at the provider: for `near_intents`, the NEAR account that receives the settle asset. **Check it twice**: it is where the money goes. It must be able to receive the settle asset (for a NEAR token: registered with the token's contract, which holding the token once takes care of). |
 | `min_usd`, `max_usd` | `1`, `10000` | Bounds on one payment. |
-| `quote_ttl_s` | `1800` | How long a payer has to send the deposit. 60 to 86,400. |
+| `quote_ttl_s` | `1800` | How long a payer is asked to be given to send the deposit. 60 to 86,400. The provider sets the deadline and may give longer: for ETH on Ethereum it gave three days. The payment's `deadline` is always the provider's. |
 | `poll_interval_s` | `15` | How often an open payment's status is asked for. After twenty polls they are spaced further apart. |
 | `settle_asset` | native USDC on NEAR | The asset delivered to the operator, as a 1Click asset id. It should be a dollar stablecoin: what arrives is credited one to one. |
 | `settle_decimals` | `6` | That asset's decimals. |
@@ -373,9 +373,18 @@ payment. (What a request then burns of the credit is the
   refunds, failures, short deposits, quotes and statuses that are forged or
   about another quote, a memo chain, a restart in the middle of a payment,
   the agent example.
-- **Not done: a real payment.** No funds have been sent through this code.
-  The status answers of the real service after a deposit (their exact
-  shape, how long they take) have only been read in its documentation.
+- **One real payment** (12 November 2026, through the
+  [top-up page](#the-top-up-page)): $1 of credit paid with 0.000506 ETH on
+  Ethereum mainnet. The payment went `awaiting_deposit` → `processing`
+  (`PROCESSING`, with the deposit's transaction hash) → `settled`
+  (`SUCCESS`) 31 seconds later, and the key was credited $1.00 once, under
+  `near_intents:<deposit address>`. The provider gave that deposit address
+  a deadline three days away, not the 30 minutes of `quote_ttl_s`.
+- **Not done with real funds:** a refund, a failure, a short deposit, an
+  expiry, an asset with a memo, and any amount above a dollar. Those have
+  only met the mock. That the operator's account received the USDC was not
+  checked by the gateway (it never is: see above) and was not looked up by
+  hand either.
 
 ## Trying it with real funds
 
@@ -411,6 +420,9 @@ uses real funds, so use a dollar or two.
    `settled` with `credited_usd` of 1, and `GET /admin/keys` should show the
    key with a budget of 1 and a balance of one dollar. Your account
    should hold one more USDC.
+
+The same can be done on the [top-up page](#the-top-up-page) instead of
+steps 3 to 6: open `http://127.0.0.1:8080/topup` and type the key.
 
 Paying with wrapped NEAR from a NEAR account keeps the fees lowest. If the
 payment ends as `refunded` or `expired`, nothing was credited and the

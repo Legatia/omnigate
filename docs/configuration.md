@@ -590,7 +590,7 @@ field, and what the gateway does and does not do with money, is in
 | `provider` | string | required | `near_intents`, the one provider there is. |
 | `recipient` | string | required | The operator's account at the provider (a NEAR account), where the settle asset is delivered. |
 | `min_usd`, `max_usd` | numbers | `1`, `10000` | Bounds on one payment. |
-| `quote_ttl_s` | whole number, 60 to 86,400 | `1800` | How long a payer has to send the deposit. |
+| `quote_ttl_s` | whole number, 60 to 86,400 | `1800` | How long a payer is asked to be given to send the deposit. The provider sets the deadline and may give longer. |
 | `poll_interval_s` | whole number, 1 to 3,600 | `15` | How often an open payment's status is asked for. |
 | `settle_asset`, `settle_decimals`, `slippage_bps`, `jwt_env`, `base_url`, `public_key` | | see [Payments](payments.md#switching-it-on) | The `near_intents` provider's own settings. |
 

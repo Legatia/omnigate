@@ -727,6 +727,26 @@ Back `payments.json` up with the rest of the data directory.
 | Admin API | | `GET /admin/topups`, `GET /admin/payments`. |
 | Gateway API | | `/v1/payments*`: `404` unless payments are configured. |
 
+## The top-up page commit
+
+Two pages, both only while `payments` is configured: a
+[top-up page](payments.md#the-top-up-page) for key holders on the gateway's
+port, and a Payments page on the dashboard. No stored format changes.
+
+**Between the two processes.** The data plane now passes `GET /topup` on to
+the control plane (`/internal/topup`).
+
+| Data plane | Control plane | What happens |
+|---|---|---|
+| new | old | `GET /topup` is answered `404` by the old control plane. |
+| old | new | The old data plane asks for a key on `/topup` and then answers `404 not_found`; the page cannot be reached until it is upgraded. The dashboard's Payments page works. |
+
+| What | Before | After |
+|---|---|---|
+| Gateway port | `GET /topup` was `401` without a key, `404` with one | With payments configured: the top-up page, **without a key**. Without them: `404`. |
+| `GET /v1/payments` | `{"payments": [...]}` | One more field, `"credits"`: the key's balance, or null for a key that is not prepaid. |
+| The dashboard's top bar | | A link to the Payments page (`/payments`), with payments configured. |
+
 ## Tested upgrades
 
 `tools/upgrade_test.py` builds an older commit, lets it write state, stops

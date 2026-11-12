@@ -512,6 +512,9 @@ defmodule OmnigateControl.PaymentsTest do
       refute Map.has_key?(payment, "key")
       assert {200, ^payment} = gateway(:get, "/internal/v1/payments/#{id}", hash)
       assert {200, %{"payments" => [^payment]}} = gateway(:get, "/internal/v1/payments", hash)
+      # The list also says what is left on the key, so a payer needs no admin token for that.
+      assert {200, %{"credits" => %{"balance_usd" => left, "burned_usd" => burned}}} = gateway(:get, "/internal/v1/payments", hash)
+      assert is_number(left) and is_number(burned)
 
       # Nothing has arrived: asked, and still waiting; nothing credited.
       :ok = Payments.poll_now()
@@ -803,6 +806,59 @@ defmodule OmnigateControl.PaymentsTest do
 
       assert {200, %{"configured" => false, "payments" => []}} = admin(:get, "/admin/payments")
       assert FakeIntents.get(:calls) == 0
+    end
+  end
+
+  # ================================================================== the pages
+
+  defp page(path, headers) do
+    Enum.reduce(headers, conn(:get, path), fn {name, value}, conn -> put_req_header(conn, name, value) end) |> Router.call(Router.init([]))
+  end
+
+  describe "the pages" do
+    test "the top-up page is the data plane's to serve: self-contained, and it never sees a key" do
+      internal = [{"x-omnigate-internal", OmnigateControl.internal_token()}]
+      conn = page("/internal/topup", internal)
+      assert conn.status == 200
+      assert [type] = get_resp_header(conn, "content-type")
+      assert type =~ "text/html"
+
+      # Nothing loads from elsewhere, and only the page's own script runs.
+      assert [csp] = get_resp_header(conn, "content-security-policy")
+      assert [_, nonce] = Regex.run(~r/script-src 'nonce-([A-Za-z0-9_-]+)'/, csp)
+      assert csp =~ "default-src 'none'" and csp =~ "connect-src 'self'"
+      assert conn.resp_body =~ ~s(<script nonce="#{nonce}">)
+      refute conn.resp_body =~ ~r/(src|href)="https?:/
+      assert get_resp_header(conn, "cache-control") == ["no-store"]
+
+      # It talks to the payments API with the key typed into it, and draws the address as a QR code.
+      assert conn.resp_body =~ "/v1/payments/quote" and conn.resp_body =~ "qrMatrix"
+      # A new nonce for every answer.
+      refute page("/internal/topup", internal).resp_body =~ nonce
+      # Not without the data plane's token.
+      assert page("/internal/topup", []).status in [401, 403]
+      assert page("/topup", []).status == 404
+    end
+
+    test "the Payments page is the operator's: behind the sign-in, and linked from the dashboard" do
+      token = [{"authorization", "Bearer " <> @admin}]
+      conn = page("/payments", token)
+      assert conn.status == 200
+      assert conn.resp_body =~ "/admin/payments" and conn.resp_body =~ "/topup</code>"
+      assert [csp] = get_resp_header(conn, "content-security-policy")
+      assert csp =~ "script-src 'nonce-"
+
+      # Nobody else: a visitor is sent to the sign-in.
+      assert page("/payments", []).status == 302
+      assert page("/", token).resp_body =~ ~s(<a href="/payments">Payments</a>)
+    end
+
+    test "without a \"payments\" section neither page exists", %{original: original} do
+      :persistent_term.put({ConfigStore, :config}, Map.put(original, :payments, nil))
+      token = [{"authorization", "Bearer " <> @admin}]
+      assert page("/internal/topup", [{"x-omnigate-internal", OmnigateControl.internal_token()}]).status == 404
+      assert page("/payments", token).status == 404
+      refute page("/", token).resp_body =~ ~s(href="/payments")
     end
   end
 end

@@ -23,6 +23,10 @@ defmodule OmnigateControl.Router do
     * `GET  /private-chat`    — the Private chat page (session), with
       `GET /admin/private-chat/state` and `POST /admin/private-chat/send`,
       see `PrivateChat`
+    * `GET  /payments`        — the Payments page (session), while payments
+      are configured, see `PaymentsPage`
+    * `GET  /internal/topup`  — the top-up page for key holders, which the
+      data plane serves at `GET /topup`, see `TopupPage`
     * `GET/POST /login`, `POST /logout` — dashboard sessions, see `AdminAuth`
     * `GET  /metrics`         — Prometheus metrics (admin token or session)
     * `GET  /healthz`         — liveness, no authentication
@@ -46,6 +50,7 @@ defmodule OmnigateControl.Router do
     Ledger,
     Metrics,
     Payments,
+    PaymentsPage,
     Privacy,
     PrivateChat,
     PrivateChatPage,
@@ -55,6 +60,7 @@ defmodule OmnigateControl.Router do
     Rejections,
     Storage,
     Text,
+    TopupPage,
     UrlSigner
   }
 
@@ -344,7 +350,9 @@ defmodule OmnigateControl.Router do
   get "/internal/v1/payments" do
     with {:ok, key} <- gateway_key(conn),
          true <- Payments.configured?() || {:error, 404, "not_found", "payments are not configured on this gateway"} do
-      send_json(conn, 200, %{payments: Enum.map(Payments.list(key), &Payments.view/1)})
+      # With the key's credit (null for a key that is not prepaid), so that a
+      # payer sees what is left without an admin token.
+      send_json(conn, 200, %{payments: Enum.map(Payments.list(key), &Payments.view/1), credits: Admin.key_view(key).credits})
     else
       {:error, status, type, message} -> send_error(conn, status, type, message)
     end
@@ -366,6 +374,18 @@ defmodule OmnigateControl.Router do
       send_json(conn, 200, Payments.view(payment))
     else
       {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
+  end
+
+  # The top-up page (`OmnigateControl.TopupPage`), which the data plane serves
+  # at `GET /topup` on the public port. It holds nothing secret: the key is
+  # typed into it and stays in the browser.
+  get "/internal/topup" do
+    if Payments.configured?() do
+      nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+      send_html(conn, 200, TopupPage.page(nonce), nonce)
+    else
+      send_error(conn, 404, "not_found", "payments are not configured on this gateway")
     end
   end
 
@@ -633,6 +653,24 @@ defmodule OmnigateControl.Router do
       end
 
     send_html(conn, 200, PrivateChatPage.page(csrf, nonce), nonce)
+  end
+
+  # -- the Payments page (opt-in, like the payments themselves) ------------------
+
+  get "/payments" do
+    if Payments.configured?() do
+      nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+
+      csrf =
+        case conn.assigns[:auth] == :session && AdminAuth.session(conn) do
+          session when is_binary(session) -> AdminAuth.csrf_token(session)
+          _ -> ""
+        end
+
+      send_html(conn, 200, PaymentsPage.page(csrf, nonce, PrivateChat.gateway_url()), nonce)
+    else
+      send_error(conn, 404, "not_found", "the Payments page is off: the config has no \"payments\" section")
+    end
   end
 
   get "/login" do
@@ -1016,7 +1054,7 @@ defmodule OmnigateControl.Router do
     end
   end
 
-  defp admin_auth(%{path_info: path} = conn, _opts) when path in [[], ["private-chat"]] do
+  defp admin_auth(%{path_info: path} = conn, _opts) when path in [[], ["private-chat"], ["payments"]] do
     conn = assign(conn, :auth, AdminAuth.authenticate(conn))
 
     case conn.assigns.auth do

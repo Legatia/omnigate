@@ -1180,7 +1180,8 @@ the states, the errors, what is checked and what is trusted) is in
 | `POST /v1/payments/quote` | `{"amount_usd", "asset", "refund_to"}`: what a payment would take, without starting one. |
 | `POST /v1/payments` | The same body: start a payment. `201` with the deposit address, the amount to send and the deadline. |
 | `GET /v1/payments/{id}` | The payment: `awaiting_deposit`, `processing`, `settled` (with `credited_usd`), `refunded`, `failed` or `expired`. |
-| `GET /v1/payments` | The key's payments, newest first. |
+| `GET /v1/payments` | The key's payments, newest first, and under `"credits"` what is left on the key. |
+| `GET /topup` | Not an API: the [top-up page](payments.md#the-top-up-page), which does the calls above for a person. Served without a key. |
 | `POST /v1/payments/{id}/tx` | `{"tx_hash"}`: optional hint to the provider. |
 
 Their errors use the gateway's error shape; the codes are

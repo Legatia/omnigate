@@ -456,6 +456,14 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         return forwardToControl(app, acc, arena, request, guard, method, path, query, null, null, null, false, null);
     }
 
+    // The top-up page: the control plane's, and only there when it takes
+    // payments (it answers 404 otherwise). The page holds nothing secret and
+    // asks for no key; the key is typed into it and sent with its calls to
+    // `/v1/payments*`, which are authenticated below like any other.
+    if (method == .GET and std.mem.eql(u8, path, "/topup")) {
+        return forwardToControl(app, acc, arena, request, guard, method, path, "", null, null, null, false, null);
+    }
+
     // --- authentication -------------------------------------------------
     const presented = hdrs.api_key orelse
         return respondError(acc, request, .unauthorized, "missing_api_key", "send Authorization: Bearer <key> or x-api-key");

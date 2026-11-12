@@ -101,6 +101,39 @@ admin API with a total budget (`"budget_usd": 0` is the usual start). A key
 from the config file, a key without a budget and a key with a monthly or
 daily budget are answered `409 not_prepaid`.
 
+## The top-up page
+
+For a person rather than a program: **`GET /topup`** on the gateway's port
+(`http://127.0.0.1:8080/topup`) is a page that does the same three calls.
+
+1. The holder types the gateway key. The page shows the credit left on it
+   and the key's earlier payments.
+2. They choose an amount, a network and an asset, give a refund address,
+   and ask for a quote. Nothing is started until they press *Start payment*.
+3. The page shows what to send where, with the deposit address as a QR
+   code and a countdown to the deadline, and follows the payment until the
+   credit is added. A payment that is still open can be opened again later
+   with the key.
+
+What to know about it:
+
+- **It asks for no sign-in and holds nothing secret.** Anyone who can reach
+  the gateway can load it; everything it shows comes from the payments API
+  with the key that was typed in.
+- **The key stays in the page.** It is not put in a cookie, in browser
+  storage or in the address, and it is sent only to this gateway. Reloading
+  the page forgets it.
+- **Nothing is loaded from elsewhere.** The page is one document with its
+  own style and script (a `Content-Security-Policy` with a nonce, no
+  third-party request, `Cache-Control: no-store`); the QR code is drawn in
+  the page.
+- **The QR code holds the deposit address only**, which every wallet reads.
+  The amount, and a memo where the network needs one, are typed or copied.
+- It exists only while payments are configured: a `404` otherwise.
+
+Serve the gateway over HTTPS before giving this address to anyone: a key
+typed into a page that came over plain HTTP can be read on the way.
+
 ## The API
 
 On the gateway's port, with a gateway key, like every other endpoint. **A
@@ -113,7 +146,7 @@ are for.
 | `POST /v1/payments/quote` | What a payment would take, without starting one. |
 | `POST /v1/payments` | Start a payment: get a deposit address and the amount to send. |
 | `GET /v1/payments/{id}` | The payment and its state. |
-| `GET /v1/payments` | The key's payments, newest first (up to 50). |
+| `GET /v1/payments` | The key's payments, newest first (up to 50), and under `"credits"` what is left on the key (`balance_usd`, `burned_usd`; null for a key that is not prepaid). |
 | `POST /v1/payments/{id}/tx` | Optional: tell the provider which transaction carries the deposit. |
 
 ### Assets
@@ -322,8 +355,10 @@ payment. (What a request then burns of the credit is the
   idempotent).
 - **Changing `recipient`** affects new payments; open ones keep the
   recipient they were quoted for.
-- **The dashboard** does not show payments or credit balances yet; the
-  admin API does.
+- **The dashboard** has a Payments page (`/payments`, linked from the top
+  bar while payments are configured): the credit left on every prepaid key,
+  a form to add credit by hand (`POST /admin/keys/{name}/topup`), every
+  payment with its state, and every top-up and bonus.
 
 ## What has been tested
 

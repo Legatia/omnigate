@@ -20,6 +20,7 @@ import hmac
 import http.client
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -880,6 +881,19 @@ def payment_checks():
     listed = jcall("GET", GATEWAY + "/v1/payments", key=second)[2].get("payments", [])
     check("POST /v1/payments/quote says what a payment would take without starting one: an amount, no deposit address, nothing stored",
           status == 200 and float(dry.get("amount") or 0) > 0 and dry.get("symbol") == "ETH" and "address" not in json.dumps(dry) and len(listed) == 1, (status, dry, len(listed)))
+
+    # The page a key holder tops up on: public, self-contained, and it asks for no key to load.
+    status, heads, raw = call("GET", GATEWAY + "/topup")
+    page = raw.decode("utf-8", "replace")
+    csp = heads.get("content-security-policy", "")
+    credits = jcall("GET", GATEWAY + "/v1/payments", key=second)[2].get("credits") or {}
+    check("GET /topup is the top-up page, served without a key: one self-contained page (strict CSP, nothing stored), and the key's own list says what credit is left",
+          status == 200 and heads.get("content-type", "").startswith("text/html") and "default-src 'none'" in csp and "script-src 'nonce-" in csp
+          and heads.get("cache-control") == "no-store" and "/v1/payments/quote" in page and "qrMatrix" in page and not re.search(r'(src|href)="https?:', page)
+          and close(credits.get("balance_usd"), 2 - (key_row("e2e-payer-2").get("credits_burned_usd") or 0)),
+          (status, heads, credits, page[:200]))
+    check("/topup is a page to read: other methods need a key like everything else",
+          call("POST", GATEWAY + "/topup", body={})[0] == 401, call("POST", GATEWAY + "/topup", body={})[0])
 
     secret = payer("e2e-payer-3")
     new = lambda **body: ask(secret, **body)

@@ -31,6 +31,8 @@ defmodule OmnigateControl.Dashboard do
       ~s(<a href="#config">Configuration</a>),
       # Only where the config has an attested upstream (the feature is opt-in).
       if(OmnigateControl.Attestation.configured?(), do: ~s(<a href="/private-chat">Private chat</a>), else: ""),
+      # Only where the config takes payments (opt-in as well).
+      if(OmnigateControl.Payments.configured?(), do: ~s(<a href="/payments">Payments</a>), else: ""),
       ~s(</nav>),
       ~s(<div class="right"><span id="updated" class="muted" role="status">Updated ),
       h(clock(o.generated_at)),

@@ -149,6 +149,13 @@ only met a mock, is tracked in the README's
     `tools/near_intents_live.py` (the real asset list and dry quotes through
     a running gateway; `--serve` for one real payment by hand).
 
+- **A site** (`site/`): a landing page, and the pages of `docs/` rendered
+  to static HTML by `python site/build.py` (needs
+  `pip install -r site/requirements.txt`; everything else in the repository
+  still needs the standard library only). `docs/` stays the source. The
+  build fails when a link between two pages names a page or a heading that
+  does not exist, and CI runs it. The pages load nothing from another host.
+
 ### Changed
 
 - `tools/e2e.py` keeps the managed keys and the audit log of a run in the

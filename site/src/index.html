@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>omnigate · a self-hosted AI gateway</title>
+<meta name="description" content="A self-hostable AI gateway in two small processes: one port for OpenAI- and Anthropic-style APIs and media jobs, with keys, budgets, failover and a usage ledger. Optional attested private inference and crypto top-ups.">
+<meta property="og:title" content="omnigate · a self-hosted AI gateway">
+<meta property="og:description" content="One port for text and media models, with keys, budgets, failover and a usage ledger. Optional: proof that a prompt only went to verified hardware.">
+<meta property="og:type" content="website">
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body class="landing">
+<header class="top">
+  <div class="bar">
+    <a class="brand" href="/"><img src="/assets/icon.svg" alt="" width="22" height="22">omnigate</a>
+    <nav>
+      <a href="/docs/">Docs</a>
+      <a href="/docs/quickstart/">Quickstart</a>
+      <a href="https://github.com/Legatia/omnigate">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero wrap">
+  <p class="pill">Pre-release 0.1.0-rc.1 · source-available</p>
+  <h1>One gateway for every model you call. Yours to run.</h1>
+  <p class="lead">omnigate puts one port in front of OpenAI- and Anthropic-style text APIs and seven kinds of media provider, with gateway keys, budgets, failover and a usage ledger. It is two small processes and files on disk: no database, no queue, no cloud account.</p>
+  <p class="actions">
+    <a class="button primary" href="/docs/quickstart/">Run it locally</a>
+    <a class="button" href="https://github.com/Legatia/omnigate">Source on GitHub</a>
+  </p>
+<svg class="diagram" viewBox="0 0 960 250" role="img" aria-label="Applications call the data plane, which calls the text providers. The control plane gives it configuration, receives usage events, runs media jobs and stores their outputs.">
+    <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" class="head"/></marker></defs>
+    <g class="box"><rect x="10" y="30" width="120" height="56" rx="8"/><rect x="250" y="30" width="230" height="56" rx="8" class="own"/><rect x="250" y="166" width="230" height="56" rx="8" class="own"/><rect x="690" y="30" width="260" height="56" rx="8"/><rect x="690" y="132" width="260" height="46" rx="8"/><rect x="690" y="194" width="260" height="46" rx="8"/></g>
+    <g class="wire"><path d="M130 58H248"/><path d="M480 58H688"/><path d="M320 164V88"/><path d="M410 88V164"/><path d="M480 184H600V155H688"/><path d="M480 204H600V217H688"/></g>
+    <g class="name"><text x="70" y="63">your apps</text><text x="365" y="55">data plane</text><text x="365" y="191">control plane</text><text x="820" y="55">text providers</text><text x="820" y="160">media providers</text><text x="820" y="222">your bucket or disk</text></g>
+    <g class="sub"><text x="365" y="73">Zig · the public port</text><text x="365" y="209">Elixir · ledger, budgets, jobs</text><text x="820" y="73">OpenAI-style, Anthropic-style</text></g>
+    <g class="tag"><text x="189" y="50">/v1</text><text x="282" y="130">config</text><text x="468" y="130">usage events</text><text x="585" y="50">keys, limits, failover</text><text x="560" y="176">jobs</text></g>
+  </svg>
+</section>
+
+<section class="wrap">
+  <h2>What it does</h2>
+  <div class="grid">
+    <article>
+      <h3>Text gateway</h3>
+      <p>Chat, messages, embeddings and responses endpoints, streaming and not. An OpenAI client can use an Anthropic-style upstream and the reverse, with tools, images and structured output translated.</p>
+      <a href="/docs/api/">API reference</a>
+    </article>
+    <article>
+      <h3>Failover and limits</h3>
+      <p>The next target is tried on timeouts, 429 and 5xx before any byte reaches the client. Each key has a model list, a rate limit, a concurrency limit and a budget.</p>
+      <a href="/docs/configuration/">Configuration</a>
+    </article>
+    <article>
+      <h3>Media jobs</h3>
+      <p>Images, speech, sound, music and video as jobs with signed, retried webhooks. Outputs are copied to your own bucket or disk, and a job can fail over between providers.</p>
+      <a href="/docs/providers/">Providers</a>
+    </article>
+    <article>
+      <h3>A ledger that survives outages</h3>
+      <p>Usage is read from the provider's own counts, spooled to disk and deduplicated by request id. A call made while the control plane was down is billed once.</p>
+      <a href="/docs/architecture/">Architecture</a>
+    </article>
+    <article>
+      <h3>Privacy mode</h3>
+      <p>Redact personal data and secrets before a provider sees them, keep no request content, encrypt job outputs, and unlink usage from the key. Per key or per request.</p>
+      <a href="/docs/privacy/">Privacy mode</a>
+    </article>
+    <article>
+      <h3>Small enough to audit</h3>
+      <p>The data plane uses the Zig standard library only; the control plane has two direct Hex packages. The security model, known limits and past advisories are written down.</p>
+      <a href="https://github.com/Legatia/omnigate/blob/main/SECURITY.md">Security policy</a>
+    </article>
+  </div>
+</section>
+
+<section class="wrap split">
+  <div>
+    <p class="kicker">Optional · NEAR AI Cloud</p>
+    <h2>Proof that a prompt only went to verified hardware</h2>
+    <p>For models that run in a trusted execution environment, the gateway checks the provider's evidence itself instead of taking its word:</p>
+    <ul class="checks">
+      <li>The Intel TDX quote is verified in the control plane against Intel's pinned root, with revocation lists and patch status.</li>
+      <li>The signing key, the software configuration and the GPU evidence are bound to that quote.</li>
+      <li>A key marked <code>attested</code> gets <code>503</code> instead of an answer when verification fails. It cannot reach an unverified model.</li>
+      <li>Each answer comes with a receipt carrying the provider's signature over the request and the response, which anyone can check offline.</li>
+    </ul>
+    <p>Without an <code>attestation</code> block in the config none of this is active, and omnigate is a plain model gateway.</p>
+    <p><a class="more" href="/docs/attestation/">How attested inference works, and what it does not prove</a></p>
+  </div>
+  <figure>
+    <img src="/assets/private-chat.jpg" alt="The Private chat page: the conversation, what left the machine after redaction, and the list of verification checks with a signed receipt." width="800" height="450" loading="lazy">
+    <figcaption>The Private chat page, with a real answer from NEAR AI Cloud. The personal details are sample data.</figcaption>
+  </figure>
+</section>
+
+<section class="wrap split">
+  <div>
+    <p class="kicker">Optional · NEAR Intents</p>
+    <h2>Keys that pay for themselves</h2>
+    <p>A prepaid key holds credit: one credit is one dollar when it is added, and a request burns what the provider charged times a multiplier you set. When the credit runs out, the holder of the key, or an agent using it, can buy more without anyone in between:</p>
+    <ul class="checks">
+      <li>It asks the gateway for a payment and gets a deposit address for the asset it wants to pay with, from about 230 assets on 39 chains.</li>
+      <li>The funds are swapped to USDC and delivered to the operator's account. The gateway never holds a private key.</li>
+      <li>What arrived is credited to the key, once.</li>
+    </ul>
+    <p><a class="more" href="/docs/payments/">Payments</a> · <a class="more" href="/docs/credits/">The credit rule</a></p>
+  </div>
+<pre class="hl sample"><code><span class="c"># a key that is out of credit can still do this</span>
+curl $GATEWAY/v1/payments \
+  -H "Authorization: Bearer $KEY" \
+  -d '{"amount_usd": 5,
+       "asset": "nep141:wrap.near",
+       "refund_to": "payer.near"}'
+
+<span class="c"># → a deposit address, the amount to send, a deadline</span>
+<span class="c"># then: awaiting_deposit → processing → settled</span></code></pre>
+</section>
+
+<section class="wrap">
+  <h2>Measured, with the caveats attached</h2>
+  <div class="figures">
+    <div><strong>0.5 ms</strong><span>added latency at the median</span></div>
+    <div><strong>1.9 MB</strong><span>data plane binary</span></div>
+    <div><strong>13 MB</strong><span>data plane memory under the benchmark</span></div>
+    <div><strong>669,000</strong><span>requests in a five-minute load test, none lost or billed twice</span></div>
+  </div>
+  <p class="note">One machine, localhost, against a mock provider written in Python. This shows the gateway is stable and not a bottleneck in front of a mock; it is not a comparison with any other gateway. <a href="https://github.com/Legatia/omnigate#measurements">How these were taken</a></p>
+</section>
+
+<section class="wrap split even">
+  <div>
+    <h2>Where it stands</h2>
+    <p>omnigate is a pre-release. The text gateway and seven of the eight media adapters have been checked by hand against the real provider APIs, and every push runs the unit, end-to-end, SDK, container and hostile-input suites. It has never served production traffic.</p>
+    <p>Other gateways are ahead in places, and the README says where:</p>
+    <ul>
+      <li>They speak to far more providers natively. Azure, Bedrock and Vertex are not reachable from omnigate.</li>
+      <li>They have production mileage.</li>
+      <li>Cost-aware routing, guardrails, SSO and tracing integrations are not here.</li>
+    </ul>
+    <p><a class="more" href="https://github.com/Legatia/omnigate#what-has-been-verified">What has been verified</a> · <a class="more" href="https://github.com/Legatia/omnigate#how-it-compares">How it compares</a></p>
+  </div>
+  <div>
+    <h2>Run it</h2>
+    <p>With Zig 0.17, Erlang/OTP 29 with Elixir 1.20 and Python 3.9 or newer:</p>
+<pre class="hl"><code>git clone https://github.com/Legatia/omnigate
+cd omnigate/dataplane &amp;&amp; zig build
+cd .. &amp;&amp; python tools/e2e.py</code></pre>
+    <p>The last command starts mock providers, both processes and a few hundred checks; no API key is needed. On a server, a Compose file with a TLS proxy is included.</p>
+    <p><a class="more" href="/docs/quickstart/">Quickstart</a> · <a class="more" href="/docs/deployment/">Deployment</a></p>
+  </div>
+</section>
+
+<section class="wrap license">
+  <h2>License</h2>
+  <p>omnigate is source-available under the <a href="https://github.com/Legatia/omnigate/blob/main/LICENSE">PolyForm Noncommercial License 1.0.0</a>: free for personal projects, learning, research and noncommercial organisations. Use in or for a business needs a <a href="https://github.com/Legatia/omnigate/blob/main/COMMERCIAL.md">commercial license</a>; write to <a href="mailto:hello@legatia.solutions">hello@legatia.solutions</a>.</p>
+</section>
+</main>
+
+<footer class="wrap">
+  <p>omnigate, by <a href="https://legatia.solutions">Legatia</a>. The attestation and payments parts were built at the NEAR Hackathon, November 2026.</p>
+  <p><a href="/docs/">Docs</a> · <a href="https://github.com/Legatia/omnigate">GitHub</a> · <a href="https://github.com/Legatia/omnigate/blob/main/CHANGELOG.md">Changelog</a> · <a href="https://github.com/Legatia/omnigate/blob/main/SECURITY.md">Security</a></p>
+  <p class="quiet">This site sets no cookies and loads nothing from any other host.</p>
+</footer>
+</body>
+</html>

@@ -27,3 +27,6 @@ __pycache__/
 # Compose secret files (copy from the .example files)
 .env.control
 .env.dataplane
+
+# Built site (python site/build.py)
+site/dist/

@@ -138,6 +138,11 @@ jobs:
       - name: Receipt verifier against RFC 8032's Ed25519 vectors
         run: python tools/verify_receipt.py --self-test
 
+      - name: Site builds and every link between its pages holds
+        run: |
+          pip install -r site/requirements.txt
+          python site/build.py
+
   e2e:
     name: End to end (mock providers)
     needs: [dataplane, control]

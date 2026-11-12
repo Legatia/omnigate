@@ -327,6 +327,7 @@ a response from an upstream or the control plane.
 ## Layout
 
 ```
+site/                 the static site: build.py renders docs/ to HTML next to a hand-written landing page (src/); output in site/dist/, not committed
 dataplane/            Zig data plane: the public port
   build.zig, build.zig.zon
   src/main.zig        startup, environment variables (read strictly, all listed in its header), the accept loop, stop signals and shutdown, `healthcheck`

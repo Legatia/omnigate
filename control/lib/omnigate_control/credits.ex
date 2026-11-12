@@ -8,7 +8,7 @@ defmodule OmnigateControl.Credits do
       1 credit      = 1 US dollar, at the moment a top-up is applied
       balance       = top-ups + bonuses − burns
       burn          = what the provider cost × the burn multiplier
-      weekly bonus  = average bonus-eligible balance over the week
+      weekly bonus  = average balance over the week
                       × the annual bonus rate ÷ 52
 
   A key at or below zero is blocked (`402 budget_exceeded`) until it is
@@ -28,15 +28,10 @@ defmodule OmnigateControl.Credits do
       promise.
     * `sample_interval_s` — how often balances are sampled for the weekly
       average while a bonus rate is set (default 900).
-    * `admin_topups_eligible` — whether a top-up made through the admin API
-      earns the bonus when the call does not say (default false).
 
-  ## Two kinds of credit
-
-  Every top-up says whether it is **bonus-eligible**. A key therefore holds
-  two balances: eligible credit, and the rest ("plain"). Spending draws on
-  plain credit first, so eligible credit keeps earning as long as it can. A
-  bonus is itself eligible, so it compounds.
+  All credit is the same: whatever a prepaid key holds earns the bonus,
+  wherever it came from (the budget it was created with, a top-up, a
+  payment, an earlier bonus, which therefore compounds).
 
   ## Arithmetic
 
@@ -47,8 +42,8 @@ defmodule OmnigateControl.Credits do
   ## The weekly average
 
   Weeks are ISO weeks in UTC (Monday 00:00 to Monday 00:00). The average is
-  the integral of the eligible balance over the week divided by the length
-  of the week, so a key that held credit for half the week earns half. The
+  the integral of the balance over the week (below zero counts as zero)
+  divided by the length of the week, so a key that held credit for half the week earns half. The
   integral is built from samples: between two samples the balance is taken
   to have moved in a straight line. Samples are taken at every top-up and
   every `sample_interval_s`; if the control plane was not running, the gap is
@@ -57,16 +52,16 @@ defmodule OmnigateControl.Credits do
   `bonus:<key>:<ISO week>`, and a reference is only ever credited once).
 
   The state per key (in the key store, under `"credits"`) is a small map:
-  `plain`, `eligible`, `burned` (the key's lifetime burn the two balances
-  already account for), `at` (when), `integral` (dollar-seconds of eligible
-  balance in the week `at` falls in), and `last_bonus`.
+  `balance`, `burned` (the key's lifetime burn the balance already accounts
+  for), `at` (when), `integral` (dollar-seconds of balance in the week `at`
+  falls in), and `last_bonus`.
   """
   alias OmnigateControl.{ConfigStore, Keys}
 
   @week_s 604_800
   @min_bonus 1.0e-6
-  @defaults %{burn_multiplier: 1.0, bonus_annual_rate: 0.0, sample_interval_s: 900, admin_topups_eligible: false}
-  @known ~w(burn_multiplier bonus_annual_rate sample_interval_s admin_topups_eligible)
+  @defaults %{burn_multiplier: 1.0, bonus_annual_rate: 0.0, sample_interval_s: 900}
+  @known ~w(burn_multiplier bonus_annual_rate sample_interval_s)
 
   # ---- Settings ------------------------------------------------------------
 
@@ -95,12 +90,6 @@ defmodule OmnigateControl.Credits do
           nil -> 900
           n when is_integer(n) and n >= 1 and n <= 86_400 -> n
           other -> raise ArgumentError, "credits.sample_interval_s must be a whole number of seconds from 1 to 86400, got #{inspect(other)}"
-        end,
-      admin_topups_eligible:
-        case raw["admin_topups_eligible"] do
-          nil -> false
-          b when is_boolean(b) -> b
-          other -> raise ArgumentError, "credits.admin_topups_eligible must be true or false, got #{inspect(other)}"
         end
     }
   end
@@ -187,16 +176,15 @@ defmodule OmnigateControl.Credits do
 
   # ---- The state of one key ------------------------------------------------------
 
-  @doc "A fresh state: `balance` of plain credit at `now`, with `burned` of the key's lifetime burn accounted for."
+  @doc "A fresh state: `balance` of credit at `now`, with `burned` of the key's lifetime burn accounted for."
   def new(balance, burned, now) do
-    %{"plain" => balance * 1.0, "eligible" => 0.0, "burned" => burned * 1.0, "at" => now, "integral" => 0.0}
+    %{"balance" => balance * 1.0, "burned" => burned * 1.0, "at" => now, "integral" => 0.0}
   end
 
   @doc "A state read from disk, or nil when it is not one."
-  def load(%{"plain" => p, "eligible" => e, "burned" => b, "at" => at} = raw) when is_number(p) and is_number(e) and is_number(b) and is_integer(at) do
+  def load(%{"balance" => balance, "burned" => b, "at" => at} = raw) when is_number(balance) and is_number(b) and is_integer(at) do
     state = %{
-      "plain" => p * 1.0,
-      "eligible" => max(e * 1.0, 0.0),
+      "balance" => balance * 1.0,
       "burned" => b * 1.0,
       "at" => at,
       "integral" => if(is_number(raw["integral"]), do: max(raw["integral"] * 1.0, 0.0), else: 0.0)
@@ -208,19 +196,24 @@ defmodule OmnigateControl.Credits do
     end
   end
 
+  # A state from before all credit was one kind: two balances, of which only
+  # one earned. They are added up; the week under way keeps what it had.
+  def load(%{"plain" => p, "eligible" => e} = raw) when is_number(p) and is_number(e) do
+    raw |> Map.drop(["plain", "eligible"]) |> Map.put("balance", p + e) |> load()
+  end
+
   def load(_), do: nil
 
-  @doc "What is left: plain plus eligible (negative after the request that crossed zero)."
-  def balance(state), do: state["plain"] + state["eligible"]
+  @doc "What is left (negative after the request that crossed zero)."
+  def balance(state), do: state["balance"]
 
   @doc """
   Bring a state up to `now`, given the key's lifetime burn `burned_now`.
 
-  The burn since the state's own time is drawn from plain credit first, then
-  from eligible credit; the eligible balance's path goes into the weekly
-  integral. Every week that ended on the way is closed: its bonus, at `rate`
-  (annual), is added as eligible credit unless `credited?.(week)` says that
-  week's bonus exists already.
+  The burn since the state's own time comes off the balance, and the
+  balance's path goes into the weekly integral. Every week that ended on the
+  way is closed: its bonus, at `rate` (annual), is added unless
+  `credited?.(week)` says that week's bonus exists already.
 
   Returns `{state, bonuses}` with `bonuses` as `[{week, amount_usd, at}]`,
   oldest first. Pure: nothing is stored.
@@ -245,7 +238,7 @@ defmodule OmnigateControl.Credits do
 
       {state, bonuses} =
         if rate > 0 and bonus >= @min_bonus and not credited?.(week) do
-          state = state |> credit(bonus, true) |> Map.put("last_bonus", %{"week" => week, "amount_usd" => bonus, "at" => week_end})
+          state = state |> credit(bonus) |> Map.put("last_bonus", %{"week" => week, "amount_usd" => bonus, "at" => week_end})
           {state, [{week, bonus, week_end} | bonuses]}
         else
           {state, bonuses}
@@ -258,40 +251,29 @@ defmodule OmnigateControl.Credits do
   # One straight line from the state's time to `t`, ending at burn `burned`.
   defp step(state, t, burned) do
     burn = max(burned - state["burned"], 0.0)
-    before = state["eligible"]
-    {plain, eligible} = draw(state["plain"], before, burn)
+    before = state["balance"]
+    left = before - burn
     seconds = max(t - state["at"], 0)
 
     Map.merge(state, %{
-      "plain" => plain,
-      "eligible" => eligible,
+      "balance" => left,
       "burned" => max(burned, state["burned"]),
       "at" => max(t, state["at"]),
-      "integral" => state["integral"] + (before + eligible) / 2 * seconds
+      "integral" => state["integral"] + area(before, left, seconds)
     })
   end
 
-  @doc "Take `burn` out of `{plain, eligible}`: plain first, then eligible; what neither covers leaves plain below zero."
-  def draw(plain, eligible, burn) do
-    from_plain = min(max(plain, 0.0), burn)
-    rest = burn - from_plain
-    from_eligible = min(eligible, rest)
-    {plain - from_plain - (rest - from_eligible), eligible - from_eligible}
-  end
+  # Dollar-seconds under a straight line from `a` down to `b` over `seconds`,
+  # counting only what is above zero.
+  defp area(a, _b, _seconds) when a <= 0, do: 0.0
+  defp area(a, b, seconds) when b >= 0, do: (a + b) / 2 * seconds
+  defp area(a, b, seconds), do: a / 2 * seconds * (a / (a - b))
 
-  @doc "Add `amount` of credit, eligible or plain. Eligible credit first pays off a balance below zero."
-  def credit(state, amount, true), do: settle(%{state | "eligible" => state["eligible"] + amount})
-  def credit(state, amount, false), do: settle(%{state | "plain" => state["plain"] + amount})
+  @doc "Add `amount` of credit."
+  def credit(state, amount), do: %{state | "balance" => state["balance"] + amount}
 
-  @doc "Change the plain balance by `delta` (an operator changed the budget); eligible credit covers what goes below zero."
-  def adjust(state, delta), do: settle(%{state | "plain" => state["plain"] + delta})
-
-  defp settle(%{"plain" => plain, "eligible" => eligible} = state) when plain < 0 and eligible > 0 do
-    moved = min(eligible, -plain)
-    %{state | "plain" => plain + moved, "eligible" => eligible - moved}
-  end
-
-  defp settle(state), do: state
+  @doc "Change the balance by `delta` (an operator changed the budget)."
+  def adjust(state, delta), do: %{state | "balance" => state["balance"] + delta}
 
   # ---- What is shown ---------------------------------------------------------------
 
@@ -303,13 +285,9 @@ defmodule OmnigateControl.Credits do
     if prepaid?(key) do
       settings = settings()
       state = Map.get(key, :credits) || new(key.budget_usd - burned, burned, now)
-      # Up to now, without closing weeks: a pending bonus is not shown as held.
-      {state, _} = advance(state, now, burned, 0.0)
 
       %{
         balance_usd: round6(key.budget_usd - burned),
-        eligible_usd: round6(state["eligible"]),
-        plain_usd: round6(key.budget_usd - burned - state["eligible"]),
         burned_usd: round6(burned),
         burn_multiplier: multiplier(key, settings),
         bonus_annual_rate: settings.bonus_annual_rate,

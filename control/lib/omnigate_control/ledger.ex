@@ -125,7 +125,7 @@ defmodule OmnigateControl.Ledger do
   @doc """
   Record credit added to a key (a top-up or a bonus), so that the events
   feed is a complete statement: usage and credit in one order. The event is
-  `%{"id", "key_sha256", "amount_usd", "source", "reference", "eligible",
+  `%{"id", "key_sha256", "amount_usd", "source", "reference",
   "budget_usd"}`; it counts as no request and costs nothing.
   """
   def record_credit(%{"id" => id, "key_sha256" => key} = event) when is_binary(id) and is_binary(key) do
@@ -738,7 +738,7 @@ defmodule OmnigateControl.Ledger do
 
     event
     |> Map.take(["id", "key_sha256", "status", "source", "reference", "budget_usd", "ts_ms"])
-    |> Map.merge(%{"kind" => "credit", "amount_usd" => amount, "eligible" => event["eligible"] == true, "cost_usd" => 0.0})
+    |> Map.merge(%{"kind" => "credit", "amount_usd" => amount, "cost_usd" => 0.0})
     |> stamp()
   end
 

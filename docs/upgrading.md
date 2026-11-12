@@ -690,7 +690,7 @@ nothing else. Include it in backups if receipts matter to you.
 ## The credits and payments commit
 
 Adds [prepaid credit](credits.md) as a rule of its own (a burn multiplier,
-bonus-eligible credit, a weekly bonus) and, opt-in, [payments](payments.md)
+a weekly bonus) and, opt-in, [payments](payments.md)
 through NEAR Intents. With neither `credits` nor `payments` in the config
 nothing changes in what the gateway does; the differences are the additive
 ones in the tables.
@@ -707,7 +707,7 @@ to the control plane (GET and POST), also for a key that is blocked.
 
 | File | Change | Old code reading it afterwards |
 |---|---|---|
-| `keys.json` | A top-up record gains `"source"` and `"eligible"`. A prepaid managed key gains `"credits"` (its two balances and the weekly measure) at its first top-up after the upgrade, and `"burn_multiplier"` when it is given one. A key that is never topped up and has no multiplier is written exactly as before. | Ignores the new fields, and **drops them at its next key change**: the bonus measure of the current week and which credit was eligible are then lost (the budget itself is not). Bonuses already credited stay, as top-ups. |
+| `keys.json` | A top-up record gains `"source"`. A prepaid managed key gains `"credits"` (its balance and the weekly measure) at its first top-up after the upgrade, or at the first sample while a bonus rate is set, and `"burn_multiplier"` when it is given one. With no bonus rate, a key that is never topped up and has no multiplier is written exactly as before. (For one day, commits 4b74680 and c45d461, credit was of two kinds: a top-up record carried `"eligible"` and the state two balances. Such a file loads; the two balances are added up and the field is ignored.) | Ignores the new fields, and **drops them at its next key change**: the bonus measure of the current week is then lost (the budget itself is not). Bonuses already credited stay, as top-ups. |
 | `ledger.jsonl`, `ledger.NNNNNN.jsonl` | A usage event of a prepaid key whose burn multiplier is not 1 carries `"credits_usd"` next to `"cost_usd"`. Credit added to a key (a top-up, a bonus) is recorded as an event of `"kind": "credit"` with an `amount_usd`, at no cost. At a multiplier of 1 and without top-ups the files are what they were. | Reads `cost_usd` only: **a key's credit burned shrinks back to its cost**, so a prepaid key that was blocked at a multiplier above 1 may be unblocked. It counts each `credit` event as one request of that key, at no cost, with no tokens. |
 | `ledger.snapshot` | Holds one more kind of row (what each key burned beyond cost). | Loads it; the rows are not looked at. |
 | `payments.json` (new; `OMNIGATE_PAYMENTS`) | Written only when `payments` is configured: one record per payment, with its deposit address and state. | Does not read it. An open payment is then never credited by the gateway: credit it by hand with a top-up under its reference. |
@@ -719,10 +719,10 @@ Back `payments.json` up with the rest of the data directory.
 | A key with a total budget | Blocked when its cost reached the budget | Blocked when its credit burned (cost times its burn multiplier) reaches the budget. The same at the default multiplier of 1. |
 | `GET /admin/keys`, a key | | Three more fields: `credits_burned_usd`, `credits` (an object for a prepaid key, `null` otherwise), and `period_spend_usd` of a total budget is now the credit burned. The dashboard's "spent" for a total budget is that figure too. |
 | `GET /admin/events` | Text requests and media jobs | Every event has `credits_usd`; top-ups and bonuses appear as events of `"kind": "credit"`. A consumer that assumed every event is usage should skip that kind (`examples/usage_export.py` writes them as rows with `amount_usd`, `source` and `reference`). |
-| `POST /admin/keys/{name}/topup` | `amount_usd`, `reference` | Also takes `source` and `bonus_eligible`; the answer's `topup` has `source` and `eligible`. A reference that starts with `bonus:` can collide with the gateway's own (`bonus:<key>:<ISO week>`); pick other names. |
+| `POST /admin/keys/{name}/topup` | `amount_usd`, `reference` | Also takes `source`; the answer's `topup` has `source`. A reference that starts with `bonus:` can collide with the gateway's own (`bonus:<key>:<ISO week>`); pick other names. |
 | Audit log | | New actions written by the gateway itself, with `"auth": "system"` and `"address": null`: `key.bonus`, `payment.create`, `payment.settle`, `payment.refunded`, `payment.failed`. A reader that assumes every line has an address should not. |
 | `/metrics` | | `omnigate_key_credits_burned_usd_total`, `omnigate_payments{status}`, `omnigate_payments_credited_usd`. |
-| The key store file | Rewritten when a key changes | With a bonus rate set, also rewritten every `credits.sample_interval_s` (15 minutes) while any key holds bonus-eligible credit. |
+| The key store file | Rewritten when a key changes | With a bonus rate set, also rewritten every `credits.sample_interval_s` (15 minutes) while any prepaid managed key holds credit. |
 | Config | `credits` and `payments` were unknown top-level sections, silently ignored | Both are read and checked: a config that happened to carry one with fields the gateway does not know no longer loads. |
 | Admin API | | `GET /admin/topups`, `GET /admin/payments`. |
 | Gateway API | | `/v1/payments*`: `404` unless payments are configured. |

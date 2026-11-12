@@ -19,7 +19,7 @@ exercised against a mock, or not at all, the page says so.
 | Call the gateway from an application, with plain HTTP or the official SDKs | [API reference](api.md) |
 | Use the dashboard, create and revoke gateway keys, set budgets, read the audit log | [Admin](admin.md) |
 | Build something around the gateway: a payment service that credits keys, a billing tool that reads usage, an agent on its own key; which interfaces are stable | [Building on omnigate](building-on-omnigate.md) |
-| Sell prepaid credit: what a dollar of provider cost burns, bonus-eligible credit, the weekly bonus | [Prepaid credit](credits.md) |
+| Sell prepaid credit: what a dollar of provider cost burns, the weekly bonus | [Prepaid credit](credits.md) |
 | Let key holders (and agents) pay for credit themselves, in crypto, through NEAR Intents; what the gateway checks and what it trusts | [Payments](payments.md) |
 | Connect OpenAI, Anthropic, Gemini, xAI or a media provider | [Providers](providers.md) |
 | Put it on a server with TLS | [Deployment](deployment.md) |
@@ -38,7 +38,7 @@ exercised against a mock, or not at all, the page says so.
 - [`config/omnigate.dev.json`](../config/omnigate.dev.json): the config the quickstart uses, with mock providers.
 - [`config/omnigate.example.json`](../config/omnigate.example.json): a template for real providers.
 - [`config/omnigate.near.json`](../config/omnigate.near.json): NEAR AI Cloud as an attested upstream, with a relayed model and an unattested route to compare; used by `tools/near_live.py`.
-- [`config/omnigate.payments.json`](../config/omnigate.payments.json): prepaid credit with a burn multiplier and a bonus rate, and payments through NEAR Intents; used by `tools/near_intents_live.py --serve`.
+- [`config/omnigate.payments.json`](../config/omnigate.payments.json): prepaid credit with a bonus rate, and payments through NEAR Intents; used by `tools/near_intents_live.py --serve`.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md): building, tests, code layout.
 - [`SECURITY.md`](../SECURITY.md): reporting a vulnerability, security model, known limits, past advisories.
 - `.env.example`, `.env.control.example`, `.env.dataplane.example`: the three environment files of the Compose deployment.

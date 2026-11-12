@@ -151,7 +151,6 @@ defmodule OmnigateControl.Admin do
       amount_usd: e["amount_usd"] || 0.0,
       source: e["source"],
       reference: e["reference"],
-      bonus_eligible: e["eligible"] == true,
       budget_usd: e["budget_usd"],
       cost_usd: 0.0,
       credits_usd: 0.0

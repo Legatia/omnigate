@@ -1472,7 +1472,7 @@ check, then the endpoint.
 | `POST /admin/keys` | Create a managed key. The answer is the only one that contains the key itself. |
 | `PATCH /admin/keys/{name}` | Change a managed key's budget, period, rate limit, models, open-job limit, jobs-per-day limit, webhook secret or disabled flag. |
 | `POST /admin/keys/{name}/rotate` | Give a managed key a new secret. |
-| `POST /admin/keys/{name}/topup` | Add `amount_usd` to a managed key's total budget, once per `reference` (a payment id): the same call again adds nothing. Optional `source` and `bonus_eligible`. |
+| `POST /admin/keys/{name}/topup` | Add `amount_usd` to a managed key's total budget, once per `reference` (a payment id): the same call again adds nothing. Optional `source`. |
 | `GET /admin/topups?key=NAME&limit=N` | Applied top-ups and bonuses, newest first ([Prepaid credit](credits.md#seeing-it)). |
 | `GET /admin/payments?limit=N` | [Payments](payments.md#for-operators) taken for credit, newest first; empty unless payments are configured. |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |

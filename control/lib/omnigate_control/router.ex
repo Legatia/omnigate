@@ -443,7 +443,7 @@ defmodule OmnigateControl.Router do
     Audit.record(conn, "key.topup", audit_name(name), outcome(result),
       topup:
         case result do
-          {:ok, _key, done} -> Map.take(done, ["reference", "amount_usd", "budget_usd", "replayed", "source", "eligible"])
+          {:ok, _key, done} -> Map.take(done, ["reference", "amount_usd", "budget_usd", "replayed", "source"])
           # What was asked, cut to what an audit line should hold.
           _ -> %{"reference" => audit_name(attrs["reference"]), "amount_usd" => if(is_number(attrs["amount_usd"]), do: attrs["amount_usd"])}
         end

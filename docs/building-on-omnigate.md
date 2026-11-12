@@ -269,7 +269,7 @@ How to consume it:
   [burn multiplier](credits.md#the-burn-multiplier) applies.
 - **`"kind": "credit"`** is credit added to a key, in the same order as its
   usage: `amount_usd`, `source` (`admin`, a payment provider's name,
-  `bonus`), `reference`, `bonus_eligible` and `budget_usd` (the budget after
+  `bonus`), `reference` and `budget_usd` (the budget after
   it); `cost_usd` and `credits_usd` are 0. A consumer that only wants usage
   skips this kind. (New with the credits commit: a consumer written before
   it sees rows without a model or tokens.)

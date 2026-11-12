@@ -568,9 +568,8 @@ is in [Prepaid credit](credits.md).
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `burn_multiplier` | number, 0.01 to 100 | `1` | Credit a prepaid key burns per dollar of provider cost. A key's own `burn_multiplier` wins. |
-| `bonus_annual_rate` | number, 0 to 10 | `0` (no bonus) | Rate per year, as a fraction (`0.05` is 5%), of the weekly bonus on bonus-eligible credit. |
-| `sample_interval_s` | whole number, 1 to 86,400 | `900` | How often eligible balances are sampled for the bonus's weekly average, while a rate is set. |
-| `admin_topups_eligible` | boolean | `false` | Whether a top-up through the admin API earns the bonus when the call does not say. |
+| `bonus_annual_rate` | number, 0 to 10 | `0` (no bonus) | Rate per year, as a fraction (`0.05` is 5%), of the weekly bonus on a prepaid key's credit. |
+| `sample_interval_s` | whole number, 1 to 86,400 | `900` | How often balances are sampled for the bonus's weekly average, while a rate is set. |
 
 A field `credits` does not know, or a value outside these ranges, is rejected
 when the file is loaded.
@@ -592,7 +591,6 @@ field, and what the gateway does and does not do with money, is in
 | `recipient` | string | required | The operator's account at the provider (a NEAR account), where the settle asset is delivered. |
 | `min_usd`, `max_usd` | numbers | `1`, `10000` | Bounds on one payment. |
 | `quote_ttl_s` | whole number, 60 to 86,400 | `1800` | How long a payer has to send the deposit. |
-| `bonus_eligible` | boolean | `true` | Whether credit bought this way earns the weekly bonus. |
 | `poll_interval_s` | whole number, 1 to 3,600 | `15` | How often an open payment's status is asked for. |
 | `settle_asset`, `settle_decimals`, `slippage_bps`, `jwt_env`, `base_url`, `public_key` | | see [Payments](payments.md#switching-it-on) | The `near_intents` provider's own settings. |
 

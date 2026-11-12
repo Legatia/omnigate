@@ -87,8 +87,7 @@ defmodule OmnigateControl.Keys do
   had been applied before and nothing was added now.
 
   `attrs` may also carry `"source"` (who the credit came from, "admin" by
-  default) and `"bonus_eligible"` (whether it earns the weekly bonus; by
-  default what `credits.admin_topups_eligible` says).
+  default).
   """
   def topup(name, attrs) when is_map(attrs), do: GenServer.call(__MODULE__, {:topup, name, attrs})
 
@@ -331,8 +330,7 @@ defmodule OmnigateControl.Keys do
     with {:ok, key} <- managed_key(name, state),
          {:ok, amount} <- validate_amount(attrs["amount_usd"]),
          {:ok, reference} <- validate_reference(attrs["reference"]),
-         {:ok, source} <- validate_source(attrs["source"]),
-         {:ok, eligible} <- validate_eligible(attrs["bonus_eligible"]) do
+         {:ok, source} <- validate_source(attrs["source"]) do
       case Enum.find(state.topups, &(&1["reference"] == reference)) do
         # The same payment again (a retry, a watcher that restarted): what
         # the first call did, and nothing added.
@@ -345,7 +343,7 @@ defmodule OmnigateControl.Keys do
            state}
 
         nil ->
-          apply_topup(state, key, amount, reference, source, eligible)
+          apply_topup(state, key, amount, reference, source)
       end
     else
       {:error, _, _, _} = error -> {:reply, error, state}
@@ -358,13 +356,17 @@ defmodule OmnigateControl.Keys do
   end
 
   def handle_call(:checkpoint, _from, state) do
+    earning? = Credits.settings().bonus_annual_rate > 0
+
     {keys, bonuses, changed} =
       Enum.reduce(state.keys, {[], [], false}, fn key, {keys, bonuses, changed} ->
-        # Nothing to sample for a key that holds no eligible credit, and
-        # nothing to say about any key while the ledger is starting.
-        with %{"eligible" => eligible, "integral" => integral} when eligible > 0 or integral > 0 <- Map.get(key, :credits),
-             true <- Credits.prepaid?(key),
-             {:ok, _burned} <- burned_now(key) do
+        # Nothing to sample for a key that holds no credit, and nothing to
+        # say about any key while the ledger is starting. A prepaid key that
+        # was never topped up has no state yet: it gets one here, while a
+        # bonus rate is set, so that the budget it was created with earns too.
+        with true <- Credits.prepaid?(key),
+             {:ok, burned} <- burned_now(key),
+             true <- samples?(Map.get(key, :credits), key.budget_usd - burned, earning?) do
           {rolled, won} = roll(key, state)
           {[rolled | keys], bonuses ++ won, changed or rolled != key}
         else
@@ -399,7 +401,7 @@ defmodule OmnigateControl.Keys do
   # A top-up is credit bought in advance. Only a total budget is that: a
   # monthly or daily budget is an allowance that starts over by itself, and a
   # key without a budget has nothing to add to.
-  defp apply_topup(state, key, amount, reference, source, eligible) do
+  defp apply_topup(state, key, amount, reference, source) do
     cond do
       is_nil(key.budget_usd) or budget_period(key) != "total" ->
         {:reply,
@@ -413,7 +415,7 @@ defmodule OmnigateControl.Keys do
         # The key's credit as it stands now (closing any week that has
         # ended, with its bonus), then the new credit on top.
         {rolled, bonuses} = roll(key, state)
-        updated = Map.merge(rolled, %{budget_usd: rolled.budget_usd + amount, credits: Credits.credit(rolled.credits, amount, eligible)})
+        updated = Map.merge(rolled, %{budget_usd: rolled.budget_usd + amount, credits: Credits.credit(rolled.credits, amount)})
 
         done = %{
           "reference" => reference,
@@ -421,8 +423,7 @@ defmodule OmnigateControl.Keys do
           "amount_usd" => amount,
           "budget_usd" => updated.budget_usd,
           "at" => now_iso(),
-          "source" => source,
-          "eligible" => eligible
+          "source" => source
         }
 
         commit_credit(state, updated, {:ok, updated, Map.put(done, "replayed", false)}, bonuses ++ [done])
@@ -447,7 +448,10 @@ defmodule OmnigateControl.Keys do
     end
   end
 
-  # The state a key has, or the one it starts with: all it holds is plain.
+  defp samples?(%{"balance" => balance, "integral" => integral}, _held, _earning?), do: balance > 0 or integral > 0
+  defp samples?(_none, held, earning?), do: earning? and held > 0
+
+  # The state a key has, or the one it starts with.
   defp credit_state(key, burned, now), do: Map.get(key, :credits) || Credits.new(key.budget_usd - burned, burned, now)
 
   # A prepaid key with its credit brought up to now: the burn since the
@@ -476,7 +480,7 @@ defmodule OmnigateControl.Keys do
         Map.put(updated, :credits, nil)
 
       not Credits.prepaid?(before) ->
-        # Starts at the next look: everything it holds is plain credit.
+        # Starts at the next look.
         Map.put(updated, :credits, nil)
 
       is_map(Map.get(before, :credits)) and updated.budget_usd != before.budget_usd ->
@@ -511,8 +515,7 @@ defmodule OmnigateControl.Keys do
            "amount_usd" => amount,
            "budget_usd" => budget + amount,
            "at" => at |> DateTime.from_unix!() |> DateTime.to_iso8601(),
-           "source" => "bonus",
-           "eligible" => true
+           "source" => "bonus"
          }, budget + amount}
       end)
 
@@ -538,7 +541,6 @@ defmodule OmnigateControl.Keys do
         "amount_usd" => done["amount_usd"],
         "source" => done["source"],
         "reference" => done["reference"],
-        "eligible" => done["eligible"] == true,
         "budget_usd" => done["budget_usd"]
       })
     end
@@ -714,10 +716,6 @@ defmodule OmnigateControl.Keys do
   end
 
   defp validate_source(_), do: invalid("source must be a string")
-
-  defp validate_eligible(nil), do: {:ok, Credits.settings().admin_topups_eligible}
-  defp validate_eligible(b) when is_boolean(b), do: {:ok, b}
-  defp validate_eligible(_), do: invalid("bonus_eligible must be true or false")
 
   defp invalid(message), do: {:error, 400, "invalid_request", message}
 

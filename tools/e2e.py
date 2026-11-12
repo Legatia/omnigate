@@ -745,31 +745,31 @@ def payer(name, **attrs):
 def credit_checks():
     """Prepaid credit: what a dollar of provider cost burns (OmnigateControl.Credits)."""
     section("credit: a burn multiplier on a prepaid key")
-    status, _, probe = admin("POST", "/admin/keys", {"name": "e2e-credit-probe", "budget_usd": 5, "burn_multiplier": 1.2})
+    status, _, probe = admin("POST", "/admin/keys", {"name": "e2e-credit-probe", "budget_usd": 5, "burn_multiplier": 1.5})
     secret = probe.get("key", "")
     usable = wait_until(lambda: chat("direct", key=secret)[0] == 200, 6, 0.2)
     row = wait_until(lambda: (lambda r: r if r.get("requests") == 1 else None)(key_row("e2e-credit-probe")), 10, 0.2) or {}
     cost = row.get("cost_usd") or 0
     credits = row.get("credits") or {}
-    check("a prepaid key with a burn multiplier of 1.2 burns 1.2 times what the provider cost; the listing shows both figures and the balance",
-          status == 201 and bool(usable) and cost > 0 and close(row.get("credits_burned_usd"), cost * 1.2) and credits.get("burn_multiplier") == 1.2
-          and close(credits.get("balance_usd"), 5 - cost * 1.2) and close(credits.get("burned_usd"), cost * 1.2), row)
+    check("a prepaid key with a burn multiplier of 1.5 burns 1.5 times what the provider cost; the listing shows both figures and the balance",
+          status == 201 and bool(usable) and cost > 0 and close(row.get("credits_burned_usd"), cost * 1.5) and credits.get("burn_multiplier") == 1.5
+          and close(credits.get("balance_usd"), 5 - cost * 1.5) and close(credits.get("burned_usd"), cost * 1.5), row)
     _, _, feed = admin("GET", "/admin/events?limit=100&key=e2e-credit-probe")
     events = feed.get("events", [])
     check("... and so does the usage feed, per event: the provider cost and the credit burned",
-          len(events) == 1 and events[0].get("kind") == "text" and close(events[0].get("cost_usd"), cost) and close(events[0].get("credits_usd"), cost * 1.2), events)
+          len(events) == 1 and events[0].get("kind") == "text" and close(events[0].get("cost_usd"), cost) and close(events[0].get("credits_usd"), cost * 1.5), events)
 
-    # Credit for exactly two such calls at 1.2 (a shade less, to stay clear of
+    # Credit for exactly two such calls at 1.5 (a shade less, to stay clear of
     # rounding): at the provider's price two calls would not have used it up.
-    budget = cost * 2.4 * 0.999
-    status, _, created = admin("POST", "/admin/keys", {"name": "e2e-credit", "budget_usd": budget, "burn_multiplier": 1.2})
+    budget = cost * 3 * 0.999
+    status, _, created = admin("POST", "/admin/keys", {"name": "e2e-credit", "budget_usd": budget, "burn_multiplier": 1.5})
     secret = created.get("key", "")
     first = wait_until(lambda: chat("direct", key=secret)[0] == 200, 6, 0.2)
     after_one = wait_until(lambda: (lambda r: r if r.get("requests") == 1 else None)(key_row("e2e-credit")), 10, 0.2) or {}
     second = chat("direct", key=secret)[0]
     blocked = wait_until(lambda: (lambda r: r if r.get("state") == "blocked" else None)(key_row("e2e-credit")), 10, 0.2) or {}
     refused = wait_until(lambda: chat("direct", key=secret)[0] == 402, 6, 0.2)
-    check("a prepaid key at 1.2 is blocked once the providers have cost 1/1.2 of its credit: after two calls, which at the provider's price would have left credit for a third",
+    check("a prepaid key at 1.5 is blocked once the providers have cost two thirds of its credit: after two calls, which at the provider's price would have left credit for a third",
           bool(first) and after_one.get("state") == "active" and second == 200 and blocked.get("requests") == 2 and close(blocked.get("cost_usd"), cost * 2)
           and blocked.get("credits_burned_usd", 0) >= budget and cost * 2 < budget and bool(refused),
           (first, after_one.get("state"), second, blocked.get("requests"), blocked.get("cost_usd"), blocked.get("credits_burned_usd"), budget))
@@ -826,12 +826,12 @@ def payment_checks():
     actions = [(e.get("action"), e.get("target"), (e.get("payment") or {}).get("reference")) for e in audit.get("entries", [])]
     _, _, listing = admin("GET", "/admin/payments")
     credits = row.get("credits") or {}
-    check("the credit is bonus-eligible credit from near_intents, under a reference made of the deposit address: in the top-up history, the usage feed, the audit log and GET /admin/payments",
-          [(t.get("reference"), t.get("amount_usd"), t.get("source"), t.get("eligible")) for t in topups.get("topups", [])] == [(reference, 2, "near_intents", True)]
-          and len(credit_events) == 1 and credit_events[0].get("amount_usd") == 2 and credit_events[0].get("source") == "near_intents" and credit_events[0].get("bonus_eligible") is True
+    check("the credit is credit from near_intents, under a reference made of the deposit address: in the top-up history, the usage feed, the audit log and GET /admin/payments",
+          [(t.get("reference"), t.get("amount_usd"), t.get("source")) for t in topups.get("topups", [])] == [(reference, 2, "near_intents")]
+          and len(credit_events) == 1 and credit_events[0].get("amount_usd") == 2 and credit_events[0].get("source") == "near_intents"
           and ("payment.create", "e2e-payer", reference) in actions and ("payment.settle", "e2e-payer", reference) in actions
           and any(p.get("id") == pay.get("id") and p.get("key") == "e2e-payer" and p.get("reference") == reference for p in listing.get("payments", []))
-          and close(credits.get("eligible_usd"), 2 - (row.get("credits_burned_usd") or 0)) and credits.get("plain_usd") == 0,
+          and close(credits.get("balance_usd"), 2 - (row.get("credits_burned_usd") or 0)) and "eligible_usd" not in credits,
           (topups, credit_events, credits))
 
     # The provider keeps saying SUCCESS for as long as anyone asks.

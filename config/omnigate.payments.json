@@ -22,7 +22,6 @@
     }
   ],
   "credits": {
-    "burn_multiplier": 1.2,
     "bonus_annual_rate": 0.05
   },
   "payments": {
@@ -30,7 +29,6 @@
     "recipient": "letobias.near",
     "min_usd": 1,
     "max_usd": 1000,
-    "quote_ttl_s": 1800,
-    "bonus_eligible": true
+    "quote_ttl_s": 1800
   }
 }

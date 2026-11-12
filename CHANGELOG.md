@@ -112,12 +112,11 @@ only met a mock, is tracked in the README's
     key's own `burn_multiplier`: a request burns what the provider cost
     times it. Usage records, the events feed, the key listing and the
     metrics show both the provider cost and the credit burned.
-  - **Two kinds of credit.** A top-up is bonus-eligible or not (`source` and
-    `bonus_eligible` on `POST /admin/keys/{name}/topup`; plain unless the
-    call or `credits.admin_topups_eligible` says otherwise). Spending draws
-    on plain credit first.
-  - **A weekly bonus** on the time-weighted average of the eligible balance
-    over the ISO week, at `credits.bonus_annual_rate` ÷ 52 (0, that is off,
+  - **Where credit came from.** A top-up carries a `source` (`source` on
+    `POST /admin/keys/{name}/topup`; `admin` unless given). All credit is
+    the same otherwise.
+  - **A weekly bonus** on the time-weighted average of the balance over the
+    ISO week, at `credits.bonus_annual_rate` ÷ 52 (0, that is off,
     unless set). Credited as a top-up of its own under
     `bonus:<key>:<ISO week>`, so a week is credited once whatever happens,
     including weeks that ended while the control plane was not running.

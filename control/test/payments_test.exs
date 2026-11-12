@@ -225,7 +225,6 @@ defmodule OmnigateControl.PaymentsTest do
                max_usd: 10_000.0,
                quote_ttl_s: 1800,
                poll_interval_s: 15,
-               bonus_eligible: true,
                jwt_env: nil,
                base_url: "https://1click.chaindefuser.com",
                public_key: "reYaWhvwu8Jzo3WUM3zhn6VrhuMEF4eADL17qtRVifc"
@@ -244,7 +243,8 @@ defmodule OmnigateControl.PaymentsTest do
             Map.merge(ok, %{"min_usd" => 50, "max_usd" => 10}),
             Map.put(ok, "quote_ttl_s", 10),
             Map.put(ok, "slippage_bps", 5000),
-            Map.put(ok, "bonus_eligible", "yes"),
+            # Gone with the two kinds of credit: all credit earns the bonus.
+            Map.put(ok, "bonus_eligible", true),
             Map.put(ok, "settle_asset", "not an asset"),
             Map.put(ok, "settle_decimals", 99),
             Map.put(ok, "public_key", "0OIl"),
@@ -528,10 +528,10 @@ defmodule OmnigateControl.PaymentsTest do
       assert key(key.name).budget_usd == 5.0
       refute Keys.over_budget?(key(key.name))
 
-      # Credited as eligible credit from this provider, under the deposit address.
+      # Credited as coming from this provider, under the deposit address.
       reference = "near_intents:" <> address
-      assert [%{"reference" => ^reference, "amount_usd" => 5.0, "source" => "near_intents", "eligible" => true}] = Keys.topups(10, key.name)
-      assert %{eligible_usd: 5.0, plain_usd: +0.0} = OmnigateControl.Credits.view(key(key.name), 0.0)
+      assert [%{"reference" => ^reference, "amount_usd" => 5.0, "source" => "near_intents"}] = Keys.topups(10, key.name)
+      assert %{balance_usd: 5.0} = OmnigateControl.Credits.view(key(key.name), 0.0)
 
       # Seen settled again, however often: credited once.
       :ok = Payments.poll_now()
@@ -564,7 +564,7 @@ defmodule OmnigateControl.PaymentsTest do
       assert {200,
               %{
                 "configured" => true,
-                "payments" => [%{"id" => ^id, "key" => name, "reference" => ^reference, "recipient" => "operator.near", "bonus_eligible" => true}]
+                "payments" => [%{"id" => ^id, "key" => name, "reference" => ^reference, "recipient" => "operator.near"}]
               }} = admin(:get, "/admin/payments")
 
       assert name == key.name

@@ -25,8 +25,6 @@ defmodule OmnigateControl.Payments do
       account for `near_intents`).
     * `min_usd`, `max_usd` — bounds on one payment (default 1 and 10,000).
     * `quote_ttl_s` — how long a payer has to send the deposit (default 1800).
-    * `bonus_eligible` — whether credit bought this way earns the weekly
-      bonus of `OmnigateControl.Credits` (default true).
     * `poll_interval_s` — how often an open payment is asked about
       (default 15; later polls are spaced further apart).
     * plus the provider's own fields.
@@ -61,7 +59,7 @@ defmodule OmnigateControl.Payments do
   @grace_s 900
   @assets_ttl_ms 300_000
   @open ~w(awaiting_deposit processing)
-  @common ~w(provider recipient min_usd max_usd quote_ttl_s bonus_eligible poll_interval_s)
+  @common ~w(provider recipient min_usd max_usd quote_ttl_s poll_interval_s)
 
   # ---- Settings ------------------------------------------------------------------
 
@@ -107,13 +105,7 @@ defmodule OmnigateControl.Payments do
       min_usd: min_usd,
       max_usd: max_usd,
       quote_ttl_s: integer!(raw["quote_ttl_s"], 1_800, 60, 86_400, "quote_ttl_s"),
-      poll_interval_s: integer!(raw["poll_interval_s"], 15, 1, 3_600, "poll_interval_s"),
-      bonus_eligible:
-        case raw["bonus_eligible"] do
-          nil -> true
-          b when is_boolean(b) -> b
-          other -> raise ArgumentError, "payments.bonus_eligible must be true or false, got #{inspect(other)}"
-        end
+      poll_interval_s: integer!(raw["poll_interval_s"], 15, 1, 3_600, "poll_interval_s")
     })
   end
 
@@ -211,7 +203,6 @@ defmodule OmnigateControl.Payments do
           "credited_usd" => nil,
           "detail" => nil,
           "tx" => [],
-          "bonus_eligible" => config.bonus_eligible,
           "created_at" => now_iso(),
           "updated_at" => now_iso(),
           "polls" => 0,
@@ -422,7 +413,7 @@ defmodule OmnigateControl.Payments do
 
   @doc "A payment as the admin API shows it: the same, with the key's name and the reference it is credited under."
   def admin_view(p),
-    do: p |> view() |> Map.merge(%{key: p["key"], reference: reference(p), bonus_eligible: p["bonus_eligible"] == true, recipient: p["recipient"]})
+    do: p |> view() |> Map.merge(%{key: p["key"], reference: reference(p), recipient: p["recipient"]})
 
   @doc "The reference a payment is credited under: the provider's name and the deposit address (and memo), which no two payments share."
   def reference(p) do
@@ -564,7 +555,7 @@ defmodule OmnigateControl.Payments do
     # amount far above what was asked for is not believed beyond it.
     credit = Float.round(min(delivered, payment["amount_usd"] * 1.05), 6)
 
-    attrs = %{"amount_usd" => credit, "reference" => reference(payment), "source" => payment["provider"], "bonus_eligible" => payment["bonus_eligible"] == true}
+    attrs = %{"amount_usd" => credit, "reference" => reference(payment), "source" => payment["provider"]}
 
     case Keys.topup(payment["key"], attrs) do
       {:ok, _key, _done} ->

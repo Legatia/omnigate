@@ -76,7 +76,7 @@ USDC on NEAR unless configured otherwise.
 ```
 
 [`config/omnigate.payments.json`](../config/omnigate.payments.json) is a
-complete example (a text route, a burn multiplier, a bonus rate, payments).
+complete example (a text route, a bonus rate, payments).
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -84,7 +84,6 @@ complete example (a text route, a burn multiplier, a bonus rate, payments).
 | `recipient` | required | The operator's account at the provider: for `near_intents`, the NEAR account that receives the settle asset. **Check it twice**: it is where the money goes. It must be able to receive the settle asset (for a NEAR token: registered with the token's contract, which holding the token once takes care of). |
 | `min_usd`, `max_usd` | `1`, `10000` | Bounds on one payment. |
 | `quote_ttl_s` | `1800` | How long a payer has to send the deposit. 60 to 86,400. |
-| `bonus_eligible` | `true` | Whether credit bought this way earns the [weekly bonus](credits.md#the-weekly-bonus). |
 | `poll_interval_s` | `15` | How often an open payment's status is asked for. After twenty polls they are spaced further apart. |
 | `settle_asset` | native USDC on NEAR | The asset delivered to the operator, as a 1Click asset id. It should be a dollar stablecoin: what arrives is credited one to one. |
 | `settle_decimals` | `6` | That asset's decimals. |
@@ -238,9 +237,8 @@ awaiting_deposit → expired                   nothing arrived by the deadline (
   other, under the reference `near_intents:<deposit address>` (with
   `:<memo>` where there is one). The provider reporting success a hundred
   times, a restart in the middle, two polls racing: one credit.
-- **As eligible credit** from source `near_intents` unless
-  `payments.bonus_eligible` is false; see
-  [Two kinds of credit](credits.md#two-kinds-of-credit).
+- **As credit like any other**, from source `near_intents`; it earns the
+  [weekly bonus](credits.md#the-weekly-bonus) where one is set.
 - **When**: within one poll interval of the provider reporting success, and
   the data plane unblocks the key with its next config poll (a second or
   two by default).
@@ -376,7 +374,7 @@ uses real funds, so use a dollar or two.
    `deposit.address` before `deadline`.
 6. Watch it: `GET /v1/payments/<id>` should go from `awaiting_deposit` to
    `settled` with `credited_usd` of 1, and `GET /admin/keys` should show the
-   key with a budget of 1 and one dollar of eligible credit. Your account
+   key with a budget of 1 and a balance of one dollar. Your account
    should hold one more USDC.
 
 Paying with wrapped NEAR from a NEAR account keeps the fees lowest. If the

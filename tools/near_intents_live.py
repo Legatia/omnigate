@@ -127,9 +127,12 @@ def run_checks(stack, recipient):
     bnb = next((a for a in assets if a.get("chain") == "bsc"), None)
     if bnb:
         status, _, body = jcall("POST", gw + "/v1/payments/quote", key=key, body={"amount_usd": 5, "asset": bnb["asset"], "refund_to": EVM}, timeout=90)
-        check("$5 from BNB Chain (which has a $1,000 minimum, or no quote at all for the pair): refused with the provider's reason",
-              status == 400 and (body.get("error") or {}).get("code") == "payment_quote_refused", (status, body))
-        print(f"        the provider said: {(body.get('error') or {}).get('message')}")
+        # What the provider does with this pair has changed over time (a $1,000
+        # minimum, no quote, a quote): either answer is fine, as long as it is
+        # the provider's own and reaches the payer intact.
+        refused = status == 400 and (body.get("error") or {}).get("code") == "payment_quote_refused"
+        check("$5 from BNB Chain: a quote, or a refusal with the provider's reason", refused or (status == 200 and body.get("provider") == "near_intents" and "deposit" not in body), (status, body))
+        print(f"        the provider said: {(body.get('error') or {}).get('message') if refused else 'quoted: ' + str(body.get('amount')) + ' ' + str(body.get('symbol'))}")
 
     section("nothing was started")
     status, _, listed = jcall("GET", gw + "/v1/payments", key=key)

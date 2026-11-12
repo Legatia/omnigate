@@ -33,3 +33,6 @@ site/dist/
 
 # Wrangler local cache (holds the Cloudflare account name)
 .wrangler/
+
+# Recorded demo video (not part of the source)
+demo-out/

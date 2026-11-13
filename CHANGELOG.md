@@ -2,7 +2,8 @@
 
 All notable changes to omnigate are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The first
-tagged version is the pre-release 0.1.0-rc.1.
+tagged version is the pre-release 0.1.0-rc.1; the first stable one is
+1.0.0.
 
 When a release is cut, the "Unreleased" section is renamed to
 `## [<version>] - <date>` and a new, empty "Unreleased" section is started
@@ -16,6 +17,16 @@ only met a mock, is tracked in the README's
 `docs/`, rather than here.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-11-13
+
+The first stable release: everything since the pre-release 0.1.0-rc.1.
+Upgrading from 0.1.0-rc.1 needs no change to configuration or to the files
+on disk and was run as a test
+([docs/upgrading.md](docs/upgrading.md#100)). It has not run under
+production load, and certificates for a real domain through the bundled
+proxy are untested; the README's
+[Known limits](README.md#known-limits) lists the rest.
 
 ### Added
 

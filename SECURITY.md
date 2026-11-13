@@ -18,7 +18,7 @@ Include, as far as you can:
 Please do not test against deployments you do not own, and do not include
 real provider keys, gateway keys or tokens in a report.
 
-The only tagged version is the pre-release 0.1.0-rc.1. Fixes are made on `main`. Whether fixes
+The current release is 1.0.0, the first stable one. Fixes are made on `main`. Whether fixes
 will also be applied to earlier releases, once there are any, has not been
 decided; the release process is in [docs/releasing.md](docs/releasing.md).
 

@@ -772,9 +772,8 @@ tools.
 
 ## Upgrades
 
-The only tagged version so far is the pre-release 0.1.0-rc.1, and
 `compose.yaml` builds both images from source, so an upgrade is a rebuild
-from newer source:
+from newer source (a release tag such as `v1.0.0`, or `main`):
 
 ```bash
 git pull

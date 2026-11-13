@@ -7,7 +7,8 @@ For maintainers. A release is made by pushing a version tag; the
 2026 and all four jobs passed on the first attempt: five archives with
 checksums and two multi-platform images were published as a pre-release. Two
 archives were downloaded and matched their checksums; the published images
-have not been run. A full (non-pre-release) version has not been cut; read
+have not been run. The first full version is 1.0.0 (13 November 2026); what
+its run published is on the repository's releases page. Read
 [What may fail the first time](#what-may-fail-the-first-time) for what was
 rehearsed beforehand.
 
@@ -102,7 +103,7 @@ One-time things to settle. None of them is done by the workflow.
 ## Cutting a release
 
 1. **Pick the version**, `<major>.<minor>.<patch>`. The source currently
-   says `0.1.0-rc.1` in both places below (the first pre-release).
+   says `1.0.0` in both places below (the first stable release).
 
 2. **Set the version in the source.** Both must be exactly the version you
    are about to tag; the workflow stops before building anything if they

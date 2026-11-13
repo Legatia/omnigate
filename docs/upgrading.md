@@ -34,6 +34,9 @@ Contents:
 - [The attestation commit](#the-attestation-commit)
 - [The build-around commit](#the-build-around-commit)
 - [The receipts commit](#the-receipts-commit)
+- [The credits and payments commit](#the-credits-and-payments-commit)
+- [The top-up page commit](#the-top-up-page-commit)
+- [1.0.0](#100)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -746,6 +749,16 @@ the control plane (`/internal/topup`).
 | Gateway port | `GET /topup` was `401` without a key, `404` with one | With payments configured: the top-up page, **without a key**. Without them: `404`. |
 | `GET /v1/payments` | `{"payments": [...]}` | One more field, `"credits"`: the key's balance, or null for a key that is not prepaid. |
 | The dashboard's top bar | | A link to the Payments page (`/payments`), with payments configured. |
+
+## 1.0.0
+
+The first stable release (13 November 2026). It is the tree after the
+top-up page commit plus changes to tests, CI and documentation only, so
+coming from 0.1.0-rc.1 the sections from
+[The attestation commit](#the-attestation-commit) to
+[The top-up page commit](#the-top-up-page-commit) are the whole of what
+changes. The version in `omnigate_build_info`, in the outbound
+`user-agent` and in the webhook `user-agent` is `1.0.0`.
 
 ## Tested upgrades
 

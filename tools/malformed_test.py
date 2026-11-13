@@ -62,6 +62,7 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import fastbind  # noqa: E402,F401  (servers start without a DNS lookup)
 
 results = []
 ARGS = None

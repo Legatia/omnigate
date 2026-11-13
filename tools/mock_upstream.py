@@ -86,6 +86,9 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fastbind  # noqa: E402,F401  (servers start without a DNS lookup)
+
 WORDS = ["Hello", " from", " the", " mock", " upstream", "."]
 
 # What two providers really answer a bad key with on their OpenAI-compatible

@@ -30,6 +30,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import verify_receipt as ed  # Ed25519 arithmetic (RFC 8032), standard library only
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fastbind  # noqa: E402,F401  (servers start without a DNS lookup)
+
 USDC = "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"
 TOKENS = [
     {"assetId": "nep141:wrap.near", "decimals": 24, "blockchain": "near", "symbol": "wNEAR", "price": 3.7, "contractAddress": "wrap.near"},

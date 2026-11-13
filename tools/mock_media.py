@@ -56,6 +56,9 @@ import uuid
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fastbind  # noqa: E402,F401  (servers start without a DNS lookup)
+
 # Where the servers listen, and the host name they put in the URLs they hand
 # out. Both default to loopback; the container test sets them so that other
 # containers can reach the mocks by name.

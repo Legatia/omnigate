@@ -34,6 +34,9 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mock_intents as mock_intents_module  # the payment provider's stand-in: its signing key goes into the config
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fastbind  # noqa: E402,F401  (servers start without a DNS lookup)
 WINDOWS = os.name == "nt"
 CONTROL_PORT = 14000
 GATEWAY_PORT = 18080

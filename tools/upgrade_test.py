@@ -59,6 +59,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e  # noqa: E402
 from e2e import CONTROL, CONTROL_PORT, GATEWAY, GATEWAY_PORT, ADMIN_TOKEN, ROOT, WINDOWS, call, jcall, wait_port, wait_until  # noqa: E402
+import fastbind  # noqa: E402,F401  (servers start without a DNS lookup)
 
 K_MAIN, K_BUDGET = "og-upgrade-main-key-0001", "og-upgrade-budget-key-0002"
 HOOK_SECRET = "upgrade-webhook-secret"
@@ -691,7 +692,8 @@ def mixed_old_dataplane(r, old, new, seen):
     ask = {"model": "echo", "messages": [{"role": "user", "content": f"mail {email} now"}]}
     st, h, _ = jcall("POST", GATEWAY + "/v1/chat/completions", key=secret, body=ask)
     last = jcall("GET", "http://127.0.0.1:9002/__last?model=echo-1")[2]
-    if old.name[:7] in ("421fd49", "f1152ff", "99dd04c"):
+    # control_dir is <worktree>/control; redact.zig came with privacy mode.
+    if os.path.exists(os.path.join(os.path.dirname(old.control_dir), "dataplane", "src", "redact.zig")):
         print("      (the old data plane already knows privacy mode: nothing to show here)")
     else:
         check("a key made private on the current control plane is NOT private through the old data plane, as the upgrade guide warns: no redaction, no privacy header",

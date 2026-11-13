@@ -69,11 +69,13 @@ sha256sum -c omnigate-dp-<version>-x86_64-linux-musl.tar.gz.sha256
 the runner, and the x86-64 Linux binary and the amd64 data-plane image are
 started once to see that they run. The arm64 image is started under
 emulation, as a warning-only check. The Windows, macOS and arm64 Linux
-binaries are cross-compiled and never executed. The README lists macOS and
-ARM as untried platforms; a release does not change that. CI on `main`
-(unit, end-to-end, SDK, hostile-input and container suites) is the real
-test of a commit, which is why a tag should only go on a commit whose CI
-is green.
+binaries are cross-compiled and never executed by the release build. CI on
+`main` (unit, end-to-end, SDK, hostile-input and container suites on
+x86-64 Linux) and the Platforms workflow (the suites built natively on
+arm64 Linux and on macOS on Apple silicon, and the container suite on
+arm64) are the real test of a commit, which is why a tag should only go on
+a commit where both are green. Neither runs the cross-compiled release
+binaries themselves, and the x86-64 macOS binary's platform is untried.
 
 ## Before the first release
 
@@ -125,7 +127,7 @@ One-time things to settle. None of them is done by the workflow.
    (the status paragraph, what has been verified, known limits). The README
    carries no counts of test checks, on purpose: they change too often.
 
-5. **Commit, push to `main`, and wait for CI to pass** on that commit. The
+5. **Commit, push to `main`, and wait for CI and Platforms to pass** on that commit. The
    release workflow does not run the end-to-end, SDK, hostile-input or
    container suites, and it does not check that the tagged commit is on
    `main`.

@@ -155,7 +155,7 @@ cp config/omnigate.example.json config/omnigate.json
 
 Fill them in, then `docker compose up -d --build`. Only the proxy publishes ports; the control plane and the internal API between the two processes stay on the private Docker network, and both omnigate containers have a memory limit (1 GiB each unless `.env` says otherwise). **Upgrading from an earlier commit:** read [docs/upgrading.md](docs/upgrading.md) for what changes on disk, which defaults changed and the order to upgrade in; a deployment from before commit 3a0b147 kept everything in one `.env` and must also be [split](docs/deployment.md#coming-from-a-commit-before-3a0b147) before it will start.
 
-Without containers the same rules apply: give each process only its own secrets, keep the control plane on a private address, and put TLS in front of both ports. A release build of the control plane needs `OMNIGATE_CONFIG`. Tested with Docker 29 and Compose 2.40 on Ubuntu 24.04 (x86-64); not tested on ARM, with Let's Encrypt on a real domain, or on Kubernetes. What to back up, the readiness probe and upgrades are in [docs/deployment.md](docs/deployment.md), and the hardening checklist in [docs/security.md](docs/security.md).
+Without containers the same rules apply: give each process only its own secrets, keep the control plane on a private address, and put TLS in front of both ports. A release build of the control plane needs `OMNIGATE_CONFIG`. Tested with Docker 29 and Compose 2.40 on Ubuntu 24.04 (x86-64, and arm64 in CI); not tested with Let's Encrypt on a real domain, or on Kubernetes. What to back up, the readiness probe and upgrades are in [docs/deployment.md](docs/deployment.md), and the hardening checklist in [docs/security.md](docs/security.md).
 
 ## How it compares
 
@@ -229,7 +229,7 @@ Not verified against anything real:
 - The security fixes against anything but the project's own tests: no external penetration test, no real hostile traffic, and neither the figures billed for an abandoned stream after reading the provider's answer to its end nor the estimate have been compared with what a provider charged for one.
 - The official SDKs against real providers: `tools/sdk_compat.py` runs the Python SDKs against the mocks only, and no other language's SDK has been tried.
 - Replicate's `owner/name:version` form, job cancellation at a real provider, Gemini's Veo models (no adapter), xAI video with an input image, images in translated requests, long conversations, large payloads, and sustained or concurrent load against real providers.
-- Platforms other than Windows 11 and x86-64 Linux (CI runs the unit, end-to-end, SDK, hostile-input and container suites on Ubuntu 24.04 for every push). macOS and ARM are untried.
+- Platforms other than Windows 11, Linux (x86-64 and arm64) and macOS on Apple silicon. CI runs the unit, end-to-end, SDK, hostile-input and container suites on x86-64 Ubuntu 24.04 for every push, and a second workflow, Platforms, runs the unit, end-to-end and hostile-input suites on arm64 Ubuntu 24.04 and on macOS 15 (Apple silicon), plus the container suite on arm64. On macOS that is all that has been run: nobody has used it there beyond those suites, and Intel Macs are untried.
 
 ## Known limits
 

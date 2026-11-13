@@ -347,7 +347,8 @@ checks then do not run, since they test `compose.yaml`). Needs a Linux
 Docker daemon and Python 3.9 or newer. CI runs it on every push.
 
 From the README: tested with Docker 29 and Compose 2.40 on Ubuntu 24.04
-(x86-64, under WSL 2). **Not tested: ARM, Let's Encrypt issuance with a real
+(x86-64, under WSL 2), and the container test also runs on an arm64 Ubuntu
+24.04 runner for every push. **Not tested: Let's Encrypt issuance with a real
 domain, and Kubernetes.**
 
 ## Health and readiness probes

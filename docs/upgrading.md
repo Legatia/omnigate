@@ -789,6 +789,12 @@ key made private is not private through an old data plane, and is as soon
 as the data plane is current; the request header redacts on a current data
 plane whatever the control plane.
 
+On 13 November 2026 it was run again from the tag `v0.1.0-rc.1` to the
+tree after the top-up page commit, on Windows, in both variants and with
+both mixed pairs: all 68 checks passed. The release candidate's data plane
+already knows privacy mode, so the "not private through an old data plane"
+row does not apply to it and the test skips that check.
+
 What this does not show: an upgrade under load, one with a large ledger
 (the test writes a few hundred events), bucket storage, Linux, or the
 container images. One thing it found is fixed in 0.1.0-rc.1 (the stop

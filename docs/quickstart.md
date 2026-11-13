@@ -11,9 +11,10 @@ Two parts: run everything locally against the mock providers that ship in
   optional SDK test, which needs the two official SDKs
   (`pip install openai==3.49.0 anthropic==2.8.0`, the versions CI pins).
 
-The README records what has been tried: Windows 11 and x86-64 Linux, where
-CI builds and runs both processes on Ubuntu 24.04 for every push. macOS and
-ARM are untried. The commands below are given for PowerShell (as in the
+The README records what has been tried: Windows 11, and in CI for every
+push Ubuntu 24.04 on x86-64 and arm64 and macOS 15 on Apple silicon, where
+both processes are built and run against the mock providers. On macOS
+nothing beyond those suites has been run. The commands below are given for PowerShell (as in the
 README) and for a POSIX shell.
 
 On Windows, Erlang and Elixir are installed but not on `PATH`. In PowerShell,

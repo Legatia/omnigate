@@ -1,4 +1,5 @@
-# CI for omnigate. Seven jobs, all on Linux:
+# CI for omnigate. Seven jobs, all on x86-64 Linux (platforms.yml runs the
+# suites on arm64 Linux and macOS):
 #
 #   dataplane   Zig unit tests and a build of the data plane. Zig is installed
 #               the way dataplane/Dockerfile installs it: downloaded from

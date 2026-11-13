@@ -19,6 +19,13 @@ only met a mock, is tracked in the README's
 
 ### Added
 
+- **arm64 Linux and macOS are tested.** A second workflow, Platforms
+  (`.github/workflows/platforms.yml`), builds both programs natively on
+  GitHub's arm64 Ubuntu 24.04 and macOS 15 (Apple silicon) runners and runs
+  the unit, end-to-end and hostile-input suites there, and the container
+  suite on arm64. All of it passed on its first complete run (13 November
+  2026); nothing in the gateway had to change. The upgrade test passed from
+  `v0.1.0-rc.1` the same day ([docs/upgrading.md](docs/upgrading.md#tested-upgrades)).
 - **Attested upstreams** ([docs/attestation.md](docs/attestation.md)). A
   text upstream can carry `"attestation": {"provider": "near", ...}`: the
   control plane then verifies NEAR AI Cloud's TEE attestation for every

@@ -1,0 +1,146 @@
+# The test suites on the platforms CI (ci.yml, x86-64 Linux) does not cover:
+# arm64 Linux and macOS on Apple silicon, both on real hardware (GitHub's
+# hosted arm64 and macOS runners), not under emulation.
+#
+#   suites      Per platform: the Zig unit tests, the Elixir unit tests, then
+#               tools/e2e.py and tools/malformed_test.py against the mock
+#               providers, exactly as ci.yml runs them.
+#   containers  arm64 Linux only: tools/container_test.py --compose, which
+#               builds both images natively and checks them through the TLS
+#               proxy.
+#
+# It is a workflow of its own so that a platform-specific failure shows as
+# such and does not hide the result of CI. A release should have both green
+# on the tagged commit (docs/releasing.md).
+#
+# Elixir on macOS comes from Homebrew, so its version is whatever Homebrew
+# ships that day, not the one pinned below; the job log prints it.
+#
+# No job needs a secret or an API key: every provider is a mock.
+
+name: Platforms
+
+on:
+  push:
+    branches: [main, "platforms/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OTP_VERSION: "29"
+  ELIXIR_VERSION: "1.20.5"
+  PYTHON_VERSION: "3.12"
+  PYRAGE_VERSION: "1.4.0"
+
+jobs:
+  suites:
+    name: Suites (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm64 Linux
+            runner: ubuntu-24.04-arm
+          - name: macOS, Apple silicon
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Platform
+        run: |
+          uname -a
+          python3 --version || true
+
+      - uses: ./.github/actions/setup-zig
+
+      - name: Zig unit tests
+        working-directory: dataplane
+        run: zig build test --summary all
+
+      - name: Build the data plane
+        working-directory: dataplane
+        run: zig build
+
+      - uses: erlef/setup-beam@v1
+        if: runner.os == 'Linux'
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Elixir from Homebrew
+        if: runner.os == 'macOS'
+        run: |
+          brew install elixir
+          elixir --version
+
+      - name: Fetch dependencies
+        working-directory: control
+        run: |
+          mix local.hex --force --if-missing
+          mix local.rebar --force --if-missing
+          mix deps.get
+
+      - name: Elixir unit tests
+        working-directory: control
+        run: mix test
+
+      - name: Compile the control plane
+        working-directory: control
+        run: mix compile
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pyrage
+        run: python -m pip install "pyrage==${PYRAGE_VERSION}"
+
+      - name: End-to-end test
+        env:
+          TMPDIR: ${{ runner.temp }}
+          OMNIGATE_REQUIRE_PYRAGE: "1"
+        run: python tools/e2e.py
+
+      - name: Hostile-input test
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python tools/malformed_test.py
+
+      - name: Upload logs and state
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: platform-logs-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/omnigate-e2e-*
+            ${{ runner.temp }}/omnigate-malformed-*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  containers:
+    name: Containers (arm64 Linux)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Docker and Compose versions
+        run: |
+          uname -a
+          docker version
+          docker compose version
+
+      - name: Container test
+        run: python3 tools/container_test.py --compose
+
+      - name: What was left running
+        if: failure()
+        run: docker ps -a

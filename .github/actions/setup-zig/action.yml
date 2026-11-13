@@ -1,6 +1,6 @@
 # Installs the Zig compiler the same way dataplane/Dockerfile does: the
 # tarball comes from ziglang.org and must match the SHA-256 pinned in that
-# file. The version and checksums are read from the Dockerfile's ARG lines, so
+# file (Linux x86-64 and arm64, and macOS arm64). The version and checksums are read from the Dockerfile's ARG lines, so
 # the Dockerfile stays the single place where the compiler is pinned.
 #
 # The tarball (not the unpacked compiler) is cached, and the checksum is
@@ -26,10 +26,12 @@ runs:
         set -euo pipefail
         dockerfile=dataplane/Dockerfile
         version="$(sed -n 's/^ARG ZIG_VERSION=//p' "$dockerfile" | tr -d '[:space:]')"
-        case "$(uname -m)" in
-          x86_64)  arch=x86_64;  sum="$(sed -n 's/^ARG ZIG_SHA256_X86_64=//p' "$dockerfile" | tr -d '[:space:]')" ;;
-          aarch64) arch=aarch64; sum="$(sed -n 's/^ARG ZIG_SHA256_AARCH64=//p' "$dockerfile" | tr -d '[:space:]')" ;;
-          *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+        os=linux
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64)  arch=x86_64;  sum="$(sed -n 's/^ARG ZIG_SHA256_X86_64=//p' "$dockerfile" | tr -d '[:space:]')" ;;
+          Linux-aarch64) arch=aarch64; sum="$(sed -n 's/^ARG ZIG_SHA256_AARCH64=//p' "$dockerfile" | tr -d '[:space:]')" ;;
+          Darwin-arm64)  arch=aarch64; os=macos; sum="$(sed -n 's/^ARG ZIG_SHA256_MACOS_AARCH64=//p' "$dockerfile" | tr -d '[:space:]')" ;;
+          *) echo "unsupported platform: $(uname -s) $(uname -m)" >&2; exit 1 ;;
         esac
         if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
           echo "could not read ZIG_VERSION from $dockerfile (got '$version')" >&2; exit 1
@@ -40,6 +42,7 @@ runs:
         {
           echo "version=$version"
           echo "arch=$arch"
+          echo "os=$os"
           echo "sha256=$sum"
         } >> "$GITHUB_OUTPUT"
 
@@ -47,26 +50,29 @@ runs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/omnigate-zig
-        key: zig-tarball-${{ steps.pin.outputs.arch }}-${{ steps.pin.outputs.version }}-${{ steps.pin.outputs.sha256 }}
+        key: zig-tarball-${{ steps.pin.outputs.os }}-${{ steps.pin.outputs.arch }}-${{ steps.pin.outputs.version }}-${{ steps.pin.outputs.sha256 }}
 
     - name: Download (if not cached), verify and unpack
       shell: bash
       env:
         ZIG_VERSION: ${{ steps.pin.outputs.version }}
         ZIG_ARCH: ${{ steps.pin.outputs.arch }}
+        ZIG_OS: ${{ steps.pin.outputs.os }}
         ZIG_SHA256: ${{ steps.pin.outputs.sha256 }}
       run: |
         set -euo pipefail
         dir="$HOME/.cache/omnigate-zig"
-        tarball="$dir/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+        tarball="$dir/zig-${ZIG_ARCH}-${ZIG_OS}-${ZIG_VERSION}.tar.xz"
         mkdir -p "$dir"
         if [ ! -f "$tarball" ]; then
           curl -fsSL --retry 3 --retry-delay 5 -o "$tarball" \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-${ZIG_OS}-${ZIG_VERSION}.tar.xz"
         fi
         # Same check as the Dockerfile. A tarball that fails it is removed so
         # that it is never saved to the cache.
-        if ! echo "${ZIG_SHA256}  ${tarball}" | sha256sum -c -; then
+        # macOS has shasum, not sha256sum.
+        check() { if command -v sha256sum > /dev/null; then sha256sum -c -; else shasum -a 256 -c -; fi; }
+        if ! echo "${ZIG_SHA256}  ${tarball}" | check; then
           rm -f "$tarball"
           exit 1
         fi

@@ -535,7 +535,7 @@ def one_variant(old, new, hard, mixed, keep):
         check("the spool is empty once its events were delivered", wait_until(lambda: not os.path.exists(spool) or os.path.getsize(spool) == 0, 15, 0.5), len(spool_after))
 
         keys_now = {k.get("name"): k for k in admin("GET", "/admin/keys")[2].get("keys", [])}
-        skip_fields = {"requests", "input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens", "cost_usd", "spend_usd", "period_spend_usd",
+        skip_fields = {"requests", "input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens", "cost_usd", "spend_usd", "period_spend_usd", "credits_burned_usd",
                        "last_used_at", "jobs", "spend", "usage", "period", "lifetime"}
         diffs = {}
         for name, old_row in seen["keys"].items():

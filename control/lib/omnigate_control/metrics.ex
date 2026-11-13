@@ -94,6 +94,9 @@ defmodule OmnigateControl.Metrics do
         "1 when the key has spent its budget for the current period and is refused, else 0.",
         per_key.(fn k, _ -> if(Keys.over_budget?(k), do: 1, else: 0) end)
       ),
+      metric("omnigate_data_planes", :gauge, "Data planes that reported their rate-limit counts in the last 30 seconds.", [
+        {[], OmnigateControl.LimitSync.instances()}
+      ]),
       metric(
         "omnigate_rejected_requests_total",
         :counter,

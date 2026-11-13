@@ -242,6 +242,14 @@ pub fn postCounters(app: *App, body: []const u8) !void {
     if (status != .ok) return error.BadStatus;
 }
 
+/// POST what this data plane allowed its rate-limited keys and read what the
+/// others allowed into `out` (see limitsync.zig). An error means the control
+/// plane did not take the report.
+pub fn postLimitSync(app: *App, body: []const u8, out: *Io.Writer) !void {
+    const status = try call(app, .POST, "/internal/limits/sync", body, out);
+    if (status != .ok) return error.BadStatus;
+}
+
 /// POST a `{"events":[...]}` usage batch. An error means "try again later".
 pub fn postUsageBatch(app: *App, body: []const u8) !BatchOutcome {
     const status = try call(app, .POST, "/internal/usage/batch", body, null);

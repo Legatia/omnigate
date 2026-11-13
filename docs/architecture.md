@@ -62,6 +62,7 @@ All of it is HTTP from the data plane to the control plane, under
 | `GET /internal/config` | pull, every `OMNIGATE_POLL_MS` | The config snapshot. Answered `503 not_ready` while the ledger is not loaded; the data plane then keeps the config it has. |
 | `POST /internal/usage/batch` | push, every `OMNIGATE_FLUSH_MS` when there is something to send | Usage events. At-least-once, spooled to disk. |
 | `POST /internal/counters` | push, every `OMNIGATE_FLUSH_MS` when there is something to send | Counts of requests the data plane refused before routing, by key name and reason. Best effort, memory only. |
+| `POST /internal/limits/sync` | push, every `OMNIGATE_LIMIT_SYNC_MS` | What this data plane allowed its rate-limited keys since the last call; the answer is what the other data planes allowed. Best effort, memory only. |
 | `/internal/v1/jobs*`, `/internal/v1/files/*` | per client request | The jobs API, forwarded. The data plane names the authenticated key in `x-omnigate-key-sha256`. |
 
 **What a client can make the data plane say to the control plane** is
@@ -913,8 +914,11 @@ The reasons below are the ones stated in the code and the README.
   job id is persisted before polling, and a resumed job polls instead of
   resubmitting.
 
-What this design does not give you yet: cluster-wide budgets and rate
-limits (both are per process or per node), and latency- or cost-aware
+What this design does not give you yet: more than one control-plane node
+(budgets are counted on the one there is), and latency- or cost-aware
 routing. The response cache, the refusal counts, the per-key concurrency
-cap and the memory budgets are likewise per data-plane process, not
-shared.
+cap and the memory budgets are per data-plane process, not shared. Rate
+limits are shared between the data planes of a control plane, but only
+approximately: each decides from its own bucket and hears about once a
+second what the others allowed
+([Operations](operations.md#rate-limits)).

@@ -13,6 +13,9 @@
 //!                            empty value counts as not set)
 //!   OMNIGATE_POLL_MS         config poll interval in ms    (default 2000)
 //!   OMNIGATE_FLUSH_MS        usage flush interval in ms    (default 500)
+//!   OMNIGATE_LIMIT_SYNC_MS   how often the rate limit is shared with the
+//!                            other data planes of the same control plane
+//!                            (default 1000; 0 = each limits on its own)
 //!   OMNIGATE_UPSTREAM_TIMEOUT_MS  max wait for upstream response headers
 //!                            (default 600000; 0 = no limit; an upstream's
 //!                            `timeout_ms` in the config overrides it)
@@ -89,6 +92,7 @@ const cache = @import("cache.zig");
 const config = @import("config.zig");
 const control = @import("control.zig");
 const counters = @import("counters.zig");
+const limitsync = @import("limitsync.zig");
 const health = @import("health.zig");
 const limits = @import("limits.zig");
 const logging = @import("logging.zig");
@@ -168,6 +172,10 @@ pub const App = struct {
     internal_token: []const u8,
     poll_interval_ms: i64,
     flush_interval_ms: i64,
+    /// How often rate limits are shared with other data planes; 0 = never.
+    limit_sync_ms: i64,
+    /// This process, to the control plane (limitsync.zig).
+    instance: limitsync.Instance,
     upstream_timeout_ms: u32,
     client_timeout_ms: u32,
     stream_idle_timeout_ms: u32,
@@ -399,6 +407,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const poll_ms: i64 = try envInt(env, u31, "OMNIGATE_POLL_MS", 2000);
     const flush_ms: i64 = try envInt(env, u31, "OMNIGATE_FLUSH_MS", 500);
+    const limit_sync_ms: i64 = try envInt(env, u31, "OMNIGATE_LIMIT_SYNC_MS", 1000);
     const upstream_timeout_ms = try envInt(env, u32, "OMNIGATE_UPSTREAM_TIMEOUT_MS", 600_000);
     const client_timeout_ms = try envInt(env, u32, "OMNIGATE_CLIENT_TIMEOUT_MS", 30_000);
     const stream_idle_timeout_ms = try envInt(env, u32, "OMNIGATE_STREAM_IDLE_TIMEOUT_MS", 300_000);
@@ -486,6 +495,8 @@ pub fn main(init: std.process.Init) !void {
         .internal_token = internal_token,
         .poll_interval_ms = poll_ms,
         .flush_interval_ms = flush_ms,
+        .limit_sync_ms = limit_sync_ms,
+        .instance = limitsync.newInstance(io),
         .upstream_timeout_ms = upstream_timeout_ms,
         .client_timeout_ms = client_timeout_ms,
         .stream_idle_timeout_ms = stream_idle_timeout_ms,
@@ -523,6 +534,7 @@ pub fn main(init: std.process.Init) !void {
     try background.concurrent(io, control.pollLoop, .{&app});
     try background.concurrent(io, reporter.flushLoop, .{&app});
     try background.concurrent(io, counters.flushLoop, .{&app});
+    if (limit_sync_ms > 0) try background.concurrent(io, limitsync.syncLoop, .{&app});
     try background.concurrent(io, watchdogTask, .{&app});
     try background.concurrent(io, stopWatcher, .{ &app, wake_address });
 
@@ -602,6 +614,7 @@ test {
     _ = balance;
     _ = cache;
     _ = counters;
+    _ = limitsync;
     _ = @import("headers.zig");
     _ = @import("guard.zig");
     _ = @import("framing.zig");

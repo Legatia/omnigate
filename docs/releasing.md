@@ -7,8 +7,12 @@ For maintainers. A release is made by pushing a version tag; the
 2026 and all four jobs passed on the first attempt: five archives with
 checksums and two multi-platform images were published as a pre-release. Two
 archives were downloaded and matched their checksums; the published images
-have not been run. The first full version is 1.0.0 (13 November 2026); what
-its run published is on the repository's releases page. Read
+have not been run. The first full version is 1.0.0 (13 November 2026): all four
+jobs passed, and five archives and two multi-platform images were published.
+Of those, the Windows binary then passed the end-to-end and hostile-input
+suites, the x86-64 Linux images passed the container suite and the x86-64
+Linux binary was started; the arm64 and macOS archives and the arm64 images
+have not been run. Read
 [What may fail the first time](#what-may-fail-the-first-time) for what was
 rehearsed beforehand.
 

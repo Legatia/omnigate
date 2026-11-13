@@ -1594,6 +1594,7 @@ curl http://127.0.0.1:4000/metrics -H "Authorization: Bearer dev-admin-token-cha
 | `omnigate_key_budget_usd` | gauge | `key` | Budget, for keys that have one. |
 | `omnigate_key_period_cost_usd` | gauge | `key` | Spend in the key's current budget period: this month, this day, or everything for a total budget. |
 | `omnigate_key_blocked` | gauge | `key` | 1 when the key has spent its budget for the current period and is refused, else 0. |
+| `omnigate_data_planes` | gauge | | Data planes that reported their rate-limit counts in the last 30 seconds. A data plane with `OMNIGATE_LIMIT_SYNC_MS=0`, or older than this metric, is not counted. |
 | `omnigate_rejected_requests_total` | counter | `key`, `reason` | Requests data planes refused before routing, since this control plane started. `reason` is the `error.code` the client got; `key` is the key's name, or `-` when the request had no usable key. |
 | `omnigate_redactions_total` | counter | `key`, `class` | Values [privacy mode](privacy.md#redaction) replaced by placeholders before a provider saw them, since this control plane started. `class` is `email`, `phone`, `card`, `ip` or `secret`. Counts only. |
 | `omnigate_key_private` | gauge | `key` | 1 when the key has any part of privacy mode switched on, else 0. |
@@ -1637,7 +1638,8 @@ Used by data planes only, with the internal token in the
 `POST /internal/usage/batch` (answered with how many events were
 `accepted`, were `duplicates` or were `invalid`),
 `POST /internal/counters` (counts of refused
-requests), and the jobs and files API under `/internal/v1/`. It is not a
+requests), `POST /internal/limits/sync` (what a data plane allowed its
+rate-limited keys, answered with what the others allowed), and the jobs and files API under `/internal/v1/`. It is not a
 public interface. The Compose proxy answers 404 for these paths from
 outside, and the control plane itself refuses any percent-encoded spelling
 of them. The data plane builds the address of such a call from its own

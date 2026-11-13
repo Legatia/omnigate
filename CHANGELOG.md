@@ -18,6 +18,32 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Added
+
+- **A key's rate limit holds across data planes.** Until now every data
+  plane of a control plane allowed a key its full `rpm`. Each still decides
+  from its own bucket and never waits for the network, but about once a
+  second (`OMNIGATE_LIMIT_SYNC_MS`) it reports what it allowed and takes
+  what the others allowed out of its bucket
+  (`POST /internal/limits/sync`). The sharing is approximate: requests
+  that reach several data planes within the same second are each allowed
+  and made up for afterwards; with the control plane away, each data plane
+  limits on its own as before. New metric `omnigate_data_planes`. See
+  [docs/operations.md](docs/operations.md#rate-limits) and
+  [docs/upgrading.md](docs/upgrading.md#the-shared-rate-limit-commit).
+  Tested with two data planes against the mock providers only.
+
+### Changed
+
+- `Retry-After` on `429 rate_limit_exceeded` can now be longer than the
+  time one request takes to refill, when other data planes allowed more
+  than was left in this one's bucket.
+- The published 1.0.0 artifacts were run after the release: the Windows
+  archive's binary passed the end-to-end and hostile-input suites, the
+  x86-64 Linux images passed the container suite, and the x86-64 Linux
+  archive's binary starts. The arm64 and macOS archives and the arm64
+  images were not run.
+
 ## [1.0.0] - 2026-11-13
 
 The first stable release: everything since the pre-release 0.1.0-rc.1.

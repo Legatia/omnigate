@@ -5,6 +5,8 @@ defmodule OmnigateControl.Router do
     * `GET  /internal/config` — snapshot for data planes (internal token)
     * `POST /internal/usage/batch` — usage events from data planes (internal token)
     * `POST /internal/counters` — counts of requests data planes refused (internal token)
+    * `POST /internal/limits/sync` — what a data plane allowed its rate-limited
+      keys; answers what the other data planes allowed (internal token)
     * `/internal/v1/jobs...`, `/internal/v1/files/...` — the media job API. Data
       planes authenticate the gateway key and forward `/v1/jobs*` and
       `/v1/files*` here, naming the key in `x-omnigate-key-sha256`.
@@ -206,6 +208,22 @@ defmodule OmnigateControl.Router do
 
       _ ->
         send_error(conn, 400, "invalid_request", "expected {\"counters\": [...]}")
+    end
+  end
+
+  # A key's `rpm` is counted in each data plane; this is how several of them
+  # hear what the others allowed (`OmnigateControl.LimitSync`).
+  post "/internal/limits/sync" do
+    case conn.body_params do
+      %{"instance" => instance, "taken" => taken} ->
+        case OmnigateControl.LimitSync.sync(instance, taken) do
+          {:ok, others, instances} -> send_json(conn, 200, %{others: others, instances: instances})
+          {:error, "too many data planes"} -> send_error(conn, 503, "overloaded", "more data planes report rate limits than this control plane keeps track of")
+          {:error, reason} -> send_error(conn, 400, "invalid_request", reason)
+        end
+
+      _ ->
+        send_error(conn, 400, "invalid_request", "expected {\"instance\": \"...\", \"taken\": [...]}")
     end
   end
 

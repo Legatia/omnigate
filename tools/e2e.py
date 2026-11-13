@@ -69,6 +69,9 @@ INTENTS_PORT = 9120
 FAKE_CONTROL_PORT = 14001
 GATEWAY2_PORT = 18081
 GATEWAY2 = f"http://127.0.0.1:{GATEWAY2_PORT}"
+# A second data plane of the real control plane (see `shared_limit_checks`).
+GATEWAY3_PORT = 18082
+GATEWAY3 = f"http://127.0.0.1:{GATEWAY3_PORT}"
 WEBHOOK_SECRET = "e2e-webhook-secret"
 
 # A string that only ever goes into private requests. After the run, no file
@@ -612,6 +615,50 @@ def key_checks():
     status, _, overview = admin("GET", "/admin/overview")
     check("the overview feed the dashboard polls has totals, keys, requests, jobs and config",
           status == 200 and all(k in overview for k in ("totals", "today", "keys", "requests", "jobs", "config")), list(overview)[:8])
+
+
+def shared_limit_checks(stack):
+    """Two data planes of one control plane share a key's requests-per-minute limit."""
+    section("rate limit across two data planes")
+    status, _, created = admin("POST", "/admin/keys", {"name": "e2e-shared-rpm", "models": ["direct"], "rpm": 6})
+    secret = created.get("key", "")
+    exe = os.path.join(ROOT, "dataplane", "zig-out", "bin", "omnigate-dp" + (".exe" if WINDOWS else ""))
+    work = os.path.join(stack.work, "gateway3")
+    os.makedirs(work, exist_ok=True)
+    env = {"OMNIGATE_LISTEN": f"127.0.0.1:{GATEWAY3_PORT}", "OMNIGATE_CONTROL_URL": CONTROL, "OMNIGATE_POLL_MS": "300", "OMNIGATE_FLUSH_MS": "200",
+           "OMNIGATE_LIMIT_SYNC_MS": "200"}
+    env.update(stack.gateway_env)
+    proc = stack.start("gateway3", [exe], cwd=work, env=env)
+    try:
+        if not wait_port(GATEWAY3_PORT, 15, proc):
+            stack.fail("the second data plane did not start", "gateway3")
+        ask = lambda base: jcall("POST", base + "/v1/chat/completions", key=secret, body=dict(CHAT, model="direct"))
+        models = lambda base: call("GET", base + "/v1/models", key=secret)[0] == 200
+        ready = wait_until(lambda: models(GATEWAY) and models(GATEWAY3), 15)
+
+        def planes():
+            _, _, text = control_raw("GET", "/metrics", {"authorization": "Bearer " + ADMIN_TOKEN})
+            return "omnigate_data_planes 2" in text.splitlines() or None
+        check("the control plane counts two data planes (omnigate_data_planes)", status == 201 and bool(ready) and bool(wait_until(planes, 10)))
+
+        # Six a minute. Four on the first data plane; the second must hear of
+        # them (the first reports once a second) and allow only the other two.
+        first = [ask(GATEWAY)[0] for _ in range(4)]
+        time.sleep(2.5)
+        answers = [ask(GATEWAY3) for _ in range(6)]
+        second = [a[0] for a in answers]
+        check("a key with rpm 6 gets four requests on one data plane, then two (not six) on the other",
+              first == [200] * 4 and second in ([200, 200, 429, 429, 429, 429], [200, 200, 200, 429, 429, 429]), (first, second))
+        refusal = next((a for a in answers if a[0] == 429), (0, {}, {}))
+        check("... and the refusal there is the usual one: rate_limit_exceeded with Retry-After",
+              ((refusal[2] or {}).get("error") or {}).get("code") == "rate_limit_exceeded" and (refusal[1].get("retry-after") or "").isdigit(), (refusal[1].get("retry-after"), refusal[2]))
+        # And back: what the second allowed is taken out of the first one's bucket.
+        time.sleep(1.5)
+        back = [ask(GATEWAY)[0] for _ in range(2)]
+        check("the first data plane has heard of those two and allows no more", back == [429, 429], back)
+    finally:
+        stack.stop("gateway3")
+    admin("DELETE", "/admin/keys/e2e-shared-rpm")
 
 
 def example(script, *args, env=None):
@@ -2376,6 +2423,7 @@ def main():
         login_checks()
         key_checks()
         if run_text:
+            shared_limit_checks(stack)
             build_around_checks(work)
             credit_checks()
             payment_checks()

@@ -68,6 +68,8 @@ defmodule OmnigateControl.Application do
 
     children = [
       {OmnigateControl.ConfigStore, path: config},
+      # What data planes tell each other about rate limits; holds no files.
+      OmnigateControl.LimitSync,
       # Checks of attested upstreams run as tasks; the manager decides when.
       {Task.Supervisor, name: OmnigateControl.Attestation.TaskSup},
       OmnigateControl.Attestation.Manager,

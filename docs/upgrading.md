@@ -37,6 +37,7 @@ Contents:
 - [The credits and payments commit](#the-credits-and-payments-commit)
 - [The top-up page commit](#the-top-up-page-commit)
 - [1.0.0](#100)
+- [The shared rate limit commit](#the-shared-rate-limit-commit)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -760,6 +761,30 @@ coming from 0.1.0-rc.1 the sections from
 changes. The version in `omnigate_build_info`, in the outbound
 `user-agent` and in the webhook `user-agent` is `1.0.0`.
 
+## The shared rate limit commit
+
+After 1.0.0. The data planes of one control plane now share a key's rate
+limit ([Operations](operations.md#rate-limits)). Nothing changes on disk and
+no configuration is needed. An installation with one data plane behaves as
+before, apart from one small request a second to the control plane.
+
+**Between the two processes.** A data plane now calls
+`POST /internal/limits/sync` every `OMNIGATE_LIMIT_SYNC_MS`.
+
+| Data plane | Control plane | What happens |
+|---|---|---|
+| new | old | The old control plane answers `404`. The data plane logs one warning that rate limits are not shared and limits on its own, as 1.0.0 does. |
+| old | new | The old data plane never calls; it limits on its own and is not counted in `omnigate_data_planes`. New data planes beside it share among themselves and do not hear of what the old one allowed. |
+
+| What | Before | After |
+|---|---|---|
+| A key with `rpm` on several data planes | Each data plane allowed the full limit | The limit holds for all of them together, approximately (see the link above). A client that relied on getting a multiple of its limit now gets `429` sooner. |
+| `Retry-After` on `429 rate_limit_exceeded` | At most the time one request takes to refill | Can be longer, up to the time a full bucket and one request take, when other data planes allowed more than was left. |
+| Metrics | | `omnigate_data_planes`. |
+| Data-plane settings | | `OMNIGATE_LIMIT_SYNC_MS` (default 1000; 0 switches sharing off for that data plane). |
+
+**Going back** to 1.0.0 needs nothing.
+
 ## Tested upgrades
 
 `tools/upgrade_test.py` builds an older commit, lets it write state, stops
@@ -807,6 +832,10 @@ tree after the top-up page commit, on Windows, in both variants and with
 both mixed pairs: all 68 checks passed. The release candidate's data plane
 already knows privacy mode, so the "not private through an old data plane"
 row does not apply to it and the test skips that check.
+
+The same day it was run from the tag `v1.0.0` to the tree with the shared
+rate limit, the same way: all 68 checks passed, with the 1.0.0 control
+plane answering `404` to the new call and logging no error.
 
 What this does not show: an upgrade under load, one with a large ledger
 (the test writes a few hundred events), bucket storage, Linux, or the

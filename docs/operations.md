@@ -329,7 +329,34 @@ minute (a token bucket).
 - Over the limit, the answer is 429 `rate_limit_exceeded` with a
   `Retry-After` header in whole seconds.
 - State is in memory in each data-plane process. A restart forgives the
-  last minute; several data planes each allow the full limit.
+  last minute.
+- **Several data planes share the limit, approximately.** Each decides a
+  request from its own bucket and never waits for anyone. Every
+  `OMNIGATE_LIMIT_SYNC_MS` (one second) it tells the control plane what it
+  allowed each limited key, and hears what the other data planes of that
+  control plane allowed, which it takes out of its own bucket. What that
+  means in practice:
+  - Requests that reach several data planes before they have heard of each
+    other (within about a second, plus the time of the call) are allowed
+    by each. In the worst case, a full burst arriving at all of them at
+    once, a key gets its burst once per data plane. The buckets then owe
+    what was allowed elsewhere and refuse until it is made up for, so over
+    minutes a key gets its limit and not a multiple of it. A bucket never
+    owes more than one full burst, so the longest `Retry-After` is one
+    minute plus the time one request takes to refill.
+  - While the control plane is away, or is a version older than this
+    feature, each data plane limits on its own, as before: several data
+    planes then each allow the full limit. The data plane logs once that
+    limits are not shared, and once when they are again. Reports made
+    meanwhile are dropped, not sent later.
+  - A data plane that has not reported for 30 seconds is forgotten, with
+    what it had not been told yet. The control plane keeps track of at most
+    64 data planes; further ones are answered 503 and limit on their own.
+  - `omnigate_data_planes` in the [metrics](api.md#get-metrics) says how
+    many are taking part.
+  - `OMNIGATE_LIMIT_SYNC_MS=0` on a data plane takes it out: it neither
+    reports nor hears.
+  - The per-key concurrency cap is not shared: it holds per data plane.
 - **Job creation is counted a second time, in the control plane**, with the
   same `rpm` and the same token bucket, number for number. It is the
   handler that creates the job that counts, so the limit holds however a

@@ -18,6 +18,12 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-14
+
+One feature, the shared rate limit, and what was learned from running the
+published 1.0.0. Nothing changes on disk and no configuration is needed
+([docs/upgrading.md](docs/upgrading.md#110)).
+
 ### Added
 
 - **A key's rate limit holds across data planes.** Until now every data
@@ -30,7 +36,7 @@ only met a mock, is tracked in the README's
   and made up for afterwards; with the control plane away, each data plane
   limits on its own as before. New metric `omnigate_data_planes`. See
   [docs/operations.md](docs/operations.md#rate-limits) and
-  [docs/upgrading.md](docs/upgrading.md#the-shared-rate-limit-commit).
+  [docs/upgrading.md](docs/upgrading.md#110).
   Tested with two data planes against the mock providers only.
 
 ### Changed
@@ -48,6 +54,12 @@ only met a mock, is tracked in the README's
   archive's binary passed the end-to-end and hostile-input suites, the
   x86-64 Linux images passed the container suite, and the x86-64 Linux
   archive's binary starts. The arm64 and macOS archives were not run.
+
+### Fixed
+
+- The Payments page of the dashboard no longer needs sideways scrolling to
+  show a payment's note: the note now sits under the deposit address
+  instead of in a column of its own.
 
 ## [1.0.0] - 2026-11-13
 

@@ -4,7 +4,7 @@ defmodule OmnigateControl.MixProject do
   def project do
     [
       app: :omnigate_control,
-      version: "1.0.0",
+      version: "1.1.0",
       elixir: "~> 1.20",
       start_permanent: Mix.env() == :prod,
       deps: deps()

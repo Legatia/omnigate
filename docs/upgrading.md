@@ -37,7 +37,7 @@ Contents:
 - [The credits and payments commit](#the-credits-and-payments-commit)
 - [The top-up page commit](#the-top-up-page-commit)
 - [1.0.0](#100)
-- [The shared rate limit commit](#the-shared-rate-limit-commit)
+- [1.1.0](#110)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -761,9 +761,10 @@ coming from 0.1.0-rc.1 the sections from
 changes. The version in `omnigate_build_info`, in the outbound
 `user-agent` and in the webhook `user-agent` is `1.0.0`.
 
-## The shared rate limit commit
+## 1.1.0
 
-After 1.0.0. The data planes of one control plane now share a key's rate
+Released 14 November 2026: 1.0.0 plus the shared rate limit and a layout
+fix on the Payments page. The data planes of one control plane now share a key's rate
 limit ([Operations](operations.md#rate-limits)). Nothing changes on disk and
 no configuration is needed. An installation with one data plane behaves as
 before, apart from one small request a second to the control plane.
@@ -834,7 +835,7 @@ already knows privacy mode, so the "not private through an old data plane"
 row does not apply to it and the test skips that check.
 
 The same day it was run from the tag `v1.0.0` to the tree with the shared
-rate limit, the same way: all 68 checks passed, with the 1.0.0 control
+rate limit (what became 1.1.0), the same way: all 68 checks passed, with the 1.0.0 control
 plane answering `404` to the new call and logging no error.
 
 What this does not show: an upgrade under load, one with a large ledger

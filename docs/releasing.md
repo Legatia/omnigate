@@ -108,7 +108,7 @@ One-time things to settle. None of them is done by the workflow.
 ## Cutting a release
 
 1. **Pick the version**, `<major>.<minor>.<patch>`. The source currently
-   says `1.0.0` in both places below (the first stable release).
+   says `1.1.0` in both places below.
 
 2. **Set the version in the source.** Both must be exactly the version you
    are about to tag; the workflow stops before building anything if they

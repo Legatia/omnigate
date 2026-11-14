@@ -45,8 +45,8 @@ defmodule OmnigateControl.PaymentsPage do
       ~s(<label>Reference <span class="muted">an invoice or transfer id</span><input name="reference" required maxlength="200" pattern="[!-~]+" spellcheck="false"></label>),
       ~s(</div><div class="row"><button type="submit">Add credit</button><span id="t-status" role="status" aria-live="polite"></span></div></form></section>),
       ~s(<section aria-labelledby="h-pay"><h2 id="h-pay">Payments</h2>),
-      ~s(<div class="scroll"><table><thead><tr><th>Started</th><th>Key</th><th>State</th><th class="num">Asked</th><th class="num">Credited</th><th>Paid with</th><th>Deposit address</th><th>Note</th></tr></thead>),
-      ~s(<tbody id="payments"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody></table></div></section>),
+      ~s(<div class="scroll"><table><thead><tr><th>Started</th><th>Key</th><th>State</th><th class="num">Asked</th><th class="num">Credited</th><th>Paid with</th><th>Deposit address and note</th></tr></thead>),
+      ~s(<tbody id="payments"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody></table></div></section>),
       ~s(<section aria-labelledby="h-added"><h2 id="h-added">Credit added</h2>),
       ~s(<p class="muted">Every top-up and bonus, newest first: payments, credit added by hand, and weekly bonuses.</p>),
       ~s(<div class="scroll"><table><thead><tr><th>Time</th><th>Key</th><th>Source</th><th class="num">Amount</th><th>Reference</th></tr></thead>),
@@ -64,6 +64,7 @@ defmodule OmnigateControl.PaymentsPage do
     ~S"""
     nav a[aria-current=page]{border-bottom-color:var(--accent)}
     #t-status.bad{color:var(--bad)}td.addr{white-space:normal;word-break:break-all;min-width:220px;max-width:320px}
+    td.addr .note{display:block;margin-top:2px;font-size:12px;word-break:normal;overflow-wrap:anywhere}
     """
   end
 
@@ -96,13 +97,14 @@ defmodule OmnigateControl.PaymentsPage do
         tr.appendChild(el('td',null,c.last_bonus?usd(c.last_bonus.amount_usd)+' for '+c.last_bonus.week:'—'));body.appendChild(tr)});
       if(keep)sel.value=keep}
     function renderPayments(list){
-      var body=$('payments');if(!list.length){empty(body,8,'No payment yet.');return}clear(body);
+      var body=$('payments');if(!list.length){empty(body,7,'No payment yet.');return}clear(body);
       list.forEach(function(p){var tr=el('tr'),st=el('td'),d=p.deposit||{};
         tr.appendChild(el('td',null,when(p.created_at)));tr.appendChild(el('td',null,p.key));
         st.appendChild(el('span','pill '+cls(p.status),word(p.status)));tr.appendChild(st);
         tr.appendChild(el('td','num',usd(p.amount_usd)));tr.appendChild(el('td','num',p.credited_usd==null?'—':usd(p.credited_usd)));
         tr.appendChild(el('td',null,(d.amount||'')+' '+(d.symbol||'')+' on '+(d.chain||'')));
-        tr.appendChild(el('td','mono addr',d.address||''));tr.appendChild(el('td','addr',p.detail||(p.tx&&p.tx.length?'tx '+p.tx.join(', '):'')));body.appendChild(tr)})}
+        var a=el('td','addr'),note=p.detail||(p.tx&&p.tx.length?'tx '+p.tx.join(', '):'');a.appendChild(el('span','mono',d.address||''));
+        if(note)a.appendChild(el('span','muted note',note));tr.appendChild(a);body.appendChild(tr)})}
     function renderAdded(list){
       var body=$('added');if(!list.length){empty(body,5,'Nothing added yet.');return}clear(body);
       list.forEach(function(t){var tr=el('tr');

@@ -1,6 +1,6 @@
 .{
     .name = .omnigate_dp,
-    .version = "1.0.0",
+    .version = "1.1.0",
     .fingerprint = 0x6cd0e4ccd7a55167,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

@@ -38,11 +38,15 @@ only met a mock, is tracked in the README's
 - `Retry-After` on `429 rate_limit_exceeded` can now be longer than the
   time one request takes to refill, when other data planes allowed more
   than was left in this one's bucket.
+- The published 1.0.0 arm64 images ran on a real arm64 server behind a real
+  domain, with a Let's Encrypt certificate obtained by a Caddy already on
+  that host ([docs/deployment.md](docs/deployment.md#behind-a-proxy-you-already-run)).
+  The bundled proxy container has still not obtained a public certificate,
+  and no completion ran there (no provider key was set).
 - The published 1.0.0 artifacts were run after the release: the Windows
   archive's binary passed the end-to-end and hostile-input suites, the
   x86-64 Linux images passed the container suite, and the x86-64 Linux
-  archive's binary starts. The arm64 and macOS archives and the arm64
-  images were not run.
+  archive's binary starts. The arm64 and macOS archives were not run.
 
 ## [1.0.0] - 2026-11-13
 

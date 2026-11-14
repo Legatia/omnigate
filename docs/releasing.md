@@ -11,8 +11,9 @@ have not been run. The first full version is 1.0.0 (13 November 2026): all four
 jobs passed, and five archives and two multi-platform images were published.
 Of those, the Windows binary then passed the end-to-end and hostile-input
 suites, the x86-64 Linux images passed the container suite and the x86-64
-Linux binary was started; the arm64 and macOS archives and the arm64 images
-have not been run. Read
+Linux binary was started, and the arm64 images ran on a real server
+([Deployment](deployment.md#behind-a-proxy-you-already-run)); the arm64 and
+macOS archives have not been run. Read
 [What may fail the first time](#what-may-fail-the-first-time) for what was
 rehearsed beforehand.
 

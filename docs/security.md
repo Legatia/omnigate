@@ -257,8 +257,9 @@ your proxy's own access control in front of the control plane's port.
 
 - Neither process has a TLS listener. The proxy terminates TLS for both
   host names; with real DNS names Caddy obtains and renews certificates by
-  itself. (Issuance with a real domain has not been tested by this
-  project.)
+  itself. (Issuance for a real domain has been seen once, by a Caddy
+  of the same major version outside the bundled container:
+  [Deployment](deployment.md#behind-a-proxy-you-already-run).)
 - Traffic between the proxy, the data plane and the control plane is plain
   HTTP on the private Docker network. It carries the internal token and
   gateway key hashes. Keep those three on one host or one private network;

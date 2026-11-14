@@ -348,8 +348,48 @@ Docker daemon and Python 3.9 or newer. CI runs it on every push.
 
 From the README: tested with Docker 29 and Compose 2.40 on Ubuntu 24.04
 (x86-64, under WSL 2), and the container test also runs on an arm64 Ubuntu
-24.04 runner for every push. **Not tested: Let's Encrypt issuance with a real
-domain, and Kubernetes.**
+24.04 runner for every push. **Not tested: Kubernetes, and Let's Encrypt issuance
+by the bundled proxy container** (a Caddy of the same major version on the
+host has done it; see the next section).
+
+### Behind a proxy you already run
+
+On 14 November 2026 the published 1.0.0 images
+(`ghcr.io/legatia/omnigate-control:1.0.0` and `-dataplane:1.0.0`, arm64)
+were run on a Hetzner arm64 server (Ubuntu 24.04, Docker 29, Compose 5)
+that already had a Caddy 2.11 on ports 80 and 443 for another site. What
+was done, as a pattern for the same situation:
+
+- A Compose project with the `control` and `dataplane` services only, no
+  `proxy`, and both ports published on localhost: `127.0.0.1:18080:8080`
+  for the gateway and `127.0.0.1:14000:4000` for the control plane.
+  `OMNIGATE_TRUST_FORWARDED` is left unset, because the control plane is
+  not behind the proxy there: the dashboard is reached through an SSH
+  tunnel (`ssh -L 14000:127.0.0.1:14000 user@host`).
+- One site block in the existing Caddyfile, the gateway's block of
+  [`deploy/Caddyfile`](../deploy/Caddyfile) with the address changed:
+
+  ```
+  gw.example.com {
+  	reverse_proxy 127.0.0.1:18080 {
+  		flush_interval -1
+  		header_up X-Forwarded-For {remote_host}
+  	}
+  }
+  ```
+
+What was seen: Caddy obtained a Let's Encrypt certificate for the name
+within seconds of the reload; the gateway answered over TLS 1.3 from
+outside, with the certificate verified by OpenSSL and by Python's default
+trust store; plain HTTP was redirected; requests without a key, with a key,
+with a broken body and over the key's rate limit got their usual answers;
+`/admin`, `/internal` and `/metrics` on the gateway's name got 401; neither
+published port answered from outside; and the other site on that Caddy
+kept answering. No provider key was set, so no completion ran and nothing
+was streamed through that proxy: a chat request reached the provider and
+came back with the provider's 401. Not covered: the admin host block (the
+allow-list and the `/internal` refusal of `deploy/Caddyfile`), certificate
+renewal, and load.
 
 ## Health and readiness probes
 

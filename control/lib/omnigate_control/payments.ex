@@ -5,8 +5,9 @@ defmodule OmnigateControl.Payments do
 
   The holder of a prepaid gateway key asks for a payment of some amount in
   US dollars, to be paid with an asset they name. A payment provider
-  (`OmnigateControl.Payments.Provider`; the one there is, `near_intents`,
-  is `OmnigateControl.Payments.NearIntents`) answers with a deposit address
+  (`OmnigateControl.Payments.Provider`: `near_intents`, which is
+  `OmnigateControl.Payments.NearIntents`, or `solana`, which is
+  `OmnigateControl.Payments.Solana`) answers with a deposit address
   and the exact amount to send. The payer sends it; the provider delivers
   the settle asset to the operator's own account; this process asks the
   provider what became of the payment until it has an end, and when it has
@@ -20,9 +21,9 @@ defmodule OmnigateControl.Payments do
 
   ## Settings (`"payments"`)
 
-    * `provider` — required; `"near_intents"`.
+    * `provider` — required; `"near_intents"` or `"solana"`.
     * `recipient` — required; the operator's account at the provider (a NEAR
-      account for `near_intents`).
+      account for `near_intents`, a wallet address for `solana`).
     * `min_usd`, `max_usd` — bounds on one payment (default 1 and 10,000).
     * `quote_ttl_s` — how long a payer has to send the deposit (default 1800).
     * `poll_interval_s` — how often an open payment is asked about
@@ -65,6 +66,7 @@ defmodule OmnigateControl.Payments do
 
   @doc "The module of a provider by its name in the config, or nil."
   def provider("near_intents"), do: OmnigateControl.Payments.NearIntents
+  def provider("solana"), do: OmnigateControl.Payments.Solana
   def provider(_), do: nil
 
   # The module behind a normalized config (whose provider was checked then).
@@ -79,7 +81,7 @@ defmodule OmnigateControl.Payments do
   def normalize!(nil), do: nil
 
   def normalize!(%{} = raw) do
-    module = provider(raw["provider"]) || raise ArgumentError, "payments.provider must be \"near_intents\", got #{inspect(raw["provider"])}"
+    module = provider(raw["provider"]) || raise ArgumentError, "payments.provider must be \"near_intents\" or \"solana\", got #{inspect(raw["provider"])}"
 
     case Map.keys(raw) -- (@common ++ module.fields()) do
       [] -> :ok
@@ -88,11 +90,8 @@ defmodule OmnigateControl.Payments do
 
     recipient =
       case raw["recipient"] do
-        r when is_binary(r) ->
-          if r =~ ~r/\A[a-z0-9][a-z0-9._\-]{1,63}\z/, do: r, else: raise(ArgumentError, "payments.recipient is not an account name: #{inspect(r)}")
-
-        other ->
-          raise ArgumentError, "payments.recipient is required: the account that receives payments, got #{inspect(other)}"
+        r when is_binary(r) -> module.recipient!(r)
+        other -> raise ArgumentError, "payments.recipient is required: the account that receives payments, got #{inspect(other)}"
       end
 
     min_usd = number!(raw["min_usd"], 1.0, 0.01, 1.0e9, "min_usd")
@@ -132,6 +131,14 @@ defmodule OmnigateControl.Payments do
   @doc "True when the config has a `\"payments\"` section."
   def configured?, do: config() != nil
 
+  @doc "True when a payment needs `refund_to`: the provider sends funds back by itself when a payment fails."
+  def refund_address? do
+    case config() do
+      nil -> false
+      config -> module!(config).refund_address?()
+    end
+  end
+
   # ---- What a key holder may do ------------------------------------------------------
 
   @doc """
@@ -154,7 +161,7 @@ defmodule OmnigateControl.Payments do
   defp cached_assets(config) do
     now = System.monotonic_time(:millisecond)
     # (Kept per provider address, so that a config change takes effect at once.)
-    source = {config.provider, Map.get(config, :base_url)}
+    source = {config.provider, Map.get(config, :base_url), Map.get(config, :mint), Map.get(config, :symbol)}
 
     case :persistent_term.get({__MODULE__, :assets}, nil) do
       {at, ^source, assets} when now - at < @assets_ttl_ms ->
@@ -178,12 +185,30 @@ defmodule OmnigateControl.Payments do
          :ok <- prepaid(key),
          {:ok, amount} <- amount(attrs["amount_usd"], config),
          {:ok, asset} <- asset(attrs["asset"]),
-         {:ok, refund_to} <- refund_to(attrs["refund_to"]),
+         {:ok, refund_to} <- refund_to(attrs["refund_to"], config),
          :ok <- room(key),
-         :ok <- rate(key),
-         deadline = System.os_time(:second) + config.quote_ttl_s,
-         request = %{amount_usd: amount, asset: asset, refund_to: refund_to, deadline: deadline, dry: false, aliases: aliases(asset, config)},
-         {:ok, quoted} <- module!(config).quote(config, request) do
+         :ok <- rate(key) do
+      start(key, config, amount, asset, refund_to, 4)
+    end
+  end
+
+  # Ask for a quote and store the payment. Where every payment goes to the
+  # same address, the amount is what tells them apart: one that another open
+  # payment took in the meantime is asked for again.
+  defp start(key, config, amount, asset, refund_to, tries) do
+    deadline = System.os_time(:second) + config.quote_ttl_s
+
+    request = %{
+      amount_usd: amount,
+      asset: asset,
+      refund_to: refund_to,
+      deadline: deadline,
+      dry: false,
+      aliases: aliases(asset, config),
+      taken: GenServer.call(__MODULE__, :open_amounts)
+    }
+
+    with {:ok, quoted} <- module!(config).quote(config, request) do
       described = describe(asset, config)
 
       payment =
@@ -210,7 +235,11 @@ defmodule OmnigateControl.Payments do
         })
         |> Map.put("deadline_at", deadline_unix(quoted["deadline"], deadline))
 
-      GenServer.call(__MODULE__, {:insert, payment})
+      case GenServer.call(__MODULE__, {:insert, payment}) do
+        {:error, :amount_taken} when tries > 0 -> start(key, config, amount, asset, refund_to, tries - 1)
+        {:error, :amount_taken} -> {:error, 503, "payment_provider_unavailable", "too many payments of this amount are waiting; try again shortly"}
+        other -> other
+      end
     end
   end
 
@@ -224,7 +253,7 @@ defmodule OmnigateControl.Payments do
          :ok <- prepaid(key),
          {:ok, amount} <- amount(attrs["amount_usd"], config),
          {:ok, asset} <- asset(attrs["asset"]),
-         {:ok, refund_to} <- refund_to(attrs["refund_to"]),
+         {:ok, refund_to} <- refund_to(attrs["refund_to"], config),
          :ok <- rate(key),
          request = %{
            amount_usd: amount,
@@ -354,14 +383,20 @@ defmodule OmnigateControl.Payments do
 
   defp asset(_), do: {:error, 400, "invalid_request", "asset is required: the id of the asset to pay with; GET /v1/payments/assets lists them"}
 
-  defp refund_to(address) when is_binary(address) do
+  defp refund_to(address, _config) when is_binary(address) do
     if address =~ ~r/\A[!-~]{1,200}\z/,
       do: {:ok, address},
       else: {:error, 400, "invalid_request", "refund_to must be an address on the chain of the asset paid with"}
   end
 
-  defp refund_to(_),
-    do: {:error, 400, "invalid_request", "refund_to is required: the address on the paying chain that gets the funds back if the payment fails"}
+  defp refund_to(other, config) do
+    # A provider that gives nothing back by itself needs no refund address.
+    module = module!(config)
+
+    if is_nil(other) and not module.refund_address?(),
+      do: {:ok, nil},
+      else: {:error, 400, "invalid_request", "refund_to is required: the address on the paying chain that gets the funds back if the payment fails"}
+  end
 
   defp room(key) do
     if GenServer.call(__MODULE__, {:open_count, key.name}) >= @max_open_per_key do
@@ -393,6 +428,10 @@ defmodule OmnigateControl.Payments do
       deposit: %{
         address: p["deposit_address"],
         memo: p["deposit_memo"],
+        # Where every payment goes to one address: what a wallet adds to the
+        # transfer so that it is recognized, and a link that makes it do so.
+        reference: p["deposit_reference"],
+        url: p["pay_url"],
         asset: p["asset"],
         symbol: p["asset_symbol"],
         chain: p["asset_chain"],
@@ -415,10 +454,14 @@ defmodule OmnigateControl.Payments do
   def admin_view(p),
     do: p |> view() |> Map.merge(%{key: p["key"], reference: reference(p), recipient: p["recipient"]})
 
-  @doc "The reference a payment is credited under: the provider's name and the deposit address (and memo), which no two payments share."
+  @doc """
+  The reference a payment is credited under: the provider's name and the
+  deposit address (and memo), which no two payments share; where they do
+  share the address, the payment's own reference instead.
+  """
   def reference(p) do
     memo = if p["deposit_memo"], do: ":" <> p["deposit_memo"], else: ""
-    text = "#{p["provider"]}:#{p["deposit_address"]}#{memo}"
+    text = "#{p["provider"]}:#{p["deposit_reference"] || p["deposit_address"]}#{memo}"
     # A top-up reference is at most 200 visible characters.
     if byte_size(text) <= 200 and text =~ ~r/\A[!-~]+\z/, do: text, else: "#{p["provider"]}:sha256:" <> OmnigateControl.sha256_hex(text)
   end
@@ -432,21 +475,34 @@ defmodule OmnigateControl.Payments do
     path = Keyword.fetch!(opts, :path)
     payments = load(path)
     if payments != [], do: Logger.info("loaded #{length(payments)} payments from #{path}")
+    # What a provider remembers between questions (transactions it has read).
+    if :ets.whereis(OmnigateControl.Payments.Solana.cache()) == :undefined,
+      do: :ets.new(OmnigateControl.Payments.Solana.cache(), [:named_table, :public, :set, read_concurrency: true])
+
     Process.send_after(self(), :tick, 1_000)
     {:ok, %{path: path, payments: payments, polling: nil}}
   end
 
   @impl true
   def handle_call({:insert, payment}, _from, state) do
-    case save(state, [payment | state.payments]) do
-      {:ok, state} ->
-        Audit.system("payment.create", payment["key"], "ok", payment: audit(payment))
-        {:reply, {:ok, payment}, state}
+    if payment["deposit_reference"] && Enum.any?(state.payments, &same_deposit?(&1, payment)) do
+      {:reply, {:error, :amount_taken}, state}
+    else
+      case save(state, [payment | state.payments]) do
+        {:ok, state} ->
+          Audit.system("payment.create", payment["key"], "ok", payment: audit(payment))
+          {:reply, {:ok, payment}, state}
 
-      {:error, state} ->
-        {:reply, {:error, 500, "storage_error", "the payment could not be stored; nothing was started. Do not send funds to an address you were not given."},
-         state}
+        {:error, state} ->
+          {:reply, {:error, 500, "storage_error", "the payment could not be stored; nothing was started. Do not send funds to an address you were not given."},
+           state}
+      end
     end
+  end
+
+  # The amounts open payments wait for (smallest units, as text).
+  def handle_call(:open_amounts, _from, state) do
+    {:reply, for(p <- state.payments, p["status"] in @open, is_binary(p["amount_in"]), do: p["amount_in"]), state}
   end
 
   def handle_call({:get, id}, _from, state), do: {:reply, Enum.find(state.payments, &(&1["id"] == id)), state}
@@ -508,6 +564,11 @@ defmodule OmnigateControl.Payments do
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{polling: ref} = state), do: {:noreply, %{state | polling: nil}}
   def handle_info(_other, state), do: {:noreply, state}
+
+  # An open payment that waits for the same amount at the same address.
+  defp same_deposit?(other, payment) do
+    other["status"] in @open and other["deposit_address"] == payment["deposit_address"] and other["amount_in"] == payment["amount_in"]
+  end
 
   # One question per open payment: `[{id, {:ok, outcome} | {:error, reason}}]`.
   defp ask(config, payments) do

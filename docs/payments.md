@@ -9,9 +9,19 @@ whose credit is spent can do this without a person.
 no payment endpoints (they answer 404), nothing is asked of any provider,
 and nothing on this page applies. omnigate stays a model gateway.
 
-There is one payment provider today: **NEAR Intents**, through its 1Click
-API. Payments are built as a provider interface with that one adapter, the
-way media providers are; the config names the provider. Other ways of
+There are two payment providers, and the config names one:
+
+- **`near_intents`**: NEAR Intents, through its 1Click API. The payer pays
+  with any of a few hundred assets on a few dozen chains; the provider swaps
+  it and delivers a stablecoin to the operator's NEAR account. Most of this
+  page describes it.
+- **`solana`**: a stablecoin (USDC) on Solana, straight from the payer to
+  the operator's own wallet, with nobody in between. One asset, no swap, no
+  fee beyond the chain's; see [The solana provider](#the-solana-provider)
+  for what differs.
+
+Payments are built as a provider interface, the way media providers are.
+Other ways of
 taking money still work as before, from outside: anything that can call
 [`POST /admin/keys/{name}/topup`](building-on-omnigate.md#taking-payments-prepaid-keys-and-top-ups)
 can credit a key.
@@ -19,6 +29,7 @@ can credit a key.
 - [What the gateway does and does not do](#what-the-gateway-does-and-does-not-do)
 - [The flow](#the-flow)
 - [Switching it on](#switching-it-on)
+- [The solana provider](#the-solana-provider)
 - [The API](#the-api)
 - [States of a payment](#states-of-a-payment)
 - [What is credited, and when](#what-is-credited-and-when)
@@ -80,7 +91,7 @@ complete example (a text route, a bonus rate, payments).
 
 | Field | Default | Meaning |
 |---|---|---|
-| `provider` | required | `"near_intents"`. The only one there is. |
+| `provider` | required | `"near_intents"` (this table) or `"solana"` ([its own fields](#the-solana-provider)). |
 | `recipient` | required | The operator's account at the provider: for `near_intents`, the NEAR account that receives the settle asset. **Check it twice**: it is where the money goes. It must be able to receive the settle asset (for a NEAR token: registered with the token's contract, which holding the token once takes care of). |
 | `min_usd`, `max_usd` | `1`, `10000` | Bounds on one payment. |
 | `quote_ttl_s` | `1800` | How long a payer is asked to be given to send the deposit. 60 to 86,400. The provider sets the deadline and may give longer: for ETH on Ethereum it gave three days. The payment's `deadline` is always the provider's. |
@@ -100,6 +111,92 @@ Only **prepaid managed keys** can be paid for: keys created through the
 admin API with a total budget (`"budget_usd": 0` is the usual start). A key
 from the config file, a key without a budget and a key with a monthly or
 daily budget are answered `409 not_prepaid`.
+
+## The solana provider
+
+```json
+"payments": {
+  "provider": "solana",
+  "recipient": "<your wallet address>",
+  "rpc_url": "https://your-rpc.example",
+  "min_usd": 1,
+  "max_usd": 1000
+}
+```
+
+The payer sends USDC on Solana to the operator's wallet and the key is
+credited when the transfer is final. The gateway still holds no keys and
+moves no funds: it only reads the chain, through a Solana JSON-RPC
+endpoint.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `recipient` | required | The operator's **wallet** address (the owner, not a token account). **Check it twice.** |
+| `rpc_url` | `https://api.mainnet-beta.solana.com` | The JSON-RPC endpoint the chain is read through. The default is Solana's public one, which is rate limited and meant for trying things; use your own or a provider's for real traffic. The gateway believes what this endpoint says. |
+| `mint` | USDC | The token taken. It should be a dollar stablecoin: what arrives is credited one to one. |
+| `decimals`, `symbol` | `6`, `USDC` | The mint's decimals (6 to 12) and its name on the top-up page. |
+| `commitment` | `finalized` | When a transfer is believed: `finalized` (about 15 seconds) or `confirmed` (a second or two, and in theory reversible). |
+| `min_usd`, `max_usd`, `quote_ttl_s`, `poll_interval_s` | as above | As for the other provider. Here `quote_ttl_s` is exactly how long a payment is watched for. |
+
+**How a transfer is recognized.** Every payment goes to the same wallet, so
+each one is told apart in two ways, and either is enough:
+
+- **By a reference.** A payment has a fresh `deposit.reference` (32 random
+  bytes written like an address) and a `deposit.url`: a
+  [Solana Pay](https://docs.solanapay.com/spec) transfer request,
+  `solana:<wallet>?amount=…&spl-token=<mint>&reference=…`. A wallet that
+  opens the link or scans it (the top-up page draws it as the QR code)
+  adds the reference to the transfer as a read-only account, and the
+  gateway finds the transaction by asking the chain for transactions that
+  mention the reference. A program does the same by adding the reference
+  to its transfer instruction's accounts (non-signer, read-only).
+- **By the exact amount.** The amount to send is what was asked for plus a
+  fraction of a cent that no other open payment has: `10` becomes, say,
+  `10.004217`. A plain transfer of **exactly** that amount, to the last
+  digit, made after the payment was started, is that payment. This is for
+  payers whose wallet cannot open a Solana Pay link. The gateway looks
+  through the 50 latest transactions of the wallet's token account at each
+  poll, so a wallet that receives more than that between two polls should
+  be paid by reference.
+
+For a transaction found either way, the gateway reads the transaction and
+takes the amount from its token balances: how much more of the mint the
+wallet owns after it than before. A failed transaction counts for nothing.
+
+**What differs from the rest of this page.**
+
+- `refund_to` is not needed and not asked for (`GET /v1/payments/assets`
+  says `"refund_address": false`). **Nothing is refunded automatically**:
+  the money is in the operator's wallet the moment it is paid, and giving
+  it back is the operator's act. A payment never becomes `refunded` or
+  `failed`; it is credited or it expires.
+- There is one asset, `solana:<mint>`, and no swap: `processing` means "on
+  the chain, not final yet".
+- **What arrived is credited**, as everywhere, including the fraction of a
+  cent. A transfer with the reference that carries less than was asked is
+  credited as what it carried and ends the payment; one that carries more
+  is credited up to 5% above what was asked. Only the first transfer of a
+  payment is credited.
+- **What is not recognized**: a transfer after the payment expired, and a
+  transfer by hand whose amount is not exactly the payment's. The money
+  has arrived all the same; the operator sees it in the wallet and can add
+  the credit by hand
+  ([`POST /admin/keys/{name}/topup`](building-on-omnigate.md#taking-payments-prepaid-keys-and-top-ups)).
+- A payment is credited under the reference `solana:<deposit.reference>`.
+- **What is trusted**: the RPC endpoint. The gateway does not verify the
+  chain's own signatures; an endpoint that lies about a transaction can
+  make the gateway credit a key for nothing. Nothing an endpoint says can
+  move the operator's funds.
+
+**Tested**: against a stand-in for the RPC endpoint
+([`tools/mock_solana.py`](../tools/mock_solana.py)) in the unit and
+end-to-end suites, and the three calls the gateway makes against the real
+public mainnet endpoint, read-only
+(`python tools/solana_live.py`, 14 November 2026: the answers have the
+fields the gateway reads; it also showed that the chain now carries
+version 1 transactions, which the gateway asks for). **No real payment has
+been made through this provider.** `python tools/solana_live.py --wallet
+<your wallet>` shows what the gateway would see of your wallet.
 
 ## The top-up page
 
@@ -142,7 +239,7 @@ are for.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /v1/payments/assets` | What can be paid with. `?chain=` and `?symbol=` narrow the list. |
+| `GET /v1/payments/assets` | What can be paid with. `?chain=` and `?symbol=` narrow the list. The answer also names the `provider` and says whether a payment needs a refund address (`refund_address`). |
 | `POST /v1/payments/quote` | What a payment would take, without starting one. |
 | `POST /v1/payments` | Start a payment: get a deposit address and the amount to send. |
 | `GET /v1/payments/{id}` | The payment and its state. |

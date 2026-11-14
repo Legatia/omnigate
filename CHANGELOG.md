@@ -18,6 +18,22 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Added
+
+- **A second payment provider: USDC on Solana, straight to the operator's
+  wallet** (`"provider": "solana"`, [docs/payments.md](docs/payments.md#the-solana-provider)).
+  No third party and no swap: the config names the wallet, and the control
+  plane reads the chain through a Solana JSON-RPC endpoint until the
+  transfer is final. A payment is recognized by a reference of its own,
+  carried by a Solana Pay link (`deposit.url`, the QR code of the top-up
+  page), or by its exact amount, which is what was asked plus a fraction of
+  a cent no other open payment has. No refund address is asked for, and
+  nothing is refunded automatically. New: `tools/mock_solana.py`,
+  `tools/solana_live.py`. Tested against the mock and, read-only, against
+  the real public endpoint; no real payment has been made through it.
+- `GET /v1/payments/assets` also answers `provider` and `refund_address`;
+  a payment's `deposit` has `reference` and `url` (null for `near_intents`).
+
 ## [1.1.0] - 2026-11-14
 
 One feature, the shared rate limit, and what was learned from running the

@@ -68,6 +68,16 @@ defmodule OmnigateControl.Payments.NearIntents do
   @doc "The fields of `\"payments\"` this provider reads."
   def fields, do: @known
 
+  @doc "A failed swap is refunded on the paying chain, so a payment needs a refund address."
+  def refund_address?, do: true
+
+  @doc "The operator's NEAR account, validated. Raises `ArgumentError`."
+  def recipient!(account) do
+    if account =~ ~r/\A[a-z0-9][a-z0-9._\-]{1,63}\z/,
+      do: account,
+      else: raise(ArgumentError, "payments.recipient is not an account name: #{inspect(account)}")
+  end
+
   @impl true
   def normalize!(raw) do
     %{

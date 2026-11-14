@@ -20,7 +20,7 @@ exercised against a mock, or not at all, the page says so.
 | Use the dashboard, create and revoke gateway keys, set budgets, read the audit log | [Admin](admin.md) |
 | Build something around the gateway: a payment service that credits keys, a billing tool that reads usage, an agent on its own key; which interfaces are stable | [Building on omnigate](building-on-omnigate.md) |
 | Sell prepaid credit: what a dollar of provider cost burns, the weekly bonus | [Prepaid credit](credits.md) |
-| Let key holders (and agents) pay for credit themselves, in crypto, through NEAR Intents; what the gateway checks and what it trusts | [Payments](payments.md) |
+| Let key holders (and agents) pay for credit themselves, in crypto, through NEAR Intents or in USDC on Solana straight to your wallet; what the gateway checks and what it trusts | [Payments](payments.md) |
 | Connect OpenAI, Anthropic, Gemini, xAI or a media provider | [Providers](providers.md) |
 | Put it on a server with TLS | [Deployment](deployment.md) |
 | Upgrade an installation that runs an earlier commit: what changes on disk, which defaults changed, what clients will notice, the order to upgrade the two processes, and going back | [Upgrading](upgrading.md) |

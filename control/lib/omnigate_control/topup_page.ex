@@ -14,7 +14,10 @@ defmodule OmnigateControl.TopupPage do
   in storage, not in the address.
 
   The deposit address is also drawn as a QR code, made in the page (byte
-  mode, error correction level M, versions 1 to 9: up to 180 bytes).
+  mode, error correction level M, versions 1 to 9: up to 180 bytes). Where
+  the provider gives a payment link (`deposit.url`, a Solana Pay link), the
+  code holds the link instead: a wallet that scans it fills in the amount
+  and the payment's reference.
   """
   alias OmnigateControl.Dashboard
 
@@ -48,19 +51,20 @@ defmodule OmnigateControl.TopupPage do
       ~s(<div class="fields"><label>Amount in USD<input id="usd" type="number" min="0" step="0.01" inputmode="decimal" required></label>),
       ~s(<label>Network<select id="chain" required></select></label>),
       ~s(<label>Pay with<select id="asset" required></select></label></div>),
-      ~s(<label>Refund address <span class="muted">on that network: where the funds return if the payment fails. Use the address you pay from.</span>),
+      ~s(<label id="refund-l">Refund address <span class="muted">on that network: where the funds return if the payment fails. Use the address you pay from.</span>),
       ~s(<input id="refund" required maxlength="200" spellcheck="false" autocomplete="off"></label>),
       ~s(<div id="quote" class="quote" hidden></div>),
       ~s(<div class="row"><button type="submit" id="quote-go">Get a quote</button><button type="button" id="pay-go" hidden>Start payment</button>),
       ~s(<span id="new-status" class="status" role="status"></span></div></form></section>),
       # 3: one payment
       ~s(<section id="s-pay" class="panel" hidden><div class="row head"><h2>Payment</h2><span id="pay-pill"></span></div>),
-      ~s(<ol id="steps" class="steps"><li id="st-1">Send the deposit</li><li id="st-2">Swap in progress</li><li id="st-3">Credit added</li></ol>),
+      ~s(<ol id="steps" class="steps"><li id="st-1">Send the deposit</li><li id="st-2">Processing</li><li id="st-3">Credit added</li></ol>),
       ~s(<div id="pay-send" class="send"><div id="qr" class="qr" role="img" aria-label="The deposit address as a QR code"></div>),
       ~s(<dl class="what"><dt>Send exactly</dt><dd><span id="p-amount" class="big"></span> <button type="button" class="small ghost copy" data-copy="p-amount-raw">Copy</button><span id="p-amount-raw" hidden></span></dd>),
       ~s(<dt>On</dt><dd id="p-chain"></dd>),
       ~s(<dt>To this address</dt><dd><span id="p-address" class="mono addr"></span> <button type="button" class="small ghost copy" data-copy="p-address">Copy</button></dd>),
       ~s(<dt id="p-memo-l" hidden>With this memo</dt><dd id="p-memo-d" hidden><span id="p-memo" class="mono addr"></span> <button type="button" class="small ghost copy" data-copy="p-memo">Copy</button></dd>),
+      ~s(<dt id="p-link-l" hidden>From a wallet on this device</dt><dd id="p-link-d" hidden><a id="p-link" rel="noreferrer">Open in a wallet</a></dd>),
       ~s(<dt>Before</dt><dd id="p-deadline"></dd></dl></div>),
       ~s(<p id="pay-note" class="muted"></p>),
       ~s(<dl id="pay-facts" class="facts"></dl>),
@@ -82,7 +86,7 @@ defmodule OmnigateControl.TopupPage do
     ~S"""
     .tu-main{max-width:760px;margin:0 auto;padding:16px 16px 40px;display:flex;flex-direction:column;gap:14px}
     .tu h2{margin:0 0 6px;font-size:17px}.tu .panel p{margin:0 0 12px}
-    .tu label{margin-bottom:12px}.status{font-size:13px}.status.bad{color:var(--bad)}
+    .tu label{margin-bottom:12px}.tu label[hidden]{display:none}.status{font-size:13px}.status.bad{color:var(--bad)}
     .bal{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:8px 20px}
     .bal .value{font-size:34px;font-weight:650;line-height:1.1}
     .amounts{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 14px}.amt{min-width:64px}.amt.on{background:var(--accent);color:var(--accent-text)}
@@ -188,7 +192,7 @@ defmodule OmnigateControl.TopupPage do
     ~S"""
     (function(){
     "use strict";
-    var key=null,assets=[],quoted=null,current=null,timer=null,tick=null,busy=false;
+    var key=null,assets=[],quoted=null,current=null,timer=null,tick=null,busy=false,refunds=true;
     var END={settled:1,refunded:1,failed:1,expired:1};
     function $(id){return document.getElementById(id)}
     function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
@@ -222,7 +226,8 @@ defmodule OmnigateControl.TopupPage do
       load().then(function(d){
         $('key').value='';show('s-key',false);show('forget',true);$('who').textContent='key ending '+v.slice(-4);say('key-status','');
         if(!d.credits)return;show('s-new',true);
-        return api('GET','/v1/payments/assets').then(function(a){assets=a.assets||[];renderChains()})})
+        return api('GET','/v1/payments/assets').then(function(a){assets=a.assets||[];refunds=a.refund_address!==false;
+          show('refund-l',refunds);$('refund').required=refunds;renderChains()})})
       .catch(function(e){key=null;say('key-status',e.status===401?'This gateway does not know that key.':e.status===404?'Payments are not switched on at this gateway.':e.message,true)})
       .finally(function(){busy=false})});
     $('forget').addEventListener('click',function(){location.reload()});
@@ -239,7 +244,7 @@ defmodule OmnigateControl.TopupPage do
         .forEach(function(a){var o=el('option',null,a.symbol);o.value=a.asset;sel.appendChild(o)});
       unquote()}
     function unquote(){quoted=null;show('quote',false);show('pay-go',false);$('quote-go').className='';say('new-status','')}
-    function ask(){return {amount_usd:Number($('usd').value),asset:$('asset').value,refund_to:$('refund').value.trim()}}
+    function ask(){var a={amount_usd:Number($('usd').value),asset:$('asset').value};if(refunds)a.refund_to=$('refund').value.trim();return a}
     $('chain').addEventListener('change',renderAssets);
     ['asset','usd','refund'].forEach(function(id){$(id).addEventListener('input',function(){unquote();if(id==='usd')marks()})});
     function marks(){Array.prototype.forEach.call(document.querySelectorAll('.amt'),function(b){b.classList.toggle('on',Number(b.dataset.usd)===Number($('usd').value))})}
@@ -270,11 +275,13 @@ defmodule OmnigateControl.TopupPage do
       if(s==='awaiting_deposit'){
         $('p-amount').textContent=d.amount+' '+d.symbol;$('p-amount-raw').textContent=d.amount;$('p-chain').textContent=d.chain+', as '+d.symbol;
         $('p-address').textContent=d.address;show('p-memo-l',!!d.memo);show('p-memo-d',!!d.memo);$('p-memo').textContent=d.memo||'';
-        var box=$('qr');if(box.dataset.for!==d.address){clear(box);var svg=qrSvg(d.address);if(svg)box.appendChild(svg);box.hidden=!svg;box.dataset.for=d.address}
+        var code=d.url||d.address,box=$('qr');if(box.dataset.for!==code){clear(box);var svg=qrSvg(code);if(svg)box.appendChild(svg);box.hidden=!svg;box.dataset.for=code}
+        show('p-link-l',!!d.url);show('p-link-d',!!d.url);if(d.url&&/^solana:/.test(d.url))$('p-link').href=d.url;else $('p-link').removeAttribute('href');
         countdown()}
       $('pay-note').textContent=
-        s==='awaiting_deposit'?'Send it from a wallet of your own, in one transfer. This page notices when it arrives; you can also close it and come back with the key.'+(d.memo?' The memo is required: a transfer without it is not recognized.':''):
-        s==='processing'?'The deposit arrived and is being swapped. This usually takes under a minute.':
+        s==='awaiting_deposit'?'Send it from a wallet of your own, in one transfer. This page notices when it arrives; you can also close it and come back with the key.'+(d.memo?' The memo is required: a transfer without it is not recognized.':'')+
+          (d.url?' Scan the code with a wallet, or send exactly this amount by hand: the exact amount, to the last digit, is how a transfer made by hand is recognized.':''):
+        s==='processing'?(d.url?'The transfer is on the chain and is credited once it is final. This usually takes under a minute.':'The deposit arrived and is being swapped. This usually takes under a minute.'):
         s==='settled'?(p.credited_usd==null?'The payment arrived but could not be credited to this key. Contact the operator of this gateway.':usd(p.credited_usd)+' of credit was added to this key.'):
         s==='refunded'?'The payment was not completed and the funds were sent back to the refund address.':
         s==='failed'?'The payment could not be completed.':'Nothing arrived before the deadline. Nothing was credited; start a new payment.';

@@ -66,6 +66,8 @@ KEY_ATTESTED = "og-e2e-attested"
 # (see `attestation_checks`).
 # The payment provider's stand-in (tools/mock_intents.py).
 INTENTS_PORT = 9120
+# A Solana RPC endpoint's stand-in (tools/mock_solana.py), for the `solana` payment provider.
+SOLANA_PORT = 9121
 FAKE_CONTROL_PORT = 14001
 GATEWAY2_PORT = 18081
 GATEWAY2 = f"http://127.0.0.1:{GATEWAY2_PORT}"
@@ -407,7 +409,7 @@ class Stack:
     # -- individual services --------------------------------------------
 
     def start_mocks(self):
-        ports = [9001, 9002, 9003, 9004, 9005] + (MEDIA_PORTS if self.media else []) + ([INTENTS_PORT] if self.payments else [])
+        ports = [9001, 9002, 9003, 9004, 9005] + (MEDIA_PORTS if self.media else []) + ([INTENTS_PORT, SOLANA_PORT] if self.payments else [])
         busy = [p for p in ports + [CONTROL_PORT, GATEWAY_PORT] if not port_free(p)]
         if busy:
             self.fail(f"ports already in use: {busy}. Stop whatever is listening there and rerun.")
@@ -418,6 +420,9 @@ class Stack:
             self.start("mock_intents", [sys.executable, os.path.join(ROOT, "tools", "mock_intents.py"), str(INTENTS_PORT)])
             if not wait_port(INTENTS_PORT, 15):
                 self.fail("the payment provider mock did not start", "mock_intents")
+            self.start("mock_solana", [sys.executable, os.path.join(ROOT, "tools", "mock_solana.py"), str(SOLANA_PORT)])
+            if not wait_port(SOLANA_PORT, 15):
+                self.fail("the Solana RPC mock did not start", "mock_solana")
         for port in [9001, 9002, 9003, 9004, 9005]:
             if not wait_port(port, 15):
                 self.fail(f"mock on port {port} did not start", "mock_upstream")
@@ -1026,6 +1031,94 @@ def payment_after_restart_checks():
     admin("DELETE", "/admin/keys/e2e-restart-payer")
 
 
+SOLANA_WALLET = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+SOLANA_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+SOLANA_TOKEN_ACCOUNT = "7UX2i7SucgLMQcfZ75s3VXmZZY4YRUyJN9X1RgfMoDUi"
+
+
+def solana_payment_checks(stack):
+    """The `solana` payment provider (USDC straight to the operator's wallet), against tools/mock_solana.py.
+
+    The config is switched to it while the gateway runs, and switched back at the end."""
+    section("payments: USDC on Solana, straight to the operator's wallet")
+    chain = lambda path, body=None: jcall("POST" if body is not None else "GET", f"http://127.0.0.1:{SOLANA_PORT}{path}", body=body)[2] or {}
+    config = text_config()
+    original = json.loads(json.dumps(config))
+    config["payments"] = {"provider": "solana", "recipient": SOLANA_WALLET, "rpc_url": f"http://127.0.0.1:{SOLANA_PORT}",
+                          "poll_interval_s": 1, "min_usd": 1, "max_usd": 1000, "quote_ttl_s": 600}
+    with open(stack.config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    secret = payer("e2e-sol-payer")
+    asset = "solana:" + SOLANA_USDC
+    listed = wait_until(lambda: (lambda r: r if r[0] == 200 and [a.get("asset") for a in r[2].get("assets", [])] == [asset] else None)(
+        jcall("GET", GATEWAY + "/v1/payments/assets", key=secret)), 20, 0.5) or (0, {}, {})
+    check("after the config names the solana provider, a key is offered one asset: the stablecoin on Solana, and no refund address is asked for",
+          listed[0] == 200 and listed[2].get("provider") == "solana" and listed[2].get("refund_address") is False
+          and listed[2]["assets"][0].get("symbol") == "USDC" and listed[2]["assets"][0].get("chain") == "solana", listed[2])
+
+    status, _, pay = jcall("POST", GATEWAY + "/v1/payments", key=secret, body={"amount_usd": 3, "asset": asset})
+    deposit = pay.get("deposit", {})
+    units = int(deposit.get("amount_units") or 0)
+    reference = deposit.get("reference") or ""
+    check("a payment is started without a refund address: the operator's wallet, a reference of its own, a Solana Pay link, and an amount a fraction of a cent above what was asked",
+          status == 201 and pay.get("status") == "awaiting_deposit" and deposit.get("address") == SOLANA_WALLET and len(reference) in (43, 44)
+          and 3_000_000 < units < 3_010_000 and deposit.get("url", "").startswith("solana:" + SOLANA_WALLET + "?amount=" + (deposit.get("amount") or "x"))
+          and "reference=" + reference in deposit.get("url", "") and "spl-token=" + SOLANA_USDC in deposit.get("url", "") and len(deposit.get("url", "")) <= 180,
+          (status, pay))
+    payment_id = pay.get("id", "missing")
+
+    # Mentions the reference but failed; then the real transfer, confirmed and not yet final.
+    chain("/__mock/land", {"addresses": [reference], "owner": SOLANA_WALLET, "mint": SOLANA_USDC, "units": units, "failed": True})
+    time.sleep(2.5)
+    still = payment(secret, payment_id)
+    landed = chain("/__mock/land", {"addresses": [reference, SOLANA_TOKEN_ACCOUNT], "owner": SOLANA_WALLET, "mint": SOLANA_USDC, "units": units, "status": "confirmed"})
+    seen = wait_until(lambda: (lambda p: p if p.get("status") == "processing" else None)(payment(secret, payment_id)), 15, 0.3) or {}
+    check("a failed transaction with the reference is no payment; the transfer itself is seen while it is not final, and nothing is credited yet",
+          still.get("status") == "awaiting_deposit" and seen.get("status") == "processing" and seen.get("credited_usd") is None
+          and seen.get("tx") == [landed.get("signature")] and key_row("e2e-sol-payer").get("budget_usd") == 0, (still.get("status"), seen))
+    chain("/__mock/finalize", {})
+    settled = wait_until(lambda: (lambda p: p if p.get("status") == "settled" else None)(payment(secret, payment_id)), 15, 0.3) or {}
+    unblocked = wait_until(lambda: chat("direct", key=secret)[0] == 200, 10, 0.3)
+    _, _, topups = admin("GET", "/admin/topups")
+    mine = [(t.get("reference"), t.get("source")) for t in topups.get("topups", []) if t.get("key") == "e2e-sol-payer"]
+    check("once final it is credited, once, with what arrived, under the payment's reference, and the key works again",
+          settled.get("credited_usd") == units / 1e6 and close(key_row("e2e-sol-payer").get("budget_usd"), units / 1e6) and bool(unblocked)
+          and mine == [("solana:" + reference, "solana")], (settled, mine))
+
+    # Two payments of the same number of dollars, paid by hand: plain transfers, told apart by their amounts.
+    second, third = payer("e2e-sol-payer-2"), payer("e2e-sol-payer-3")
+    _, _, a = jcall("POST", GATEWAY + "/v1/payments", key=second, body={"amount_usd": 3, "asset": asset})
+    _, _, b = jcall("POST", GATEWAY + "/v1/payments", key=third, body={"amount_usd": 3, "asset": asset})
+    a_units, b_units = int(a.get("deposit", {}).get("amount_units") or 0), int(b.get("deposit", {}).get("amount_units") or 0)
+    chain("/__mock/land", {"addresses": [SOLANA_TOKEN_ACCOUNT], "owner": SOLANA_WALLET, "mint": SOLANA_USDC, "units": 3_000_000})
+    chain("/__mock/land", {"addresses": [SOLANA_TOKEN_ACCOUNT], "owner": SOLANA_WALLET, "mint": SOLANA_USDC, "units": b_units, "age_s": 900})
+    time.sleep(6)
+    waiting = (payment(second, a.get("id")).get("status"), payment(third, b.get("id")).get("status"))
+    chain("/__mock/land", {"addresses": [SOLANA_TOKEN_ACCOUNT], "owner": SOLANA_WALLET, "mint": SOLANA_USDC, "units": b_units})
+    paid = wait_until(lambda: (lambda p: p if p.get("status") == "settled" else None)(payment(third, b.get("id"))), 20, 0.3) or {}
+    time.sleep(1.5)
+    other = payment(second, a.get("id"))
+    check("two open payments of the same dollars wait for different amounts; a plain transfer is recognized by its exact amount, made after the payment started, and only by that",
+          a_units != b_units and a_units and waiting == ("awaiting_deposit", "awaiting_deposit") and paid.get("credited_usd") == b_units / 1e6
+          and other.get("status") == "awaiting_deposit" and key_row("e2e-sol-payer-2").get("budget_usd") == 0
+          and close(key_row("e2e-sol-payer-3").get("budget_usd"), b_units / 1e6), (a_units, b_units, waiting, paid, other.get("status")))
+
+    status, _, body = jcall("POST", GATEWAY + "/v1/payments", key=second, body={"amount_usd": 3, "asset": "nep141:wrap.near", "refund_to": "payer.near"})
+    status2, _, dry = jcall("POST", GATEWAY + "/v1/payments/quote", key=second, body={"amount_usd": 3, "asset": asset})
+    status3, _, page = call("GET", GATEWAY + "/topup")
+    check("another asset is refused in words; a dry quote is the plain amount; the top-up page is served and knows payment links",
+          status == 400 and (body.get("error") or {}).get("code", (body.get("error") or {}).get("type")) == "payment_quote_refused"
+          and status2 == 200 and dry.get("amount") == "3.00" and dry.get("provider") == "solana"
+          and status3 == 200 and b"p-link" in page, (status, body, status2, dry, status3))
+
+    for name in ("e2e-sol-payer", "e2e-sol-payer-2", "e2e-sol-payer-3"):
+        admin("DELETE", f"/admin/keys/{name}")
+    with open(stack.config_path, "w", encoding="utf-8") as f:
+        json.dump(original, f, indent=2)
+    back = wait_until(lambda: (jcall("GET", GATEWAY + "/v1/payments/assets", key=KEY_MAIN)[2] or {}).get("provider") == "near_intents", 20, 0.5)
+    check("the config switched back, payments are the first provider's again", bool(back), back)
+
+
 def empty_prepaid_key():
     """A managed key with nothing in its prepaid budget, known to the gateway."""
     admin("DELETE", "/admin/keys/e2e-empty")
@@ -1236,6 +1329,7 @@ def text_checks(stack):
     row = wait_until(lambda: main_row_with(main_calls), 30)
     check(f"after recovery every outage call is billed exactly once ({main_calls} total)", bool(row), usage_row("main"))
     payment_after_restart_checks()
+    solana_payment_checks(stack)
 
 
 # --------------------------------------------------------------------------

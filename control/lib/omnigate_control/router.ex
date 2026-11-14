@@ -338,7 +338,7 @@ defmodule OmnigateControl.Router do
 
     with {:ok, _key} <- gateway_key(conn),
          {:ok, assets} <- Payments.assets(Map.take(conn.query_params, ["chain", "symbol"])) do
-      send_json(conn, 200, %{assets: assets})
+      send_json(conn, 200, %{assets: assets, provider: Payments.config().provider, refund_address: Payments.refund_address?()})
     else
       {:error, status, type, message} -> send_error(conn, status, type, message)
     end

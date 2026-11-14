@@ -19,8 +19,27 @@ omnigate is source-available under the
   service.
 - Any other use the PolyForm Noncommercial License does not permit.
 
-To get a commercial license, write to **hello@legatia.solutions** and say
-what you plan to run it for and roughly at what scale.
+**What it costs**
 
-The [LICENSE](LICENSE) file is the binding text; this page is a plain-words
-summary of the intent and does not change it.
+- **$490 per company per year**, for any number of servers, data planes and
+  gateway keys. Not per seat, per request or per token.
+- Offering omnigate, or something built on it, to others as a hosted or
+  paid service, and larger deployments that want their own terms: by
+  agreement.
+
+**How to buy**
+
+1. Write to **hello@legatia.solutions** with your company's name and
+   country, and what you plan to run omnigate for.
+2. You get an invoice and the license terms by email. Nothing is owed until
+   you have read them and agreed.
+3. You pay the invoice in USDC on Solana, with the payment link on it. If
+   that does not work for your company, say so in your email.
+4. You get the confirmation of your license for the year by email. There is
+   nothing to install or activate: the software is the same.
+
+The same is on <https://omnigate.legatia.solutions/pricing/>.
+
+The [LICENSE](LICENSE) file is the binding text for noncommercial use, and
+the terms sent with the invoice are for commercial use; this page is a
+plain-words summary of the intent and changes neither.

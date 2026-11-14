@@ -103,6 +103,17 @@ figcaption { font-size: 13.5px; color: var(--soft); margin-top: 10px; }
 .figures span { color: var(--soft); font-size: 14.5px; }
 .note { color: var(--soft); font-size: 14.5px; max-width: 78ch; margin: 1.6em 0 0; }
 .license p { max-width: 78ch; color: var(--soft); }
+.plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; align-items: stretch; }
+.plans article { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 24px 24px 20px; display: flex; flex-direction: column; }
+.plans article.featured { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.plans article > p { color: var(--soft); margin: 0 0 0.6em; }
+.plans .price { font-size: 2.3rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; color: var(--ink); margin: 0 0 0.3em; font-variant-numeric: tabular-nums; }
+.plans .price span { font-size: 0.95rem; font-weight: 500; letter-spacing: 0; color: var(--soft); }
+.plans .checks { flex: 1; color: var(--soft); font-size: 15px; }
+.plans article > p:last-child { margin: 0.6em 0 0; }
+.steps { padding-left: 1.3em; color: var(--soft); }
+.steps li { margin: 0.7em 0; }
+.steps strong { color: var(--ink); }
 footer { border-top: 1px solid var(--line); padding: 32px 24px 56px !important; color: var(--soft); font-size: 14.5px; }
 footer p { margin: 0.4em 0; }
 .quiet { opacity: 0.8; }

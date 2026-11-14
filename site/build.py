@@ -211,6 +211,8 @@ def build():
 
     shutil.copy(SRC / "index.html", DIST / "index.html")
     shutil.copy(SRC / "404.html", DIST / "404.html")
+    (DIST / "pricing").mkdir(parents=True, exist_ok=True)
+    shutil.copy(SRC / "pricing.html", DIST / "pricing" / "index.html")
     # Cloudflare Pages reads this: what a browser may do with these pages.
     (DIST / "_headers").write_text(
         "/*\n"

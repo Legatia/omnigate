@@ -340,13 +340,13 @@ defmodule OmnigateControl.AttestationManagerTest do
     assert Privacy.attested?(%{privacy: p})
     refute Privacy.attested?(%{privacy: nil})
     assert Privacy.summary(p) == "attested"
-    assert Privacy.for_data_plane(p) == %{no_store: false, redact: [], unlink: false, attested: true}
+    assert Privacy.for_data_plane(p) == %{no_store: false, redact: [], unlink: false, attested: true, unwatermarked: false}
     assert Privacy.view(p).attested
     assert {:error, "privacy.attested must be true or false"} = Privacy.normalize(%{"attested" => "yes"})
     assert {:ok, nil} = Privacy.normalize(%{"attested" => false})
     # A setting stored before the part existed.
     assert %{attested: false} = Privacy.load(%{"no_store" => true})
-    assert Privacy.for_data_plane(Privacy.load(%{"no_store" => true})) == %{no_store: true, redact: [], unlink: false, attested: false}
+    assert Privacy.for_data_plane(Privacy.load(%{"no_store" => true})) == %{no_store: true, redact: [], unlink: false, attested: false, unwatermarked: false}
     assert Privacy.header("attested, no-store") == {:ok, true}
     assert Privacy.header("attested") == {:ok, false}
   end

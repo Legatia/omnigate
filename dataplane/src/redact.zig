@@ -1419,12 +1419,14 @@ pub const Request = struct {
     unlink: bool = false,
     /// Only to a provider whose attestation holds (proxy.zig).
     attested: bool = false,
+    /// Only to an upstream the operator marked as not watermarking text.
+    unwatermarked: bool = false,
 
     /// `on` (or `true`, `1`): the three parts that need nothing else.
     /// Otherwise a comma-separated list of `no-store`, `redact`, `unlink`,
-    /// `attested`. Null for anything else. (`on` does not include
-    /// `attested`: it would refuse every request of a gateway that has no
-    /// attested upstream.)
+    /// `attested`, `unwatermarked`. Null for anything else. (`on` does not
+    /// include `attested` or `unwatermarked`: either would refuse every
+    /// request of a gateway that has no such upstream.)
     pub fn parse(value: []const u8) ?Request {
         const v = std.mem.trim(u8, value, " \t");
         if (v.len == 0 or v.len > 64) return null;
@@ -1442,6 +1444,8 @@ pub const Request = struct {
                 out.unlink = true;
             } else if (eq(p, "attested")) {
                 out.attested = true;
+            } else if (eq(p, "unwatermarked")) {
+                out.unwatermarked = true;
             } else return null;
         }
         return out;
@@ -1767,8 +1771,11 @@ test "the header only ever asks for more" {
     try testing.expectEqual(Request{ .attested = true }, Request.parse("Attested").?);
     try testing.expectEqual(Request{ .redact = true, .attested = true }, Request.parse("redact , attested").?);
     try testing.expect(!Request.parse("on").?.attested);
+    try testing.expectEqual(Request{ .unwatermarked = true }, Request.parse("Unwatermarked").?);
+    try testing.expectEqual(Request{ .attested = true, .unwatermarked = true }, Request.parse("attested, unwatermarked").?);
+    try testing.expect(!Request.parse("on").?.unwatermarked);
     const long: [65]u8 = @splat('x');
-    for ([_][]const u8{ "", "off", "false", "0", "none", "redact,off", "redact;unlink", "attest", "attested=false", "on,attested", &long }) |bad| {
+    for ([_][]const u8{ "", "off", "false", "0", "none", "redact,off", "redact;unlink", "attest", "attested=false", "on,attested", "unwatermark", "watermarked", &long }) |bad| {
         try testing.expectEqual(@as(?Request, null), Request.parse(bad));
     }
 }

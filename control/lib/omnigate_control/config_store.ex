@@ -223,6 +223,10 @@ defmodule OmnigateControl.ConfigStore do
             # Whether a private request is sent `"store": false` here; nil =
             # only when the host is api.openai.com.
             privacy_store_flag: store_flag!(u),
+            # The operator's statement that this provider puts no watermark
+            # into the text it writes; a request that asks for
+            # `unwatermarked` only goes to such upstreams.
+            unwatermarked: unwatermarked!(u),
             # The provider proves what it runs on (`OmnigateControl.Attestation`),
             # and its targets are only used while that is verified; nil = no.
             attestation: OmnigateControl.Attestation.normalize!(u["attestation"], "upstream #{inspect(u["name"])}")
@@ -280,6 +284,14 @@ defmodule OmnigateControl.ConfigStore do
       n
     else
       raise ArgumentError, "#{what} must be a whole number from #{first} to #{last}, got #{inspect(n)}"
+    end
+  end
+
+  defp unwatermarked!(u) do
+    case u["unwatermarked"] do
+      nil -> false
+      b when is_boolean(b) -> b
+      other -> raise ArgumentError, "upstream #{inspect(u["name"])}: \"unwatermarked\" must be true or false, got #{inspect(other)}"
     end
   end
 

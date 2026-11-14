@@ -14,7 +14,8 @@ defmodule OmnigateControl.Privacy do
         "redact":     true,          (or a list: ["email", "phone", "card", "ip", "secret"])
         "unlink":     true,
         "encrypt_to": "age1...",
-        "attested":   true
+        "attested":   true,
+        "unwatermarked": true
       }
 
     * `no_store`: nothing of a request's content is kept here. The data
@@ -35,19 +36,26 @@ defmodule OmnigateControl.Privacy do
       (`OmnigateControl.Attestation`). When no such target is there the
       request is refused, not sent elsewhere. Media jobs are refused: no
       media provider is attested.
+    * `unwatermarked`: a text request only goes to an upstream the config
+      marks `"unwatermarked": true`: the operator's statement that the
+      provider puts no watermark into the text it writes. When a model has
+      no such target the request is refused, not sent elsewhere. The
+      gateway never changes a provider's text; this chooses providers.
+      Media jobs are not affected.
 
   `true` is `no_store`, `redact` (every class) and `unlink`. It is not
-  `attested`: that part needs an attested upstream in the config, and a
-  key that had `true` before the part existed must keep working. A request can
+  `attested` or `unwatermarked`: those parts need an upstream of that kind
+  in the config, and a key that had `true` before they existed must keep
+  working. A request can
   add parts for itself with the `x-omnigate-privacy` header; nothing a
   request sends can take one away.
 
-  Normalised, a setting is `nil` (nothing on) or a map with all five fields.
+  Normalised, a setting is `nil` (nothing on) or a map with all six fields.
   """
   alias OmnigateControl.Age
 
   @classes ~w(email phone card ip secret)
-  @fields ~w(no_store redact unlink encrypt_to attested)
+  @fields ~w(no_store redact unlink encrypt_to attested unwatermarked)
 
   @doc "The classes of values `redact` knows."
   def classes, do: @classes
@@ -58,7 +66,7 @@ defmodule OmnigateControl.Privacy do
   """
   def normalize(nil), do: {:ok, nil}
   def normalize(false), do: {:ok, nil}
-  def normalize(true), do: {:ok, %{no_store: true, redact: @classes, unlink: true, encrypt_to: nil, attested: false}}
+  def normalize(true), do: {:ok, %{no_store: true, redact: @classes, unlink: true, encrypt_to: nil, attested: false, unwatermarked: false}}
 
   def normalize(%{} = map) do
     map = Map.new(map, fn {k, v} -> {to_string(k), v} end)
@@ -67,10 +75,11 @@ defmodule OmnigateControl.Privacy do
          {:ok, no_store} <- flag(map["no_store"], "no_store"),
          {:ok, unlink} <- flag(map["unlink"], "unlink"),
          {:ok, attested} <- flag(map["attested"], "attested"),
+         {:ok, unwatermarked} <- flag(map["unwatermarked"], "unwatermarked"),
          {:ok, redact} <- redact(map["redact"]),
          {:ok, encrypt_to} <- encrypt_to(map["encrypt_to"]) do
-      if no_store or unlink or attested or redact != [] or encrypt_to != nil do
-        {:ok, %{no_store: no_store, redact: redact, unlink: unlink, encrypt_to: encrypt_to, attested: attested}}
+      if no_store or unlink or attested or unwatermarked or redact != [] or encrypt_to != nil do
+        {:ok, %{no_store: no_store, redact: redact, unlink: unlink, encrypt_to: encrypt_to, attested: attested, unwatermarked: unwatermarked}}
       else
         {:ok, nil}
       end
@@ -135,11 +144,14 @@ defmodule OmnigateControl.Privacy do
 
   @doc "The setting as the admin API shows it; nil when nothing is on."
   def view(nil), do: nil
-  def view(%{} = p), do: %{no_store: p.no_store, redact: p.redact, unlink: p.unlink, encrypt_to: p.encrypt_to, attested: attested?(p)}
+
+  def view(%{} = p),
+    do: %{no_store: p.no_store, redact: p.redact, unlink: p.unlink, encrypt_to: p.encrypt_to, attested: attested?(p), unwatermarked: unwatermarked?(p)}
 
   @doc "What a data plane needs of it (it has no use for the recipient); nil when none of that is on."
   def for_data_plane(%{} = p) do
-    if p.no_store or p.unlink or attested?(p) or p.redact != [], do: %{no_store: p.no_store, redact: p.redact, unlink: p.unlink, attested: attested?(p)}
+    if p.no_store or p.unlink or attested?(p) or unwatermarked?(p) or p.redact != [],
+      do: %{no_store: p.no_store, redact: p.redact, unlink: p.unlink, attested: attested?(p), unwatermarked: unwatermarked?(p)}
   end
 
   def for_data_plane(_), do: nil
@@ -148,7 +160,14 @@ defmodule OmnigateControl.Privacy do
   def summary(nil), do: ""
 
   def summary(%{} = p) do
-    [p.no_store && "no-store", p.redact != [] && "redact", p.unlink && "unlink", p.encrypt_to && "encrypt", attested?(p) && "attested"]
+    [
+      p.no_store && "no-store",
+      p.redact != [] && "redact",
+      p.unlink && "unlink",
+      p.encrypt_to && "encrypt",
+      attested?(p) && "attested",
+      unwatermarked?(p) && "unwatermarked"
+    ]
     |> Enum.filter(& &1)
     |> Enum.join(", ")
   end
@@ -169,6 +188,11 @@ defmodule OmnigateControl.Privacy do
   def attested?(%{privacy: %{attested: true}}), do: true
   def attested?(_), do: false
 
+  @doc "Does this key's setting (or the setting itself) ask for providers marked as not watermarking only?"
+  def unwatermarked?(%{unwatermarked: true}), do: true
+  def unwatermarked?(%{privacy: %{unwatermarked: true}}), do: true
+  def unwatermarked?(_), do: false
+
   @doc "A key's setting, or nil."
   def of(key) when is_map(key), do: Map.get(key, :privacy)
   def of(_), do: nil
@@ -177,7 +201,8 @@ defmodule OmnigateControl.Privacy do
   What an `x-omnigate-privacy` request header asks for, for a media job:
   `{:ok, no_store?}` or `:error`. (The data plane has checked it already;
   this is the same grammar. It refuses a job that asks for `attested`, so
-  the word is accepted here and means nothing more.)
+  the word is accepted here and means nothing more; `unwatermarked` is
+  about text and means nothing for a job.)
   """
   def header(nil), do: {:ok, false}
 
@@ -194,7 +219,7 @@ defmodule OmnigateControl.Privacy do
       true ->
         parts = v |> String.split(",") |> Enum.map(&String.trim/1)
 
-        if Enum.all?(parts, &(&1 in ["no-store", "no_store", "redact", "unlink", "attested"])),
+        if Enum.all?(parts, &(&1 in ["no-store", "no_store", "redact", "unlink", "attested", "unwatermarked"])),
           do: {:ok, Enum.any?(parts, &(&1 in ["no-store", "no_store"]))},
           else: :error
     end

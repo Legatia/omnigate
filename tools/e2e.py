@@ -62,6 +62,8 @@ KEY_SEALED = "og-e2e-sealed"
 KEY_PLAIN = "og-e2e-plain"
 # Privacy mode with `attested` only: its requests may go to attested providers alone.
 KEY_ATTESTED = "og-e2e-attested"
+# Privacy mode with `unwatermarked` only: its requests may go only to upstreams marked as not watermarking text.
+KEY_UNMARKED = "og-e2e-unmarked"
 # A second data plane, in front of a control plane played by this script
 # (see `attestation_checks`).
 # The payment provider's stand-in (tools/mock_intents.py).
@@ -301,6 +303,7 @@ def text_config():
             {"name": "sealed", "key": KEY_SEALED, "privacy": {"encrypt_to": AGE_RECIPIENT}},
             {"name": "plain", "key": KEY_PLAIN, "webhook_secret": WEBHOOK_SECRET},
             {"name": "attested", "key": KEY_ATTESTED, "privacy": {"attested": True}},
+            {"name": "unmarked", "key": KEY_UNMARKED, "privacy": {"unwatermarked": True}},
         ],
         "upstreams": [
             {"name": "mock-flaky", "kind": "openai", "base_url": "http://127.0.0.1:9001", "api_key_env": "MOCK_API_KEY"},
@@ -308,7 +311,9 @@ def text_config():
             {"name": "mock-anthropic", "kind": "anthropic", "base_url": "http://127.0.0.1:9003", "api_key_env": "MOCK_API_KEY"},
             {"name": "mock-slow", "kind": "openai", "base_url": "http://127.0.0.1:9004", "api_key_env": "MOCK_API_KEY", "timeout_ms": 500},
             # A provider whose OpenAI-compatible API is not under /v1 (Gemini's layout).
-            {"name": "mock-compat", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY", "v1_path": "/v1beta/openai"},
+            {"name": "mock-compat", "kind": "openai", "base_url": "http://127.0.0.1:9002", "api_key_env": "MOCK_API_KEY", "v1_path": "/v1beta/openai",
+             # (The one upstream the operator says does not watermark text.)
+             "unwatermarked": True},
             # Nothing listens here: every call is refused at once.
             {"name": "mock-dead", "kind": "openai", "base_url": "http://127.0.0.1:9", "api_key_env": "MOCK_API_KEY"},
             # The working mock again, declared to take OpenAI's `"store": false`.
@@ -1672,6 +1677,26 @@ def attestation_checks(stack):
     check("a media job is refused: no media provider is attested", status == 503 and error_code(body) == "attestation_unverified", (status, body))
     status, _, body = jcall("POST", GATEWAY + "/v1/jobs", key=KEY_PLAIN, headers={"x-omnigate-privacy": "attested"}, body={"model": "image", "input": {"prompt": "x"}})
     check("... also when only the header asks", status == 503 and error_code(body) == "attestation_unverified", (status, body))
+
+    section("privacy mode: providers marked as not watermarking only")
+    served = [ask("spread", KEY_UNMARKED)[1].get("x-omnigate-upstream") for _ in range(4)]
+    check("a key that asks for unwatermarked providers is only sent to the upstream marked so, on a route that spreads over two",
+          served == ["mock-compat"] * 4, served)
+    before = jcall("GET", "http://127.0.0.1:9002/__watch")[2].get("requests")
+    status, _, body = ask("direct", KEY_UNMARKED)
+    check("... and is refused on a model that has no such target: 403 watermark_possible, not sent elsewhere",
+          status == 403 and error_code(body) == "watermark_possible", (status, body))
+    status, _, body = ask("direct", KEY_PLAIN, headers={"x-omnigate-privacy": "unwatermarked"})
+    status2, headers2, _ = ask("spread", KEY_PLAIN, headers={"x-omnigate-privacy": "unwatermarked, no-store"})
+    check("the request header asks for the same, also next to other parts",
+          status == 403 and error_code(body) == "watermark_possible" and status2 == 200 and headers2.get("x-omnigate-upstream") == "mock-compat", (status, body, status2))
+    check("none of the refused requests was sent anywhere", jcall("GET", "http://127.0.0.1:9002/__watch")[2].get("requests") == before + 1)
+    status, _, dry = ask("spread", KEY_UNMARKED, headers={"x-omnigate-dry-run": "privacy"})
+    status2, _, _ = ask("direct", KEY_PLAIN, headers={"x-omnigate-privacy": "unwatermark"})
+    status3, headers3, _ = ask("direct", KEY_PLAIN, headers={"x-omnigate-privacy": "on"})
+    check("a dry run says so; a misspelt part is a 400; \"on\" does not include it",
+          status == 200 and dry.get("unwatermarked_only") is True and status2 == 400 and status3 == 200 and headers3.get("x-omnigate-upstream") == "mock-ok",
+          (status, dry, status2, status3))
 
     status, _, body = jcall("GET", GATEWAY + "/v1/attestations/req_does-not-exist", key=KEY_PLAIN)
     check("the receipt of a request that has none is a 404", status == 404 and error_code(body) == "receipt_not_found", (status, body))

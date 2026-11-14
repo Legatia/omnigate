@@ -109,6 +109,7 @@ job error's reason from `error.type` must read `error.code` now.
 | 401 | `invalid_api_key` | `invalid_request_error` | `authentication_error` | The key is not known: never configured, deleted, disabled, shadowed by a config-file key of the same name, or replaced by a rotation. |
 | 402 | `budget_exceeded` | `insufficient_quota` | `billing_error` | The key has spent its budget for the current period and the request would start new work (a text request, or `POST /v1/jobs`). Reading is still allowed; see [below](#what-an-over-budget-key-can-still-do). |
 | 403 | `model_not_allowed` | `permission_error` | `permission_error` | The key's `models` list does not include this model. |
+| 403 | `watermark_possible` | `permission_error` | `permission_error` | The request may only go to an upstream marked as not watermarking text ([privacy mode](privacy.md#unwatermarked-providers-only), from the key or the request header), and no target of the model is. Nothing was sent. |
 | 404 | `not_found` | `invalid_request_error` | `not_found_error` | The path is not an endpoint the gateway serves. |
 | 404 | `model_not_found` | `invalid_request_error` | `not_found_error` | No route has this name; or, on `GET /v1/models/{id}`, the model does not exist or the key may not use it. |
 | 405 | `method_not_allowed` | `invalid_request_error` | `invalid_request_error` | A method other than GET or POST on `/v1/jobs*`, `/v1/files/*` or `/v1/payments*`. |
@@ -426,7 +427,7 @@ Request headers the gateway acts on:
 | `anthropic-version` | Forwarded to `anthropic` upstreams. Defaults to `2023-06-01` when absent. |
 | `anthropic-beta` | Forwarded to `anthropic` upstreams. |
 | `Idempotency-Key` | Jobs API only. |
-| `x-omnigate-privacy` | Switches parts of [privacy mode](privacy.md#the-request-header) on for this one request: `on` (`no-store`, `redact` and `unlink`), or a comma-separated list of `no-store`, `redact`, `unlink`, `attested`. It can only add to the key's setting; any other value, or the header sent twice, answers `400 invalid_request`. Never forwarded. |
+| `x-omnigate-privacy` | Switches parts of [privacy mode](privacy.md#the-request-header) on for this one request: `on` (`no-store`, `redact` and `unlink`), or a comma-separated list of `no-store`, `redact`, `unlink`, `attested`, `unwatermarked`. It can only add to the key's setting; any other value, or the header sent twice, answers `400 invalid_request`. Never forwarded. |
 | `x-omnigate-dry-run` | `privacy`: answer with the request as privacy mode left it (`{"object": "omnigate.privacy_dry_run", "sent_upstream": false, "body": "...", ...}`) and send nothing to any provider. Any other value, or the header twice, answers `400 invalid_request`. See [Seeing what a provider would be sent](attestation.md#seeing-what-a-provider-would-be-sent). Never forwarded. |
 | `x-omnigate-tag` | The caller's own label for the request (a tenant, a run, an end user's id in its system): 1 to 64 letters, digits, `.`, `_`, `:` or `-`. Recorded with the request's usage and shown in the [usage feed](building-on-omnigate.md#reading-usage); never sent to a provider, in no metric. Also taken on `POST /v1/jobs`. Anything else, or the header sent twice, is `400 invalid_request`. |
 
@@ -446,7 +447,7 @@ The provider's response, with these headers added:
 | `x-omnigate-request-id` | Id of this request (32 hex characters); also the id of its usage event in the ledger. |
 | `x-request-id`, `request-id` | The request id where the OpenAI and the Anthropic SDK look for it. The provider's own id is preferred, so that a support ticket can quote it: when the provider sent both headers each keeps its value, when it sent only one of them that id goes into both, and when it sent neither both carry the gateway's id (the value of `x-omnigate-request-id`). |
 | `x-omnigate-cache` | Only on routes with `cache_ttl_s`, for non-streaming requests: `hit` or `miss`. See [Response cache](#response-cache). |
-| `x-omnigate-privacy` | Only when a part of [privacy mode](privacy.md) applied to the request (from the key or from the request header): the parts, in the order `no-store, redact, unlink`. (`attested` is not listed here; the next header answers it.) |
+| `x-omnigate-privacy` | Only when a part of [privacy mode](privacy.md) applied to the request (from the key or from the request header): the parts, in the order `no-store, redact, unlink`. (`attested` and `unwatermarked` are not listed here; the next header answers the first, and `x-omnigate-upstream` says who answered.) |
 | `x-omnigate-attestation` | Only when the upstream that answered is an [attested upstream](attestation.md): `verified; tcb=<platform status>; since=<unix seconds>`. It says the provider's attestation was verified, and recently, when the request was sent; it is not a signature over this response. |
 
 **Request ids are on every answer the gateway produces, with three

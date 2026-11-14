@@ -48,6 +48,14 @@ only met a mock, is tracked in the README's
   nothing is refunded automatically. New: `tools/mock_solana.py`,
   `tools/solana_live.py`. Tested against the mock and, read-only, against
   the real public endpoint; no real payment has been made through it.
+- **Unwatermarked providers only**, a sixth part of privacy mode
+  ([docs/privacy.md](docs/privacy.md#unwatermarked-providers-only)). A text
+  upstream can be marked `"unwatermarked": true` (the operator's statement
+  that the provider puts no watermark into the text it writes), and a key
+  or a request that asks for `unwatermarked` only goes to such upstreams;
+  a model without one answers `403 watermark_possible`. It chooses
+  providers and never changes a provider's text. Tested against the mock
+  providers.
 - `GET /v1/payments/assets` also answers `provider` and `refund_address`;
   a payment's `deposit` has `reference` and `url` (null for `near_intents`).
 

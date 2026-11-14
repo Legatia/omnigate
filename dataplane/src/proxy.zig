@@ -266,14 +266,17 @@ const Privacy = struct {
     unlink: bool = false,
     /// Only targets whose attestation holds are used.
     attested: bool = false,
+    /// Only upstreams marked as not watermarking text are used.
+    unwatermarked: bool = false,
 
     fn of(key: *const config.Key, header: redact.Request) Privacy {
-        var p: Privacy = .{ .no_store = header.no_store, .unlink = header.unlink, .attested = header.attested };
+        var p: Privacy = .{ .no_store = header.no_store, .unlink = header.unlink, .attested = header.attested, .unwatermarked = header.unwatermarked };
         if (header.redact) p.redact = .every;
         if (key.privacy) |k| {
             p.no_store = p.no_store or k.no_store;
             p.unlink = p.unlink or k.unlink;
             p.attested = p.attested or k.attested;
+            p.unwatermarked = p.unwatermarked or k.unwatermarked;
             for (k.redact) |name| {
                 if (redact.Class.parse(name)) |c| p.redact.add(c);
             }
@@ -418,7 +421,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         return respondError(acc, request, .bad_request, "invalid_request", "x-omnigate-privacy was sent more than once");
     const privacy_request: redact.Request = if (hdrs.privacy) |v|
         redact.Request.parse(v) orelse
-            return respondError(acc, request, .bad_request, "invalid_request", "invalid x-omnigate-privacy header: use \"on\", or a comma-separated list of no-store, redact, unlink, attested (it can only switch protections on)")
+            return respondError(acc, request, .bad_request, "invalid_request", "invalid x-omnigate-privacy header: use \"on\", or a comma-separated list of no-store, redact, unlink, attested, unwatermarked (it can only switch protections on)")
     else
         .{};
     // A tag that would be dropped or cut is refused instead: the caller's
@@ -680,7 +683,7 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
         const w = &out.writer;
         try w.writeAll("{\"object\":\"omnigate.privacy_dry_run\",\"sent_upstream\":false,\"protections\":");
         try std.json.Stringify.value(privacy.note() orelse "", .{}, w);
-        try w.print(",\"attested_only\":{},\"replaced\":{{", .{privacy.attested});
+        try w.print(",\"attested_only\":{},\"unwatermarked_only\":{},\"replaced\":{{", .{ privacy.attested, privacy.unwatermarked });
         for (redact.Class.all, 0..) |c, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("\"{s}\":{d}", .{ c.name(), redactions.hits[c.index()] });
@@ -721,9 +724,10 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     // Never for a private request: a "no-store" request leaves nothing
     // behind, and an answer that was written around placeholders belongs to
     // the request that made them.
-    // Nor for one that may only be answered by an attested provider: the
-    // cache does not know who wrote what it holds.
-    const cacheable = ep.metered and !is_stream and app.cache.max_bytes > 0 and !privacy.no_store and privacy.redact.isEmpty() and !privacy.attested;
+    // Nor for one that may only be answered by an attested provider, or by
+    // one that does not watermark: the cache does not know who wrote what
+    // it holds.
+    const cacheable = ep.metered and !is_stream and app.cache.max_bytes > 0 and !privacy.no_store and privacy.redact.isEmpty() and !privacy.attested and !privacy.unwatermarked;
     const cache_ttl_ms: i64 = if (cacheable) @as(i64, route.cache_ttl_s) * 1000 else 0;
     // The key is the request in canonical form, which takes a tree of it. A
     // body too costly to parse (see `cacheKeyFor`) is simply not cached.
@@ -829,12 +833,20 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
     // Targets passed over because their attestation does not hold, or
     // because the request wanted an attested one and they are not.
     var unattested: u32 = 0;
+    // Targets passed over because the request may only go to an upstream
+    // marked as not watermarking text, and theirs is not.
+    var watermarking: u32 = 0;
     for (order) |target_index| {
         const t = &route.targets[target_index];
         const up = snapshot.findUpstream(t.upstream) orelse {
             try attempts.append(arena, .{ .upstream = t.upstream, .outcome = "unknown_upstream" });
             continue;
         };
+        if (privacy.unwatermarked and !up.unwatermarked) {
+            try attempts.append(arena, .{ .upstream = up.name, .outcome = "not_unwatermarked" });
+            watermarking += 1;
+            continue;
+        }
         // An upstream that has to prove what it runs on is only used while
         // that proof holds; a request that asked for such an upstream is
         // sent to no other. Either way the target is passed over like one
@@ -1110,6 +1122,14 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
             "this request may only go to an attested provider, and no target of this model has a verified attestation right now"
         else
             "the providers of this model must prove what they run on, and none has a verified attestation right now");
+    }
+
+    // Nothing was sent because the request may only go to an upstream marked
+    // as not watermarking text and this model has none. That does not change
+    // by waiting: it is how the gateway is set up.
+    if (tried == 0 and watermarking > 0) {
+        acc.attempts = 0;
+        return respondError(acc, request, .forbidden, "watermark_possible", "this request may only go to a provider marked as not watermarking text, and no target of this model is");
     }
 
     // Nothing was sent upstream because no target can serve this request at

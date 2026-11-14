@@ -38,6 +38,7 @@ Contents:
 - [The top-up page commit](#the-top-up-page-commit)
 - [1.0.0](#100)
 - [1.1.0](#110)
+- [After 1.1.0](#after-110)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -785,6 +786,23 @@ before, apart from one small request a second to the control plane.
 | Data-plane settings | | `OMNIGATE_LIMIT_SYNC_MS` (default 1000; 0 switches sharing off for that data plane). |
 
 **Going back** to 1.0.0 needs nothing.
+
+## After 1.1.0
+
+Not released yet. Nothing changes on disk.
+
+| What | Before | After |
+|---|---|---|
+| Payments | One provider, `near_intents` | A second, `solana` ([Payments](payments.md#the-solana-provider)). `GET /v1/payments/assets` also answers `provider` and `refund_address`; a payment's `deposit` has `reference` and `url`. Existing payments and settings are untouched. |
+| Privacy mode | Five parts | A sixth, `unwatermarked`, with an `unwatermarked` field on text upstreams ([Privacy mode](privacy.md#unwatermarked-providers-only)). The admin API shows it as `false` on every key that has a privacy setting. New error `403 watermark_possible`. |
+
+**Between the two processes.** `unwatermarked` is applied by the data
+plane. A 1.1.0 or older data plane behind a newer control plane does not
+know the part: it ignores it on a key, and refuses the word in the
+`x-omnigate-privacy` header with `400`. So a key set to `unwatermarked` is
+**not** restricted until its data planes are upgraded; upgrade them before
+you rely on it. The other way round (new data plane, old control plane) the
+part cannot be set at all.
 
 ## Tested upgrades
 

@@ -24,6 +24,10 @@ pub const Upstream = struct {
     /// (see proxy.zig, `takesStoreFlag`). Null: only when the host is
     /// api.openai.com.
     privacy_store_flag: ?bool = null,
+    /// The operator's statement that text from this upstream carries no
+    /// provider watermark. A request that asks for `unwatermarked` only
+    /// goes to upstreams that have it (proxy.zig).
+    unwatermarked: bool = false,
 };
 
 /// The client's path as an upstream spells it.
@@ -121,6 +125,8 @@ pub const Privacy = struct {
     unlink: bool = false,
     /// Only send to targets whose attestation holds (see `Attestation`).
     attested: bool = false,
+    /// Only send to upstreams marked `unwatermarked`.
+    unwatermarked: bool = false,
 };
 
 pub const Key = struct {
@@ -210,6 +216,16 @@ test "snapshots parse with and without the newer optional fields" {
     try std.testing.expect(!private.value.keys[2].privacy.?.no_store and private.value.keys[2].privacy.?.redact.len == 0);
     try std.testing.expectEqual(@as(?Privacy, null), old.value.keys[0].privacy);
     try std.testing.expect(!p.attested);
+    try std.testing.expect(!p.unwatermarked);
+
+    var unmarked = try parse(gpa,
+        \\{"version":"v6","upstreams":[{"name":"a","kind":"openai","base_url":"http://a","api_key_env":"K","unwatermarked":true},
+        \\  {"name":"b","kind":"openai","base_url":"http://b","api_key_env":"K"}],
+        \\ "keys":[{"key_sha256":"aa","name":"p","privacy":{"unwatermarked":true}}],"routes":[]}
+    );
+    defer unmarked.deinit();
+    try std.testing.expect(unmarked.value.keys[0].privacy.?.unwatermarked);
+    try std.testing.expect(unmarked.value.upstreams[0].unwatermarked and !unmarked.value.upstreams[1].unwatermarked);
     try std.testing.expectEqual(@as(?Attestation, null), old.value.routes[0].targets[0].attestation);
 
     var attested = try parse(gpa,

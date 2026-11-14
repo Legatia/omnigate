@@ -10,6 +10,7 @@ can be switched on by itself:
 | Encrypted outputs | `encrypt_to` | The outputs of the key's media jobs are encrypted to an [age](https://age-encryption.org) recipient before they are stored anywhere. |
 | Unlinking | `unlink` | The request fields that name an end user to the provider are removed. |
 | Attested providers only | `attested` | A text request only goes to a provider that has proven, and recently, what hardware and configuration it runs on. Otherwise it is refused, not sent elsewhere. It needs an [attested upstream](attestation.md) in the config. |
+| Unwatermarked providers only | `unwatermarked` | A text request only goes to an upstream you have marked as not watermarking the text it writes. Otherwise it is refused, not sent elsewhere. It chooses providers; it never changes a provider's text. |
 
 Read [What it does not do](#what-it-does-not-do) before you rely on it. In
 one sentence: the provider still reads the prompt, with the listed kinds of
@@ -24,6 +25,7 @@ Contents:
 - [Encrypted outputs](#encrypted-outputs)
 - [Unlinking](#unlinking)
 - [Attested providers only](#attested-providers-only)
+- [Unwatermarked providers only](#unwatermarked-providers-only)
 - [The request header](#the-request-header)
 - [What it does not do](#what-it-does-not-do)
 - [What has been tested](#what-has-been-tested)
@@ -61,6 +63,7 @@ by part:
 | `unlink` | boolean | `false` | [Unlinking](#unlinking). |
 | `encrypt_to` | string | none | An age X25519 recipient (`age1...`). [Encrypted outputs](#encrypted-outputs). |
 | `attested` | boolean | `false` | [Attested providers only](#attested-providers-only). |
+| `unwatermarked` | boolean | `false` | [Unwatermarked providers only](#unwatermarked-providers-only). |
 
 `false`, `null`, or leaving `privacy` out switches everything off. Anything
 else is refused: an unknown field, an unknown class, a recipient that is not
@@ -365,6 +368,48 @@ To see what a provider would be sent without sending it, add
 `x-omnigate-dry-run: privacy` to a request:
 [Seeing what a provider would be sent](attestation.md#seeing-what-a-provider-would-be-sent).
 
+## Unwatermarked providers only
+
+Some providers can put a statistical watermark into the text their models
+write: a slight preference among words that a detector of theirs can find
+later. Whether they do depends on the provider, the model, the region and
+often on a setting of the account the API key belongs to. `unwatermarked`
+restricts where a text request may go: only to an upstream whose config
+says `"unwatermarked": true`.
+
+```json
+"upstreams": [
+  { "name": "local", "kind": "openai", "base_url": "http://10.0.0.5:8000", "api_key_env": "LOCAL_KEY", "unwatermarked": true },
+  { "name": "openai", "kind": "openai", "base_url": "https://api.openai.com", "api_key_env": "OPENAI_API_KEY" }
+],
+"keys": [
+  { "name": "drafts", "key_sha256": "...", "privacy": { "unwatermarked": true } }
+]
+```
+
+- **The mark on an upstream is your statement, not something the gateway
+  checks.** It cannot: a watermark of this kind is only visible to the
+  provider's own detector. Mark an upstream when you know it: a model you
+  host yourself, or a provider account on which you have confirmed the
+  feature is off. An upstream without the field counts as "may watermark".
+- A target on any other upstream is passed over. When a model has no
+  target left, the request is refused with `403 watermark_possible` and
+  sent nowhere: it does not fall back to a provider that may watermark.
+  Unlike `attestation_unverified` this does not change by waiting; it is
+  how the gateway is configured.
+- **The gateway never alters a provider's text** to remove or weaken a
+  watermark, here or anywhere else. This option only chooses who writes
+  the answer.
+- The response cache is not used for such a request: the cache does not
+  know who wrote what it holds.
+- It is about text. Media jobs are not affected, and what image, audio or
+  video providers embed in their outputs is outside this option.
+- `"privacy": true` does not include it, for the reason it does not
+  include `attested`.
+- **Both processes must know it.** A data plane older than this option
+  ignores it and sends the request wherever the route says
+  ([Upgrading](upgrading.md#after-110)).
+
 ## The request header
 
 A request can switch protections on for itself, on any key:
@@ -374,6 +419,7 @@ x-omnigate-privacy: on                    all of no-store, redact, unlink
 x-omnigate-privacy: redact                one part
 x-omnigate-privacy: no-store, unlink      several
 x-omnigate-privacy: redact, attested      attested providers only is asked for by name
+x-omnigate-privacy: unwatermarked         so is unwatermarked providers only
 ```
 
 It can only add to the key's setting. There is no value that switches a part
@@ -385,6 +431,7 @@ not go out without. `redact` in the header means every class.
 On `POST /v1/jobs` the part that matters is `no-store` (it makes that job
 private); `redact` and `unlink` are accepted and have no effect there, and
 `attested` gets the job refused (no media provider is attested).
+`unwatermarked` is accepted and has no effect on a job.
 Encryption cannot be asked for per request: it needs a recipient, which is
 the key's.
 

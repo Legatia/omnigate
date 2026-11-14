@@ -286,17 +286,39 @@ defmodule OmnigateControl.PrivacyTest do
 
   describe "the setting" do
     test "true is no_store, redact and unlink; an object picks parts; nothing on is nil" do
-      assert Privacy.normalize(true) == {:ok, %{no_store: true, redact: Privacy.classes(), unlink: true, encrypt_to: nil, attested: false}}
+      assert Privacy.normalize(true) ==
+               {:ok, %{no_store: true, redact: Privacy.classes(), unlink: true, encrypt_to: nil, attested: false, unwatermarked: false}}
+
       assert Privacy.normalize(nil) == {:ok, nil}
       assert Privacy.normalize(false) == {:ok, nil}
       assert Privacy.normalize(%{}) == {:ok, nil}
       assert Privacy.normalize(%{"no_store" => false, "redact" => [], "unlink" => false, "encrypt_to" => nil}) == {:ok, nil}
 
       assert Privacy.normalize(%{"redact" => ["secret", "email"]}) ==
-               {:ok, %{no_store: false, redact: ["email", "secret"], unlink: false, encrypt_to: nil, attested: false}}
+               {:ok, %{no_store: false, redact: ["email", "secret"], unlink: false, encrypt_to: nil, attested: false, unwatermarked: false}}
 
       assert {:ok, %{redact: all, no_store: true}} = Privacy.normalize(%{"redact" => true, "no_store" => true})
       assert all == ~w(email phone card ip secret)
+    end
+
+    test "unwatermarked is a part of its own: not in true, sent to data planes, named in the summary and the job header" do
+      assert {:ok, %{unwatermarked: false}} = Privacy.normalize(true)
+
+      assert {:ok, %{unwatermarked: true, attested: false, no_store: false, redact: [], unlink: false, encrypt_to: nil} = p} =
+               Privacy.normalize(%{"unwatermarked" => true})
+
+      assert Privacy.unwatermarked?(%{privacy: p})
+      refute Privacy.unwatermarked?(%{privacy: nil})
+      assert Privacy.summary(p) == "unwatermarked"
+      assert Privacy.for_data_plane(p) == %{no_store: false, redact: [], unlink: false, attested: false, unwatermarked: true}
+      assert Privacy.view(p).unwatermarked
+      assert {:error, "privacy.unwatermarked must be true or false"} = Privacy.normalize(%{"unwatermarked" => "yes"})
+      assert {:ok, nil} = Privacy.normalize(%{"unwatermarked" => false})
+      # A setting stored before the part existed.
+      assert %{unwatermarked: false} = Privacy.load(%{"no_store" => true})
+      # For a job the word is accepted and means nothing.
+      assert Privacy.header("unwatermarked") == {:ok, false}
+      assert Privacy.header("unwatermarked, no-store") == {:ok, true}
     end
 
     test "anything it does not know is refused, with a message that says what is allowed" do
@@ -321,7 +343,7 @@ defmodule OmnigateControl.PrivacyTest do
 
     test "a recipient must be a real age recipient" do
       {recipient, _public, _secret} = AgeReader.keypair()
-      assert {:ok, %{encrypt_to: ^recipient, no_store: false}} = Privacy.normalize(%{"encrypt_to" => recipient, "attested" => false})
+      assert {:ok, %{encrypt_to: ^recipient, no_store: false}} = Privacy.normalize(%{"encrypt_to" => recipient, "attested" => false, "unwatermarked" => false})
       # Upper case is the same address.
       assert {:ok, %{encrypt_to: ^recipient}} = Privacy.normalize(%{"encrypt_to" => String.upcase(recipient)})
 
@@ -372,6 +394,21 @@ defmodule OmnigateControl.PrivacyTest do
         ConfigStore.normalize(%{"keys" => [%{"name" => "bad", "key" => "k", "privacy" => %{"encrypt_to" => "age1nope"}}]})
       end
 
+      # An upstream the operator says does not watermark text: false unless said.
+      marked =
+        ConfigStore.normalize(%{
+          "upstreams" => [
+            %{"name" => "a", "kind" => "openai", "base_url" => "https://x", "api_key_env" => "K", "unwatermarked" => true},
+            %{"name" => "b", "kind" => "openai", "base_url" => "https://y", "api_key_env" => "K"}
+          ]
+        })
+
+      assert Enum.map(marked.upstreams, & &1.unwatermarked) == [true, false]
+
+      assert_raise ArgumentError, ~r/"unwatermarked" must be true or false/, fn ->
+        ConfigStore.normalize(%{"upstreams" => [%{"name" => "a", "kind" => "openai", "base_url" => "x", "api_key_env" => "K", "unwatermarked" => "yes"}]})
+      end
+
       assert_raise ArgumentError, ~r/privacy_store_flag/, fn ->
         ConfigStore.normalize(%{"upstreams" => [%{"name" => "a", "kind" => "openai", "base_url" => "x", "api_key_env" => "K", "privacy_store_flag" => "yes"}]})
       end
@@ -386,12 +423,29 @@ defmodule OmnigateControl.PrivacyTest do
 
       created = admin_json(:post, "/admin/keys", %{"name" => name, "privacy" => true})
       assert created.status == 201
-      assert json(created)["privacy"] == %{"no_store" => true, "redact" => Privacy.classes(), "unlink" => true, "encrypt_to" => nil, "attested" => false}
+
+      assert json(created)["privacy"] == %{
+               "no_store" => true,
+               "redact" => Privacy.classes(),
+               "unlink" => true,
+               "encrypt_to" => nil,
+               "attested" => false,
+               "unwatermarked" => false
+             }
+
       assert json(created)["privacy_summary"] == "no-store, redact, unlink"
 
       changed = admin_json(:patch, "/admin/keys/#{name}", %{"privacy" => %{"redact" => ["secret"], "encrypt_to" => recipient}})
       assert changed.status == 200
-      assert json(changed)["privacy"] == %{"no_store" => false, "redact" => ["secret"], "unlink" => false, "encrypt_to" => recipient, "attested" => false}
+
+      assert json(changed)["privacy"] == %{
+               "no_store" => false,
+               "redact" => ["secret"],
+               "unlink" => false,
+               "encrypt_to" => recipient,
+               "attested" => false,
+               "unwatermarked" => false
+             }
 
       # What is on disk reads back as the same setting.
       stored = Application.fetch_env!(:omnigate_control, :keys_path) |> File.read!() |> JSON.decode!() |> Map.fetch!("keys") |> Enum.find(&(&1["name"] == name))
@@ -399,7 +453,7 @@ defmodule OmnigateControl.PrivacyTest do
 
       # The snapshot: what a data plane applies, and nothing else.
       in_snapshot = Router.snapshot().keys |> Enum.find(&(&1.name == name))
-      assert in_snapshot.privacy == %{no_store: false, redact: ["secret"], unlink: false, attested: false}
+      assert in_snapshot.privacy == %{no_store: false, redact: ["secret"], unlink: false, attested: false, unwatermarked: false}
       refute JSON.encode!(Router.snapshot()) =~ recipient
       assert Enum.all?(Router.snapshot().keys, &Map.has_key?(&1, :privacy))
 

@@ -843,8 +843,12 @@ defmodule OmnigateControl.Router do
 
       [value] ->
         case Privacy.header(value) do
-          {:ok, private} -> {:ok, private}
-          :error -> {:error, 400, "invalid_request", "invalid x-omnigate-privacy header: use \"on\", or a comma-separated list of no-store, redact, unlink"}
+          {:ok, private} ->
+            {:ok, private}
+
+          :error ->
+            {:error, 400, "invalid_request",
+             "invalid x-omnigate-privacy header: use \"on\", or a comma-separated list of no-store, redact, unlink, attested, unwatermarked"}
         end
 
       _ ->

@@ -88,7 +88,7 @@ listed before the managed keys created through it
 | `webhook_secret` | string | none | Signing secret for this key's job webhooks. |
 | `webhook_secret_env` | string | none | Name of an environment variable (read by the control plane) holding that secret. Used when `webhook_secret` is absent. |
 | `burn_multiplier` | number, 0.01 to 100 | absent (the value of `credits.burn_multiplier`) | For a key with a total budget: how much of its credit one dollar of provider cost uses up. Ignored for a key with a monthly or daily budget, or none. See [Prepaid credit](credits.md#the-burn-multiplier). Anything else is rejected when the file is loaded. |
-| `privacy` | `true`, or an object | absent (off) | Privacy mode for every request of the key: `true`, or `{"no_store", "redact", "unlink", "encrypt_to", "attested"}` part by part. What each part does, and what none of them does, is in [Privacy mode](privacy.md). Anything it does not know (a field, a class of `redact`, a recipient that is not a valid `age1...` address) is rejected when the file is loaded. |
+| `privacy` | `true`, or an object | absent (off) | Privacy mode for every request of the key: `true`, or `{"no_store", "redact", "unlink", "encrypt_to", "attested", "unwatermarked"}` part by part. What each part does, and what none of them does, is in [Privacy mode](privacy.md). Anything it does not know (a field, a class of `redact`, a recipient that is not a valid `age1...` address) is rejected when the file is loaded. |
 
 `max_concurrent` is new with the close-out commit (the one after
 55a294d). Until then every key had the data plane's
@@ -141,6 +141,7 @@ Example:
 | `timeout_ms` | whole number, 0 to 3,600,000 | `0` | Maximum wait for the provider's response headers. `0` uses the data plane's `OMNIGATE_UPSTREAM_TIMEOUT_MS`. |
 | `v1_path` | string | absent (`/v1`) | For providers that do not serve the API under `/v1`: the leading `/v1` of the request path is replaced by this value. Gemini's OpenAI-compatible endpoint uses `/v1beta/openai`. An empty string puts the API at the root. |
 | `privacy_store_flag` | boolean | absent (only when the host is `api.openai.com`) | Whether a request of a key with [privacy mode](privacy.md#no-retention)'s `no_store` is sent `"store": false` on chat completions and the Responses API. Set `true` for a proxy in front of OpenAI or a compatible server known to take the field; `false` to switch it off for an OpenAI upstream. Only read for `openai` upstreams. Anything but `true` or `false` is rejected when the file is loaded. |
+| `unwatermarked` | boolean | `false` | Your statement that this provider puts no watermark into the text it writes. A request that asks for [`unwatermarked`](privacy.md#unwatermarked-providers-only) only goes to upstreams that have it. The gateway does not and cannot check it. |
 
 | `attestation` | object | absent | The provider proves what hardware and configuration it runs on, and its targets are only used while that is verified: `{"provider": "near", "accepted_tcb": [...], "gpu": "if_present", "max_age_s": 900, "measurements": {...}}`. Every field, what is verified and what is not: [Attested upstreams](attestation.md#switching-it-on). A setting that is not understood is rejected when the file is loaded. |
 
@@ -752,7 +753,7 @@ control plane (`GET /internal/config`) that contains:
   key has none of its own);
 - for each of those keys, the parts of its [privacy mode](privacy.md) that a
   data plane applies (`no_store`, the classes to `redact`, `unlink`,
-  `attested`), or `null`; never the `encrypt_to` recipient, which only the
+  `attested`, `unwatermarked`), or `null`; never the `encrypt_to` recipient, which only the
   control plane uses;
 - the text upstreams as configured (the `api_key_env` name, never a secret;
   `privacy_store_flag` when set), without their `attestation` setting, which

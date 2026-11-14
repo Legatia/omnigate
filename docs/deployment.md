@@ -385,9 +385,13 @@ trust store; plain HTTP was redirected; requests without a key, with a key,
 with a broken body and over the key's rate limit got their usual answers;
 `/admin`, `/internal` and `/metrics` on the gateway's name got 401; neither
 published port answered from outside; and the other site on that Caddy
-kept answering. No provider key was set, so no completion ran and nothing
-was streamed through that proxy: a chat request reached the provider and
-came back with the provider's 401. Not covered: the admin host block (the
+kept answering. With Gemini and xAI keys set, completions ran through the
+public name in both protocols, streamed and not (a streamed xAI answer
+took 0.24 s of events directly and 0.31 s through the gateway and the
+proxy, so nothing held the events back), privacy mode's redaction worked on
+a real request, and the usage of every request reached the ledger. A route
+whose provider key was not valid answered with the provider's 401. Not
+covered: the admin host block (the
 allow-list and the `/internal` refusal of `deploy/Caddyfile`), certificate
 renewal, and load.
 

@@ -41,8 +41,9 @@ only met a mock, is tracked in the README's
 - The published 1.0.0 arm64 images ran on a real arm64 server behind a real
   domain, with a Let's Encrypt certificate obtained by a Caddy already on
   that host ([docs/deployment.md](docs/deployment.md#behind-a-proxy-you-already-run)).
-  The bundled proxy container has still not obtained a public certificate,
-  and no completion ran there (no provider key was set).
+  Real completions ran through it against Gemini and xAI, streamed and
+  not. The bundled proxy container has still not obtained a public
+  certificate.
 - The published 1.0.0 artifacts were run after the release: the Windows
   archive's binary passed the end-to-end and hostile-input suites, the
   x86-64 Linux images passed the container suite, and the x86-64 Linux

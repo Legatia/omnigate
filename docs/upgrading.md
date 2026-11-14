@@ -838,9 +838,16 @@ The same day it was run from the tag `v1.0.0` to the tree with the shared
 rate limit (what became 1.1.0), the same way: all 68 checks passed, with the 1.0.0 control
 plane answering `404` to the new call and logging no error.
 
+On 14 November 2026 the published arm64 images were taken from 1.0.0 to
+1.1.0 in place on a real server, by hand: stopped, data copied out, tags
+changed, started. Eight seconds of downtime; the key list and the ledger
+were the same before and after
+([Deployment](deployment.md#behind-a-proxy-you-already-run)). That
+installation was a day old and idle.
+
 What this does not show: an upgrade under load, one with a large ledger
-(the test writes a few hundred events), bucket storage, Linux, or the
-container images. One thing it found is fixed in 0.1.0-rc.1 (the stop
+(the test writes a few hundred events), bucket storage, or the test itself
+on Linux. One thing it found is fixed in 0.1.0-rc.1 (the stop
 described above); the old data plane in these runs showed it, and had to be
 killed in the "asked to stop" variant.
 

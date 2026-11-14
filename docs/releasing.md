@@ -13,7 +13,12 @@ Of those, the Windows binary then passed the end-to-end and hostile-input
 suites, the x86-64 Linux images passed the container suite and the x86-64
 Linux binary was started, and the arm64 images ran on a real server
 ([Deployment](deployment.md#behind-a-proxy-you-already-run)); the arm64 and
-macOS archives have not been run. Read
+macOS archives have not been run. 1.1.0 (14 November 2026) was published and
+checked the same way, with the same results, and its arm64 images replaced
+the 1.0.0 ones on that server. One thing to know when repeating the check:
+the container suite compares the license files in an image with those of
+the source tree it is run from, so run it from the tag
+(`git archive v<version>`), not from a later `main`. Read
 [What may fail the first time](#what-may-fail-the-first-time) for what was
 rehearsed beforehand.
 

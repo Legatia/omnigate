@@ -18,6 +18,23 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Changed
+
+- The published 1.1.0 arm64 images were run on the real server of the
+  1.0.0 notes ([docs/deployment.md](docs/deployment.md#behind-a-proxy-you-already-run)):
+  the upgrade from 1.0.0 in place (eight seconds of downtime, keys and
+  ledger unchanged), one key's rate limit held across two data planes with
+  a real provider behind them, and a 60-second load run against a mock
+  provider passed with the ledger exact. Single runs on a small shared
+  machine.
+- The other published 1.1.0 artifacts were run after the release, as for
+  1.0.0: the Windows binary passed the end-to-end and hostile-input suites,
+  the x86-64 Linux images passed the container suite (run from the tagged
+  source), and the x86-64 Linux binary starts. The arm64 and macOS archives
+  were not run.
+- A commercial license has a price, $490 per company per year, and a way to
+  order it ([COMMERCIAL.md](COMMERCIAL.md)).
+
 ### Added
 
 - **A second payment provider: USDC on Solana, straight to the operator's

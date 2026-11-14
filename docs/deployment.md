@@ -395,6 +395,39 @@ covered: the admin host block (the
 allow-list and the `/internal` refusal of `deploy/Caddyfile`), certificate
 renewal, and load.
 
+The same day that installation was taken from 1.0.0 to 1.1.0 and used for
+three more runs. They are single runs on one small machine (2 arm64 cores,
+4 GB, shared with another site), not measurements to plan with.
+
+- **The upgrade in place.** The containers were stopped, both data
+  directories copied out as a backup, the two image tags changed and the
+  project started again: eight seconds from stop to both containers
+  healthy. The key list (settings, usage, dates) was identical before and
+  after, the ledger kept its events, and real completions ran through the
+  public name again afterwards. It was idle while upgraded.
+- **One key's rate limit across two data planes, with a real provider.** A
+  second `dataplane` service on another localhost port, and a key with
+  `rpm: 8`: six requests through the first data plane, then eight through
+  the second, of which two were answered and six got `429`, then eight
+  more through the first, of which one was answered. Nine allowed in ten
+  seconds, where one shared bucket allows at most ten and two separate
+  ones sixteen. `omnigate_data_planes` said 2. (After containers are
+  recreated it counts the old instances too for up to 30 seconds.)
+- **Load.** [`tools/load_test.py`](../tools/load_test.py) for 60 seconds
+  from the host against the gateway's localhost port, with
+  [`tools/mock_upstream.py`](../tools/mock_upstream.py) as the provider,
+  running in the data plane's network namespace: 94 clients, about 1,240
+  finished requests a second in all, of which 20,488 plain chats (median
+  47 ms, 99th percentile 80 ms, the mock's own time included), no
+  malformed or unexpected answer, idle and stalled clients disconnected
+  after 30 seconds, the data plane's memory level at about 70 MiB, and the
+  control plane's ledger holding exactly the requests that were answered
+  (66,204 on the load key). The load generator, the mock and the gateway
+  shared the two cores, so this says the gateway stays correct under that
+  load, not how fast it can go. The other site on the host answered every
+  probe during it (slowest 0.18 s). The load did not pass through the TLS
+  proxy.
+
 ## Health and readiness probes
 
 | Process | Probe | Says |

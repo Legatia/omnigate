@@ -408,7 +408,7 @@ says `"unwatermarked": true`.
   include `attested`.
 - **Both processes must know it.** A data plane older than this option
   ignores it and sends the request wherever the route says
-  ([Upgrading](upgrading.md#after-110)).
+  ([Upgrading](upgrading.md#120)).
 
 ## The request header
 

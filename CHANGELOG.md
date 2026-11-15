@@ -18,6 +18,12 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-15
+
+Two additions, both opt-in: a second payment provider and a sixth part of
+privacy mode. Nothing changes on disk and no configuration is needed
+([docs/upgrading.md](docs/upgrading.md#120)).
+
 ### Changed
 
 - The published 1.1.0 arm64 images were run on the real server of the

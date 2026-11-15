@@ -38,7 +38,7 @@ Contents:
 - [The top-up page commit](#the-top-up-page-commit)
 - [1.0.0](#100)
 - [1.1.0](#110)
-- [After 1.1.0](#after-110)
+- [1.2.0](#120)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -787,9 +787,9 @@ before, apart from one small request a second to the control plane.
 
 **Going back** to 1.0.0 needs nothing.
 
-## After 1.1.0
+## 1.2.0
 
-Not released yet. Nothing changes on disk.
+Released 15 November 2026. Nothing changes on disk.
 
 | What | Before | After |
 |---|---|---|

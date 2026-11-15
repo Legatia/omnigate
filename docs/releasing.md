@@ -18,7 +18,8 @@ checked the same way, with the same results, and its arm64 images replaced
 the 1.0.0 ones on that server. One thing to know when repeating the check:
 the container suite compares the license files in an image with those of
 the source tree it is run from, so run it from the tag
-(`git archive v<version>`), not from a later `main`. Read
+(`git archive v<version>`), not from a later `main`. 1.2.0 (15 November
+2026) was published and checked the same way. Read
 [What may fail the first time](#what-may-fail-the-first-time) for what was
 rehearsed beforehand.
 

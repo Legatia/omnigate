@@ -18,6 +18,19 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Changed
+
+- The published 1.2.0 artifacts were run after the release, as before: the
+  Windows binary passed the end-to-end and hostile-input suites, the x86-64
+  Linux images passed the container suite (from the tagged source), the
+  x86-64 Linux binary starts, answers its own health check and stops
+  cleanly, and the arm64 images replaced 1.1.0 on the real server
+  ([docs/deployment.md](docs/deployment.md#behind-a-proxy-you-already-run)):
+  eight seconds of downtime with a ledger of 66,365 events, keys and usage
+  unchanged. There, `unwatermarked` was tried with two real providers on
+  one route. The arm64 and macOS archives were not run, and no real payment
+  has been made through the `solana` provider.
+
 ## [1.2.0] - 2026-11-15
 
 Two additions, both opt-in: a second payment provider and a sixth part of

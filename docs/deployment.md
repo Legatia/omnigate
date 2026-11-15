@@ -428,6 +428,16 @@ three more runs. They are single runs on one small machine (2 arm64 cores,
   probe during it (slowest 0.18 s). The load did not pass through the TLS
   proxy.
 
+On 15 November it was taken to 1.2.0 the same way, now with the load run's
+66,365 events in the ledger (35 MB of data): again eight seconds, and the
+same keys and usage afterwards. Then
+[`unwatermarked`](privacy.md#unwatermarked-providers-only) was tried with
+real providers: a route that alternates between two of them, one marked for
+the test, sent every request with `x-omnigate-privacy: unwatermarked` to
+the marked one, and a route with only the other answered
+`403 watermark_possible`. The mark was removed again afterwards; it says
+nothing about either provider.
+
 ## Health and readiness probes
 
 | Process | Probe | Says |

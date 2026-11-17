@@ -28,8 +28,11 @@ only met a mock, is tracked in the README's
   ([docs/deployment.md](docs/deployment.md#behind-a-proxy-you-already-run)):
   eight seconds of downtime with a ledger of 66,365 events, keys and usage
   unchanged. There, `unwatermarked` was tried with two real providers on
-  one route. The arm64 and macOS archives were not run, and no real payment
-  has been made through the `solana` provider.
+  one route. The arm64 and macOS archives were not run.
+- The `solana` payment provider was switched on there with a real wallet
+  and the public RPC endpoint: quotes, the top-up page and the polling of
+  an open payment work against the real chain. No real payment has been
+  made through it.
 
 ## [1.2.0] - 2026-11-15
 

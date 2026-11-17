@@ -194,8 +194,13 @@ end-to-end suites, and the three calls the gateway makes against the real
 public mainnet endpoint, read-only
 (`python tools/solana_live.py`, 14 November 2026: the answers have the
 fields the gateway reads; it also showed that the chain now carries
-version 1 transactions, which the gateway asks for). **No real payment has
-been made through this provider.** `python tools/solana_live.py --wallet
+version 1 transactions, which the gateway asks for). On 17 November 2026
+the published 1.2.0 was switched to this provider on a real server with a
+real wallet and the public endpoint: the asset list, a dry quote, the
+top-up page and a started payment worked, and the control plane asked the
+chain about that payment for its whole life without an error. **No real
+payment has been made through this provider**: nothing was sent to that
+payment. `python tools/solana_live.py --wallet
 <your wallet>` shows what the gateway would see of your wallet.
 
 ## The top-up page

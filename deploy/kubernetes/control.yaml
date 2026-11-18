@@ -65,7 +65,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: control
-          image: ghcr.io/legatia/omnigate-control:1.2.0
+          image: ghcr.io/legatia/omnigate-control:1.3.0
           ports:
             - name: http
               containerPort: 4000

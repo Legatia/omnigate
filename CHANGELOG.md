@@ -18,6 +18,15 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-18
+
+Selling and running it got easier: a transfer that was not recognized can
+be credited from its signature, there is an invoice tool, a Docker
+quickstart and Kubernetes manifests, and what a release publishes is now
+checked on every platform. Nothing changes on disk that 1.2.0 cannot read,
+and no configuration is needed
+([docs/upgrading.md](docs/upgrading.md#130)).
+
 ### Added
 
 - **Crediting a transfer from its signature** (`solana` payments;

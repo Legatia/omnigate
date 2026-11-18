@@ -39,7 +39,7 @@ Contents:
 - [1.0.0](#100)
 - [1.1.0](#110)
 - [1.2.0](#120)
-- [After 1.2.0](#after-120)
+- [1.3.0](#130)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -805,10 +805,10 @@ know the part: it ignores it on a key, and refuses the word in the
 you rely on it. The other way round (new data plane, old control plane) the
 part cannot be set at all.
 
-## After 1.2.0
+## 1.3.0
 
-Not released yet. Nothing changes on disk that an older version cannot
-read.
+Released 18 November 2026. Nothing changes on disk that an older version
+cannot read.
 
 | What | Before | After |
 |---|---|---|

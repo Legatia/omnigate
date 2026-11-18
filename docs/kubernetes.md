@@ -63,7 +63,7 @@ values (`"key": "..."`) would sit in the ConfigMap in plain text: give keys
 as `key_sha256`, or make them through the admin API.
 
 The manifests name the images of one release
-(`ghcr.io/legatia/omnigate-control:1.2.0` and `-dataplane:1.2.0`). To run
+(`ghcr.io/legatia/omnigate-control:1.3.0` and `-dataplane:1.3.0`). To run
 another version or images you built, put a `kustomization.yaml` of your own
 next to a copy of the directory:
 
@@ -75,9 +75,9 @@ resources:
   - kubernetes        # your copy of deploy/kubernetes
 images:
   - name: ghcr.io/legatia/omnigate-control
-    newTag: 1.2.0
+    newTag: 1.3.0
   - name: ghcr.io/legatia/omnigate-dataplane
-    newTag: 1.2.0
+    newTag: 1.3.0
 ```
 
 ## Reaching it

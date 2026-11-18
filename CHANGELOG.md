@@ -18,6 +18,13 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Changed
+
+- The published 1.3.1 passed the release check on all five archives and
+  both images, and replaced 1.3.0 on the real server in place: both ports
+  answered again five seconds after the swap began, with keys and usage
+  unchanged.
+
 ## [1.3.1] - 2026-11-18
 
 The pages got their finish: the top-up page can say whose gateway it is,

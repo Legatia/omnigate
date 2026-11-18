@@ -441,6 +441,13 @@ the marked one, and a route with only the other answered
 `403 watermark_possible`. The mark was removed again afterwards; it says
 nothing about either provider.
 
+On 18 November it was taken to 1.3.0 the same way (66,412 events in the
+ledger): both ports answered again three seconds after the swap began,
+with the same keys and usage, and the same checks over the public name
+passed (completions and streaming in both protocols with two real
+providers, privacy mode, a provider's own 401 passed through). The top-up
+page and the payments API there are the 1.3.0 ones; no payment was made.
+
 ## Health and readiness probes
 
 | Process | Probe | Says |

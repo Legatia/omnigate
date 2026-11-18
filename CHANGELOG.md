@@ -18,6 +18,17 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Changed
+
+- The published 1.3.0 was checked by the release check workflow, the
+  first release it ran for by itself: all five archives passed the
+  end-to-end and hostile-input suites on their own platforms and both
+  images passed the container suite on amd64 and arm64. The arm64 images
+  then replaced 1.2.0 on the real server
+  ([docs/deployment.md](docs/deployment.md#behind-a-proxy-you-already-run)):
+  both ports answered again three seconds after the swap began, with keys
+  and usage unchanged and a ledger of 66,412 events.
+
 ## [1.3.0] - 2026-11-18
 
 Selling and running it got easier: a transfer that was not recognized can

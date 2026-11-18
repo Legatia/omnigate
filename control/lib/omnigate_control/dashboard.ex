@@ -509,9 +509,9 @@ defmodule OmnigateControl.Dashboard do
   @doc "The dashboard's style sheet; the Private chat page builds on it."
   def css do
     ~S"""
-    :root{--bg:#f6f7f9;--panel:#fff;--text:#1c2024;--muted:#667085;--line:#e3e6ea;--accent:#2f5bea;--accent-text:#fff;
+    :root{--bg:#f6f7f9;--panel:#fff;--text:#1c2024;--muted:#667085;--line:#e3e6ea;--accent:#0c6b5d;--accent-text:#fff;
     --ok:#12703a;--ok-bg:#e3f6ea;--warn:#8a5a00;--warn-bg:#fdf1d3;--bad:#a8231c;--bad-bg:#fde7e5;--info:#1d4f91;--info-bg:#e4eefb;--off:#555d68;--off-bg:#eceef1}
-    @media (prefers-color-scheme:dark){:root{--bg:#111418;--panel:#1a1e24;--text:#e8eaed;--muted:#98a1ae;--line:#2b313a;--accent:#7c9cff;--accent-text:#0b1020;
+    @media (prefers-color-scheme:dark){:root{--bg:#111418;--panel:#1a1e24;--text:#e8eaed;--muted:#98a1ae;--line:#2b313a;--accent:#58cdb6;--accent-text:#06211c;
     --ok:#7fdc9f;--ok-bg:#143321;--warn:#f2c661;--warn-bg:#3a2e10;--bad:#ff9a92;--bad-bg:#41191a;--info:#9cc3ff;--info-bg:#152a45;--off:#b3bac4;--off-bg:#272c34}}
     *{box-sizing:border-box}html{scroll-padding-top:64px}
     body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}

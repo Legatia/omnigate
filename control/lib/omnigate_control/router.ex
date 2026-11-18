@@ -349,7 +349,12 @@ defmodule OmnigateControl.Router do
         refund_address: Payments.refund_address?(),
         # The bounds of one payment, so that a page can say them before asking.
         min_usd: config.min_usd,
-        max_usd: config.max_usd
+        max_usd: config.max_usd,
+        # Who runs this gateway and where to ask, when the operator says so.
+        operator: config.operator,
+        contact: config.contact,
+        # Where a transaction can be looked at ("{tx}" is its signature), or null.
+        explorer_tx: Payments.explorer_tx(config)
       })
     else
       {:error, status, type, message} -> send_error(conn, status, type, message)
@@ -413,7 +418,7 @@ defmodule OmnigateControl.Router do
   get "/internal/topup" do
     if Payments.configured?() do
       nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
-      send_html(conn, 200, TopupPage.page(nonce), nonce)
+      send_html(conn, 200, TopupPage.page(nonce, Payments.config()), nonce)
     else
       send_error(conn, 404, "not_found", "payments are not configured on this gateway")
     end
@@ -522,6 +527,7 @@ defmodule OmnigateControl.Router do
       provider: config && config.provider,
       # Can a transaction be credited from its signature (POST /admin/payments/credit)?
       credit_by_tx: config != nil and config.provider == "solana",
+      explorer_tx: Payments.explorer_tx(config),
       payments: Enum.map(Payments.all(limit), &Payments.admin_view/1)
     })
   end
@@ -732,12 +738,15 @@ defmodule OmnigateControl.Router do
   end
 
   get "/login" do
+    conn = fetch_query_params(conn)
+    next = next_page(conn.query_params["next"])
+
     case conn.assigns[:auth] do
-      ok when ok in [:session, :token] -> redirect(conn, "/")
+      ok when ok in [:session, :token] -> redirect(conn, next)
       # A bearer token from an address that sent too many wrong ones gets
       # the same answer here as on `/` and `/admin/*`, not a page with 200.
       :throttled -> too_many_tokens(conn)
-      _ -> send_html(conn, 200, login_page(nil))
+      _ -> send_html(conn, 200, login_page(nil, next))
     end
   end
 
@@ -746,12 +755,14 @@ defmodule OmnigateControl.Router do
   # (or an operator's) wait and writes at most two lines per address a minute.
   post "/login" do
     address = AdminAuth.client_address(conn)
+    # The page the visitor was on the way to (one of the dashboard's own).
+    next = next_page(conn.body_params["next"])
 
     cond do
       # Counted before the password is compared (see `AdminAuth.begin_attempt/3`).
       AdminAuth.begin_attempt(address) == :throttled ->
         Audit.anonymous(conn, "login", "throttled", auth: "password")
-        send_html(conn, 429, login_page("Too many failed attempts. Wait a minute and try again."))
+        send_html(conn, 429, login_page("Too many failed attempts. Wait a minute and try again.", next))
 
       AdminAuth.valid_token?(conn.body_params["password"]) ->
         AdminAuth.clear_failures(address)
@@ -764,11 +775,11 @@ defmodule OmnigateControl.Router do
           secure: secure_cookie?(conn),
           max_age: AdminAuth.session_ttl_s()
         )
-        |> redirect("/")
+        |> redirect(next)
 
       true ->
         Audit.anonymous(conn, "login", "denied", auth: "password")
-        send_html(conn, 401, login_page("That is not the admin token."))
+        send_html(conn, 401, login_page("That is not the admin token.", next))
     end
   end
 
@@ -1122,7 +1133,8 @@ defmodule OmnigateControl.Router do
     case conn.assigns.auth do
       ok when ok in [:session, :token] -> conn
       :throttled -> too_many_tokens(conn)
-      _ -> conn |> redirect("/login") |> halt()
+      # The form sends the visitor back to the page they asked for.
+      _ -> conn |> redirect(if(path == [], do: "/login", else: "/login?next=/" <> Enum.join(path, "/"))) |> halt()
     end
   end
 
@@ -1246,6 +1258,11 @@ defmodule OmnigateControl.Router do
 
   defp csrf(conn, _opts), do: conn
 
+  # Where a sign-in may lead: one of the dashboard's pages, never an address
+  # a link could name.
+  defp next_page(next) when next in ["/private-chat", "/payments"], do: next
+  defp next_page(_), do: "/"
+
   defp redirect(conn, to) do
     conn |> put_resp_header("location", to) |> send_resp(302, "")
   end
@@ -1279,19 +1296,24 @@ defmodule OmnigateControl.Router do
     |> send_resp(status, html)
   end
 
-  defp login_page(error) do
-    message = if error, do: "<p class=\"err\">#{h(error)}</p>", else: ""
+  # In the dashboard's colours (`Dashboard.css/0`), light and dark.
+  defp login_page(error, next) do
+    message = if error, do: "<p class=\"err\" role=\"alert\">#{h(error)}</p>", else: ""
+    back = if next == "/", do: "", else: "<input type=\"hidden\" name=\"next\" value=\"#{h(next)}\">"
 
     """
-    <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
     <title>omnigate · sign in</title><link rel="icon" href="data:,">
-    <style>body{font:14px system-ui;margin:0;min-height:100vh;display:grid;place-items:center;color:#222;background:#fafafa}
-    form{background:#fff;border:1px solid #ddd;border-radius:8px;padding:24px;width:min(320px,calc(100vw - 32px));box-sizing:border-box}
-    h1{font-size:18px;margin:0 0 16px}label{display:block;margin-bottom:6px}
-    input{width:100%;box-sizing:border-box;padding:8px;border:1px solid #bbb;border-radius:4px;font:inherit}
-    button{margin-top:12px;width:100%;padding:8px;border:0;border-radius:4px;background:#222;color:#fff;font:inherit;cursor:pointer}
-    .err{color:#b00020;margin:0 0 12px}</style></head>
-    <body><form method="post" action="/login"><h1>omnigate control plane</h1>#{message}
+    <style>:root{--bg:#f6f7f9;--panel:#fff;--text:#1c2024;--line:#e3e6ea;--accent:#0c6b5d;--accent-text:#fff;--bad:#a8231c}
+    @media (prefers-color-scheme:dark){:root{--bg:#111418;--panel:#1a1e24;--text:#e8eaed;--line:#2b313a;--accent:#58cdb6;--accent-text:#06211c;--bad:#ff9a92}}
+    body{font:14px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;color:var(--text);background:var(--bg)}
+    form{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:24px;width:min(320px,calc(100vw - 32px));box-sizing:border-box}
+    h1{font-size:18px;margin:0 0 16px}label{display:block;margin-bottom:6px;font-weight:600;font-size:12.5px}
+    input{width:100%;box-sizing:border-box;padding:8px 9px;border:1px solid var(--line);border-radius:6px;font:inherit;color:var(--text);background:var(--bg)}
+    button{margin-top:12px;width:100%;padding:8px;border:1px solid var(--accent);border-radius:6px;background:var(--accent);color:var(--accent-text);font:inherit;cursor:pointer}
+    input:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+    .err{color:var(--bad);margin:0 0 12px}</style></head>
+    <body><form method="post" action="/login"><h1>omnigate control plane</h1>#{message}#{back}
     <label for="password">Admin token</label>
     <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
     <button type="submit">Sign in</button></form></body></html>

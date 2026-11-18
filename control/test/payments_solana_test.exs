@@ -182,7 +182,10 @@ defmodule OmnigateControl.PaymentsSolanaTest do
                decimals: 6,
                symbol: "USDC",
                commitment: "finalized",
-               rpc_url: "https://api.mainnet-beta.solana.com"
+               rpc_url: "https://api.mainnet-beta.solana.com",
+               explorer_tx: "https://explorer.solana.com/tx/{tx}",
+               operator: nil,
+               contact: nil
              } =
                config
 
@@ -197,6 +200,66 @@ defmodule OmnigateControl.PaymentsSolanaTest do
       end
 
       assert_raise ArgumentError, ~r/"near_intents" or "solana"/, fn -> Payments.normalize!(%{"provider" => "bank", "recipient" => @wallet}) end
+    end
+
+    test "who runs the gateway, where to ask, and where a transaction can be looked at" do
+      ok = %{"provider" => "solana", "recipient" => @wallet}
+
+      assert %{operator: "Example Labs", contact: "pay@example.com"} =
+               Payments.normalize!(Map.merge(ok, %{"operator" => "  Example Labs ", "contact" => "pay@example.com"}))
+
+      assert %{contact: "https://example.com/help"} = Payments.normalize!(Map.put(ok, "contact", "https://example.com/help"))
+
+      for bad <-
+            [%{"operator" => ""}, %{"operator" => String.duplicate("x", 61)}, %{"operator" => "two\nlines"}, %{"operator" => 7}] ++
+              [%{"contact" => "javascript:alert(1)"}, %{"contact" => "http://example.com"}, %{"contact" => "call me"}, %{"contact" => "a@b"}] ++
+              [%{"contact" => "https://x.example/\"><script>"}, %{"contact" => "mailto:a@b.example"}] do
+        assert_raise ArgumentError, fn -> Payments.normalize!(Map.merge(ok, bad)) end
+      end
+
+      # The explorer follows the cluster the endpoint names, can be another one, or none.
+      assert %{explorer_tx: "https://explorer.solana.com/tx/{tx}?cluster=devnet"} = Payments.normalize!(Map.put(ok, "rpc_url", "https://api.devnet.solana.com"))
+      assert %{explorer_tx: "https://solscan.io/tx/{tx}"} = Payments.normalize!(Map.put(ok, "explorer_tx", "https://solscan.io/tx/{tx}"))
+      assert %{explorer_tx: nil} = Payments.normalize!(Map.put(ok, "explorer_tx", false))
+
+      for bad <- [
+            "http://solscan.io/tx/{tx}",
+            "https://solscan.io/tx/",
+            "https://x.example/{tx}/{tx}",
+            "javascript:{tx}",
+            "https://x.example/{tx}\" onclick",
+            true
+          ] do
+        assert_raise ArgumentError, ~r/explorer_tx/, fn -> Payments.normalize!(Map.put(ok, "explorer_tx", bad)) end
+      end
+
+      # The other provider has no one place to look.
+      assert Payments.explorer_tx(Payments.normalize!(%{"provider" => "near_intents", "recipient" => "operator.near"})) == nil
+      assert Payments.explorer_tx(nil) == nil
+    end
+
+    test "the top-up page names the operator, and only as text" do
+      alias OmnigateControl.TopupPage
+      plain = TopupPage.page("n0nce", Payments.normalize!(%{"provider" => "solana", "recipient" => @wallet}))
+      assert plain =~ "<title>Top up · omnigate</title>"
+      refute plain =~ "run-by\">"
+
+      named =
+        TopupPage.page(
+          "n0nce",
+          Payments.normalize!(%{"provider" => "solana", "recipient" => @wallet, "operator" => "A <b>& Co", "contact" => "pay@example.com"})
+        )
+
+      assert named =~ "<title>Top up · A &lt;b&gt;&amp; Co</title>"
+      assert named =~ ~s(data-operator="A &lt;b&gt;&amp; Co" data-contact="pay@example.com")
+
+      assert named =~
+               ~s(This gateway is run by A &lt;b&gt;&amp; Co. Questions about a payment: <a rel="noreferrer" href="mailto:pay@example.com">pay@example.com</a>.)
+
+      refute named =~ "<b>&"
+
+      linked = TopupPage.page("n0nce", Payments.normalize!(%{"provider" => "solana", "recipient" => @wallet, "contact" => "https://example.com/help"}))
+      assert linked =~ ~s(Questions about a payment: <a rel="noreferrer" href="https://example.com/help">)
     end
 
     test "amounts are written without noise" do

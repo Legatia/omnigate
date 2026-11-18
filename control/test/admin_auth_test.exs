@@ -73,6 +73,40 @@ defmodule OmnigateControl.AdminAuthTest do
       assert get_resp_header(conn, "cache-control") == ["no-store"]
     end
 
+    test "signing in leads back to the page that was asked for, and nowhere else" do
+      conn = conn(:get, "/payments") |> call()
+      assert get_resp_header(conn, "location") == ["/login?next=/payments"]
+      assert get_resp_header(conn(:get, "/private-chat") |> call(), "location") == ["/login?next=/private-chat"]
+
+      form = conn(:get, "/login?next=/payments") |> call()
+      assert form.resp_body =~ ~s(<input type="hidden" name="next" value="/payments">)
+
+      go = fn next, ip ->
+        conn(:post, "/login", "password=" <> @token <> "&next=" <> URI.encode_www_form(next))
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> Map.put(:remote_ip, ip)
+        |> call()
+      end
+
+      assert get_resp_header(go.("/payments", {10, 0, 1, 1}), "location") == ["/payments"]
+
+      # Only the dashboard's own pages: not another site, not another path.
+      for {bad, n} <- Enum.with_index(["https://evil.example/", "//evil.example", "/admin/keys", "/payments/../x", ""]) do
+        assert get_resp_header(go.(bad, {10, 0, 1, 10 + n}), "location") == ["/"]
+        refute (conn(:get, "/login?next=" <> URI.encode_www_form(bad)) |> call()).resp_body =~ ~s(name="next")
+      end
+
+      # A wrong token keeps the way back.
+      wrong =
+        conn(:post, "/login", "password=nope&next=%2Fpayments")
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> Map.put(:remote_ip, {10, 0, 1, 2})
+        |> call()
+
+      assert wrong.status == 401
+      assert wrong.resp_body =~ ~s(name="next" value="/payments")
+    end
+
     test "a wrong token gets no session" do
       conn = login("not-the-token", {10, 0, 0, 2})
       assert conn.status == 401

@@ -29,6 +29,11 @@ providers; nothing here has run under production load.
 | Session | `POST /login` with the token as the form field `password`; the answer sets the `omnigate_session` cookie (12 hours, `HttpOnly`, `SameSite=Strict`, `Secure` behind TLS) | The dashboard in a browser |
 
 Both open the same things: the dashboard page, `/admin/*` and `/metrics`.
+
+A browser that asks for one of the dashboard's pages without a session is
+sent to `/login?next=<that page>` and lands on it after signing in. `next`
+is one of the dashboard's own pages (`/private-chat`, `/payments`) or it is
+ignored: the form never leads anywhere else.
 There is one admin token and no user accounts; changing the token ends
 every session. The token must be at least 16 characters long, or the
 control plane does not start.

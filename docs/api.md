@@ -1177,7 +1177,7 @@ the states, the errors, what is checked and what is trusted) is in
 
 | Method and path | Purpose |
 |---|---|
-| `GET /v1/payments/assets` | What can be paid with; `?chain=` and `?symbol=` narrow it. Also `provider` and `refund_address` (whether a payment needs `refund_to`). |
+| `GET /v1/payments/assets` | What can be paid with; `?chain=` and `?symbol=` narrow it. Also `provider`, `refund_address` (whether a payment needs `refund_to`), `min_usd` and `max_usd`, `operator` and `contact` (null unless configured), and `explorer_tx` (where a transaction can be looked at, or null). |
 | `POST /v1/payments/quote` | `{"amount_usd", "asset", "refund_to"}`: what a payment would take, without starting one. |
 | `POST /v1/payments` | The same body: start a payment. `201` with the deposit address, the amount to send and the deadline. |
 | `GET /v1/payments/{id}` | The payment: `awaiting_deposit`, `processing`, `settled` (with `credited_usd`), `refunded`, `failed` or `expired`. |

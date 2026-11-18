@@ -90,10 +90,16 @@ defmodule OmnigateControl.PaymentsPage do
     function api(method,path,body){
       return fetch(path,{method:method,credentials:'same-origin',headers:{'content-type':'application/json','x-csrf-token':csrf,accept:'application/json'},body:body==null?null:JSON.stringify(body)})
         .then(function(r){return r.text().then(function(t){var j=null;try{j=t?JSON.parse(t):null}catch(e){}
+          // The session ended: sign in, and come back here.
+          if(r.status===401){location.href='/login?next=/payments'}
           if(!r.ok)throw new Error(j&&j.error&&j.error.message?j.error.message:'Request failed (HTTP '+r.status+')');return j})})}
     function empty(body,cols,text){clear(body);var tr=el('tr'),td=el('td','muted',text);td.colSpan=cols;tr.appendChild(td);body.appendChild(tr)}
     function cls(s){return s==='settled'||s==='active'?'ok':s==='awaiting_deposit'?'info':s==='processing'?'warn':s==='disabled'?'off':'bad'}
-    var byTx=false,sure=null;
+    var byTx=false,sure=null,explorer=null;
+    // A transaction's signature, as a link where there is somewhere to look it up.
+    function txNode(sig){
+      if(!explorer||!/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(sig))return document.createTextNode(sig);
+      var a=el('a',null,sig);a.href=explorer.replace('{tx}',sig);a.target='_blank';a.rel='noopener noreferrer';a.title='Look at this transaction on the chain';return a}
     function say(id,text,bad){var s=$(id);s.className=bad?'bad':'';s.textContent=text||''}
     function word(s){return {awaiting_deposit:'waiting for the deposit',settled:'credited'}[s]||s}
 
@@ -116,9 +122,10 @@ defmodule OmnigateControl.PaymentsPage do
         tr.appendChild(el('td',null,(d.amount||'')+' '+(d.symbol||'')+' on '+(d.chain||'')));
         var a=el('td','addr'),note=p.detail||'',c=p.claimed_tx;a.appendChild(el('span','mono',d.address||''));
         if(d.reference)a.appendChild(el('span','muted note','reference '+d.reference));
-        if(p.tx&&p.tx.length)a.appendChild(el('span','muted note','tx '+p.tx.join(', ')));
+        if(p.tx&&p.tx.length){var txs=el('span','muted note','tx ');p.tx.forEach(function(t,i){if(i)txs.appendChild(document.createTextNode(', '));txs.appendChild(txNode(String(t)))});a.appendChild(txs)}
         if(note)a.appendChild(el('span','muted note',note));
-        if(c&&byTx){var box=el('span','note','The payer names a transaction of '+usd(c.amount_usd)+': '+c.signature+' '),ask='Credit '+usd(c.amount_usd)+' to '+p.key+'?',b=el('button','small ghost',sure===p.id?ask:'Read and credit');
+        if(c&&byTx){var box=el('span','note','The payer names a transaction of '+usd(c.amount_usd)+': '),ask='Credit '+usd(c.amount_usd)+' to '+p.key+'?',b=el('button','small ghost',sure===p.id?ask:'Read and credit');
+          box.appendChild(txNode(c.signature));box.appendChild(document.createTextNode(' '));
           b.type='button';b.addEventListener('click',function(){
             // (Asked twice; the question outlives the table being drawn again.)
             if(sure!==p.id){sure=p.id;b.textContent=ask;return}
@@ -131,10 +138,13 @@ defmodule OmnigateControl.PaymentsPage do
       var body=$('added');if(!list.length){empty(body,5,'Nothing added yet.');return}clear(body);
       list.forEach(function(t){var tr=el('tr');
         tr.appendChild(el('td',null,when(t.at||t.applied_at||t.time)));tr.appendChild(el('td',null,t.key));tr.appendChild(el('td',null,t.source||'admin'));
-        tr.appendChild(el('td','num',usd(t.amount_usd)));tr.appendChild(el('td','mono addr',t.reference||''));body.appendChild(tr)})}
+        // "solana:tx:<signature>": the signature is a link.
+        var ref=el('td','mono addr'),m=/^([a-z_]+:tx:)([1-9A-HJ-NP-Za-km-z]{64,88})$/.exec(t.reference||'');
+        if(m){ref.appendChild(document.createTextNode(m[1]));ref.appendChild(txNode(m[2]))}else ref.textContent=t.reference||'';
+        tr.appendChild(el('td','num',usd(t.amount_usd)));tr.appendChild(ref);body.appendChild(tr)})}
     function refresh(){
       return Promise.all([api('GET','/admin/keys'),api('GET','/admin/payments'),api('GET','/admin/topups')]).then(function(r){
-        byTx=!!r[1].credit_by_tx;$('bytx').hidden=!byTx;renderCredit(r[0].keys||[]);renderPayments(r[1].payments||[]);renderAdded(r[2].topups||[]);$('updated').textContent='Updated '+new Date().toISOString().slice(11,19)+' UTC'})
+        byTx=!!r[1].credit_by_tx;explorer=typeof r[1].explorer_tx==='string'&&/^https:\/\//.test(r[1].explorer_tx)?r[1].explorer_tx:null;$('bytx').hidden=!byTx;renderCredit(r[0].keys||[]);renderPayments(r[1].payments||[]);renderAdded(r[2].topups||[]);$('updated').textContent='Updated '+new Date().toISOString().slice(11,19)+' UTC'})
       .catch(function(e){$('updated').textContent=e.message})}
     $('topup').addEventListener('submit',function(ev){
       ev.preventDefault();var f=ev.target,s=$('t-status');s.className='';s.textContent='Adding…';

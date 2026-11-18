@@ -1050,7 +1050,8 @@ def solana_payment_checks(stack):
     config = text_config()
     original = json.loads(json.dumps(config))
     config["payments"] = {"provider": "solana", "recipient": SOLANA_WALLET, "rpc_url": f"http://127.0.0.1:{SOLANA_PORT}",
-                          "poll_interval_s": 1, "min_usd": 1, "max_usd": 1000, "quote_ttl_s": 600}
+                          "poll_interval_s": 1, "min_usd": 1, "max_usd": 1000, "quote_ttl_s": 600,
+                          "operator": "Example & Co", "contact": "pay@example.com"}
     with open(stack.config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     secret = payer("e2e-sol-payer")
@@ -1060,6 +1061,13 @@ def solana_payment_checks(stack):
     check("after the config names the solana provider, a key is offered one asset: the stablecoin on Solana, and no refund address is asked for",
           listed[0] == 200 and listed[2].get("provider") == "solana" and listed[2].get("refund_address") is False
           and listed[2]["assets"][0].get("symbol") == "USDC" and listed[2]["assets"][0].get("chain") == "solana", listed[2])
+    status, _, page = call("GET", GATEWAY + "/topup")
+    page = page.decode("utf-8", "replace") if isinstance(page, bytes) else str(page)
+    check("the config names the operator: the payments API says who runs the gateway, where to ask and where a transaction can be looked at, and the top-up page carries the name as text",
+          listed[2].get("operator") == "Example & Co" and listed[2].get("contact") == "pay@example.com"
+          and listed[2].get("explorer_tx") == "https://explorer.solana.com/tx/{tx}"
+          and status == 200 and "<title>Top up · Example &amp; Co</title>" in page and 'href="mailto:pay@example.com"' in page,
+          (listed[2], status, page[:200]))
 
     status, _, pay = jcall("POST", GATEWAY + "/v1/payments", key=secret, body={"amount_usd": 3, "asset": asset})
     deposit = pay.get("deposit", {})
@@ -1767,7 +1775,7 @@ def attestation_checks(stack):
           status == 200 and "Private chat" in page and "What left this machine" in page and "default-src 'none'" in headers.get("content-security-policy", "")
           and "http://" not in page.replace("http://www.w3.org", "") and "https://" not in page, (status, headers.get("content-security-policy")))
     status, headers, _ = control_raw("GET", "/private-chat")
-    check("... and sends anyone else to the login form", status == 302 and headers.get("location") == "/login", (status, headers.get("location")))
+    check("... and sends anyone else to the login form, which leads back here", status == 302 and headers.get("location") == "/login?next=/private-chat", (status, headers.get("location")))
     status, _, state = admin("GET", "/admin/private-chat/state")
     by_model = {m["model"]: m for m in state.get("models", [])}
     check("its state lists the text models and which targets are attested",

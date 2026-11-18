@@ -54,6 +54,10 @@ defmodule OmnigateControl.Payments.Solana do
       (default `USDC`).
     * `commitment` — `finalized` (default) or `confirmed`: when a transfer
       is believed.
+    * `explorer_tx` — where a transaction can be looked at: an `https://`
+      address with `{tx}` where the signature goes, or `false` for no
+      links (default: Solana's own explorer, on the cluster `rpc_url`
+      names).
   """
   @behaviour OmnigateControl.Payments.Provider
 
@@ -61,7 +65,8 @@ defmodule OmnigateControl.Payments.Solana do
 
   @rpc_url "https://api.mainnet-beta.solana.com"
   @usdc "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-  @known ~w(rpc_url mint decimals symbol commitment)
+  @known ~w(rpc_url mint decimals symbol commitment explorer_tx)
+  @explorer "https://explorer.solana.com/tx/{tx}"
   @timeout 20_000
   # The cache every status question shares (owned by `Payments`).
   @cache :omnigate_payments_cache
@@ -133,9 +138,31 @@ defmodule OmnigateControl.Payments.Solana do
           nil -> "finalized"
           c when c in ["finalized", "confirmed"] -> c
           other -> raise ArgumentError, "payments.commitment must be \"finalized\" or \"confirmed\", got #{inspect(other)}"
-        end
+        end,
+      explorer_tx: explorer!(raw["explorer_tx"], raw["rpc_url"])
     }
   end
+
+  # The pages make links of it, so it is an https address and nothing else.
+  defp explorer!(false, _rpc), do: nil
+
+  defp explorer!(nil, rpc) do
+    cond do
+      not is_binary(rpc) -> @explorer
+      rpc =~ "devnet" -> @explorer <> "?cluster=devnet"
+      rpc =~ "testnet" -> @explorer <> "?cluster=testnet"
+      true -> @explorer
+    end
+  end
+
+  defp explorer!(url, _rpc) when is_binary(url) and byte_size(url) <= 200 do
+    if url =~ ~r/\Ahttps:\/\/[^\s"'<>\\]+\z/ and length(String.split(url, "{tx}")) == 2,
+      do: url,
+      else: raise(ArgumentError, "payments.explorer_tx must be an https:// address with {tx} in it once, or false, got #{inspect(url)}")
+  end
+
+  defp explorer!(other, _rpc),
+    do: raise(ArgumentError, "payments.explorer_tx must be an https:// address with {tx} in it once, or false, got #{inspect(other)}")
 
   @doc "The id of the one asset this provider takes."
   def asset_id(config), do: "solana:" <> config.mint

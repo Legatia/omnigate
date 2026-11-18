@@ -18,7 +18,31 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Added
+
+- **The top-up page can say whose gateway it is.** `"operator"` and
+  `"contact"` in the `"payments"` section put the operator's name in the
+  page's title and heading and a line where to ask about a payment (an
+  email address or an `https://` address, shown as a link); the page's
+  messages then name the operator instead of "the operator of this
+  gateway". `GET /v1/payments/assets` answers both. Unset, nothing changes.
+- **Transaction signatures are links** (`solana` payments): on the top-up
+  page and on the dashboard's Payments page, to Solana's explorer on the
+  cluster `rpc_url` names, or to the address `"explorer_tx"` gives
+  (`false` for none). `GET /v1/payments/assets` and `GET /admin/payments`
+  answer `explorer_tx`.
+
 ### Changed
+
+- **Signing in leads back to the page that was asked for.** Opening
+  `/payments` or `/private-chat` without a session used to end on the
+  dashboard after the sign-in; now it ends on that page, and the Payments
+  page sends an ended session to the form instead of showing an error
+  every five seconds. Only the dashboard's own pages can be named.
+- **One accent colour.** The dashboard, the Payments and Private chat
+  pages, the top-up page and the sign-in form now use the site's green
+  (they were blue, and the form black), in light and dark; the sign-in
+  form follows the system's dark mode like the rest.
 
 - The published 1.3.0 was checked by the release check workflow, the
   first release it ran for by itself: all five archives passed the

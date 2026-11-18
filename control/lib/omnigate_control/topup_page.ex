@@ -18,21 +18,37 @@ defmodule OmnigateControl.TopupPage do
   the provider gives a payment link (`deposit.url`, a Solana Pay link), the
   code holds the link instead: a wallet that scans it fills in the amount
   and the payment's reference.
+
+  When the config names the operator (`payments.operator`, `payments.contact`)
+  the page says whose gateway it is and where to ask about a payment.
+  Transaction signatures are links to an explorer where the provider has
+  one (`Payments.explorer_tx/1`).
   """
   alias OmnigateControl.Dashboard
 
-  @doc "The page for a CSP nonce."
-  def page(nonce) do
+  @doc "The page for a CSP nonce and the payments settings."
+  def page(nonce, config \\ nil) do
+    operator = config && config[:operator]
+    contact = config && config[:contact]
+    esc = fn text -> Plug.HTML.html_escape(text || "") end
+
     [
       ~s(<!doctype html><html lang="en"><head><meta charset="utf-8">),
       ~s(<meta name="viewport" content="width=device-width, initial-scale=1">),
-      ~s(<link rel="icon" href="data:,"><title>Top up · omnigate</title><style nonce="),
+      ~s(<link rel="icon" href="data:,"><title>Top up · ),
+      esc.(operator || "omnigate"),
+      ~s(</title><style nonce="),
       nonce,
       ~s(">),
       Dashboard.css(),
       css(),
-      ~s(</style></head><body class="tu">),
-      ~s(<header class="top"><div class="brand">omnigate <span>top up</span></div>),
+      ~s(</style></head><body class="tu" data-operator="),
+      esc.(operator),
+      ~s(" data-contact="),
+      esc.(contact),
+      ~s("><header class="top"><div class="brand">),
+      esc.(operator || "omnigate"),
+      ~s( <span>top up</span></div>),
       ~s(<div class="right"><span id="who" class="muted"></span><button type="button" id="forget" class="ghost" hidden>Forget key</button></div></header>),
       ~s(<main class="tu-main">),
       ~s(<noscript><p class="panel">This page needs JavaScript. The same can be done over the payments API: see docs/payments.md.</p></noscript>),
@@ -79,6 +95,7 @@ defmodule OmnigateControl.TopupPage do
       # 4: earlier payments
       ~s(<section id="s-list" class="panel" hidden><h2>Payments on this key</h2><div class="scroll"><table><thead><tr>),
       ~s(<th>Started</th><th>State</th><th class="num">Asked</th><th class="num">Credited</th><th>Paid with</th><th></th></tr></thead><tbody id="list"></tbody></table></div></section>),
+      run_by(operator, contact, esc),
       ~s(</main><script nonce="),
       nonce,
       ~s(">),
@@ -89,8 +106,32 @@ defmodule OmnigateControl.TopupPage do
     |> IO.iodata_to_binary()
   end
 
+  # Whose gateway this is and where to ask, as far as the operator says.
+  defp run_by(nil, nil, _esc), do: []
+
+  defp run_by(operator, contact, esc) do
+    [
+      ~s(<p class="muted run-by">),
+      if(operator, do: ["This gateway is run by ", esc.(operator), ". "], else: []),
+      if(contact,
+        do: [
+          "Questions about a payment: ",
+          ~s(<a rel="noreferrer" href="),
+          if(String.starts_with?(contact, "https://"), do: [], else: "mailto:"),
+          esc.(contact),
+          ~s(">),
+          esc.(contact),
+          "</a>."
+        ],
+        else: []
+      ),
+      "</p>"
+    ]
+  end
+
   defp css do
     ~S"""
+    .run-by{margin:0;font-size:13px;text-align:center;overflow-wrap:anywhere}
     .tu-main{max-width:760px;margin:0 auto;padding:16px 16px 40px;display:flex;flex-direction:column;gap:14px}
     .tu h2{margin:0 0 6px;font-size:17px}.tu .panel p{margin:0 0 12px}
     .tu label{margin-bottom:12px}.tu label[hidden],.tu form[hidden]{display:none}.bytx{border-top:1px solid var(--line);padding-top:12px;margin-top:4px}.status{font-size:13px}.status.bad{color:var(--bad)}
@@ -205,7 +246,13 @@ defmodule OmnigateControl.TopupPage do
     ~S"""
     (function(){
     "use strict";
-    var key=null,assets=[],quoted=null,current=null,timer=null,tick=null,busy=false,refunds=true,least=0,most=Infinity;
+    var key=null,assets=[],quoted=null,current=null,timer=null,tick=null,busy=false,refunds=true,least=0,most=Infinity,explorer=null;
+    // Whom to ask, as far as the operator says (the page's own settings).
+    var who=document.body.dataset.operator||'the operator of this gateway',ask_at=document.body.dataset.contact?' ('+document.body.dataset.contact+')':'';
+    // A transaction's signature, as a link where there is somewhere to look it up.
+    function txNode(sig){
+      if(!explorer||!/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(sig))return document.createTextNode(sig);
+      var a=el('a','mono',sig);a.href=explorer.replace('{tx}',sig);a.target='_blank';a.rel='noopener noreferrer';a.title='Look at this transaction on the chain';return a}
     var END={settled:1,refunded:1,failed:1,expired:1};
     function $(id){return document.getElementById(id)}
     function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
@@ -225,7 +272,7 @@ defmodule OmnigateControl.TopupPage do
     function load(){return api('GET','/v1/payments').then(function(d){renderBalance(d.credits);renderList(d.payments||[]);return d})}
     function renderBalance(c){
       show('s-balance',true);
-      if(!c){$('balance').textContent='—';$('bal-sub').textContent='This key is not prepaid, so a payment cannot be credited to it. Ask the operator of this gateway.';show('s-new',false);return false}
+      if(!c){$('balance').textContent='—';$('bal-sub').textContent='This key is not prepaid, so a payment cannot be credited to it. Ask '+who+ask_at+'.';show('s-new',false);return false}
       $('balance').textContent=usd(c.balance_usd);$('bal-sub').textContent=usd(c.burned_usd)+' used so far';return true}
     function renderList(list){
       var body=$('list');clear(body);show('s-list',list.length>0);
@@ -240,7 +287,8 @@ defmodule OmnigateControl.TopupPage do
         $('key').value='';show('s-key',false);show('forget',true);$('who').textContent='key ending '+v.slice(-4);say('key-status','');
         if(!d.credits)return;show('s-new',true);
         return api('GET','/v1/payments/assets').then(function(a){assets=a.assets||[];refunds=a.refund_address!==false;
-          show('refund-l',refunds);$('refund').required=refunds;bounds(a);renderChains()})})
+          explorer=typeof a.explorer_tx==='string'&&/^https:\/\//.test(a.explorer_tx)?a.explorer_tx:null;
+          show('refund-l',refunds);$('refund').required=refunds;bounds(a);renderChains();if(current)renderPayment(current)})})
       .catch(function(e){key=null;say('key-status',e.status===401?'This gateway does not know that key.':e.status===404?'Payments are not switched on at this gateway.':e.message,true)})
       .finally(function(){busy=false})});
     $('forget').addEventListener('click',function(){location.reload()});
@@ -314,14 +362,16 @@ defmodule OmnigateControl.TopupPage do
         s==='awaiting_deposit'?'Send it from a wallet of your own, in one transfer. This page notices when it arrives; you can also close it and come back with the key.'+(d.memo?' The memo is required: a transfer without it is not recognized.':'')+
           (d.url?' Scan the code with a wallet, or send exactly this amount by hand: the exact amount, to the last digit, is how a transfer made by hand is recognized.':''):
         s==='processing'?(d.url?'The transfer is on the chain and is credited once it is final. This usually takes under a minute.':'The deposit arrived and is being swapped. This usually takes under a minute.'):
-        s==='settled'?(p.credited_usd==null?'The payment arrived but could not be credited to this key. Contact the operator of this gateway.':usd(p.credited_usd)+' of credit was added to this key.'):
+        s==='settled'?(p.credited_usd==null?'The payment arrived but could not be credited to this key. Contact '+who+ask_at+'.':usd(p.credited_usd)+' of credit was added to this key.'):
         s==='refunded'?'The payment was not completed and the funds were sent back to the refund address.':
         s==='failed'?'The payment could not be completed.':'Nothing arrived before the deadline. Nothing was credited; start a new payment.';
       var f=$('pay-facts');clear(f);function row(k,v){if(v==null||v==='')return;f.appendChild(el('dt',null,k));f.appendChild(el('dd',null,String(v)))}
+      // (A row of text and nodes: the signatures in it are links.)
+      function parts(k,list){f.appendChild(el('dt',null,k));var dd=el('dd');list.forEach(function(n){dd.appendChild(typeof n==='string'?document.createTextNode(n):n)});f.appendChild(dd)}
       row('Credit asked for',usd(p.amount_usd));row('Note',p.detail);row('Refund address',p.refund_to);
-      if(p.claimed_tx)row('Waiting for the operator','You named a transaction of '+usd(p.claimed_tx.amount_usd)+' ('+p.claimed_tx.signature+'). It reached this gateway, and nothing in it says which payment it is for, so the operator has to confirm it.');
+      if(p.claimed_tx)parts('Waiting for '+(document.body.dataset.operator||'the operator'),['You named a transaction of '+usd(p.claimed_tx.amount_usd)+': ',txNode(p.claimed_tx.signature),'. It reached this gateway, and nothing in it says which payment it is for, so '+(document.body.dataset.operator||'the operator')+' has to confirm it.']);
       show('f-tx',p.provider==='solana'&&(s==='awaiting_deposit'||s==='expired'));
-      if(p.tx&&p.tx.length)row('Transactions',p.tx.join(', '));row('Payment id',p.id);
+      if(p.tx&&p.tx.length){var txs=[];p.tx.forEach(function(t,i){if(i)txs.push(', ');txs.push(txNode(String(t)))});parts('Transactions',txs)}row('Payment id',p.id);
       if(was&&was!==s&&END[s])load()}
     function countdown(){
       if(tick)clearInterval(tick);

@@ -98,6 +98,8 @@ complete example (a text route, a bonus rate, payments).
 | `min_usd`, `max_usd` | `1`, `10000` | Bounds on one payment. |
 | `quote_ttl_s` | `1800` | How long a payer is asked to be given to send the deposit. 60 to 86,400. The provider sets the deadline and may give longer: for ETH on Ethereum it gave three days. The payment's `deadline` is always the provider's. |
 | `poll_interval_s` | `15` | How often an open payment's status is asked for. After twenty polls they are spaced further apart. |
+| `operator` | not named | Who runs the gateway, as the [top-up page](#the-top-up-page) should name them: up to 60 characters. |
+| `contact` | none | Where a payer can ask about a payment: an email address or an `https://` address. The top-up page shows it as a link. |
 | `settle_asset` | native USDC on NEAR | The asset delivered to the operator, as a 1Click asset id. It should be a dollar stablecoin: what arrives is credited one to one. |
 | `settle_decimals` | `6` | That asset's decimals. |
 | `slippage_bps` | `100` | Tolerance on the amount the payer is asked to send (1%). What the swap does not need is refunded to the payer by the provider. |
@@ -138,7 +140,8 @@ endpoint.
 | `mint` | USDC | The token taken. It should be a dollar stablecoin: what arrives is credited one to one. |
 | `decimals`, `symbol` | `6`, `USDC` | The mint's decimals (6 to 12) and its name on the top-up page. |
 | `commitment` | `finalized` | When a transfer is believed: `finalized` (about 15 seconds) or `confirmed` (a second or two, and in theory reversible). |
-| `min_usd`, `max_usd`, `quote_ttl_s`, `poll_interval_s` | as above | As for the other provider. Here `quote_ttl_s` is exactly how long a payment is watched for. |
+| `explorer_tx` | Solana's explorer | Where a transaction can be looked at: an `https://` address with `{tx}` where the signature goes, for example `https://solscan.io/tx/{tx}`. The top-up page and the Payments page make every signature a link to it. The default is `https://explorer.solana.com/tx/{tx}`, with `?cluster=devnet` or `?cluster=testnet` when `rpc_url` names that cluster. `false` for no links. |
+| `min_usd`, `max_usd`, `quote_ttl_s`, `poll_interval_s`, `operator`, `contact` | as above | As for the other provider. Here `quote_ttl_s` is exactly how long a payment is watched for. |
 
 **How a transfer is recognized.** Every payment goes to the same wallet, so
 each one is told apart in two ways, and either is enough:
@@ -331,6 +334,12 @@ For a person rather than a program: **`GET /topup`** on the gateway's port
    credit is added. A payment that is still open can be opened again later
    with the key.
 
+With `"operator"` and `"contact"` in the `"payments"` section, the page
+carries the operator's name in its title and heading and says where to ask
+about a payment; without them it says "omnigate" and "the operator of this
+gateway". For `solana` payments every transaction signature on it is a link
+to an explorer (`explorer_tx`), opened in a new tab without a referrer.
+
 What to know about it:
 
 - **It asks for no sign-in and holds nothing secret.** Anyone who can reach
@@ -358,7 +367,7 @@ are for.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /v1/payments/assets` | What can be paid with. `?chain=` and `?symbol=` narrow the list. The answer also names the `provider`, says whether a payment needs a refund address (`refund_address`), and gives the bounds of one payment (`min_usd`, `max_usd`). |
+| `GET /v1/payments/assets` | What can be paid with. `?chain=` and `?symbol=` narrow the list. The answer also names the `provider`, says whether a payment needs a refund address (`refund_address`), gives the bounds of one payment (`min_usd`, `max_usd`), who runs the gateway and where to ask (`operator`, `contact`: null unless the config says), and where a transaction can be looked at (`explorer_tx`, with `{tx}` for its signature; null where there is no one place). |
 | `POST /v1/payments/quote` | What a payment would take, without starting one. |
 | `POST /v1/payments` | Start a payment: get a deposit address and the amount to send. |
 | `GET /v1/payments/{id}` | The payment and its state. |
@@ -556,9 +565,10 @@ payment. (What a request then burns of the credit is the
 - **`GET /admin/payments?limit=<n>`**: every payment, newest first, with the
   key's name, the reference it is credited under and the recipient it was
   quoted for; `"configured": false` when payments are off. Also the
-  `provider`, and `credit_by_tx`: whether
+  `provider`, `credit_by_tx`: whether
   [`POST /admin/payments/credit`](#a-transfer-that-was-not-recognized) is
-  there.
+  there, and `explorer_tx`: where a transaction can be looked at (the
+  Payments page makes signatures links to it).
 - **Audit log**: `payment.create`, `payment.settle` (outcome `ok`, or
   `uncredited` when the key could not be credited), `payment.refunded`,
   `payment.failed`; all written by the gateway itself (`"auth": "system"`).

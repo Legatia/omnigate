@@ -28,6 +28,10 @@ defmodule OmnigateControl.Payments do
     * `quote_ttl_s` — how long a payer has to send the deposit (default 1800).
     * `poll_interval_s` — how often an open payment is asked about
       (default 15; later polls are spaced further apart).
+    * `operator` — who runs the gateway, as the top-up page should name
+      them (up to 60 characters; default: not named).
+    * `contact` — where a payer can ask about a payment: an email address
+      or an `https://` address (default: none).
     * plus the provider's own fields.
 
   ## A payment's states
@@ -78,7 +82,7 @@ defmodule OmnigateControl.Payments do
   @claim_within_s 60 * 86_400
   @assets_ttl_ms 300_000
   @open ~w(awaiting_deposit processing)
-  @common ~w(provider recipient min_usd max_usd quote_ttl_s poll_interval_s)
+  @common ~w(provider recipient min_usd max_usd quote_ttl_s poll_interval_s operator contact)
 
   # ---- Settings ------------------------------------------------------------------
 
@@ -122,11 +126,44 @@ defmodule OmnigateControl.Payments do
       min_usd: min_usd,
       max_usd: max_usd,
       quote_ttl_s: integer!(raw["quote_ttl_s"], 1_800, 60, 86_400, "quote_ttl_s"),
-      poll_interval_s: integer!(raw["poll_interval_s"], 15, 1, 3_600, "poll_interval_s")
+      poll_interval_s: integer!(raw["poll_interval_s"], 15, 1, 3_600, "poll_interval_s"),
+      operator: operator!(raw["operator"]),
+      contact: contact!(raw["contact"])
     })
   end
 
   def normalize!(other), do: raise(ArgumentError, "payments must be an object, got #{inspect(other)}")
+
+  # The operator's name as the top-up page shows it: one line of text.
+  defp operator!(nil), do: nil
+
+  defp operator!(name) when is_binary(name) do
+    name = String.trim(name)
+
+    if String.valid?(name) and String.length(name) in 1..60 and not (name =~ ~r/[\x00-\x1f\x7f]/),
+      do: name,
+      else: raise(ArgumentError, "payments.operator must be 1 to 60 characters on one line")
+  end
+
+  defp operator!(other), do: raise(ArgumentError, "payments.operator must be text, got #{inspect(other)}")
+
+  # Where a payer can ask: an email address or an https address, nothing
+  # else, since the page makes a link of it.
+  defp contact!(nil), do: nil
+
+  defp contact!(text) when is_binary(text) and byte_size(text) <= 200 do
+    if text =~ ~r/\Ahttps:\/\/[^\s"'<>\\]+\z/ or text =~ ~r/\A[^\s@"'<>:\/\\]+@[^\s@"'<>:\/\\]+\.[^\s@"'<>:\/\\]+\z/,
+      do: text,
+      else: raise(ArgumentError, "payments.contact must be an email address or an https:// address, got #{inspect(text)}")
+  end
+
+  defp contact!(other), do: raise(ArgumentError, "payments.contact must be an email address or an https:// address, got #{inspect(other)}")
+
+  @doc """
+  The address where one transaction can be looked at, with `{tx}` where its
+  signature goes, or nil: the provider has none, or it is switched off.
+  """
+  def explorer_tx(config \\ config()), do: config && Map.get(config, :explorer_tx)
 
   defp number!(nil, default, _min, _max, _name), do: default
   defp number!(n, _default, min, max, _name) when is_number(n) and n >= min and n <= max, do: n * 1.0

@@ -593,8 +593,10 @@ field, and what the gateway does and does not do with money, is in
 | `min_usd`, `max_usd` | numbers | `1`, `10000` | Bounds on one payment. |
 | `quote_ttl_s` | whole number, 60 to 86,400 | `1800` | How long a payer is asked to be given to send the deposit. The provider sets the deadline and may give longer. |
 | `poll_interval_s` | whole number, 1 to 3,600 | `15` | How often an open payment's status is asked for. |
+| `operator` | string, 1 to 60 characters | not named | Who runs the gateway, as the top-up page names them. |
+| `contact` | string | none | Where a payer can ask: an email address or an `https://` address. |
 | `settle_asset`, `settle_decimals`, `slippage_bps`, `jwt_env`, `base_url`, `public_key` | | see [Payments](payments.md#switching-it-on) | The `near_intents` provider's own settings. |
-| `rpc_url`, `mint`, `decimals`, `symbol`, `commitment` | | see [Payments](payments.md#the-solana-provider) | The `solana` provider's own settings. |
+| `rpc_url`, `mint`, `decimals`, `symbol`, `commitment`, `explorer_tx` | | see [Payments](payments.md#the-solana-provider) | The `solana` provider's own settings. |
 
 ## Environment variables
 

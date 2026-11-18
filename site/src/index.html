@@ -17,7 +17,7 @@
     <a class="brand" href="/"><img src="/assets/icon.svg" alt="" width="22" height="22">omnigate</a>
     <nav>
       <a href="/docs/">Docs</a>
-      <a href="/docs/quickstart/">Quickstart</a>
+      <a class="not-small" href="/docs/quickstart/">Quickstart</a>
       <a href="/pricing/">Pricing</a>
       <a href="https://github.com/Legatia/omnigate">GitHub</a>
     </nav>
@@ -33,14 +33,14 @@
     <a class="button primary" href="/docs/quickstart/">Run it locally</a>
     <a class="button" href="https://github.com/Legatia/omnigate">Source on GitHub</a>
   </p>
-<svg class="diagram" viewBox="0 0 960 250" role="img" aria-label="Applications call the data plane, which calls the text providers. The control plane gives it configuration, receives usage events, runs media jobs and stores their outputs.">
+<div class="diagram-wrap"><svg class="diagram" viewBox="0 0 960 250" role="img" aria-label="Applications call the data plane, which calls the text providers. The control plane gives it configuration, receives usage events, runs media jobs and stores their outputs.">
     <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" class="head"/></marker></defs>
     <g class="box"><rect x="10" y="30" width="120" height="56" rx="8"/><rect x="250" y="30" width="230" height="56" rx="8" class="own"/><rect x="250" y="166" width="230" height="56" rx="8" class="own"/><rect x="690" y="30" width="260" height="56" rx="8"/><rect x="690" y="132" width="260" height="46" rx="8"/><rect x="690" y="194" width="260" height="46" rx="8"/></g>
     <g class="wire"><path d="M130 58H248"/><path d="M480 58H688"/><path d="M320 164V88"/><path d="M410 88V164"/><path d="M480 184H600V155H688"/><path d="M480 204H600V217H688"/></g>
     <g class="name"><text x="70" y="63">your apps</text><text x="365" y="55">data plane</text><text x="365" y="191">control plane</text><text x="820" y="55">text providers</text><text x="820" y="160">media providers</text><text x="820" y="222">your bucket or disk</text></g>
     <g class="sub"><text x="365" y="73">Zig · the public port</text><text x="365" y="209">Elixir · ledger, budgets, jobs</text><text x="820" y="73">OpenAI-style, Anthropic-style</text></g>
     <g class="tag"><text x="189" y="50">/v1</text><text x="282" y="130">config</text><text x="468" y="130">usage events</text><text x="585" y="50">keys, limits, failover</text><text x="560" y="176">jobs</text></g>
-  </svg>
+  </svg></div>
 </section>
 
 <section class="wrap">
@@ -101,13 +101,13 @@
 
 <section class="wrap split">
   <div>
-    <p class="kicker">Optional · NEAR Intents</p>
+    <p class="kicker">Optional · Payments</p>
     <h2>Keys that pay for themselves</h2>
-    <p>A prepaid key holds credit: one credit is one dollar when it is added, and a request burns what the provider charged times a multiplier you set. When the credit runs out, the holder of the key, or an agent using it, can buy more without anyone in between:</p>
+    <p>A prepaid key holds credit: one credit is one dollar when it is added, and a request burns what the provider charged times a multiplier you set. When the credit runs out, the holder of the key, or an agent using it, can buy more without anyone in between, on a top-up page or over the API:</p>
     <ul class="checks">
-      <li>It asks the gateway for a payment and gets a deposit address for the asset it wants to pay with, from about 230 assets on 39 chains.</li>
-      <li>The funds are swapped to USDC and delivered to the operator's account. The gateway never holds a private key.</li>
-      <li>What arrived is credited to the key, once.</li>
+      <li><strong>USDC on Solana, straight to your wallet.</strong> The payer scans a code or opens a link in their wallet. Nobody sits between you and them, and there is no fee beyond the chain's.</li>
+      <li><strong>Or about 230 assets on 39 chains</strong> through NEAR Intents, swapped to USDC and delivered to your account.</li>
+      <li>Either way the gateway holds no private key and moves no funds, and what arrived is credited to the key once.</li>
     </ul>
     <p><a class="more" href="/docs/payments/">Payments</a> · <a class="more" href="/docs/credits/">The credit rule</a></p>
   </div>
@@ -115,10 +115,10 @@
 curl $GATEWAY/v1/payments \
   -H "Authorization: Bearer $KEY" \
   -d '{"amount_usd": 5,
-       "asset": "nep141:wrap.near",
-       "refund_to": "payer.near"}'
+       "asset": "solana:EPjF...Dt1v"}'
 
-<span class="c"># → a deposit address, the amount to send, a deadline</span>
+<span class="c"># → your wallet's address, the exact amount, a payment</span>
+<span class="c">#   link for the payer's wallet, a deadline</span>
 <span class="c"># then: awaiting_deposit → processing → settled</span></code></pre>
 </section>
 
@@ -147,11 +147,12 @@ curl $GATEWAY/v1/payments \
   </div>
   <div>
     <h2>Run it</h2>
-    <p>With Zig 0.17, Erlang/OTP 29 with Elixir 1.20 and Python 3.9 or newer:</p>
+    <p>With Docker, from the published images:</p>
 <pre class="hl"><code>git clone https://github.com/Legatia/omnigate
-cd omnigate/dataplane &amp;&amp; zig build
-cd .. &amp;&amp; python tools/e2e.py</code></pre>
-    <p>The last command starts mock providers, both processes and a few hundred checks; no API key is needed. On a server, a Compose file with a TLS proxy is included.</p>
+cd omnigate/deploy/quickstart
+cp .env.example .env   <span class="c"># two random tokens, one provider key</span>
+docker compose up -d</code></pre>
+    <p>The gateway is then at <code>localhost:8080</code> and the dashboard at <code>localhost:4000</code>. The quickstart also shows how to build from source and run everything against mock providers, with no API key. On a server, a Compose file with a TLS proxy is included.</p>
     <p><a class="more" href="/docs/quickstart/">Quickstart</a> · <a class="more" href="/docs/deployment/">Deployment</a></p>
   </div>
 </section>

@@ -1,7 +1,60 @@
 # Quickstart
 
-Two parts: run everything locally against the mock providers that ship in
-`tools/` (no API keys needed), then point the gateway at one real provider.
+Two ways in. **With Docker**, from the published images: a few minutes,
+and you need a key of one provider. **From source**, against the mock
+providers that ship in `tools/`: no API key, and you need three toolchains;
+this is also how to work on omnigate itself.
+
+## With Docker
+
+Needs Docker with the Compose plugin, and nothing else.
+
+```bash
+git clone https://github.com/Legatia/omnigate
+cd omnigate/deploy/quickstart
+cp .env.example .env
+```
+
+Open `.env` and fill in two different random tokens (`openssl rand -hex 24`
+makes one) and the key of at least one provider. Then:
+
+```bash
+docker compose up -d
+```
+
+The dashboard is at <http://localhost:4000>: sign in with the
+`OMNIGATE_ADMIN_TOKEN` you chose, and under **Create a key** make a
+gateway key. It is shown once; copy it. The gateway is at
+<http://localhost:8080>:
+
+```bash
+curl http://localhost:8080/v1/chat/completions   -H "Authorization: Bearer <the gateway key>"   -H "Content-Type: application/json"   -d '{"model": "gpt", "messages": [{"role": "user", "content": "Say hello."}]}'
+```
+
+`deploy/quickstart/omnigate.json` defines two models, `gpt` (OpenAI) and
+`claude` (Anthropic), with prices of zero; change the model ids to ones
+your account has, and the gateway picks the change up without a restart.
+A model whose provider has no key in `.env` answers with that provider's
+own "unauthorized". Everything in [Configuration](configuration.md)
+applies to that file.
+
+`docker compose down` stops it; add `-v` to also delete its data.
+
+This setup is for a first look: both ports are published on your machine
+only, there is no TLS, and it runs the newest release rather than a pinned
+one. For a server use the Compose file in the repository root:
+[Deployment](deployment.md).
+
+Tried on 18 November 2026 with the published 1.2.0 images on Ubuntu 24.04
+under WSL 2 (Docker 29): both containers were ready within seconds, a key
+made through the admin API listed both models, and a request without a
+provider key came back with OpenAI's own 401. A completion with a real
+provider key was not part of that run.
+
+## From source
+
+The rest of this page: run everything locally against the mock providers,
+then point the gateway at one real provider.
 
 ## Prerequisites
 

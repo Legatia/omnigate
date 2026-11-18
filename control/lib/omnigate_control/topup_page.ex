@@ -48,9 +48,10 @@ defmodule OmnigateControl.TopupPage do
       ~s(<form id="f-new" autocomplete="off"><div class="amounts" role="group" aria-label="Amount in US dollars">),
       ~s(<button type="button" class="ghost amt" data-usd="5">$5</button><button type="button" class="ghost amt" data-usd="20">$20</button>),
       ~s(<button type="button" class="ghost amt" data-usd="50">$50</button><button type="button" class="ghost amt" data-usd="100">$100</button></div>),
-      ~s(<div class="fields"><label>Amount in USD<input id="usd" type="number" min="0" step="0.01" inputmode="decimal" required></label>),
-      ~s(<label>Network<select id="chain" required></select></label>),
-      ~s(<label>Pay with<select id="asset" required></select></label></div>),
+      ~s(<div class="fields"><label>Amount in USD <span id="usd-hint" class="muted"></span><input id="usd" type="number" min="0" step="0.01" inputmode="decimal" required></label>),
+      ~s(<label id="chain-l">Network<select id="chain" required></select></label>),
+      ~s(<label id="asset-l">Pay with<select id="asset" required></select></label></div>),
+      ~s(<p id="one-asset" class="muted" hidden></p>),
       ~s(<label id="refund-l">Refund address <span class="muted">on that network: where the funds return if the payment fails. Use the address you pay from.</span>),
       ~s(<input id="refund" required maxlength="200" spellcheck="false" autocomplete="off"></label>),
       ~s(<div id="quote" class="quote" hidden></div>),
@@ -59,7 +60,10 @@ defmodule OmnigateControl.TopupPage do
       # 3: one payment
       ~s(<section id="s-pay" class="panel" hidden><div class="row head"><h2>Payment</h2><span id="pay-pill"></span></div>),
       ~s(<ol id="steps" class="steps"><li id="st-1">Send the deposit</li><li id="st-2">Processing</li><li id="st-3">Credit added</li></ol>),
-      ~s(<div id="pay-send" class="send"><div id="qr" class="qr" role="img" aria-label="The deposit address as a QR code"></div>),
+      ~s(<p id="pay-late" class="late" role="status" hidden><b>The deadline has passed. Do not send anything for this payment now.</b> ),
+      ~s(If you already sent it, wait a moment: a transfer that was on its way is still noticed for a few minutes. Otherwise go back and start a new payment.</p>),
+      ~s(<div id="pay-send" class="send"><a id="p-open" class="open-wallet" rel="noreferrer" hidden>Open in your wallet</a>),
+      ~s(<div id="qr" class="qr" role="img" aria-label="The deposit address as a QR code"></div>),
       ~s(<dl class="what"><dt>Send exactly</dt><dd><span id="p-amount" class="big"></span> <button type="button" class="small ghost copy" data-copy="p-amount-raw">Copy</button><span id="p-amount-raw" hidden></span></dd>),
       ~s(<dt>On</dt><dd id="p-chain"></dd>),
       ~s(<dt>To this address</dt><dd><span id="p-address" class="mono addr"></span> <button type="button" class="small ghost copy" data-copy="p-address">Copy</button></dd>),
@@ -109,7 +113,13 @@ defmodule OmnigateControl.TopupPage do
     .what dd{margin:2px 0 0;overflow-wrap:anywhere}.big{font-size:20px;font-weight:650}.addr{font-size:13.5px}
     .facts{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 14px;margin:12px 0;font-size:13px}
     .facts dt{color:var(--muted)}.facts dd{margin:0;overflow-wrap:anywhere}
-    .tu td button{margin:0}.tu td,.tu th{white-space:nowrap}
+    .tu td button{margin:0}.tu td,.tu th{white-space:nowrap}.tu button.small{min-height:32px;padding:5px 11px}
+    .late{border:1px solid var(--bad);background:var(--bad-bg);color:var(--text);border-radius:8px;padding:10px 12px}.late[hidden],.tu p[hidden]{display:none}
+    .late b{color:var(--bad)}
+    .open-wallet{display:none;flex:1 1 100%;text-align:center;text-decoration:none;font-weight:650;font-size:16px;padding:13px 16px;border-radius:8px;
+      background:var(--accent);color:var(--accent-text)}
+    /* On a phone the code cannot be scanned by the phone that shows it: the link is the way to pay. */
+    @media (max-width:520px),(pointer:coarse){.open-wallet:not([hidden]){display:block}#p-link-l,#p-link-d{display:none}}
     @media (max-width:520px){.qr{margin:0 auto}}
     """
   end
@@ -195,7 +205,7 @@ defmodule OmnigateControl.TopupPage do
     ~S"""
     (function(){
     "use strict";
-    var key=null,assets=[],quoted=null,current=null,timer=null,tick=null,busy=false,refunds=true;
+    var key=null,assets=[],quoted=null,current=null,timer=null,tick=null,busy=false,refunds=true,least=0,most=Infinity;
     var END={settled:1,refunded:1,failed:1,expired:1};
     function $(id){return document.getElementById(id)}
     function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
@@ -219,10 +229,10 @@ defmodule OmnigateControl.TopupPage do
       $('balance').textContent=usd(c.balance_usd);$('bal-sub').textContent=usd(c.burned_usd)+' used so far';return true}
     function renderList(list){
       var body=$('list');clear(body);show('s-list',list.length>0);
-      list.forEach(function(p){var tr=el('tr'),st=el('td'),open=el('td'),b=el('button','small ghost',END[p.status]?'Details':'Open');
-        tr.appendChild(el('td',null,when(p.created_at)));st.appendChild(el('span','pill '+stateClass(p.status),stateWord(p.status)));tr.appendChild(st);
+      list.forEach(function(p){var tr=el('tr'),st=el('td'),open=el('td'),b=el('button','small ghost',END[p.status]?'Details':'Open'),late=p.status==='awaiting_deposit'&&new Date(p.deadline)<=Date.now();
+        tr.appendChild(el('td',null,when(p.created_at)));st.appendChild(el('span','pill '+(late?'bad':stateClass(p.status)),late?'deadline passed':stateWord(p.status)));tr.appendChild(st);
         tr.appendChild(el('td','num',usd(p.amount_usd)));tr.appendChild(el('td','num',p.credited_usd==null?'—':usd(p.credited_usd)));
-        tr.appendChild(el('td',null,(p.deposit.amount||'')+' '+(p.deposit.symbol||'')+' on '+(p.deposit.chain||'')));
+        tr.appendChild(el('td',null,(p.deposit.amount||'')+' '+(p.deposit.symbol||'')+' on '+title(p.deposit.chain||'')));
         b.type='button';b.addEventListener('click',function(){openPayment(p)});open.appendChild(b);tr.appendChild(open);body.appendChild(tr)})}
     $('f-key').addEventListener('submit',function(ev){
       ev.preventDefault();if(busy)return;var v=$('key').value.trim();if(!v)return;key=v;busy=true;say('key-status','Checking…');
@@ -230,17 +240,32 @@ defmodule OmnigateControl.TopupPage do
         $('key').value='';show('s-key',false);show('forget',true);$('who').textContent='key ending '+v.slice(-4);say('key-status','');
         if(!d.credits)return;show('s-new',true);
         return api('GET','/v1/payments/assets').then(function(a){assets=a.assets||[];refunds=a.refund_address!==false;
-          show('refund-l',refunds);$('refund').required=refunds;renderChains()})})
+          show('refund-l',refunds);$('refund').required=refunds;bounds(a);renderChains()})})
       .catch(function(e){key=null;say('key-status',e.status===401?'This gateway does not know that key.':e.status===404?'Payments are not switched on at this gateway.':e.message,true)})
       .finally(function(){busy=false})});
     $('forget').addEventListener('click',function(){location.reload()});
 
     // -- a new payment ----------------------------------------------------------
+    function title(s){return s?s.charAt(0).toUpperCase()+s.slice(1):s}
+    // What one payment may be: said before it is asked for, and the amounts outside it are not offered.
+    function bounds(a){
+      least=typeof a.min_usd==='number'?a.min_usd:0;most=typeof a.max_usd==='number'?a.max_usd:Infinity;
+      $('usd').min=least;if(isFinite(most))$('usd').max=most;
+      $('usd-hint').textContent=least>0||isFinite(most)?'from '+usd(least)+(isFinite(most)?' to '+usd(most):''):'';
+      Array.prototype.forEach.call(document.querySelectorAll('.amt'),function(b){var v=Number(b.dataset.usd);b.hidden=v<least||v>most})}
+    function inBounds(v){
+      if(!(v>0))return 'Type an amount in US dollars.';
+      if(v<least)return 'The smallest payment here is '+usd(least)+'.';
+      if(v>most)return 'The largest payment here is '+usd(most)+'.';
+      return null}
     function renderChains(){
       var sel=$('chain'),seen={},names=[];clear(sel);
       assets.forEach(function(a){if(!seen[a.chain]){seen[a.chain]=1;names.push(a.chain)}});names.sort();
       names.forEach(function(c){var o=el('option',null,c);o.value=c;sel.appendChild(o)});
-      if(seen.near)sel.value='near';renderAssets()}
+      if(seen.near)sel.value='near';renderAssets();
+      // One way to pay is a statement, not two menus with one entry each.
+      var one=assets.length===1;show('chain-l',!one);show('asset-l',!one);show('one-asset',one);
+      if(one)$('one-asset').textContent='Paid in '+assets[0].symbol+' on '+title(assets[0].chain)+'.'}
     function renderAssets(){
       var sel=$('asset'),chain=$('chain').value;clear(sel);
       assets.filter(function(a){return a.chain===chain}).sort(function(a,b){return a.symbol<b.symbol?-1:a.symbol>b.symbol?1:0})
@@ -253,11 +278,12 @@ defmodule OmnigateControl.TopupPage do
     function marks(){Array.prototype.forEach.call(document.querySelectorAll('.amt'),function(b){b.classList.toggle('on',Number(b.dataset.usd)===Number($('usd').value))})}
     Array.prototype.forEach.call(document.querySelectorAll('.amt'),function(b){b.addEventListener('click',function(){$('usd').value=b.dataset.usd;unquote();marks()})});
     $('f-new').addEventListener('submit',function(ev){
-      ev.preventDefault();if(busy)return;var a=ask();busy=true;say('new-status','Asking for a quote…');
+      ev.preventDefault();if(busy)return;var a=ask(),wrong=inBounds(a.amount_usd);if(wrong){say('new-status',wrong,true);return}
+      busy=true;say('new-status','Asking for a quote…');
       api('POST','/v1/payments/quote',a).then(function(q){
         quoted=a;var box=$('quote');clear(box);show('quote',true);
         box.appendChild(document.createTextNode(usd(q.amount_usd)+' of credit takes '));box.appendChild(el('b',null,q.amount+' '+q.symbol));
-        box.appendChild(document.createTextNode(' on '+q.chain+(q.deposit_usd?' (about '+usd(q.deposit_usd)+')':'')+(q.time_estimate_s?', and about '+q.time_estimate_s+' seconds after it arrives':'')+'. The exact amount is fixed when the payment starts.'));
+        box.appendChild(document.createTextNode(' on '+title(q.chain)+(q.deposit_usd?' (about '+usd(q.deposit_usd)+')':'')+(q.time_estimate_s?', and about '+q.time_estimate_s+' seconds after it arrives':'')+'. The exact amount is fixed when the payment starts.'));
         show('pay-go',true);$('quote-go').className='ghost';say('new-status','')})
       .catch(function(e){unquote();say('new-status',e.message,true)}).finally(function(){busy=false})});
     $('pay-go').addEventListener('click',function(){
@@ -270,16 +296,19 @@ defmodule OmnigateControl.TopupPage do
     function step(id,cls){$(id).className=cls||''}
     function renderPayment(p){
       var was=current&&current.id===p.id?current.status:null;current=p;
-      var s=p.status,d=p.deposit,pill=$('pay-pill');clear(pill);pill.appendChild(el('span','pill '+stateClass(s),stateWord(s)));
-      step('st-1',s==='awaiting_deposit'?'now':s==='expired'?'bad':'done');
+      var s=p.status,d=p.deposit,pill=$('pay-pill'),late=s==='awaiting_deposit'&&new Date(p.deadline)<=Date.now();
+      clear(pill);pill.appendChild(el('span','pill '+(late?'bad':stateClass(s)),late?'deadline passed':stateWord(s)));
+      step('st-1',late?'bad':s==='awaiting_deposit'?'now':s==='expired'?'bad':'done');
       step('st-2',s==='processing'?'now':s==='settled'?'done':(s==='failed'||s==='refunded')?'bad':'');
       step('st-3',s==='settled'?(p.credited_usd==null?'bad':'done'):'');
-      show('pay-send',s==='awaiting_deposit');
-      if(s==='awaiting_deposit'){
-        $('p-amount').textContent=d.amount+' '+d.symbol;$('p-amount-raw').textContent=d.amount;$('p-chain').textContent=d.chain+', as '+d.symbol;
+      // Past the deadline nothing invites a transfer any more: no code, no address, no link.
+      show('pay-send',s==='awaiting_deposit'&&!late);show('pay-late',late);show('pay-note',!late);
+      if(s==='awaiting_deposit'&&!late){
+        $('p-amount').textContent=d.amount+' '+d.symbol;$('p-amount-raw').textContent=d.amount;$('p-chain').textContent=title(d.chain)+', as '+d.symbol;
         $('p-address').textContent=d.address;show('p-memo-l',!!d.memo);show('p-memo-d',!!d.memo);$('p-memo').textContent=d.memo||'';
         var code=d.url||d.address,box=$('qr');if(box.dataset.for!==code){clear(box);var svg=qrSvg(code);if(svg)box.appendChild(svg);box.hidden=!svg;box.dataset.for=code}
-        show('p-link-l',!!d.url);show('p-link-d',!!d.url);if(d.url&&/^solana:/.test(d.url))$('p-link').href=d.url;else $('p-link').removeAttribute('href');
+        var link=d.url&&/^solana:/.test(d.url)?d.url:null;show('p-link-l',!!link);show('p-link-d',!!link);$('p-open').hidden=!link;
+        if(link){$('p-link').href=link;$('p-open').href=link}else{$('p-link').removeAttribute('href');$('p-open').removeAttribute('href')}
         countdown()}
       $('pay-note').textContent=
         s==='awaiting_deposit'?'Send it from a wallet of your own, in one transfer. This page notices when it arrives; you can also close it and come back with the key.'+(d.memo?' The memo is required: a transfer without it is not recognized.':'')+
@@ -298,8 +327,10 @@ defmodule OmnigateControl.TopupPage do
       if(tick)clearInterval(tick);
       function draw(){if(!current||current.status!=='awaiting_deposit'){clearInterval(tick);tick=null;return}
         var left=Math.round((new Date(current.deadline)-Date.now())/1000),t=when(current.deadline);
+        // The moment the deadline passes, the page stops asking for the transfer.
+        if(left<=0){clearInterval(tick);tick=null;renderPayment(current);return}
         $('p-deadline').textContent=isNaN(left)?t:left>0?t+' ('+(left>=3600?Math.floor(left/3600)+' h ':'')+Math.floor(left%3600/60)+' min '+(left<3600?left%60+' s ':'')+'left)':t+' (passed)'}
-      draw();tick=setInterval(draw,1000)}
+      tick=setInterval(draw,1000);draw()}
     function watch(){
       if(timer)clearTimeout(timer);timer=null;if(!current||END[current.status])return;
       timer=setTimeout(function(){var id=current.id;

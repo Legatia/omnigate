@@ -53,11 +53,11 @@ defmodule OmnigateControl.PaymentsPage do
       ~s(<label>Transaction signature<input name="tx" required minlength="64" maxlength="88" pattern="[1-9A-HJ-NP-Za-km-z]+" spellcheck="false"></label>),
       ~s(</div><div class="row"><button type="submit">Read and credit</button><span id="x-status" role="status" aria-live="polite"></span></div></form></section>),
       ~s(<section aria-labelledby="h-pay"><h2 id="h-pay">Payments</h2>),
-      ~s(<div class="scroll"><table><thead><tr><th>Started</th><th>Key</th><th>State</th><th class="num">Asked</th><th class="num">Credited</th><th>Paid with</th><th>Deposit address and note</th></tr></thead>),
+      ~s(<div class="scroll"><table><thead><tr><th>Started, UTC</th><th>Key</th><th>State</th><th class="num">Asked</th><th class="num">Credited</th><th>Paid with</th><th>Deposit address and note</th></tr></thead>),
       ~s(<tbody id="payments"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody></table></div><p id="p-status" role="status" aria-live="polite"></p></section>),
       ~s(<section aria-labelledby="h-added"><h2 id="h-added">Credit added</h2>),
       ~s(<p class="muted">Every top-up and bonus, newest first: payments, credit added by hand, and weekly bonuses.</p>),
-      ~s(<div class="scroll"><table><thead><tr><th>Time</th><th>Key</th><th>Source</th><th class="num">Amount</th><th>Reference</th></tr></thead>),
+      ~s(<div class="scroll"><table><thead><tr><th>Time, UTC</th><th>Key</th><th>Source</th><th class="num">Amount</th><th>Reference</th></tr></thead>),
       ~s(<tbody id="added"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody></table></div></section>),
       ~s(</main><script nonce="),
       nonce,
@@ -85,7 +85,8 @@ defmodule OmnigateControl.PaymentsPage do
     function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
     function clear(n){while(n.firstChild)n.removeChild(n.firstChild)}
     function usd(n){return n==null?'—':'$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}
-    function when(v){var d=typeof v==='number'?new Date(v*1000):new Date(v);return isNaN(d)?String(v==null?'':v):d.toLocaleString()}
+    // UTC, as on the dashboard.
+    function when(v){var d=typeof v==='number'?new Date(v*1000):new Date(v);return isNaN(d)?String(v==null?'':v):d.toISOString().slice(0,19).replace('T',' ')}
     function api(method,path,body){
       return fetch(path,{method:method,credentials:'same-origin',headers:{'content-type':'application/json','x-csrf-token':csrf,accept:'application/json'},body:body==null?null:JSON.stringify(body)})
         .then(function(r){return r.text().then(function(t){var j=null;try{j=t?JSON.parse(t):null}catch(e){}
@@ -133,7 +134,7 @@ defmodule OmnigateControl.PaymentsPage do
         tr.appendChild(el('td','num',usd(t.amount_usd)));tr.appendChild(el('td','mono addr',t.reference||''));body.appendChild(tr)})}
     function refresh(){
       return Promise.all([api('GET','/admin/keys'),api('GET','/admin/payments'),api('GET','/admin/topups')]).then(function(r){
-        byTx=!!r[1].credit_by_tx;$('bytx').hidden=!byTx;renderCredit(r[0].keys||[]);renderPayments(r[1].payments||[]);renderAdded(r[2].topups||[]);$('updated').textContent='Updated '+new Date().toLocaleTimeString()})
+        byTx=!!r[1].credit_by_tx;$('bytx').hidden=!byTx;renderCredit(r[0].keys||[]);renderPayments(r[1].payments||[]);renderAdded(r[2].topups||[]);$('updated').textContent='Updated '+new Date().toISOString().slice(11,19)+' UTC'})
       .catch(function(e){$('updated').textContent=e.message})}
     $('topup').addEventListener('submit',function(ev){
       ev.preventDefault();var f=ev.target,s=$('t-status');s.className='';s.textContent='Adding…';

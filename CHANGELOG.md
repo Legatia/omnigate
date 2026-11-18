@@ -59,8 +59,26 @@ only met a mock, is tracked in the README's
 - The dashboard's key form can restrict a key to providers marked as not
   watermarking, and the Payments page shows a Solana payment's reference.
 
+- **A Docker quickstart** (`deploy/quickstart`, first section of
+  [docs/quickstart.md](docs/quickstart.md)): the published images on one
+  machine with two tokens and a provider key, instead of three toolchains.
+- The documentation site has a search box and a copy button on code. Both
+  are one script served from the site itself; nothing is sent anywhere.
+
 ### Changed
 
+- **The top-up page** stops asking for a transfer the moment a payment's
+  deadline has passed (no code, no address, a warning instead); on a phone
+  the payment link is the main button; the bounds of a payment are shown
+  and checked before anything is asked (`GET /v1/payments/assets` answers
+  `min_usd` and `max_usd`); and where there is one way to pay it says so
+  instead of offering two menus with one entry each.
+- **The dashboard** keeps a key's actions in view when the table is wider
+  than the window, and calls a prepaid key without credit "out of credit",
+  as the Payments page does. The Payments page shows UTC, as the dashboard
+  does.
+- The site's landing page presents payments with both providers, and its
+  header and diagram fit a phone.
 - A data plane that stops tells the control plane so with its last
   rate-limit report, and `omnigate_data_planes` no longer counts it for
   another 30 seconds. One that is killed is still counted that long.

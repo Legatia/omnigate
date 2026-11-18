@@ -14,6 +14,7 @@ The site makes no request to any other host: no fonts, scripts or analytics.
 """
 
 import html
+import json
 import re
 import shutil
 import sys
@@ -122,6 +123,18 @@ def render(name, problems, links):
     return title or name, body, toc, ids
 
 
+def sections(name, label, body):
+    """A rendered page cut at its headings: the rows of the search index (/assets/search.json)."""
+    def plain(fragment):
+        return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
+
+    parts = re.split(r'<h[2-4] id="([^"]+)">(.*?)</h[2-4]>', body, flags=re.S)
+    rows = [{"u": url_of(name), "p": label, "h": "", "t": plain(parts[0])}]
+    for i in range(1, len(parts), 3):
+        rows.append({"u": f"{url_of(name)}#{parts[i]}", "p": label, "h": plain(parts[i + 1]), "t": plain(parts[i + 2])})
+    return rows
+
+
 def menu_html(current):
     out = []
     for group, items in MENU:
@@ -185,9 +198,11 @@ def build():
 
     page = (SRC / "doc.html").read_text(encoding="utf-8")
     labels = dict(item for _, items in MENU for item in items)
+    index = []
     for name in [n for n in listed if n in on_disk]:
         title, body, toc, ids = render(name, problems, links)
         anchors[name] = ids
+        index += sections(name, labels[name] if name != "README" else "Documentation", body)
         out = DIST / "docs" / ("" if name == "README" else name) / "index.html"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
@@ -209,6 +224,9 @@ def build():
         if anchor and target in anchors and anchor not in anchors[target]:
             problems.append(f"docs/{origin}.md: no heading #{anchor} in docs/{target}.md")
 
+    # What the documentation's search box looks through (site/src/assets/docs.js).
+    (DIST / "assets" / "search.json").write_text(json.dumps(index, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
     shutil.copy(SRC / "index.html", DIST / "index.html")
     shutil.copy(SRC / "404.html", DIST / "404.html")
     (DIST / "pricing").mkdir(parents=True, exist_ok=True)
@@ -219,7 +237,7 @@ def build():
         "  X-Content-Type-Options: nosniff\n"
         "  X-Frame-Options: DENY\n"
         "  Referrer-Policy: strict-origin-when-cross-origin\n"
-        "  Content-Security-Policy: default-src 'none'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\n"
+        "  Content-Security-Policy: default-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\n"
         "/assets/*\n"
         "  Cache-Control: public, max-age=3600\n",
         encoding="utf-8",

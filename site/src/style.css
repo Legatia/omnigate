@@ -52,6 +52,7 @@ pre .c { color: var(--comment); }
 .top nav a { color: var(--soft); text-decoration: none; }
 .top nav a:hover, .top nav a[aria-current] { color: var(--ink); }
 .only-small { display: none; }
+.brand { flex: 0 0 auto; }
 
 /* Landing */
 .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
@@ -69,7 +70,8 @@ pre .c { color: var(--comment); }
 .button:hover { border-color: var(--accent); }
 .button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 .button.primary:hover { filter: brightness(1.08); }
-.diagram { display: block; width: 100%; height: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.diagram-wrap { overflow-x: auto; border-radius: 10px; }
+.diagram { display: block; width: 100%; min-width: 700px; height: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
 .diagram .box rect { fill: var(--bg); stroke: var(--line); stroke-width: 1.5; }
 .diagram .box .own { fill: var(--tint); stroke: var(--accent); }
 .diagram .wire path { fill: none; stroke: var(--soft); stroke-width: 1.5; marker-end: url(#arrow); }
@@ -170,8 +172,40 @@ footer p { margin: 0.4em 0; }
   .side { order: 2; }
   .only-small { display: inline; }
   .top nav { gap: 16px; }
+  .top nav a { padding: 6px 0; }
   .side { position: static; max-height: none; border-top: 1px solid var(--line); padding-top: 28px; }
   .prose { padding-top: 24px; padding-bottom: 40px; }
   .prose h1 { font-size: 1.75rem; }
   .diagram { padding: 6px; }
+}
+
+@media (max-width: 480px) {
+  .not-small { display: none; }
+  .top nav { gap: 14px; font-size: 14.5px; }
+  .bar { gap: 10px; }
+}
+
+/* Documentation: search, and a copy button on code */
+.search { position: relative; flex: 1 1 220px; max-width: 360px; margin: 0 auto 0 16px; }
+.search[hidden] { display: none; }
+.search input { width: 100%; font: inherit; font-size: 14.5px; padding: 7px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); }
+.search input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.hits { position: absolute; left: 0; right: 0; top: calc(100% + 6px); margin: 0; padding: 6px; list-style: none; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 16px 40px -18px rgb(0 0 0 / 0.45); max-height: min(70vh, 520px); overflow-y: auto; min-width: min(92vw, 460px); }
+.hits[hidden] { display: none; }
+.hits a { display: block; padding: 8px 10px; border-radius: 6px; text-decoration: none; color: var(--ink); }
+.hits a:hover, .hits a[aria-selected="true"] { background: var(--tint); }
+.hits .where { display: block; font-size: 12.5px; color: var(--soft); }
+.hits .what { display: block; font-weight: 600; font-size: 14.5px; }
+.hits .text { display: block; font-size: 13.5px; color: var(--soft); overflow-wrap: anywhere; }
+.hits mark { background: none; color: var(--accent); font-weight: 650; }
+.hits .none { padding: 8px 10px; color: var(--soft); font-size: 14px; }
+.code { position: relative; }
+.code .copy { position: absolute; top: 8px; right: 8px; font: inherit; font-size: 12.5px; padding: 3px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--soft); cursor: pointer; opacity: 0; }
+.code:hover .copy, .code .copy:focus-visible { opacity: 1; }
+@media (hover: none) { .code .copy { opacity: 1; } }
+@media (max-width: 800px) {
+  .docs .bar { height: auto; flex-wrap: wrap; padding-top: 10px; padding-bottom: 10px; }
+  .search { order: 3; flex: 1 1 100%; max-width: none; margin: 0; }
+  .hits { min-width: 0; }
+  .docs html, html:has(.docs) { scroll-padding-top: 120px; }
 }

@@ -12,6 +12,10 @@
 <header class="top">
   <div class="bar">
     <a class="brand" href="/"><img src="/assets/icon.svg" alt="" width="22" height="22">omnigate</a>
+    <form class="search" role="search" hidden>
+      <input id="q" type="search" placeholder="Search the docs" aria-label="Search the documentation" autocomplete="off" spellcheck="false" aria-controls="hits">
+      <ul class="hits" id="hits" hidden></ul>
+    </form>
     <nav>
       <a href="/docs/" aria-current="true">Docs</a>
       <a class="only-small" href="#menu">Menu</a>
@@ -33,5 +37,6 @@
 {{toc}}
   </aside>
 </div>
+<script src="/assets/docs.js" defer></script>
 </body>
 </html>

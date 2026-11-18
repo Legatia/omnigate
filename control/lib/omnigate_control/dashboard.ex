@@ -99,7 +99,7 @@ defmodule OmnigateControl.Dashboard do
       ~s(<p class="muted">This is the only time the key is shown. Only its hash is stored.</p></div>),
       ~s(<div class="scroll"><table><thead><tr><th>Key</th><th>State</th><th>Spend</th><th class="num">Requests</th>),
       ~s(<th class="num">Errors</th><th class="num">Tokens in / out</th><th class="num">Jobs</th><th class="num">Per min</th>),
-      ~s(<th>Models</th><th>Actions</th></tr></thead><tbody id="keys-body">),
+      ~s(<th>Models</th><th class="actions">Actions</th></tr></thead><tbody id="keys-body">),
       case o.keys do
         [] -> empty(10, "No keys yet. Create one below, or add one to the config file.")
         list -> Enum.map(list, &key_row/1)
@@ -143,7 +143,7 @@ defmodule OmnigateControl.Dashboard do
       ~s(</span> <span class="tag">),
       h(k.source),
       ~s(</span></td><td>),
-      pill(k.state, state_class(k.state)),
+      pill(state_word(k), state_class(k.state)),
       privacy_note(k),
       ~s(</td><td class="spend">),
       case k.budget_usd do
@@ -454,6 +454,10 @@ defmodule OmnigateControl.Dashboard do
 
   defp pill(text, class), do: [~s(<span class="pill ), class, ~s(">), h(text), ~s(</span>)]
 
+  # A prepaid key that is blocked has spent its credit: said as the Payments page says it.
+  defp state_word(%{state: "blocked", credits: %{}}), do: "out of credit"
+  defp state_word(k), do: k.state
+
   defp state_class("active"), do: "ok"
   defp state_class("blocked"), do: "bad"
   defp state_class(_), do: "off"
@@ -542,7 +546,9 @@ defmodule OmnigateControl.Dashboard do
     button.armed{background:var(--bad-bg);color:var(--bad);border-color:var(--bad)}
     button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     button:disabled{opacity:.55;cursor:default}
-    .actions button:last-child{margin-right:0}.models{white-space:normal;max-width:220px}
+    .actions button:last-child{margin-right:0}
+    /* The actions stay in view while the rest of a wide table scrolls under them. */
+    th.actions,td.actions{position:sticky;right:0;background:var(--panel);box-shadow:-1px 0 0 var(--line)}.models{white-space:normal;max-width:220px}
     .panel table{min-width:0}.panel td{white-space:normal;overflow-wrap:anywhere}
     form.panel{margin-top:14px}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:12px}
     label{display:block;font-size:12.5px;font-weight:600}label .muted{font-weight:400}
@@ -590,7 +596,7 @@ defmodule OmnigateControl.Dashboard do
 
     function keyRow(k){
       var r=el('tr'),n=td('');n.appendChild(el('span','name',k.name));n.appendChild(document.createTextNode(' '));n.appendChild(el('span','tag',k.source));r.appendChild(n);
-      var st=td('',pill(k.state,stateClass(k.state)));if(k.privacy_summary)st.appendChild(el('span','muted sub','private: '+k.privacy_summary));r.appendChild(st);
+      var st=td('',pill(k.state==='blocked'&&k.credits?'out of credit':k.state,stateClass(k.state)));if(k.privacy_summary)st.appendChild(el('span','muted sub','private: '+k.privacy_summary));r.appendChild(st);
       var s=td('spend');
       if(k.budget_usd==null){s.appendChild(document.createTextNode(usd(k.cost_usd)+' '));s.appendChild(muted('no budget'))}
       else{var total=k.budget_period==='total'||!k.budget_period,spent=k.period_spend_usd;

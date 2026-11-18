@@ -1,0 +1,40 @@
+{
+  "upstreams": [
+    {
+      "name": "openai",
+      "kind": "openai",
+      "base_url": "https://api.openai.com",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "name": "anthropic",
+      "kind": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "api_key_env": "ANTHROPIC_API_KEY"
+    }
+  ],
+  "routes": [
+    {
+      "model": "gpt",
+      "targets": [
+        {
+          "upstream": "openai",
+          "model": "gpt-4o-mini",
+          "price_in_per_mtok": 0.0,
+          "price_out_per_mtok": 0.0
+        }
+      ]
+    },
+    {
+      "model": "claude",
+      "targets": [
+        {
+          "upstream": "anthropic",
+          "model": "claude-sonnet-5-5",
+          "price_in_per_mtok": 0.0,
+          "price_out_per_mtok": 0.0
+        }
+      ]
+    }
+  ]
+}

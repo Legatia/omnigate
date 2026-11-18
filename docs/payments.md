@@ -358,7 +358,7 @@ are for.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /v1/payments/assets` | What can be paid with. `?chain=` and `?symbol=` narrow the list. The answer also names the `provider` and says whether a payment needs a refund address (`refund_address`). |
+| `GET /v1/payments/assets` | What can be paid with. `?chain=` and `?symbol=` narrow the list. The answer also names the `provider`, says whether a payment needs a refund address (`refund_address`), and gives the bounds of one payment (`min_usd`, `max_usd`). |
 | `POST /v1/payments/quote` | What a payment would take, without starting one. |
 | `POST /v1/payments` | Start a payment: get a deposit address and the amount to send. |
 | `GET /v1/payments/{id}` | The payment and its state. |

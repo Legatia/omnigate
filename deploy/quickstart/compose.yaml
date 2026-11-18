@@ -1,0 +1,48 @@
+# omnigate on one machine, from the published images, for a first look.
+#
+#   cp .env.example .env        # then put two random tokens and a provider key in it
+#   docker compose up -d
+#
+# The gateway is then at http://localhost:8080 and the dashboard at
+# http://localhost:4000 (sign in with OMNIGATE_ADMIN_TOKEN). Both ports are
+# published on this machine only. docs/quickstart.md walks through it.
+#
+# This is for trying it out: no TLS, the newest release rather than a pinned
+# one, and one .env file for both processes. For a server use the Compose
+# file in the repository root (docs/deployment.md), which has a TLS proxy,
+# memory limits and separate secrets for the two processes.
+
+services:
+  control:
+    image: ghcr.io/legatia/omnigate-control:latest
+    restart: unless-stopped
+    environment:
+      OMNIGATE_INTERNAL_TOKEN: ${OMNIGATE_INTERNAL_TOKEN:?put a random token in .env}
+      OMNIGATE_ADMIN_TOKEN: ${OMNIGATE_ADMIN_TOKEN:?put a random token in .env}
+      OMNIGATE_GATEWAY_URL: http://dataplane:8080
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./omnigate.json:/config/omnigate.json:ro
+      - control-data:/data
+    stop_grace_period: 30s
+
+  dataplane:
+    image: ghcr.io/legatia/omnigate-dataplane:latest
+    restart: unless-stopped
+    environment:
+      OMNIGATE_INTERNAL_TOKEN: ${OMNIGATE_INTERNAL_TOKEN:?put a random token in .env}
+      # The keys of the text providers omnigate.json names (api_key_env).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - dataplane-data:/data
+    stop_grace_period: 20s
+    depends_on:
+      - control
+
+volumes:
+  control-data:
+  dataplane-data:

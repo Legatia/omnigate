@@ -417,7 +417,11 @@ jobs:
             exit 0
           fi
           echo "upgrading from $from"
-          python tools/upgrade_test.py "$from" --variant both --mixed
+          python tools/upgrade_test.py "$from" --variant both --mixed 2>&1 | tee "$RUNNER_TEMP/upgrade.log"
+
+      - name: What failed
+        if: failure()
+        run: python tools/ci_annotate.py "$RUNNER_TEMP/upgrade.log" upgrade
 
       - name: Upload logs and state
         if: failure()
@@ -447,7 +451,12 @@ jobs:
       # when it is done. It prints pods, events and logs itself when a check
       # fails.
       - name: Kubernetes test
-        run: python3 tools/k8s_test.py
+        run: python3 tools/k8s_test.py 2>&1 | tee "$RUNNER_TEMP/k8s.log"
+
+      # The failing checks as annotations on the run: readable without the log.
+      - name: What failed
+        if: failure()
+        run: python3 tools/ci_annotate.py "$RUNNER_TEMP/k8s.log" kubernetes
 
       - name: What was left running
         if: failure()

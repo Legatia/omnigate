@@ -107,12 +107,19 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
           OMNIGATE_REQUIRE_PYRAGE: "1"
-        run: python tools/e2e.py
+        run: python tools/e2e.py 2>&1 | tee "$RUNNER_TEMP/e2e.log"
 
       - name: Hostile-input test
         env:
           TMPDIR: ${{ runner.temp }}
-        run: python tools/malformed_test.py
+        run: python tools/malformed_test.py 2>&1 | tee "$RUNNER_TEMP/hostile.log"
+
+      # The failing checks as annotations on the run: readable without the log.
+      - name: What failed
+        if: failure()
+        run: |
+          python tools/ci_annotate.py "$RUNNER_TEMP/e2e.log" e2e
+          python tools/ci_annotate.py "$RUNNER_TEMP/hostile.log" hostile-input
 
       - name: Upload logs and state
         if: failure()

@@ -416,6 +416,7 @@ tools/                Python, standard library only (sdk_compat.py excepted; e2e
   load_test.py                      load and soak test against a running gateway
   privacy_soak.py                   soak test of privacy mode on a stack it starts (long; not in check.py)
   upgrade_test.py                   an older commit's files read by the current build, and mixed pairs (long; not in check.py)
+  ci_annotate.py                    a failed test log as GitHub Actions annotations (used by the workflows)
   k8s_test.py                       deploy/kubernetes on a kind cluster it creates (needs docker, kind, kubectl; not in check.py)
   invoice.py                        payment requests in USDC on Solana for what is sold by hand, and whether they were paid
   test_invoice.py                   its tests, against mock_solana.py

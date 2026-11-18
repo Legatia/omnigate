@@ -181,6 +181,12 @@ poll faster), and checks:
   plane counts two data planes again;
 - a route added to the ConfigMap is served without a restart.
 
+Its first two runs (18 November 2026) were of the same manifests and test:
+the first failed, the second passed. The log of the first could not be
+read, so which step or check failed is not known; expect the test, not
+necessarily the manifests, to have a timing-dependent check until that is
+found.
+
 **Not tested**: an Ingress or load balancer in front (the test reaches the
 Services through `kubectl port-forward`), TLS, more than one node, a
 storage class other than kind's local one, a managed Kubernetes service,

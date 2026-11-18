@@ -43,13 +43,17 @@ only met a mock, is tracked in the README's
 - **Kubernetes manifests** in `deploy/kubernetes`, and a test that runs
   them on a one-node kind cluster in CI
   ([docs/kubernetes.md](docs/kubernetes.md)). Tested there and nowhere
-  else.
+  else. Of its first two runs in CI the first failed and the second, of
+  the same code, passed; which check failed is not known (CI now reports
+  failing checks as annotations).
 - **A check of what a release published**
   (`.github/workflows/release-check.yml`): after a release, each archive is
   downloaded, verified against its checksum and run through the end-to-end
   and hostile-input suites on a machine of its own kind (both Linux
   architectures, both kinds of Mac, Windows), and both images run the
-  container test on amd64 and arm64.
+  container test on amd64 and arm64. Run for the first time on
+  18 November 2026 against 1.2.0: all seven jobs passed, which is the
+  first time the arm64 Linux and the two macOS archives were executed.
 - CI runs the upgrade test (from the latest release to the commit, clean
   and killed, and both mixed pairs) on Linux, where it had not run before.
 - The dashboard's key form can restrict a key to providers marked as not

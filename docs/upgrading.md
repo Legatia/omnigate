@@ -39,6 +39,7 @@ Contents:
 - [1.0.0](#100)
 - [1.1.0](#110)
 - [1.2.0](#120)
+- [After 1.2.0](#after-120)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -803,6 +804,30 @@ know the part: it ignores it on a key, and refuses the word in the
 **not** restricted until its data planes are upgraded; upgrade them before
 you rely on it. The other way round (new data plane, old control plane) the
 part cannot be set at all.
+
+## After 1.2.0
+
+Not released yet. Nothing changes on disk that an older version cannot
+read.
+
+| What | Before | After |
+|---|---|---|
+| Payments (`solana`) | A transfer that was not recognized had to be credited by hand. | It can be credited from its signature: `POST /v1/payments/{id}/tx` now does something for this provider (also for an expired payment), and there is `POST /admin/payments/credit` ([Payments](payments.md#a-transfer-that-was-not-recognized)). A payment can carry `claimed_tx`; `GET /admin/payments` also answers `provider` and `credit_by_tx`. |
+| A data plane that stops | The control plane counted it in `omnigate_data_planes` for 30 more seconds. | It says that it stops, with its last rate-limit report, and is not counted from then on. One that is killed is still counted for up to 30 seconds. |
+| A data plane that starts | Waited up to 10 seconds for a control plane that does not answer before opening its port. | Waits up to 3 seconds. Later calls keep the 10. |
+| Kubernetes | Untested. | Manifests in `deploy/kubernetes`, tested in CI on a one-node cluster ([Kubernetes](kubernetes.md)). |
+
+**On disk.** `payments.json` can hold two new fields on a payment
+(`claimed_tx`, `credited_by`), and a payment made by
+`POST /admin/payments/credit` for a key has no deposit reference. An older
+control plane reads the file as before and ignores what it does not know.
+
+**Between the two processes.** A newer data plane's last report says
+`"leaving": true`; an older control plane ignores the field and forgets
+the data plane after 30 seconds, as it always did. An older data plane
+never says it, and a newer control plane forgets it the same way.
+
+**Going back** to 1.2.0 needs nothing.
 
 ## Tested upgrades
 

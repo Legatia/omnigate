@@ -508,6 +508,11 @@ pub fn main(init: std.process.Init) !void {
         .started_unix_s = @divTrunc(Io.Timestamp.now(io, .real).toMilliseconds(), 1000),
     };
 
+    // The first sync waits less than the later ones: the port opens only
+    // after it, and the poll loop asks again a moment later anyway. With
+    // the control plane up it takes milliseconds, and no request is ever
+    // decided from a cached config that the control plane could correct.
+    control.call_timeout_ms.store(control.initial_call_timeout_ms, .release);
     control.syncOnce(&app) catch |err| {
         if (control.loadCache(&app)) |_| {
             log.warn("initial config sync failed ({t}); serving the cached config until the control plane answers", .{err});
@@ -515,6 +520,7 @@ pub fn main(init: std.process.Init) !void {
             log.warn("initial config sync failed ({t}) and there is no cached config; serving 503 until the control plane answers", .{err});
         }
     };
+    control.call_timeout_ms.store(control.default_call_timeout_ms, .release);
 
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -597,6 +603,9 @@ pub fn main(init: std.process.Init) !void {
     const undelivered = reporter.drain(&app, 20);
     // And the rejection counters, which have no spool: once, best effort.
     _ = counters.flushOnce(&app);
+    // And tell the control plane that this data plane is gone, so that it
+    // is not counted for another half minute.
+    if (limit_sync_ms > 0) limitsync.leave(&app);
     if (undelivered > 0) {
         log.warn("stopped with {d} usage event(s) undelivered{s}", .{
             undelivered, if (spool_path != null) " (kept in the spool)" else " (no spool: they are lost)",

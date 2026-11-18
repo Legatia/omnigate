@@ -74,6 +74,10 @@ pub const default_call_timeout_ms: u32 = 10_000;
 /// wait ten seconds twice for a control plane that is not there.
 pub var call_timeout_ms: std.atomic.Value(u32) = .init(default_call_timeout_ms);
 pub const shutdown_call_timeout_ms: u32 = 2_000;
+/// And for the one sync before the listener opens: a control plane that
+/// does not answer within this is taken to be away, and the data plane
+/// starts from its cached config.
+pub const initial_call_timeout_ms: u32 = 3_000;
 
 fn sleepMs(io: Io, ms: u32) Io.Cancelable!void {
     return io.sleep(.fromMilliseconds(ms), .awake);

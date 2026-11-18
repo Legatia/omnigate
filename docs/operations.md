@@ -349,8 +349,10 @@ minute (a token bucket).
     planes then each allow the full limit. The data plane logs once that
     limits are not shared, and once when they are again. Reports made
     meanwhile are dropped, not sent later.
-  - A data plane that has not reported for 30 seconds is forgotten, with
-    what it had not been told yet. The control plane keeps track of at most
+  - A data plane that stops says so with its last report and is forgotten
+    at once; one that has not reported for 30 seconds (it was killed, or
+    cut off) is forgotten then, with what it had not been told yet. The
+    control plane keeps track of at most
     64 data planes; further ones are answered 503 and limit on their own.
   - `omnigate_data_planes` in the [metrics](api.md#get-metrics) says how
     many are taking part.
@@ -790,9 +792,11 @@ The data plane is built to keep serving text traffic without it.
 - **The address swallows them** (the host is off, or a firewall drops the
   packets), or the control plane takes a request and never answers. Each
   call to the control plane (config poll, usage batch, refusal counts) is
-  given up after 10 seconds. A data plane started in that state opens its
-  port about 10 seconds after starting, once its first config fetch has
-  timed out, and then serves from the cached config. Before the
+  given up after 10 seconds; the one fetch a data plane makes before it
+  opens its port, after 3. A data plane started in that state opens its
+  port about 3 seconds after starting, once that fetch has timed out, and
+  then serves from the cached config (it was 10 seconds through 1.2.0).
+  Before the
   0.1.0-rc.1 commit these calls had no limit: such a start served nothing
   for as long as the operating system kept trying to connect (minutes),
   and one unanswered call stopped the config poll or the usage reporter
@@ -952,7 +956,7 @@ Data plane:
 | `bad OMNIGATE_LOG_LEVEL or OMNIGATE_LOG_FORMAT: ...`, `<VARIABLE> is not a valid number: "<value>" (expected a whole number from <min> to <max>)`, `OMNIGATE_LISTEN must be host:port, got ...`, `OMNIGATE_LISTEN has no valid port: ...` | The data plane exited at startup over a bad setting. Every numeric variable is read strictly (digits only) and named in the message. |
 | `omnigate data plane listening on <address> (control plane <url>)` | Startup. |
 | `installed config version <id> (N routes, N keys)` | A new config snapshot is in force. |
-| `initial config sync failed (...)` | The control plane was unreachable at startup; the line says whether a cached config is being served. `ControlTimeout` in it means the address took the connection, or the packets, and gave no answer within 10 seconds. |
+| `initial config sync failed (...)` | The control plane was unreachable at startup; the line says whether a cached config is being served. `ControlTimeout` in it means the address took the connection, or the packets, and gave no answer within 3 seconds (the wait before the port opens; later calls wait 10). |
 | `config fetch returned 401` | The two `OMNIGATE_INTERNAL_TOKEN` values differ. |
 | `config sync failed (...); serving last good config` | Logged once per outage. `control plane reachable again` ends it. |
 | `upstream <name> returned <status>, failing over` | A 429 or 5xx. |

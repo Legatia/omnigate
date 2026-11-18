@@ -1477,6 +1477,7 @@ check, then the endpoint.
 | `POST /admin/keys/{name}/topup` | Add `amount_usd` to a managed key's total budget, once per `reference` (a payment id): the same call again adds nothing. Optional `source`. |
 | `GET /admin/topups?key=NAME&limit=N` | Applied top-ups and bonuses, newest first ([Prepaid credit](credits.md#seeing-it)). |
 | `GET /admin/payments?limit=N` | [Payments](payments.md#for-operators) taken for credit, newest first; empty unless payments are configured. |
+| `POST /admin/payments/credit` | With the `solana` provider: credit what one transaction moved to your wallet, once, to a payment (`{"payment", "tx"}`) or to a prepaid key (`{"key", "tx"}`). See [A transfer that was not recognized](payments.md#a-transfer-that-was-not-recognized). |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
 | `GET /admin/events?after=CURSOR&limit=N&key=NAME` | The usage feed: every recorded text request and media job, oldest first, with a cursor to continue from. No content. See [Building on omnigate](building-on-omnigate.md#reading-usage). |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |
@@ -1595,7 +1596,7 @@ curl http://127.0.0.1:4000/metrics -H "Authorization: Bearer dev-admin-token-cha
 | `omnigate_key_budget_usd` | gauge | `key` | Budget, for keys that have one. |
 | `omnigate_key_period_cost_usd` | gauge | `key` | Spend in the key's current budget period: this month, this day, or everything for a total budget. |
 | `omnigate_key_blocked` | gauge | `key` | 1 when the key has spent its budget for the current period and is refused, else 0. |
-| `omnigate_data_planes` | gauge | | Data planes that reported their rate-limit counts in the last 30 seconds. A data plane with `OMNIGATE_LIMIT_SYNC_MS=0`, or older than this metric, is not counted. |
+| `omnigate_data_planes` | gauge | | Data planes that reported their rate-limit counts in the last 30 seconds and have not said that they stopped (one that stops cleanly says so; one that is killed is counted for up to 30 seconds more). A data plane with `OMNIGATE_LIMIT_SYNC_MS=0`, or older than this metric, is not counted. |
 | `omnigate_rejected_requests_total` | counter | `key`, `reason` | Requests data planes refused before routing, since this control plane started. `reason` is the `error.code` the client got; `key` is the key's name, or `-` when the request had no usable key. |
 | `omnigate_redactions_total` | counter | `key`, `class` | Values [privacy mode](privacy.md#redaction) replaced by placeholders before a provider saw them, since this control plane started. `class` is `email`, `phone`, `card`, `ip` or `secret`. Counts only. |
 | `omnigate_key_private` | gauge | `key` | 1 when the key has any part of privacy mode switched on, else 0. |

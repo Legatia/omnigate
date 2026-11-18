@@ -1234,8 +1234,9 @@ def hostile_control(stack):
                 opened = time.time() - started
             except OSError:
                 time.sleep(0.25)
-        record("a gateway whose control plane accepts and never answers still opens its listener, ten seconds after starting",
-               opened is not None and 8 <= opened <= 16, opened)
+        # (Its first call, before the listener, waits three seconds; the later ones ten.)
+        record("a gateway whose control plane accepts and never answers still opens its listener, three seconds after starting",
+               opened is not None and 2 <= opened <= 8, opened)
         stack.stop("gateway3")
         mute.close()
 

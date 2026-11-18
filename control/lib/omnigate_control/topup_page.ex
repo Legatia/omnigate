@@ -68,6 +68,9 @@ defmodule OmnigateControl.TopupPage do
       ~s(<dt>Before</dt><dd id="p-deadline"></dd></dl></div>),
       ~s(<p id="pay-note" class="muted"></p>),
       ~s(<dl id="pay-facts" class="facts"></dl>),
+      ~s(<form id="f-tx" class="bytx" autocomplete="off" hidden><label>Paid, and it does not show here? <span class="muted">Paste the signature of your transaction.</span>),
+      ~s(<input id="tx" required minlength="64" maxlength="88" pattern="[1-9A-HJ-NP-Za-km-z]+" spellcheck="false"></label>),
+      ~s(<div class="row"><button type="submit" class="ghost">Check this transaction</button><span id="tx-status" class="status" role="status"></span></div></form>),
       ~s(<div class="row"><button type="button" id="pay-back" class="ghost">Back</button><span id="pay-status" class="status" role="status"></span></div></section>),
       # 4: earlier payments
       ~s(<section id="s-list" class="panel" hidden><h2>Payments on this key</h2><div class="scroll"><table><thead><tr>),
@@ -86,7 +89,7 @@ defmodule OmnigateControl.TopupPage do
     ~S"""
     .tu-main{max-width:760px;margin:0 auto;padding:16px 16px 40px;display:flex;flex-direction:column;gap:14px}
     .tu h2{margin:0 0 6px;font-size:17px}.tu .panel p{margin:0 0 12px}
-    .tu label{margin-bottom:12px}.tu label[hidden]{display:none}.status{font-size:13px}.status.bad{color:var(--bad)}
+    .tu label{margin-bottom:12px}.tu label[hidden],.tu form[hidden]{display:none}.bytx{border-top:1px solid var(--line);padding-top:12px;margin-top:4px}.status{font-size:13px}.status.bad{color:var(--bad)}
     .bal{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:8px 20px}
     .bal .value{font-size:34px;font-weight:650;line-height:1.1}
     .amounts{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 14px}.amt{min-width:64px}.amt.on{background:var(--accent);color:var(--accent-text)}
@@ -287,6 +290,8 @@ defmodule OmnigateControl.TopupPage do
         s==='failed'?'The payment could not be completed.':'Nothing arrived before the deadline. Nothing was credited; start a new payment.';
       var f=$('pay-facts');clear(f);function row(k,v){if(v==null||v==='')return;f.appendChild(el('dt',null,k));f.appendChild(el('dd',null,String(v)))}
       row('Credit asked for',usd(p.amount_usd));row('Note',p.detail);row('Refund address',p.refund_to);
+      if(p.claimed_tx)row('Waiting for the operator','You named a transaction of '+usd(p.claimed_tx.amount_usd)+' ('+p.claimed_tx.signature+'). It reached this gateway, and nothing in it says which payment it is for, so the operator has to confirm it.');
+      show('f-tx',p.provider==='solana'&&(s==='awaiting_deposit'||s==='expired'));
       if(p.tx&&p.tx.length)row('Transactions',p.tx.join(', '));row('Payment id',p.id);
       if(was&&was!==s&&END[s])load()}
     function countdown(){
@@ -301,6 +306,11 @@ defmodule OmnigateControl.TopupPage do
         api('GET','/v1/payments/'+encodeURIComponent(id)).then(function(p){if(current&&current.id===id){renderPayment(p);say('pay-status','')}})
         .catch(function(e){say('pay-status','Could not check just now: '+e.message,true)}).finally(watch)},4000)}
     document.addEventListener('visibilitychange',function(){if(!document.hidden&&current&&!END[current.status])watch()});
+    $('f-tx').addEventListener('submit',function(ev){
+      ev.preventDefault();if(busy||!current)return;busy=true;var id=current.id;say('tx-status','Reading the transaction…');
+      api('POST','/v1/payments/'+encodeURIComponent(id)+'/tx',{tx_hash:$('tx').value.trim()}).then(function(p){
+        $('tx').value='';say('tx-status',p.status==='settled'?'':p.claimed_tx?'Noted for the operator.':'Checking the chain…');if(current&&current.id===id)renderPayment(p);watch()})
+      .catch(function(e){say('tx-status',e.message,true)}).finally(function(){busy=false})});
     $('pay-back').addEventListener('click',function(){if(timer)clearTimeout(timer);timer=null;current=null;show('s-pay',false);show('s-new',true);load()});
     Array.prototype.forEach.call(document.querySelectorAll('.copy'),function(b){b.addEventListener('click',function(){
       var text=$(b.dataset.copy).textContent;if(!navigator.clipboard)return;navigator.clipboard.writeText(text).then(function(){var old=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=old},1200)})})});

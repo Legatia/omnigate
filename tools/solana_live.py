@@ -6,7 +6,8 @@
 Read-only and free: it sends nothing and needs no key. It makes the three
 calls the gateway makes (getSignaturesForAddress, getTransaction with
 jsonParsed encoding, getTokenAccountsByOwner) and checks that the answers
-have the fields `control/lib/omnigate_control/payments/solana.ex` reads.
+have the fields `control/lib/omnigate_control/payments/solana.ex` reads,
+also the ones it reads when a transaction is credited from its signature.
 
 Without --wallet it takes a wallet from a recent transfer of the mint
 (USDC by default), so that there is something to read. With your own wallet
@@ -107,6 +108,20 @@ def main():
         time.sleep(0.5)
     else:
         check("getTransaction (jsonParsed) carries meta.err and token balances with owner, mint and uiTokenAmount.amount", read > 0, read)
+
+    # What crediting a transaction from its signature reads (and tools/invoice.py): final transactions only, and the accounts one names.
+    final = rpc(args.rpc, "getSignaturesForAddress", [listed[0], {"limit": 5, "commitment": "finalized"}])
+    check("asked for final transactions only, getSignaturesForAddress lists only those",
+          isinstance(final, list) and final and all(e.get("confirmationStatus") == "finalized" for e in final), final[:2] if isinstance(final, list) else final)
+    if isinstance(final, list) and final:
+        time.sleep(0.5)
+        tx = rpc(args.rpc, "getTransaction", [final[0]["signature"], dict(options, commitment="finalized")])
+        keys = (((tx or {}).get("transaction") or {}).get("message") or {}).get("accountKeys")
+        check("getTransaction at commitment finalized answers it, with transaction.message.accountKeys as [{pubkey}] that include the token account asked about",
+              isinstance(keys, list) and all(isinstance(k, dict) and isinstance(k.get("pubkey"), str) for k in keys) and listed[0] in [k["pubkey"] for k in keys]
+              and isinstance(tx.get("blockTime"), int), str(tx)[:300])
+        missing = rpc(args.rpc, "getTransaction", ["1" * 64, dict(options, commitment="finalized")])
+        check("a signature the chain does not know answers null, not an error", missing is None, missing)
 
     print("ALL PASSED" if all(RESULTS) else "SOME FAILED")
     return 0 if all(RESULTS) else 1

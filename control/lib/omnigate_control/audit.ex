@@ -164,6 +164,7 @@ defmodule OmnigateControl.Audit do
     |> put_if("fields", extra[:fields])
     |> put_if("privacy", extra[:privacy])
     |> put_if("topup", extra[:topup])
+    |> put_if("payment", extra[:payment])
   end
 
   # -- server -------------------------------------------------------------------

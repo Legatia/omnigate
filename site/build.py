@@ -35,7 +35,7 @@ REPO = "https://github.com/Legatia/omnigate"
 # appear here once; the build says so if one is missing.
 MENU = [
     ("Start", [("README", "Overview"), ("quickstart", "Quickstart"), ("configuration", "Configuration"), ("api", "API reference"), ("providers", "Providers")]),
-    ("Run it", [("deployment", "Deployment"), ("admin", "Admin"), ("operations", "Operations"), ("upgrading", "Upgrading"), ("security", "Security hardening")]),
+    ("Run it", [("deployment", "Deployment"), ("kubernetes", "Kubernetes"), ("admin", "Admin"), ("operations", "Operations"), ("upgrading", "Upgrading"), ("security", "Security hardening")]),
     ("Privacy", [("privacy", "Privacy mode"), ("attestation", "Attested inference")]),
     ("Credit and payments", [("credits", "Prepaid credit"), ("payments", "Payments"), ("building-on-omnigate", "Building on omnigate")]),
     ("Reference", [("architecture", "Architecture"), ("migrating-from-litellm", "Migrating from LiteLLM"), ("releasing", "Releasing")]),

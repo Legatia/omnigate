@@ -11,6 +11,10 @@
 //!
 //!     200 {"others":[{"key":"<sha256 hex>","n":5,"rpm":60}, ...]}
 //!
+//! A data plane that stops sends one last report with `"leaving":true`, so
+//! that the control plane stops counting it at once (one that is killed
+//! is forgotten after half a minute).
+//!
 //! and takes that out of its buckets. No request ever waits for this: the
 //! limit is exact within one data plane and approximate across them. What
 //! arrives at several data planes within one interval is allowed by each
@@ -42,7 +46,7 @@ pub fn newInstance(io: Io) Instance {
 }
 
 /// The request body.
-pub fn encode(gpa: std.mem.Allocator, instance: *const Instance, taken: []const ratelimit.Limiter.Taken) ![]u8 {
+pub fn encode(gpa: std.mem.Allocator, instance: *const Instance, taken: []const ratelimit.Limiter.Taken, leaving: bool) ![]u8 {
     var out: Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
     const w = &out.writer;
@@ -51,7 +55,7 @@ pub fn encode(gpa: std.mem.Allocator, instance: *const Instance, taken: []const 
         if (i != 0) try w.writeByte(',');
         try w.print("{{\"key\":\"{s}\",\"n\":{d},\"rpm\":{d}}}", .{ t.key, t.n, t.rpm });
     }
-    try w.writeAll("]}");
+    try w.writeAll(if (leaving) "],\"leaving\":true}" else "]}");
     return out.toOwnedSlice();
 }
 
@@ -77,12 +81,22 @@ pub fn apply(limiter: *ratelimit.Limiter, gpa: std.mem.Allocator, io: Io, body: 
     return applied;
 }
 
+/// The last report of a data plane that stops. Best effort: a control plane
+/// that does not take it forgets this data plane by itself a little later.
+pub fn leave(app: *App) void {
+    exchange(app, true) catch |err| log.debug("the control plane was not told that this data plane stops ({t})", .{err});
+}
+
 /// One exchange. An error means the control plane did not take the report.
 fn syncOnce(app: *App) !void {
+    return exchange(app, false);
+}
+
+fn exchange(app: *App, leaving: bool) !void {
     const gpa = app.gpa;
     const taken = try app.limiter.takeReport(gpa, app.io);
     defer gpa.free(taken);
-    const body = try encode(gpa, &app.instance, taken);
+    const body = try encode(gpa, &app.instance, taken, leaving);
     defer gpa.free(body);
 
     var answer: Io.Writer.Allocating = .init(gpa);
@@ -122,7 +136,7 @@ test "the request names the instance and what each key was allowed" {
         .{ .key = @splat('a'), .n = 3, .rpm = 60 },
         .{ .key = @splat('b'), .n = 1, .rpm = 5 },
     };
-    const body = try encode(gpa, &instance, &taken);
+    const body = try encode(gpa, &instance, &taken, false);
     defer gpa.free(body);
     const a: [64]u8 = @splat('a');
     const b: [64]u8 = @splat('b');
@@ -130,9 +144,13 @@ test "the request names the instance and what each key was allowed" {
     defer gpa.free(want);
     try testing.expectEqualStrings(want, body);
 
-    const none = try encode(gpa, &instance, &.{});
+    const none = try encode(gpa, &instance, &.{}, false);
     defer gpa.free(none);
     try testing.expectEqualStrings("{\"instance\":\"0123456789abcdef\",\"taken\":[]}", none);
+
+    const last = try encode(gpa, &instance, &.{}, true);
+    defer gpa.free(last);
+    try testing.expectEqualStrings("{\"instance\":\"0123456789abcdef\",\"taken\":[],\"leaving\":true}", last);
 }
 
 test "an answer is taken out of the buckets, and nonsense in it is skipped" {

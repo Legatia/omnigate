@@ -38,6 +38,7 @@ TOKEN_ACCOUNT = "7UX2i7SucgLMQcfZ75s3VXmZZY4YRUyJN9X1RgfMoDUi"
 LOCK = threading.Lock()
 SIGNATURES = {}  # address -> entries, newest first
 TRANSACTIONS = {}
+STATUS = {}  # signature -> its entry (which says whether it is final)
 ACCOUNTS = [TOKEN_ACCOUNT]
 SEEN = {}
 
@@ -69,6 +70,7 @@ def land(body):
                  "postTokenBalances": [balance(1, "PayerWa11et1111111111111111111111111111111111", mint, 900000000 - units), balance(2, owner, mint, 250000 + units)]},
         "transaction": {"signatures": [signature], "message": {"accountKeys": [{"pubkey": a, "signer": False, "writable": False} for a in body.get("addresses", [])]}},
     }
+    STATUS[signature] = entry
     for address in body.get("addresses", []):
         SIGNATURES.setdefault(address, []).insert(0, entry)
     return 200, {"signature": signature}
@@ -78,10 +80,16 @@ def rpc(body):
     method, params = body.get("method"), body.get("params") or []
     SEEN[method] = SEEN.get(method, 0) + 1
     if method == "getSignaturesForAddress" and params:
-        limit = (params[1] if len(params) > 1 else {}).get("limit", 1000)
-        return {"result": SIGNATURES.get(params[0], [])[:limit]}
+        options = params[1] if len(params) > 1 else {}
+        entries = SIGNATURES.get(params[0], [])
+        if options.get("commitment") == "finalized":
+            entries = [e for e in entries if e["confirmationStatus"] == "finalized"]
+        return {"result": entries[:options.get("limit", 1000)]}
     if method == "getTransaction" and params:
-        return {"result": TRANSACTIONS.get(params[0])}
+        # Asked for final transactions only, one that is not final yet is not there.
+        final_only = (params[1] if len(params) > 1 else {}).get("commitment") == "finalized"
+        waiting = final_only and STATUS.get(params[0], {}).get("confirmationStatus") != "finalized"
+        return {"result": None if waiting else TRANSACTIONS.get(params[0])}
     if method == "getTokenAccountsByOwner" and params:
         return {"result": {"context": {"slot": 300000000}, "value": [{"pubkey": a, "account": {"owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"}} for a in ACCOUNTS]}}
     return {"error": {"code": -32601, "message": "Method not found"}}
@@ -119,9 +127,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/__mock/land":
                 return self.answer(*land(body))
             if self.path == "/__mock/finalize":
-                for entries in SIGNATURES.values():
-                    for entry in entries:
-                        entry["confirmationStatus"] = "finalized"
+                for entry in STATUS.values():
+                    entry["confirmationStatus"] = "finalized"
                 return self.answer(200, {"ok": True})
             if self.path == "/__mock/accounts":
                 ACCOUNTS[:] = body.get("accounts", [])

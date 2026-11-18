@@ -14,6 +14,7 @@ Steps, in order:
     mix-format  mix format --check-formatted   (control plane formatting)
     mix-test    mix test                       (control plane unit tests)
     importer    tools/test_import_litellm.py   (LiteLLM config importer)
+    invoice     tools/test_invoice.py          (the invoice tool, against the stand-in chain)
     e2e         tools/e2e.py                   (whole stack against mock providers)
     sdk         tools/sdk_compat.py            (official OpenAI and Anthropic SDKs as clients;
                                                 skipped unless both are importable: pip install openai anthropic)
@@ -77,6 +78,7 @@ def steps(env):
         ("mix-format", True, [mix, "format", "--check-formatted"], cp, need("mix", mix)),
         ("mix-test", True, [mix, "test"], cp, need("mix", mix)),
         ("importer", True, [py, os.path.join(tools, "test_import_litellm.py")], ROOT, None),
+        ("invoice", True, [py, os.path.join(tools, "test_invoice.py")], ROOT, None),
         ("e2e", False, [py, os.path.join(tools, "e2e.py")], ROOT, need("mix", mix)),
         ("sdk", False, [py, os.path.join(tools, "sdk_compat.py")], ROOT,
          None if have_sdks else "the openai and anthropic packages are not installed for this Python (optional)"),

@@ -18,7 +18,51 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Added
+
+- **Crediting a transfer from its signature** (`solana` payments;
+  [docs/payments.md](docs/payments.md#a-transfer-that-was-not-recognized)).
+  A transfer that was not recognized by itself (sent by hand with another
+  amount, or after the payment expired) no longer needs the operator to
+  look it up and type an amount. The payer names the transaction
+  (`POST /v1/payments/{id}/tx`, or the top-up page): if it carries the
+  payment's reference, or its exact amount inside the payment's own time,
+  an expired payment is credited at once. Anything else is only noted on
+  the payment (`claimed_tx`), because the wallet is public and anyone can
+  name a transfer somebody else made; the operator confirms it with
+  `POST /admin/payments/credit` or a button on the Payments page, for a
+  payment or for a key without one. The gateway takes the amount from the
+  chain, and one transaction is credited once. Tested against the stand-in
+  chain, and the reading of a transaction against the real one.
+- **An invoice tool for what is sold by hand**
+  ([`tools/invoice.py`](tools/invoice.py),
+  [docs/payments.md](docs/payments.md#invoices-for-what-you-sell-by-hand)):
+  payment requests in USDC on Solana with a reference and a Solana Pay
+  link each, as text and as a page with the QR code, and a check on the
+  chain of whether they were paid. Tested against the stand-in chain.
+- **Kubernetes manifests** in `deploy/kubernetes`, and a test that runs
+  them on a one-node kind cluster in CI
+  ([docs/kubernetes.md](docs/kubernetes.md)). Tested there and nowhere
+  else.
+- **A check of what a release published**
+  (`.github/workflows/release-check.yml`): after a release, each archive is
+  downloaded, verified against its checksum and run through the end-to-end
+  and hostile-input suites on a machine of its own kind (both Linux
+  architectures, both kinds of Mac, Windows), and both images run the
+  container test on amd64 and arm64.
+- CI runs the upgrade test (from the latest release to the commit, clean
+  and killed, and both mixed pairs) on Linux, where it had not run before.
+- The dashboard's key form can restrict a key to providers marked as not
+  watermarking, and the Payments page shows a Solana payment's reference.
+
 ### Changed
+
+- A data plane that stops tells the control plane so with its last
+  rate-limit report, and `omnigate_data_planes` no longer counts it for
+  another 30 seconds. One that is killed is still counted that long.
+- A data plane waits at most 3 seconds (it was 10) for a control plane
+  that does not answer before it opens its port and serves from its cached
+  config.
 
 - The published 1.2.0 artifacts were run after the release, as before: the
   Windows binary passed the end-to-end and hostile-input suites, the x86-64

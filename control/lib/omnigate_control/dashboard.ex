@@ -115,6 +115,8 @@ defmodule OmnigateControl.Dashboard do
       ~s(<label>Privacy mode<select name="privacy"><option value="">off</option>),
       ~s(<option value="on">on: keep nothing, redact, unlink</option></select></label>),
       ~s(<label>Encrypt job outputs to <span class="muted">optional, an age recipient</span><input name="encrypt_to" maxlength="90" placeholder="age1…" spellcheck="false"></label>),
+      ~s(<label>Text providers<select name="unwatermarked"><option value="">any on the route</option>),
+      ~s(<option value="on">only ones you marked as not watermarking</option></select></label>),
       ~s(</div><div class="row"><button type="submit">Create key</button><span id="create-status" role="status" aria-live="polite"></span></div>),
       ~s(<noscript><p class="muted">Creating and changing keys from this page needs JavaScript. The same actions are available over the admin API at <code>/admin/keys</code>.</p></noscript>),
       ~s(</form></section>)
@@ -700,8 +702,8 @@ defmodule OmnigateControl.Dashboard do
       if(f.elements.budget_usd.value!==''){body.budget_usd=Number(f.elements.budget_usd.value);body.budget_period=f.elements.budget_period.value}
       if(f.elements.rpm.value!=='')body.rpm=Number(f.elements.rpm.value);
       var models=f.elements.models.value.split(',').map(function(s){return s.trim()}).filter(Boolean);if(models.length)body.models=models;
-      var pv=f.elements.privacy.value==='on',enc=f.elements.encrypt_to.value.trim();
-      if(enc)body.privacy={no_store:pv,redact:pv,unlink:pv,encrypt_to:enc};else if(pv)body.privacy=true;
+      var pv=f.elements.privacy.value==='on',enc=f.elements.encrypt_to.value.trim(),uw=f.elements.unwatermarked.value==='on';
+      if(enc||uw){body.privacy={no_store:pv,redact:pv,unlink:pv};if(enc)body.privacy.encrypt_to=enc;if(uw)body.privacy.unwatermarked=true}else if(pv)body.privacy=true;
       var submit=f.querySelector('button[type=submit]');submit.disabled=true;status('Creating…',false);
       api('POST','/admin/keys',body).then(function(res){f.reset();status('Created.',false);showSecret(res.name,res.key,'New');return refresh()})
         .catch(function(e){status(e.message,true)}).finally(function(){submit.disabled=false})});

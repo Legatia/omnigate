@@ -37,8 +37,10 @@ defmodule OmnigateControl.Payments.Solana do
   It never refunds: the funds are in the operator's wallet the moment they
   are paid, and giving them back is the operator's act, by hand. A transfer
   that arrives after the payment expired, or with an amount that matches no
-  open payment and without a reference, is not credited either; the
-  operator can add the credit by hand (`POST /admin/keys/{name}/topup`).
+  open payment and without a reference, is not credited by itself. It can
+  be credited from its signature (`read_tx/2`, `Payments.submit_tx/3` and
+  `Payments.credit_tx/1`): the gateway reads the transaction and credits
+  what it moved to the wallet, once.
 
   ## Settings (inside `"payments"`)
 
@@ -92,6 +94,13 @@ defmodule OmnigateControl.Payments.Solana do
   end
 
   def address?(_), do: false
+
+  @doc "True for a transaction signature: 64 bytes in Base58."
+  def signature?(text) when is_binary(text) and byte_size(text) in 64..88 do
+    match?({:ok, <<_::binary-size(64)>>}, NearIntents.base58(text))
+  end
+
+  def signature?(_), do: false
 
   @impl true
   def normalize!(raw) do
@@ -376,6 +385,49 @@ defmodule OmnigateControl.Payments.Solana do
           {:error, reason} ->
             {:error, reason}
         end
+    end
+  end
+
+  # ---- One transaction, by its signature ------------------------------------------------
+
+  @doc """
+  What the transaction `signature` did, once it is final: `{:ok, %{units:,
+  block_time:, accounts:}}` with how much more of the mint the wallet owns
+  after it (smallest unit), when it was made (unix seconds or nil) and the
+  accounts it names. `{:error, :not_found}` for one the chain does not
+  know or that is not final yet, `{:error, :failed}` for one that failed.
+  """
+  def read_tx(config, signature) do
+    params = [signature, %{"encoding" => "jsonParsed", "commitment" => "finalized", "maxSupportedTransactionVersion" => 1}]
+
+    case rpc(config, "getTransaction", params) do
+      {:ok, %{"meta" => %{"err" => nil} = meta} = tx} ->
+        keys = get_in(tx, ["transaction", "message", "accountKeys"])
+
+        accounts =
+          for key <- if(is_list(keys), do: keys, else: []),
+              account = if(is_map(key), do: key["pubkey"], else: key),
+              is_binary(account),
+              do: account
+
+        {:ok,
+         %{
+           units: owned(meta["postTokenBalances"], config) - owned(meta["preTokenBalances"], config),
+           block_time: if(is_integer(tx["blockTime"]), do: tx["blockTime"]),
+           accounts: accounts
+         }}
+
+      {:ok, %{"meta" => %{}}} ->
+        {:error, :failed}
+
+      {:ok, nil} ->
+        {:error, :not_found}
+
+      {:ok, other} ->
+        {:error, {:unreadable, inspect(other) |> String.slice(0, 80)}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

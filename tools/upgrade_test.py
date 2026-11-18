@@ -33,8 +33,9 @@ old data plane with the new control plane on the upgraded data, and the new
 data plane with the old control plane on fresh data.
 
 It skips (exit code 0, with the reason) when git, the commit, zig or mix are
-not available. Exit code 1 when a check fails. Not part of tools/check.py:
-building an old commit takes several minutes.
+not available; with OMNIGATE_REQUIRE_UPGRADE=1 that is a failure (CI sets
+it). Exit code 1 when a check fails. Not part of tools/check.py: building an
+old commit takes several minutes.
 
 Standard library only (it imports tools/e2e.py).
 """
@@ -84,7 +85,8 @@ def section(title):
 
 def skip(reason):
     print(f"SKIP: {reason}")
-    sys.exit(0)
+    # Where the test is meant to run (CI), not being able to is a failure.
+    sys.exit(1 if os.environ.get("OMNIGATE_REQUIRE_UPGRADE") == "1" else 0)
 
 
 def run(cmd, cwd=None, env=None, timeout=1800):

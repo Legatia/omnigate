@@ -3,10 +3,11 @@
 # Pushing a tag `v<version>` (for example v0.2.0, or v0.2.0-rc.1 for a
 # pre-release) publishes that version:
 #
-#   prepare    Checks the tag against the versions written in the source,
-#              takes the release notes from CHANGELOG.md, and checks that the
-#              release Dockerfile still matches dataplane/Dockerfile. Nothing
-#              is built or published if any of this fails.
+#   prepare    Checks the tag against the versions written in the source and
+#              in the Kubernetes manifests, takes the release notes from
+#              CHANGELOG.md, and checks that the release Dockerfile still
+#              matches dataplane/Dockerfile. Nothing is built or published
+#              if any of this fails.
 #   binaries   Runs the Zig unit tests, then cross-compiles the data plane for
 #              five targets and packs each one with a SHA-256 file.
 #   images     Builds multi-architecture (amd64, arm64) container images of
@@ -19,6 +20,9 @@
 # Starting the workflow by hand (workflow_dispatch) is a dry run: prepare,
 # binaries and images run in full, but no image is pushed and no release is
 # created.
+#
+# What was published is then checked by a workflow of its own
+# (release-check.yml), which starts when this one has finished.
 #
 # No job needs a secret beyond the token GitHub gives every run. The process
 # for a maintainer is in docs/releasing.md.
@@ -118,6 +122,27 @@ jobs:
             exit 0
           fi
           message="version $VERSION does not match control/mix.exs ($mix_version) and dataplane/build.zig.zon ($zon_version); change both files, commit, and tag that commit"
+          if [ "$PUBLISH" = "true" ]; then
+            echo "::error::$message"
+            exit 1
+          fi
+          echo "::warning::dry run: $message"
+
+      # deploy/kubernetes names the images of a release. A release whose
+      # manifests point at another version would install that one.
+      - name: The Kubernetes manifests name this version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PUBLISH: ${{ steps.version.outputs.publish }}
+        run: |
+          set -euo pipefail
+          control="$(sed -n 's/^ *image: .*omnigate-control:\(.*\)$/\1/p' deploy/kubernetes/control.yaml | head -n 1)"
+          dataplane="$(sed -n 's/^ *image: .*omnigate-dataplane:\(.*\)$/\1/p' deploy/kubernetes/dataplane.yaml | head -n 1)"
+          echo "deploy/kubernetes: control '$control', dataplane '$dataplane', releasing: '$VERSION'"
+          if [ "$control" = "$VERSION" ] && [ "$dataplane" = "$VERSION" ]; then
+            exit 0
+          fi
+          message="deploy/kubernetes names the images omnigate-control:$control and omnigate-dataplane:$dataplane, not $VERSION; change both image lines, commit, and tag that commit"
           if [ "$PUBLISH" = "true" ]; then
             echo "::error::$message"
             exit 1

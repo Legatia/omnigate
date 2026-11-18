@@ -42,6 +42,7 @@ defmodule OmnigateControl.PaymentsSolanaTest do
 
       tx = %{
         "blockTime" => entry["blockTime"],
+        "transaction" => %{"message" => %{"accountKeys" => Enum.map(addresses, &%{"pubkey" => &1, "signer" => false})}},
         "meta" => %{
           "err" => opts[:err],
           "preTokenBalances" => [balance(owner, mint, 1_000_000), balance("SomeoneElse", mint, 50_000_000)],
@@ -69,13 +70,31 @@ defmodule OmnigateControl.PaymentsSolanaTest do
       state = Agent.get_and_update(__MODULE__, fn s -> {s, %{s | calls: [method | s.calls]}} end)
 
       case {state.mode, method, params} do
-        {:down, _, _} -> {:error, :econnrefused}
-        {:busy, _, _} -> {:ok, %{status: 429, headers: %{}, body: "Too many requests"}}
-        {:rpc_error, _, _} -> json(%{"error" => %{"code" => -32_005, "message" => "Node is behind"}})
-        {_, "getSignaturesForAddress", [address, %{"limit" => limit}]} -> json(%{"result" => Enum.take(Map.get(state.signatures, address, []), limit)})
-        {_, "getTransaction", [signature | _]} -> json(%{"result" => state.txs[signature]})
-        {_, "getTokenAccountsByOwner", [_owner, %{"mint" => _}, _]} -> json(%{"result" => %{"value" => Enum.map(state.accounts, &%{"pubkey" => &1})}})
-        _ -> json(%{"error" => %{"code" => -32_601, "message" => "Method not found"}})
+        {:down, _, _} ->
+          {:error, :econnrefused}
+
+        {:busy, _, _} ->
+          {:ok, %{status: 429, headers: %{}, body: "Too many requests"}}
+
+        {:rpc_error, _, _} ->
+          json(%{"error" => %{"code" => -32_005, "message" => "Node is behind"}})
+
+        {_, "getSignaturesForAddress", [address, %{"limit" => limit}]} ->
+          json(%{"result" => Enum.take(Map.get(state.signatures, address, []), limit)})
+
+        {_, "getTransaction", [signature, %{"commitment" => "finalized"}]} ->
+          # Asked for final transactions only: one that is not final yet is not there.
+          entry = state.signatures |> Map.values() |> List.flatten() |> Enum.find(&(&1["signature"] == signature))
+          json(%{"result" => if(entry == nil or entry["confirmationStatus"] == "finalized", do: state.txs[signature])})
+
+        {_, "getTransaction", [signature | _]} ->
+          json(%{"result" => state.txs[signature]})
+
+        {_, "getTokenAccountsByOwner", [_owner, %{"mint" => _}, _]} ->
+          json(%{"result" => %{"value" => Enum.map(state.accounts, &%{"pubkey" => &1})}})
+
+        _ ->
+          json(%{"error" => %{"code" => -32_601, "message" => "Method not found"}})
       end
     end
 
@@ -128,6 +147,24 @@ defmodule OmnigateControl.PaymentsSolanaTest do
       |> Router.call(Router.init([]))
 
     {conn.status, JSON.decode!(conn.resp_body)}
+  end
+
+  defp admin(method, path, body \\ nil) do
+    conn =
+      case body do
+        nil -> conn(method, path)
+        _ -> conn(method, path, JSON.encode!(body)) |> put_req_header("content-type", "application/json")
+      end
+
+    conn = conn |> put_req_header("authorization", "Bearer test-admin-token-0123456789") |> Router.call(Router.init([]))
+    {conn.status, JSON.decode!(conn.resp_body)}
+  end
+
+  # The payment as if nothing had arrived before its deadline.
+  defp expire(id) do
+    :sys.replace_state(Payments, fn state ->
+      %{state | payments: Enum.map(state.payments, &if(&1["id"] == id, do: &1 |> Map.put("status", "expired") |> Map.delete("next_poll_at"), else: &1))}
+    end)
   end
 
   defp pay(hash, attrs \\ %{}), do: gateway(:post, "/internal/v1/payments", hash, Map.merge(%{"amount_usd" => 5, "asset" => "solana:" <> @usdc}, attrs))
@@ -357,6 +394,137 @@ defmodule OmnigateControl.PaymentsSolanaTest do
       :ok = Payments.poll_now()
       assert %{"status" => "settled", "credited_usd" => 5.25} = seen(big_id, big_hash)
       assert key(big.name).budget_usd == 5.25
+    end
+  end
+
+  describe "a transfer that was not recognized, named by its signature" do
+    test "the payer names a transaction that carries the reference of an expired payment: credited at once, and once" do
+      {key, hash} = prepaid()
+      assert {201, %{"id" => id, "deposit" => %{"reference" => reference}}} = pay(hash)
+      expire(id)
+
+      # Not on the chain yet; then there, and not final.
+      assert {409, %{"error" => %{"code" => "tx_not_final"}}} = gateway(:post, "/internal/v1/payments/#{id}/tx", hash, %{"tx_hash" => signature(60)})
+      FakeRpc.land(signature(60), [reference, @token_account], @wallet, @usdc, 5_000_000, status: "confirmed")
+      assert {409, %{"error" => %{"code" => "tx_not_final"}}} = gateway(:post, "/internal/v1/payments/#{id}/tx", hash, %{"tx_hash" => signature(60)})
+      assert key(key.name).budget_usd == 0.0
+
+      FakeRpc.finalize()
+      sig = signature(60)
+
+      assert {200, %{"status" => "settled", "credited_usd" => 5.0, "tx" => [^sig], "claimed_tx" => nil}} =
+               gateway(:post, "/internal/v1/payments/#{id}/tx", hash, %{"tx_hash" => sig})
+
+      assert key(key.name).budget_usd == 5.0
+      assert [%{"reference" => "solana:tx:" <> ^sig, "source" => "solana", "amount_usd" => 5.0}] = Enum.filter(Keys.topups(50), &(&1["key"] == key.name))
+
+      # Named again, for this payment or for another: nothing more.
+      assert {409, %{"error" => %{"code" => "payment_closed"}}} = gateway(:post, "/internal/v1/payments/#{id}/tx", hash, %{"tx_hash" => sig})
+      assert {201, %{"id" => second}} = pay(hash)
+      expire(second)
+
+      assert {200, %{"status" => "expired", "claimed_tx" => %{"signature" => ^sig}}} =
+               gateway(:post, "/internal/v1/payments/#{second}/tx", hash, %{"tx_hash" => sig})
+
+      assert {409, %{"error" => %{"code" => "tx_already_credited"}}} = admin(:post, "/admin/payments/credit", %{"payment" => second, "tx" => sig})
+      assert key(key.name).budget_usd == 5.0
+    end
+
+    test "a transfer nothing ties to the payer is only noted; the operator confirms it, and it is credited once" do
+      {key, hash} = prepaid()
+      {thief, thief_hash} = prepaid()
+      assert {201, %{"id" => id}} = pay(hash)
+      assert {201, %{"id" => thief_id}} = pay(thief_hash)
+
+      # Sent by hand: a round amount, no reference.
+      sig = signature(70)
+      FakeRpc.land(sig, [@token_account], @wallet, @usdc, 5_000_000)
+      :ok = Payments.poll_now()
+      assert %{"status" => "awaiting_deposit"} = seen(id, hash)
+
+      # Anyone can name it (the wallet is public): nobody is credited by that.
+      for {pid, h} <- [{thief_id, thief_hash}, {id, hash}] do
+        assert {200, %{"status" => "awaiting_deposit", "credited_usd" => nil, "claimed_tx" => %{"signature" => ^sig, "amount_usd" => 5.0}}} =
+                 gateway(:post, "/internal/v1/payments/#{pid}/tx", h, %{"tx_hash" => sig})
+      end
+
+      assert key(key.name).budget_usd == 0.0 and key(thief.name).budget_usd == 0.0
+
+      # The operator sees who named what, and confirms one of them.
+      assert {200, %{"credit_by_tx" => true, "provider" => "solana", "payments" => listed}} = admin(:get, "/admin/payments")
+      assert Enum.count(listed, &(&1["claimed_tx"]["signature"] == sig)) == 2
+
+      assert {200, %{"id" => ^id, "status" => "settled", "credited_usd" => 5.0, "key" => name, "tx" => [^sig], "claimed_tx" => nil, "detail" => detail}} =
+               admin(:post, "/admin/payments/credit", %{"payment" => id, "tx" => sig})
+
+      assert name == key.name and detail =~ "operator"
+      # The admin API shows the reference it was credited under.
+      assert {200, %{"payments" => after_credit}} = admin(:get, "/admin/payments")
+      assert %{"reference" => "solana:tx:" <> ^sig} = Enum.find(after_credit, &(&1["id"] == id))
+      assert key(key.name).budget_usd == 5.0
+
+      # The same transaction for the other payment, or for a key: refused.
+      assert {409, %{"error" => %{"code" => "tx_already_credited"}}} = admin(:post, "/admin/payments/credit", %{"payment" => thief_id, "tx" => sig})
+      assert {409, %{"error" => %{"code" => "tx_already_credited"}}} = admin(:post, "/admin/payments/credit", %{"key" => thief.name, "tx" => sig})
+      assert {409, %{"error" => %{"code" => "payment_closed"}}} = admin(:post, "/admin/payments/credit", %{"payment" => id, "tx" => sig})
+      assert key(thief.name).budget_usd == 0.0
+      # A later poll does not credit the settled payment again.
+      :ok = Payments.poll_now()
+      assert key(key.name).budget_usd == 5.0
+    end
+
+    test "the operator credits a transaction to a key without a payment; what is refused" do
+      {key, _hash} = prepaid()
+      sig = signature(80)
+      FakeRpc.land(sig, [@token_account], @wallet, @usdc, 12_500_000)
+
+      assert {200, %{"status" => "settled", "credited_usd" => 12.5, "key" => name, "tx" => [^sig], "provider" => "solana", "deposit" => %{"amount" => "12.50"}}} =
+               admin(:post, "/admin/payments/credit", %{"key" => key.name, "tx" => sig})
+
+      assert name == key.name
+      assert key(key.name).budget_usd == 12.5
+      assert {409, %{"error" => %{"code" => "tx_already_credited"}}} = admin(:post, "/admin/payments/credit", %{"key" => key.name, "tx" => sig})
+
+      # A transaction that failed, one that pays another mint, one that is
+      # too old, one that is not a signature, a key that is not there.
+      FakeRpc.land(signature(81), [@token_account], @wallet, @usdc, 1_000_000, err: %{"InstructionError" => [0, "Custom"]})
+      FakeRpc.land(signature(82), [@token_account], @wallet, @other_mint, 1_000_000)
+      FakeRpc.land(signature(83), [@token_account], @wallet, @usdc, 1_000_000, at: System.os_time(:second) - 61 * 86_400)
+      FakeRpc.land(signature(84), [@token_account], @wallet, @usdc, 1_000_000)
+
+      assert {400, %{"error" => %{"code" => "tx_not_a_payment"}}} = admin(:post, "/admin/payments/credit", %{"key" => key.name, "tx" => signature(81)})
+      assert {400, %{"error" => %{"code" => "tx_not_a_payment"}}} = admin(:post, "/admin/payments/credit", %{"key" => key.name, "tx" => signature(82)})
+      assert {400, %{"error" => %{"code" => "tx_too_old"}}} = admin(:post, "/admin/payments/credit", %{"key" => key.name, "tx" => signature(83)})
+      assert {400, %{"error" => %{"code" => "invalid_request"}}} = admin(:post, "/admin/payments/credit", %{"key" => key.name, "tx" => "not-a-signature"})
+      assert {400, %{"error" => %{"code" => "invalid_request"}}} = admin(:post, "/admin/payments/credit", %{"tx" => signature(84)})
+      assert {404, %{"error" => %{"code" => "payment_not_found"}}} = admin(:post, "/admin/payments/credit", %{"payment" => "pay_nope", "tx" => signature(84)})
+      assert {404, %{"error" => %{"code" => "key_not_found"}}} = admin(:post, "/admin/payments/credit", %{"key" => "nobody", "tx" => signature(84)})
+      # (Refused for a key that is not there, it can still be credited to one that is.)
+      assert {200, %{"credited_usd" => 1.0}} = admin(:post, "/admin/payments/credit", %{"key" => key.name, "tx" => signature(84)})
+      assert key(key.name).budget_usd == 13.5
+
+      FakeRpc.set(:mode, :down)
+      FakeRpc.land(signature(85), [@token_account], @wallet, @usdc, 1_000_000)
+
+      assert {503, %{"error" => %{"code" => "payment_provider_unavailable"}}} =
+               admin(:post, "/admin/payments/credit", %{"key" => key.name, "tx" => signature(85)})
+
+      assert key(key.name).budget_usd == 13.5
+    end
+
+    test "a transaction a payment was credited for by itself cannot be credited again from its signature" do
+      {key, hash} = prepaid()
+      {other, _} = prepaid()
+      assert {201, %{"id" => id, "deposit" => %{"reference" => reference, "amount_units" => units}}} = pay(hash)
+      sig = signature(90)
+      FakeRpc.land(sig, [reference], @wallet, @usdc, String.to_integer(units))
+      :ok = Payments.poll_now()
+      assert %{"status" => "settled"} = seen(id, hash)
+      before = key(key.name).budget_usd
+
+      assert {409, %{"error" => %{"code" => "tx_already_credited"}}} = admin(:post, "/admin/payments/credit", %{"key" => other.name, "tx" => sig})
+      assert {409, %{"error" => %{"code" => "payment_closed"}}} = gateway(:post, "/internal/v1/payments/#{id}/tx", hash, %{"tx_hash" => sig})
+      assert key(key.name).budget_usd == before and key(other.name).budget_usd == 0.0
     end
   end
 end

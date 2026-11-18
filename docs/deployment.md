@@ -348,9 +348,10 @@ Docker daemon and Python 3.9 or newer. CI runs it on every push.
 
 From the README: tested with Docker 29 and Compose 2.40 on Ubuntu 24.04
 (x86-64, under WSL 2), and the container test also runs on an arm64 Ubuntu
-24.04 runner for every push. **Not tested: Kubernetes, and Let's Encrypt issuance
-by the bundled proxy container** (a Caddy of the same major version on the
-host has done it; see the next section).
+24.04 runner for every push. Kubernetes has manifests and a test of its
+own on a one-node cluster in CI: [Kubernetes](kubernetes.md). **Not tested:
+Let's Encrypt issuance by the bundled proxy container** (a Caddy of the
+same major version on the host has done it; see the next section).
 
 ### Behind a proxy you already run
 
@@ -411,8 +412,10 @@ three more runs. They are single runs on one small machine (2 arm64 cores,
   the second, of which two were answered and six got `429`, then eight
   more through the first, of which one was answered. Nine allowed in ten
   seconds, where one shared bucket allows at most ten and two separate
-  ones sixteen. `omnigate_data_planes` said 2. (After containers are
-  recreated it counts the old instances too for up to 30 seconds.)
+  ones sixteen. `omnigate_data_planes` said 2. (After containers were
+  recreated it counted the old instances too for up to 30 seconds. That
+  was 1.1.0; since then a data plane that stops says so and is not counted
+  any more, which the Kubernetes test checks.)
 - **Load.** [`tools/load_test.py`](../tools/load_test.py) for 60 seconds
   from the host against the gateway's localhost port, with
   [`tools/mock_upstream.py`](../tools/mock_upstream.py) as the provider,
@@ -493,7 +496,12 @@ nothing about either provider.
   They disclose nothing but the state named above.
 - For an orchestrator with separate liveness and readiness probes, use
   `/healthz` for liveness and `/readyz` for readiness on the control plane.
-  Kubernetes itself is untested.
+  The [Kubernetes manifests](kubernetes.md) do, with a startup probe that
+  gives a large ledger five minutes to be read.
+- A data plane opens its port after its first attempt to fetch the config,
+  which takes milliseconds with the control plane up and at most three
+  seconds when its address does not answer at all. It then serves from its
+  cached config, or answers `503` until the control plane is there.
 
 ## Memory limits
 

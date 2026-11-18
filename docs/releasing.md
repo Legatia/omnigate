@@ -124,10 +124,17 @@ One-time things to settle. None of them is done by the workflow.
      `omnigate_build_info{version=...}` reports.
    - `dataplane/build.zig.zon`: `.version = "<version>"`.
 
-   These are the only two places. The data plane's outbound `user-agent`
-   (`omnigate/<version>`) and the webhook `user-agent`
-   (`omnigate-webhooks/<version>`, documented in [API](api.md#webhooks))
-   are derived from them at build time.
+   These are the only two places the programs take their version from.
+   The data plane's outbound `user-agent` (`omnigate/<version>`) and the
+   webhook `user-agent` (`omnigate-webhooks/<version>`, documented in
+   [API](api.md#webhooks)) are derived from them at build time.
+
+   The Kubernetes manifests name the images of a release, so they change
+   with it: the two `image:` lines in `deploy/kubernetes/control.yaml` and
+   `deploy/kubernetes/dataplane.yaml`, and the versions shown in
+   `deploy/kubernetes/kustomization.yaml` and
+   [Kubernetes](kubernetes.md). The workflow stops if the two `image:`
+   lines do not name the version being released.
 
 3. **Update `CHANGELOG.md`.** Rename the `## [Unreleased]` heading to
    `## [<version>] - <YYYY-MM-DD>` and add a new empty `## [Unreleased]`
@@ -158,7 +165,19 @@ One-time things to settle. None of them is done by the workflow.
    the slow one: the control plane's arm64 image is compiled under
    emulation.
 
-8. **Check the result**: the release page (notes, ten attached files), and
+8. **Wait for "Release check"** (`.github/workflows/release-check.yml`),
+   which starts by itself when the release workflow has published. It
+   downloads each archive from the release, checks its SHA-256 file, and
+   runs the end-to-end and hostile-input suites with that binary on a
+   machine of its own kind (x86-64 and arm64 Linux, macOS on Apple silicon
+   and on Intel, Windows); and it pulls both images on amd64 and on arm64
+   and runs the container test on them. The tests are the ones in the tag.
+   It publishes nothing. If a job fails, the release that is out has a
+   problem on that platform: say so in its notes and fix it in the next
+   one. To check an older release, start the workflow by hand with its
+   version.
+
+9. **Check the result**: the release page (notes, ten attached files), and
    that both images pull:
 
    ```bash

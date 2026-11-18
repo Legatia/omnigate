@@ -1,0 +1,130 @@
+# The data plane: what clients talk to. Any number of replicas; they share
+# each key's rate limit through the control plane.
+#
+# The Service is ClusterIP. Put your Ingress, Gateway or load balancer in
+# front of it, with TLS; the gateway itself speaks plain HTTP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: omnigate
+  labels:
+    app.kubernetes.io/name: omnigate
+    app.kubernetes.io/component: dataplane
+spec:
+  selector:
+    app.kubernetes.io/name: omnigate
+    app.kubernetes.io/component: dataplane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnigate-dataplane
+  labels:
+    app.kubernetes.io/name: omnigate
+    app.kubernetes.io/component: dataplane
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: omnigate
+      app.kubernetes.io/component: dataplane
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: omnigate
+        app.kubernetes.io/component: dataplane
+    spec:
+      # Longer than OMNIGATE_SHUTDOWN_GRACE_MS (10 s by default), so requests
+      # in flight finish and queued usage is handed over before the kill.
+      terminationGracePeriodSeconds: 20
+      automountServiceAccountToken: false
+      # No variables named after the namespace's Services (they would start
+      # with OMNIGATE_, like the settings; see control.yaml).
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dataplane
+          image: ghcr.io/legatia/omnigate-dataplane:1.2.0
+          ports:
+            - name: http
+              containerPort: 8080
+          # The internal token and the keys of the text providers named in
+          # the config (api_key_env): the variables of .env.dataplane.example.
+          # Nothing else belongs here: this is the process the internet
+          # reaches.
+          envFrom:
+            - secretRef:
+                name: omnigate-dataplane
+          env:
+            - name: OMNIGATE_CONTROL_URL
+              value: http://omnigate-control:4000
+            # Memory budgets, kept in step with the limit below
+            # (256 + 256 + 64 of the 1Gi; see compose.yaml for the reasoning).
+            - name: OMNIGATE_REQUEST_MEMORY_MB
+              value: "256"
+            - name: OMNIGATE_PARSE_MEMORY_MB
+              value: "256"
+            - name: OMNIGATE_CACHE_MAX_MB
+              value: "64"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        # The cached config and the usage spool. An emptyDir lives as long
+        # as the pod: it survives a restart of the container, not the
+        # removal of the pod. A pod that is removed hands its usage over as
+        # it stops; only usage it could not hand over because the control
+        # plane was away at that moment is lost with it.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: omnigate-dataplane
+  labels:
+    app.kubernetes.io/name: omnigate
+    app.kubernetes.io/component: dataplane
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: omnigate
+      app.kubernetes.io/component: dataplane

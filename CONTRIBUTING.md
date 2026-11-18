@@ -89,6 +89,11 @@ Data plane unit tests:
 cd dataplane && zig build test --summary all
 ```
 
+`zig build test` does not run the tests again when nothing changed since
+they last passed (the summary then says `run test cached`). To run them
+again, for example to chase a failure that came once, run the test binary
+itself: the newest `dataplane/.zig-cache/o/*/test` (`test.exe` on Windows).
+
 Control plane formatting check and unit tests:
 
 ```bash
@@ -411,6 +416,9 @@ tools/                Python, standard library only (sdk_compat.py excepted; e2e
   load_test.py                      load and soak test against a running gateway
   privacy_soak.py                   soak test of privacy mode on a stack it starts (long; not in check.py)
   upgrade_test.py                   an older commit's files read by the current build, and mixed pairs (long; not in check.py)
+  k8s_test.py                       deploy/kubernetes on a kind cluster it creates (needs docker, kind, kubectl; not in check.py)
+  invoice.py                        payment requests in USDC on Solana for what is sold by hand, and whether they were paid
+  test_invoice.py                   its tests, against mock_solana.py
   near_live.py                      attestation, attested-only routing and receipts against the real NEAR AI Cloud (network; not in check.py)
   mock_intents.py                   a stand-in for the NEAR Intents 1Click API, signing its quotes like the real one (payments in e2e.py)
   near_intents_live.py              payments against the real 1Click API with dry quotes only (network; not in check.py)

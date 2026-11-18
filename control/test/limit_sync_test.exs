@@ -67,6 +67,18 @@ defmodule OmnigateControl.LimitSyncTest do
       assert LimitSync.instances(100_000, s) == 0
     end
 
+    test "a data plane that stops is forgotten at once; what it allowed last is still passed on", %{server: s} do
+      assert {:ok, [], 1} = LimitSync.sync("a", [], 0, s)
+      assert {:ok, [], 2} = LimitSync.sync("b", [], 0, s)
+      key = String.duplicate("7", 64)
+      assert {:ok, [], 1} = LimitSync.leave("a", [%{"key" => key, "n" => 2, "rpm" => 60}], 1_000, s)
+      assert LimitSync.instances(1_000, s) == 1
+      assert {:ok, [%{key: ^key, n: 2, rpm: 60}], 1} = LimitSync.sync("b", [], 2_000, s)
+      # One that was never known, or a report that makes no sense: nothing breaks.
+      assert {:ok, [], 1} = LimitSync.leave("never-seen", [], 2_000, s)
+      assert {:error, _} = LimitSync.leave("not valid!", [], 2_000, s)
+    end
+
     test "entries that make no sense are dropped, and a report that makes none is refused", %{server: s} do
       LimitSync.sync("b", [], 0, s)
 

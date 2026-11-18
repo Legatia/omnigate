@@ -1095,7 +1095,7 @@ def solana_payment_checks(stack):
     _, _, a = jcall("POST", GATEWAY + "/v1/payments", key=second, body={"amount_usd": 3, "asset": asset})
     _, _, b = jcall("POST", GATEWAY + "/v1/payments", key=third, body={"amount_usd": 3, "asset": asset})
     a_units, b_units = int(a.get("deposit", {}).get("amount_units") or 0), int(b.get("deposit", {}).get("amount_units") or 0)
-    chain("/__mock/land", {"addresses": [SOLANA_TOKEN_ACCOUNT], "owner": SOLANA_WALLET, "mint": SOLANA_USDC, "units": 3_000_000})
+    by_hand = chain("/__mock/land", {"addresses": [SOLANA_TOKEN_ACCOUNT], "owner": SOLANA_WALLET, "mint": SOLANA_USDC, "units": 3_000_000}).get("signature")
     chain("/__mock/land", {"addresses": [SOLANA_TOKEN_ACCOUNT], "owner": SOLANA_WALLET, "mint": SOLANA_USDC, "units": b_units, "age_s": 900})
     time.sleep(6)
     waiting = (payment(second, a.get("id")).get("status"), payment(third, b.get("id")).get("status"))
@@ -1108,13 +1108,33 @@ def solana_payment_checks(stack):
           and other.get("status") == "awaiting_deposit" and key_row("e2e-sol-payer-2").get("budget_usd") == 0
           and close(key_row("e2e-sol-payer-3").get("budget_usd"), b_units / 1e6), (a_units, b_units, waiting, paid, other.get("status")))
 
+    # The round amount sent by hand was not recognized. Its payer names the transaction; the operator confirms it.
+    status, _, named = jcall("POST", f"{GATEWAY}/v1/payments/{a.get('id')}/tx", key=second, body={"tx_hash": by_hand})
+    status_t, _, theirs = jcall("POST", f"{GATEWAY}/v1/payments/{a.get('id')}/tx", key=third, body={"tx_hash": by_hand})
+    _, _, listed = admin("GET", "/admin/payments")
+    shown = [p for p in listed.get("payments", []) if p.get("id") == a.get("id")]
+    untouched = key_row("e2e-sol-payer-2").get("budget_usd")
+    status2, _, done = admin("POST", "/admin/payments/credit", {"payment": a.get("id"), "tx": by_hand})
+    status3, _, again = admin("POST", "/admin/payments/credit", {"key": "e2e-sol-payer-3", "tx": by_hand})
+    status4, _, junk = admin("POST", "/admin/payments/credit", {"key": "e2e-sol-payer-3", "tx": "1" * 64})
+    check("a transfer that was not recognized: its payer names the transaction and nothing is credited by that; another key cannot name it for this payment; "
+          "the operator confirms it and it is credited once, from what the chain says it moved",
+          status == 200 and named.get("status") == "awaiting_deposit" and (named.get("claimed_tx") or {}).get("signature") == by_hand
+          and (named.get("claimed_tx") or {}).get("amount_usd") == 3 and status_t == 404 and untouched == 0
+          and listed.get("credit_by_tx") is True and shown and (shown[0].get("claimed_tx") or {}).get("signature") == by_hand and shown[0].get("deposit", {}).get("reference")
+          and status2 == 200 and done.get("status") == "settled" and done.get("credited_usd") == 3 and done.get("tx") == [by_hand]
+          and close(key_row("e2e-sol-payer-2").get("budget_usd"), 3)
+          and status3 == 409 and (again.get("error") or {}).get("code") == "tx_already_credited"
+          and status4 == 409 and (junk.get("error") or {}).get("code") == "tx_not_final",
+          (status, named, status_t, untouched, status2, done, status3, again, status4, junk))
+
     status, _, body = jcall("POST", GATEWAY + "/v1/payments", key=second, body={"amount_usd": 3, "asset": "nep141:wrap.near", "refund_to": "payer.near"})
     status2, _, dry = jcall("POST", GATEWAY + "/v1/payments/quote", key=second, body={"amount_usd": 3, "asset": asset})
     status3, _, page = call("GET", GATEWAY + "/topup")
     check("another asset is refused in words; a dry quote is the plain amount; the top-up page is served and knows payment links",
           status == 400 and (body.get("error") or {}).get("code", (body.get("error") or {}).get("type")) == "payment_quote_refused"
           and status2 == 200 and dry.get("amount") == "3.00" and dry.get("provider") == "solana"
-          and status3 == 200 and b"p-link" in page, (status, body, status2, dry, status3))
+          and status3 == 200 and b"p-link" in page and b"f-tx" in page, (status, body, status2, dry, status3))
 
     for name in ("e2e-sol-payer", "e2e-sol-payer-2", "e2e-sol-payer-3"):
         admin("DELETE", f"/admin/keys/{name}")

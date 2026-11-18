@@ -1,4 +1,4 @@
-# CI for omnigate. Seven jobs, all on x86-64 Linux (platforms.yml runs the
+# CI for omnigate. Nine jobs, all on x86-64 Linux (platforms.yml runs the
 # suites on arm64 Linux and macOS):
 #
 #   dataplane   Zig unit tests and a build of the data plane. Zig is installed
@@ -7,7 +7,8 @@
 #               (see .github/actions/setup-zig).
 #   control     Formatting check (`mix format --check-formatted`) and Elixir
 #               unit tests of the control plane (`mix test`).
-#   tools       Unit tests of the LiteLLM importer (Python, stdlib only).
+#   tools       Unit tests of the LiteLLM importer and of the invoice tool
+#               (Python, stdlib only), and a build of the site.
 #   e2e         tools/e2e.py: mock providers, the control plane and the data
 #               plane as local processes, checked end to end. Runs only if the
 #               two unit-test jobs pass. The data plane is built again in this
@@ -31,6 +32,14 @@
 #               compose.yaml (plus mock providers) and checks it through the
 #               TLS proxy, including malformed requests and odd spellings of
 #               guarded paths sent byte for byte through the proxy.
+#   upgrade     tools/upgrade_test.py: builds the latest release from its tag,
+#               lets it write realistic state, stops it (cleanly, and by
+#               killing it mid-job), and starts this commit on the same files;
+#               then the two mixed pairs of old and new processes. Skipped
+#               only while there is no release tag before this commit.
+#   kubernetes  tools/k8s_test.py: builds both images, creates a kind cluster
+#               on the runner, applies deploy/kubernetes and checks it
+#               (docs/kubernetes.md says what that covers).
 #
 # None of the jobs needs a secret or an API key: every provider is a mock.
 
@@ -135,6 +144,11 @@ jobs:
 
       - name: LiteLLM importer tests
         run: python tools/test_import_litellm.py
+
+      # Starts tools/mock_solana.py on a free local port. With node on the
+      # runner (it is), the QR code is also compared with the top-up page's.
+      - name: Invoice tool tests
+        run: python tools/test_invoice.py
 
       - name: Receipt verifier against RFC 8032's Ed25519 vectors
         run: python tools/verify_receipt.py --self-test
@@ -347,6 +361,99 @@ jobs:
           path: ${{ runner.temp }}/omnigate-malformed-*
           if-no-files-found: ignore
           retention-days: 7
+
+  upgrade:
+    name: Upgrade from the latest release
+    needs: [dataplane, control]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      # The whole history and the tags: the old build is checked out from one.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-zig
+
+      - name: Build the data plane
+        working-directory: dataplane
+        run: zig build
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache dependencies and their build
+        uses: actions/cache@v6
+        with:
+          path: |
+            control/deps
+            control/_build
+          key: mix-dev-${{ runner.os }}-otp-${{ steps.beam.outputs.otp-version }}-elixir-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('control/mix.lock') }}
+
+      - name: Fetch and compile the control plane
+        working-directory: control
+        run: |
+          mix deps.get
+          mix compile
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # The newest release tag before this commit (on a tagged commit: the
+      # one before it). The test builds that tag in a worktree of its own.
+      - name: Upgrade test
+        env:
+          TMPDIR: ${{ runner.temp }}
+          OMNIGATE_REQUIRE_UPGRADE: "1"
+        run: |
+          set -euo pipefail
+          from="$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD~1 2> /dev/null || true)"
+          if [ -z "$from" ]; then
+            echo "::notice::no release tag before this commit; nothing to upgrade from"
+            exit 0
+          fi
+          echo "upgrading from $from"
+          python tools/upgrade_test.py "$from" --variant both --mixed
+
+      - name: Upload logs and state
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: upgrade-logs
+          path: ${{ runner.temp }}/omnigate-*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  kubernetes:
+    name: Kubernetes (kind)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # kind and kubectl come with the runner image.
+      - name: Docker, kind and kubectl versions
+        run: |
+          docker version
+          kind version
+          kubectl version --client
+
+      # Builds both images, creates a one-node cluster in a container, loads
+      # the images into it, applies deploy/kubernetes and deletes the cluster
+      # when it is done. It prints pods, events and logs itself when a check
+      # fails.
+      - name: Kubernetes test
+        run: python3 tools/k8s_test.py
+
+      - name: What was left running
+        if: failure()
+        run: |
+          docker ps -a
+          kind get clusters || true
 
   containers:
     name: Containers (Compose, TLS proxy)

@@ -30,6 +30,8 @@ can credit a key.
 - [The flow](#the-flow)
 - [Switching it on](#switching-it-on)
 - [The solana provider](#the-solana-provider)
+- [A transfer that was not recognized](#a-transfer-that-was-not-recognized)
+- [Invoices for what you sell by hand](#invoices-for-what-you-sell-by-hand)
 - [The API](#the-api)
 - [States of a payment](#states-of-a-payment)
 - [What is credited, and when](#what-is-credited-and-when)
@@ -177,12 +179,13 @@ wallet owns after it than before. A failed transaction counts for nothing.
   credited as what it carried and ends the payment; one that carries more
   is credited up to 5% above what was asked. Only the first transfer of a
   payment is credited.
-- **What is not recognized**: a transfer after the payment expired, and a
-  transfer by hand whose amount is not exactly the payment's. The money
-  has arrived all the same; the operator sees it in the wallet and can add
-  the credit by hand
-  ([`POST /admin/keys/{name}/topup`](building-on-omnigate.md#taking-payments-prepaid-keys-and-top-ups)).
-- A payment is credited under the reference `solana:<deposit.reference>`.
+- **What is not recognized by itself**: a transfer after the payment
+  expired, and a transfer by hand whose amount is not exactly the
+  payment's. The money has arrived all the same, and it can be credited
+  from the transaction's signature:
+  [A transfer that was not recognized](#a-transfer-that-was-not-recognized).
+- A payment is credited under the reference `solana:<deposit.reference>`
+  (one credited from a signature: `solana:tx:<signature>`).
 - **What is trusted**: the RPC endpoint. The gateway does not verify the
   chain's own signatures; an endpoint that lies about a transaction can
   make the gateway credit a key for nothing. Nothing an endpoint says can
@@ -202,6 +205,117 @@ chain about that payment for its whole life without an error. **No real
 payment has been made through this provider**: nothing was sent to that
 payment. `python tools/solana_live.py --wallet
 <your wallet>` shows what the gateway would see of your wallet.
+
+### A transfer that was not recognized
+
+Someone paid, and the payment still says `awaiting_deposit` or `expired`:
+they sent a round amount by hand instead of the exact one, or paid after
+the deadline. With the `solana` provider the transfer can be credited from
+its **signature** (the transaction id every wallet and explorer shows).
+The gateway reads that transaction on the chain, takes the amount from it
+(how much more of the token your wallet owns after it), and credits it
+once.
+
+**The payer names it.** On the top-up page: "Paid, and it does not show
+here?" under the payment. Over the API:
+
+```
+POST /v1/payments/{id}/tx
+{"tx_hash": "<signature>"}
+```
+
+- If the transaction carries the payment's reference, or its exact amount
+  and was made between the payment's start and 15 minutes after its
+  deadline, it is the payer's beyond doubt: an expired payment is credited
+  at once (up to 5% above what was asked, as always) and answers `settled`.
+- Otherwise the payment answers unchanged with a `claimed_tx`
+  (`signature`, `amount_usd`, `at`), and nothing is credited. **This is on
+  purpose.** Your wallet is public: anyone can look up a transfer somebody
+  else made to it and name it as theirs. Whose it is, only you can say.
+
+**You confirm it.** The dashboard's Payments page shows the claim under
+the payment with a "Read and credit" button, and has a "Credit a
+transaction" form for a transfer that belongs to no payment. Over the
+admin API:
+
+```
+POST /admin/payments/credit
+{"payment": "pay_...", "tx": "<signature>"}     a payment that was not credited
+{"key": "customer-1",  "tx": "<signature>"}     or a prepaid key, without a payment
+```
+
+The answer is the payment, now `settled`, credited with what the
+transaction moved to the wallet it was quoted for (in full: there is no 5%
+bound when you confirm it yourself). Check first that the transfer is this
+payer's, for example that it comes from the wallet they pay from; the
+gateway cannot.
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `invalid_request` | `tx` is not a signature (64 bytes in Base58); neither or both of `payment` and `key`. |
+| 400 | `tx_not_a_payment` | The transaction failed, or does not move the token to the wallet. |
+| 400 | `tx_too_old` | It is more than 60 days old. Credit it by hand with a top-up. |
+| 404 | `payment_not_found`, `key_not_found` | |
+| 409 | `tx_not_final` | The chain does not know it, or it is not final yet. Try again in a minute. |
+| 409 | `tx_already_credited` | It was credited before, for a payment (by itself or from its signature) or for a key. Nothing is added. |
+| 409 | `payment_closed` | The payment is already `settled`. |
+| 409 | `not_supported` | The provider is not `solana`. |
+| 503 | `payment_provider_unavailable` | The RPC endpoint could not be asked. |
+
+**One transaction is credited once**: credit from a signature goes under
+the reference `solana:tx:<signature>`, a reference is credited once across
+all keys, and a transaction a payment was credited for by itself is
+refused. The 60 days are why this holds: payments are kept for 90, so the
+record of an earlier credit is always still there. Both the payer's and
+the operator's requests are in the audit log (`payment.credit_tx`,
+`payment.credit`).
+
+**Tested** against the stand-in chain in the unit and end-to-end suites,
+and the reading of a final transaction by its signature against the real
+mainnet endpoint, read-only (`tools/solana_live.py`, 18 November 2026).
+No real transfer has been credited this way.
+
+### Invoices for what you sell by hand
+
+[`tools/invoice.py`](../tools/invoice.py) is for money that is not gateway
+credit: a commercial license, a support contract. It writes payment
+requests in USDC on Solana and checks on the chain whether they were paid.
+It is a tool on your own machine; the gateway is not involved and does not
+need to run.
+
+```sh
+python tools/invoice.py new --wallet <your wallet> --usd 490 --to "Acme GmbH" --seller "Your company, address"
+python tools/invoice.py check          # ask the chain about the open ones
+python tools/invoice.py list
+```
+
+- `new` gives the invoice a number (`INV-2026-0001`) and a reference of
+  its own, and prints the request as text with a Solana Pay link. It also
+  writes `INV-2026-0001.html`, the same request as a page with the link's
+  QR code, to send or to print as a PDF. The wallet and `--seller` are
+  remembered for the next one.
+- `check` looks for final transactions that name the invoice's reference
+  and marks it paid when they add up to its amount. It exits with 0 when
+  everything asked about is paid, 2 when something is still open and 1
+  when the chain could not be asked, so it fits a scheduled job.
+- A customer who paid by hand, without the link: `python tools/invoice.py
+  paid INV-2026-0001 --tx <signature>` reads that transaction and counts
+  what it moved to your wallet. One transaction pays one invoice.
+- The invoices are in `invoices.json` in the current directory (`--file`,
+  or `OMNIGATE_INVOICES`). The file names your customers: it is in
+  `.gitignore`; back it up yourself.
+- `--rpc` (or `OMNIGATE_SOLANA_RPC`) names the endpoint. The public one is
+  rate limited and fine for a few invoices.
+
+It is a request for payment. Whether it is an invoice in the sense of your
+tax law depends on what that law wants on one. Keep invoices and gateway
+payments on separate wallets if you can: a license payment sent to the
+gateway's wallet without the link is exactly the kind of transfer a key
+holder could name as theirs (see above), and you would have to notice.
+
+**Tested** against the stand-in chain (`python tools/test_invoice.py`, in
+`tools/check.py` and CI), and its QR code is compared module for module
+with the top-up page's. Nobody has paid one yet.
 
 ## The top-up page
 
@@ -249,7 +363,7 @@ are for.
 | `POST /v1/payments` | Start a payment: get a deposit address and the amount to send. |
 | `GET /v1/payments/{id}` | The payment and its state. |
 | `GET /v1/payments` | The key's payments, newest first (up to 50), and under `"credits"` what is left on the key (`balance_usd`, `burned_usd`; null for a key that is not prepaid). |
-| `POST /v1/payments/{id}/tx` | Optional: tell the provider which transaction carries the deposit. |
+| `POST /v1/payments/{id}/tx` | Name the transaction that carries the deposit. Optional with `near_intents` (it only speeds things up). With `solana` it is also how a transfer that was not recognized is dealt with, for an expired payment too: [A transfer that was not recognized](#a-transfer-that-was-not-recognized). |
 
 ### Assets
 
@@ -336,7 +450,8 @@ loop, with the three calls, is
 | 404 | `not_found` | Payments are not configured on this gateway. |
 | 404 | `payment_not_found` | No such payment, or it is another key's. |
 | 409 | `not_prepaid` | The key is not a prepaid managed key. |
-| 409 | `payment_closed` | `POST …/tx` on a payment that has ended. |
+| 409 | `payment_closed` | `POST …/tx` on a payment that has ended (with `solana`: one that is settled). |
+| 400, 409 | `tx_not_a_payment`, `tx_too_old`, `tx_not_final`, `tx_already_credited` | `POST …/tx` with `solana`, for an expired payment: see [A transfer that was not recognized](#a-transfer-that-was-not-recognized). For an open payment the hash stays a hint and these are not answered. |
 | 429 | `too_many_open_payments` | The key has five payments waiting for a deposit. |
 | 429 | `rate_limited` | More than six quotes or payments a minute for one key (the key's own `rpm` also applies). |
 | 502 | `payment_provider_error` | The provider answered something that was not used: an answer that could not be read, or a quote that is not signed by its key or does not repeat what was asked. **No deposit address is shown in that case.** |
@@ -440,7 +555,10 @@ payment. (What a request then burns of the credit is the
 
 - **`GET /admin/payments?limit=<n>`**: every payment, newest first, with the
   key's name, the reference it is credited under and the recipient it was
-  quoted for; `"configured": false` when payments are off.
+  quoted for; `"configured": false` when payments are off. Also the
+  `provider`, and `credit_by_tx`: whether
+  [`POST /admin/payments/credit`](#a-transfer-that-was-not-recognized) is
+  there.
 - **Audit log**: `payment.create`, `payment.settle` (outcome `ok`, or
   `uncredited` when the key could not be credited), `payment.refunded`,
   `payment.failed`; all written by the gateway itself (`"auth": "system"`).
@@ -460,7 +578,9 @@ payment. (What a request then burns of the credit is the
 - **The dashboard** has a Payments page (`/payments`, linked from the top
   bar while payments are configured): the credit left on every prepaid key,
   a form to add credit by hand (`POST /admin/keys/{name}/topup`), every
-  payment with its state, and every top-up and bonus.
+  payment with its state, its reference and any transaction its payer
+  named, and every top-up and bonus. With the `solana` provider it also has
+  the form and the button that credit a transaction from its signature.
 
 ## What has been tested
 

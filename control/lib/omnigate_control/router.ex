@@ -215,8 +215,11 @@ defmodule OmnigateControl.Router do
   # hear what the others allowed (`OmnigateControl.LimitSync`).
   post "/internal/limits/sync" do
     case conn.body_params do
-      %{"instance" => instance, "taken" => taken} ->
-        case OmnigateControl.LimitSync.sync(instance, taken) do
+      %{"instance" => instance, "taken" => taken} = report ->
+        # (A data plane that stops says so with its last report.)
+        result = if report["leaving"] == true, do: OmnigateControl.LimitSync.leave(instance, taken), else: OmnigateControl.LimitSync.sync(instance, taken)
+
+        case result do
           {:ok, others, instances} -> send_json(conn, 200, %{others: others, instances: instances})
           {:error, "too many data planes"} -> send_error(conn, 503, "overloaded", "more data planes report rate limits than this control plane keeps track of")
           {:error, reason} -> send_error(conn, 400, "invalid_request", reason)
@@ -503,7 +506,35 @@ defmodule OmnigateControl.Router do
         _ -> 100
       end
 
-    send_json(conn, 200, %{configured: Payments.configured?(), payments: Enum.map(Payments.all(limit), &Payments.admin_view/1)})
+    config = Payments.config()
+
+    send_json(conn, 200, %{
+      configured: config != nil,
+      provider: config && config.provider,
+      # Can a transaction be credited from its signature (POST /admin/payments/credit)?
+      credit_by_tx: config != nil and config.provider == "solana",
+      payments: Enum.map(Payments.all(limit), &Payments.admin_view/1)
+    })
+  end
+
+  # Credit what one transaction moved to the operator's wallet, once: to a
+  # payment that was not credited, or to a key (`Payments.credit_tx/1`).
+  post "/admin/payments/credit" do
+    attrs = json_object(conn)
+    result = Payments.credit_tx(attrs)
+
+    Audit.record(conn, "payment.credit", audit_name(attrs["payment"] || attrs["key"]), outcome(result),
+      payment:
+        case result do
+          {:ok, payment} -> %{"id" => payment["id"], "key" => payment["key"], "credited_usd" => payment["credited_usd"], "tx" => audit_name(attrs["tx"])}
+          _ -> %{"tx" => audit_name(attrs["tx"])}
+        end
+    )
+
+    case result do
+      {:ok, payment} -> send_json(conn, 200, Payments.admin_view(payment))
+      {:error, status, type, message} -> send_error(conn, status, type, message)
+    end
   end
 
   # Credit added to keys, newest first: top-ups and bonuses (`Keys.topups/2`).

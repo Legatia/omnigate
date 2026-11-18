@@ -617,6 +617,7 @@ All on the control plane's port, all behind the admin token or a session.
 | `POST /admin/keys/{name}/topup` | Add to a managed key's total budget, once per payment reference: `{"amount_usd": 5, "reference": "..."}`. See [Top-ups](#top-ups). |
 | `GET /admin/topups?key=NAME&limit=N` | Applied top-ups and bonuses, newest first (100 unless `limit`, at most 1000), each with its source. See [Prepaid credit](credits.md#seeing-it). |
 | `GET /admin/payments?limit=N` | [Payments](payments.md#for-operators) taken for credit, newest first, with the key and the reference each is credited under; `"configured": false` and an empty list when payments are off. |
+| `POST /admin/payments/credit` | With the `solana` provider: read a transaction by its signature and credit what it moved to your wallet, once: `{"payment": "pay_...", "tx": "..."}` or `{"key": "name", "tx": "..."}`. See [A transfer that was not recognized](payments.md#a-transfer-that-was-not-recognized). |
 | `DELETE /admin/keys/{name}` | Delete a managed key. |
 | `GET /admin/events?after=CURSOR&limit=N&key=NAME` | The usage feed: every recorded text request and media job, oldest first, by cursor. See [Building on omnigate](building-on-omnigate.md#reading-usage). |
 | `GET /admin/usage` | The same document as `GET /admin/keys`. |

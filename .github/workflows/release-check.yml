@@ -1,0 +1,261 @@
+# Checks what a release published, after the fact: the archives and images
+# people download, not a fresh build of the same source.
+#
+#   version    Which release to check: the tag the Release workflow just
+#              published, the version typed into a manual run, or (for a push
+#              to a branch named release-check/...) the latest release.
+#   binaries   Per archive: downloads it from the GitHub release, checks its
+#              SHA-256 file, and runs tools/e2e.py and tools/malformed_test.py
+#              with that binary as the data plane, on a machine of the
+#              archive's own kind: x86-64 and arm64 Linux, macOS on Apple
+#              silicon and on Intel, and Windows.
+#   images     Per architecture (amd64, arm64, on real hardware): pulls both
+#              images from GHCR and runs tools/container_test.py on them.
+#
+# The tests come from the release's own tag, so they are the tests that
+# release was written against. The control plane the binaries job starts is
+# built from that source too; the published control plane is covered by the
+# images job.
+#
+# Nothing here publishes or changes anything. A failure means the release
+# that is already out has a problem on that platform: fix it in a new release
+# and say so in the notes of the old one.
+
+name: Release check
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released version to check, like 1.2.0 (default: the latest release)"
+        required: false
+        type: string
+  push:
+    branches: ["release-check/**"]
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: release-check-${{ github.event.workflow_run.head_branch || inputs.version || github.ref }}
+  cancel-in-progress: true
+
+env:
+  OTP_VERSION: "29"
+  ELIXIR_VERSION: "1.20.5"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  version:
+    name: Which release
+    # After the Release workflow: only when it published (a tag push that
+    # succeeded), not after a dry run.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - name: Pick the release
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASED_TAG: ${{ github.event.workflow_run.head_branch }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            tag="$RELEASED_TAG"
+          elif [ -n "${INPUT_VERSION:-}" ]; then
+            tag="v${INPUT_VERSION#v}"
+          else
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'; then
+            echo "::error::'$tag' is not a release tag like v1.2.3"
+            exit 1
+          fi
+          # It must be a published release, with its archives.
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+          {
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+          echo "checking release $tag"
+
+  binaries:
+    name: Archive (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-macos
+            runner: macos-15
+          - target: x86_64-macos
+            runner: macos-15-intel
+          - target: x86_64-windows
+            runner: windows-2025
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      # The release's own source: its tests, and its control plane.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - name: Platform
+        run: uname -a
+
+      # The archive as anyone gets it, checked against the SHA-256 file
+      # published next to it, and unpacked to where the tests look for the
+      # data plane.
+      - name: Download, verify and unpack the archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="omnigate-dp-${VERSION}-${TARGET}"
+          ext=tar.gz
+          exe=omnigate-dp
+          case "$TARGET" in *-windows*) ext=zip; exe=omnigate-dp.exe ;; esac
+          mkdir -p "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name.$ext" --pattern "$name.$ext.sha256"
+          if command -v sha256sum > /dev/null; then sha256sum -c "$name.$ext.sha256"; else shasum -a 256 -c "$name.$ext.sha256"; fi
+          if [ "$ext" = zip ]; then python3 -m zipfile -e "$name.$ext" . || python -m zipfile -e "$name.$ext" .; else tar -xzf "$name.$ext"; fi
+          ls -l "$name"
+          # The license terms travel with every copy.
+          test -s "$name/LICENSE" && test -s "$name/COMMERCIAL.md"
+          mkdir -p "$GITHUB_WORKSPACE/dataplane/zig-out/bin"
+          cp "$name/$exe" "$GITHUB_WORKSPACE/dataplane/zig-out/bin/$exe"
+          chmod 0755 "$GITHUB_WORKSPACE/dataplane/zig-out/bin/$exe"
+
+      # Without the internal token the data plane must refuse to start, with
+      # its own error status: the binary runs at all on this machine.
+      - name: The binary starts
+        run: |
+          set -uo pipefail
+          exe=omnigate-dp
+          case "$TARGET" in *-windows*) exe=omnigate-dp.exe ;; esac
+          # The step's shell stops at the first failing command; this one is
+          # meant to fail, so read its status instead.
+          set +e
+          env -u OMNIGATE_INTERNAL_TOKEN "dataplane/zig-out/bin/$exe" > start.log 2>&1
+          code=$?
+          set -e
+          cat start.log
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected the data plane to refuse to start without OMNIGATE_INTERNAL_TOKEN (exit status 1); got status $code"
+            exit 1
+          fi
+
+      - uses: erlef/setup-beam@v1
+        if: runner.os != 'macOS'
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Elixir from Homebrew
+        if: runner.os == 'macOS'
+        run: |
+          brew install elixir
+          elixir --version
+
+      - name: Fetch and compile the control plane
+        working-directory: control
+        run: |
+          mix local.hex --force --if-missing
+          mix local.rebar --force --if-missing
+          mix deps.get
+          mix compile
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: End-to-end test with the released binary
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          PYTHONIOENCODING: utf-8
+        run: python tools/e2e.py
+
+      - name: Hostile-input test with the released binary
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          PYTHONIOENCODING: utf-8
+        run: python tools/malformed_test.py
+
+      - name: Upload logs and state
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-check-logs-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/omnigate-e2e-*
+            ${{ runner.temp }}/omnigate-malformed-*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  images:
+    name: Images (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      # The published images, under the names the container test uses for
+      # the ones it would otherwise build.
+      - name: Pull the published images
+        run: |
+          set -euo pipefail
+          uname -m
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          for plane in control dataplane; do
+            docker pull "ghcr.io/$owner/omnigate-$plane:$VERSION"
+            docker image inspect --format "$plane: {{.Architecture}} {{.Id}}" "ghcr.io/$owner/omnigate-$plane:$VERSION"
+            docker tag "ghcr.io/$owner/omnigate-$plane:$VERSION" "omnigate-test-$plane"
+          done
+
+      - name: Container test on the published images
+        run: python3 tools/container_test.py --no-build
+
+      - name: What was left running
+        if: failure()
+        run: docker ps -a

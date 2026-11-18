@@ -41,6 +41,21 @@ defmodule OmnigateControl.Payments do
   longer prepaid) stays `settled` with `credited_usd` null and says why:
   the funds reached the operator, and what to do about it is theirs.
 
+  ## A transfer that was not recognized
+
+  Where the provider can read one transaction by its signature (`solana`),
+  a transfer that was not recognized by itself can still be credited, once:
+
+    * The payer names it (`submit_tx/3`). If the transaction carries the
+      payment's reference, or its exact amount within the payment's own
+      time, an expired payment is credited at once. Anything else is only
+      noted on the payment (`claimed_tx`): the wallet is public, and anyone
+      can name a transfer somebody else made.
+    * The operator confirms it (`credit_tx/1`): for a payment, or for a key
+      without one. The gateway reads the transaction and credits what it
+      moved to the wallet under `solana:tx:<signature>`, so that one
+      transaction is credited once.
+
   ## Storage
 
   `OMNIGATE_PAYMENTS` (default `data/payments.json`), rewritten atomically on
@@ -58,6 +73,9 @@ defmodule OmnigateControl.Payments do
   @quotes_per_minute 6
   # After the deadline, how long a deposit that was on its way may still show up.
   @grace_s 900
+  # How old a transaction may be to be credited from its signature: well
+  # inside the time payments are kept, so that one is never credited twice.
+  @claim_within_s 60 * 86_400
   @assets_ttl_ms 300_000
   @open ~w(awaiting_deposit processing)
   @common ~w(provider recipient min_usd max_usd quote_ttl_s poll_interval_s)
@@ -331,17 +349,145 @@ defmodule OmnigateControl.Payments do
   @doc "Every payment, newest first, at most `limit` (the admin API)."
   def all(limit \\ 100), do: GenServer.call(__MODULE__, {:list, nil, limit})
 
-  @doc "Pass the hash of the transaction that carries a payment's deposit on to the provider. Optional; it only speeds things up."
+  @doc """
+  Name the transaction that carries a payment's deposit. For an open
+  payment it is passed on to the provider and the payment is asked about at
+  once. Where the provider can read a transaction by its signature, a
+  transfer that was not recognized by itself is dealt with here too, also
+  for a payment that expired: see "A transfer that was not recognized" above.
+  """
   def submit_tx(key, id, tx_hash) do
     with %{} = config <- config() || off(),
          %{} = payment <- own(key, id) || {:error, 404, "payment_not_found", "no such payment"},
-         true <- (is_binary(tx_hash) and tx_hash =~ ~r/\A[!-~]{1,200}\z/) || {:error, 400, "invalid_request", "tx_hash must be 1-200 visible characters"},
-         true <- payment["status"] in @open || {:error, 409, "payment_closed", "this payment is #{payment["status"]}"},
-         :ok <- module!(config).submit_tx(config, payment, tx_hash) do
-      GenServer.call(__MODULE__, {:poll_soon, id})
-      {:ok, payment}
+         true <- (is_binary(tx_hash) and tx_hash =~ ~r/\A[!-~]{1,200}\z/) || {:error, 400, "invalid_request", "tx_hash must be 1-200 visible characters"} do
+      cond do
+        by_signature?(config, payment) and payment["status"] in ["expired" | @open] ->
+          claim(key, config, payment, tx_hash)
+
+        payment["status"] in @open ->
+          with :ok <- module!(config).submit_tx(config, payment, tx_hash) do
+            GenServer.call(__MODULE__, {:poll_soon, id})
+            {:ok, payment}
+          end
+
+        true ->
+          {:error, 409, "payment_closed", "this payment is #{payment["status"]}"}
+      end
     end
   end
+
+  # Can this payment's provider read one transaction by its signature?
+  defp by_signature?(config, payment \\ nil), do: config.provider == "solana" and (is_nil(payment) or payment["provider"] == "solana")
+
+  # A payer names a transaction for their payment.
+  defp claim(key, config, payment, signature) do
+    open? = payment["status"] in @open
+    id = payment["id"]
+
+    with :ok <- rate(key),
+         {:ok, tx} <- named(for_payment(config, payment), signature) do
+      cond do
+        # The provider finds this one by itself, now.
+        open? and own_transfer?(payment, tx) ->
+          GenServer.call(__MODULE__, {:poll_soon, id})
+          {:ok, payment}
+
+        own_transfer?(payment, tx) ->
+          delivered = min(tx.usd, payment["amount_usd"] * 1.05)
+          GenServer.call(__MODULE__, {:credit_tx, {:payment, id}, signature, Float.round(delivered, 6), "payer"})
+
+        # It pays the wallet, and nothing says it is this payer's.
+        true ->
+          GenServer.call(__MODULE__, {:claimed, id, signature, tx.usd})
+      end
+    else
+      # For an open payment the hash is a hint, as it always was.
+      {:error, _, _, _} when open? ->
+        GenServer.call(__MODULE__, {:poll_soon, id})
+        {:ok, payment}
+
+      refusal ->
+        refusal
+    end
+  end
+
+  # The transaction carries the payment's reference, or its exact amount
+  # while no other payment could have been waiting for that amount.
+  defp own_transfer?(payment, tx) do
+    since =
+      case DateTime.from_iso8601(payment["created_at"] || "") do
+        {:ok, at, _} -> DateTime.to_unix(at)
+        _ -> nil
+      end
+
+    (is_binary(payment["deposit_reference"]) and payment["deposit_reference"] in tx.accounts) or
+      (Integer.to_string(tx.units) == payment["amount_in"] and is_integer(tx.block_time) and is_integer(since) and tx.block_time >= since and
+         tx.block_time <= payment["deadline_at"] + @grace_s)
+  end
+
+  # (A payment keeps the wallet and the mint it was quoted for.)
+  defp for_payment(config, payment),
+    do: %{config | recipient: payment["deposit_address"] || config.recipient, mint: get_in(payment, ["proof", "mint"]) || config.mint}
+
+  # The final transaction `signature`, with what it moved to the wallet in
+  # dollars; a refusal for one that is not there or moved nothing.
+  defp named(config, signature) do
+    # (The one provider that can: `by_signature?/2`.)
+    module = OmnigateControl.Payments.Solana
+
+    with true <- module.signature?(signature) || {:error, 400, "invalid_request", "that is not a transaction signature (64 bytes in Base58)"},
+         {:ok, tx} <- module.read_tx(config, signature) do
+      cond do
+        tx.units <= 0 ->
+          {:error, 400, "tx_not_a_payment", "that transaction does not move #{config.symbol} to this gateway's wallet"}
+
+        is_integer(tx.block_time) and tx.block_time < System.os_time(:second) - @claim_within_s ->
+          {:error, 400, "tx_too_old", "that transaction is more than #{div(@claim_within_s, 86_400)} days old; the operator can add its credit by hand"}
+
+        true ->
+          {:ok, Map.put(tx, :usd, tx.units / Integer.pow(10, config.decimals))}
+      end
+    else
+      {:error, :not_found} -> {:error, 409, "tx_not_final", "that transaction is not on the chain, or not final yet; try again in a minute"}
+      {:error, :failed} -> {:error, 400, "tx_not_a_payment", "that transaction failed on the chain; it moved nothing"}
+      {:error, _, _, _} = refusal -> refusal
+      {:error, _reason} -> {:error, 503, "payment_provider_unavailable", "the chain could not be asked just now; try again shortly"}
+    end
+  end
+
+  @doc """
+  The operator credits a transaction by its signature (the admin API):
+  `"tx"` and either `"payment"` (the id of a payment that was not credited)
+  or `"key"` (a prepaid key, without a payment). The gateway reads the
+  transaction and credits what it moved to the wallet; whose transfer it is
+  is the operator's word. `{:ok, payment}` or a refusal.
+  """
+  def credit_tx(attrs) when is_map(attrs) do
+    with %{} = config <- config() || off(),
+         true <- by_signature?(config) || {:error, 409, "not_supported", "the #{config.provider} provider cannot read a transaction by its signature"},
+         {:ok, target, config} <- target(attrs, config),
+         {:ok, tx} <- named(config, attrs["tx"]) do
+      GenServer.call(__MODULE__, {:credit_tx, target, attrs["tx"], Float.round(tx.usd, 6), "operator"})
+    end
+  end
+
+  defp target(%{"payment" => id} = attrs, config) when is_binary(id) do
+    cond do
+      is_binary(attrs["key"]) ->
+        {:error, 400, "invalid_request", "give either payment or key, not both"}
+
+      payment = GenServer.call(__MODULE__, {:get, id}) ->
+        if by_signature?(config, payment), do: {:ok, {:payment, id}, for_payment(config, payment)}, else: not_this()
+
+      true ->
+        {:error, 404, "payment_not_found", "no such payment"}
+    end
+  end
+
+  defp target(%{"key" => name}, config) when is_binary(name), do: {:ok, {:key, name, config}, config}
+  defp target(_, _config), do: {:error, 400, "invalid_request", "payment or key is required: what the transaction is credited to"}
+
+  defp not_this, do: {:error, 409, "not_supported", "that payment was made with a provider that cannot read a transaction by its signature"}
 
   @doc "Ask the provider about every open payment that is due, now (also runs by itself). For tests and the admin API."
   def poll_now, do: GenServer.call(__MODULE__, :poll_now, 120_000)
@@ -445,6 +591,8 @@ defmodule OmnigateControl.Payments do
       time_estimate_s: p["time_estimate_s"],
       provider_status: p["provider_status"],
       tx: p["tx"] || [],
+      # A transaction the payer named that was not recognized as theirs.
+      claimed_tx: p["claimed_tx"],
       created_at: p["created_at"],
       updated_at: p["updated_at"]
     }
@@ -457,8 +605,11 @@ defmodule OmnigateControl.Payments do
   @doc """
   The reference a payment is credited under: the provider's name and the
   deposit address (and memo), which no two payments share; where they do
-  share the address, the payment's own reference instead.
+  share the address, the payment's own reference instead. One credited from
+  a transaction's signature: the provider's name, `tx` and the signature.
   """
+  def reference(%{"credited_by" => by, "tx" => [signature | _]} = p) when is_binary(by), do: "#{p["provider"]}:tx:#{signature}"
+
   def reference(p) do
     memo = if p["deposit_memo"], do: ":" <> p["deposit_memo"], else: ""
     text = "#{p["provider"]}:#{p["deposit_reference"] || p["deposit_address"]}#{memo}"
@@ -516,6 +667,88 @@ defmodule OmnigateControl.Payments do
     {:reply, Enum.count(state.payments, &(&1["key"] == name and &1["status"] == "awaiting_deposit")), state}
   end
 
+  # A payer named a transaction that pays the wallet and that nothing ties
+  # to them: kept for the operator to look at.
+  def handle_call({:claimed, id, signature, usd}, _from, state) do
+    case Enum.find(state.payments, &(&1["id"] == id)) do
+      %{"status" => status} = payment when status in ["expired" | @open] ->
+        noted =
+          Map.merge(payment, %{
+            "claimed_tx" => %{"signature" => signature, "amount_usd" => usd, "at" => now_iso()},
+            "updated_at" => now_iso()
+          })
+
+        case save(state, replace(state.payments, noted)) do
+          {:ok, state} -> {:reply, {:ok, noted}, state}
+          {:error, state} -> {:reply, {:error, 500, "storage_error", "the transaction could not be noted; try again"}, state}
+        end
+
+      _ ->
+        {:reply, {:error, 409, "payment_closed", "this payment has ended"}, state}
+    end
+  end
+
+  # Credit what one transaction moved to the wallet: to a payment that was
+  # not credited, or to a key without a payment. Here, so that nothing else
+  # changes the payments in between.
+  def handle_call({:credit_tx, target, signature, usd, by}, _from, state) do
+    used = Enum.find(state.payments, &(signature in (&1["tx"] || []) and &1["status"] in ["settled", "processing"] and not target?(&1, target)))
+
+    payment =
+      case target do
+        {:payment, id} -> Enum.find(state.payments, &(&1["id"] == id))
+        {:key, name, config} -> manual(name, config, usd)
+      end
+
+    cond do
+      used ->
+        {:reply, {:error, 409, "tx_already_credited", "that transaction was credited before (payment #{used["id"]}); nothing was added"}, state}
+
+      is_nil(payment) ->
+        {:reply, {:error, 404, "payment_not_found", "no such payment"}, state}
+
+      payment["status"] in ["settled", "refunded"] ->
+        {:reply, {:error, 409, "payment_closed", "this payment is #{payment["status"]}; nothing was added"}, state}
+
+      true ->
+        attrs = %{"amount_usd" => usd, "reference" => "#{payment["provider"]}:tx:#{signature}", "source" => payment["provider"]}
+
+        case Keys.topup(payment["key"], attrs) do
+          {:ok, _key, _done} ->
+            done =
+              payment
+              |> Map.merge(%{
+                "status" => "settled",
+                "credited_usd" => usd,
+                "tx" => [signature],
+                "credited_by" => by,
+                "detail" => if(by == "operator", do: "credited from a transaction the operator confirmed"),
+                "updated_at" => now_iso()
+              })
+              |> Map.drop(["next_poll_at", "claimed_tx"])
+
+            Audit.system("payment.credit_tx", done["key"], "ok", payment: done |> audit() |> Map.merge(%{"credited_usd" => usd, "tx" => signature, "by" => by}))
+            Logger.info("payment #{done["id"]}: #{usd} credited to #{done["key"]} from a transaction named by the #{by}")
+            payments = if match?({:payment, _}, target), do: replace(state.payments, done), else: [done | state.payments]
+
+            # (Credited either way; a store that could not be written says so in the log.)
+            case save(state, payments) do
+              {:ok, state} -> {:reply, {:ok, done}, state}
+              {:error, state} -> {:reply, {:ok, done}, state}
+            end
+
+          {:error, 409, "reference_conflict", _} ->
+            {:reply, {:error, 409, "tx_already_credited", "that transaction was credited before; nothing was added"}, state}
+
+          {:error, 404, _, _} ->
+            {:reply, {:error, 404, "key_not_found", "no managed key named #{inspect(payment["key"])}; nothing was added"}, state}
+
+          {:error, _, _, _} = refusal ->
+            {:reply, refusal, state}
+        end
+    end
+  end
+
   def handle_call({:poll_soon, id}, _from, state) do
     payments = Enum.map(state.payments, &if(&1["id"] == id and &1["status"] in @open, do: Map.put(&1, "next_poll_at", 0), else: &1))
     {:reply, :ok, %{state | payments: payments}}
@@ -564,6 +797,30 @@ defmodule OmnigateControl.Payments do
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{polling: ref} = state), do: {:noreply, %{state | polling: nil}}
   def handle_info(_other, state), do: {:noreply, state}
+
+  defp target?(payment, {:payment, id}), do: payment["id"] == id
+  defp target?(_payment, _key), do: false
+
+  defp replace(payments, changed), do: Enum.map(payments, &if(&1["id"] == changed["id"], do: changed, else: &1))
+
+  # The record of credit from a transaction without a payment before it.
+  defp manual(name, config, usd) do
+    %{
+      "id" => "pay_" <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower),
+      "key" => name,
+      "provider" => config.provider,
+      "recipient" => config.recipient,
+      "amount_usd" => usd,
+      "asset" => OmnigateControl.Payments.Solana.asset_id(config),
+      "asset_symbol" => config.symbol,
+      "asset_chain" => "solana",
+      "deposit_address" => config.recipient,
+      "amount_in_formatted" => OmnigateControl.Payments.Solana.formatted(round(usd * Integer.pow(10, config.decimals)), config.decimals),
+      "status" => "awaiting_deposit",
+      "created_at" => now_iso(),
+      "polls" => 0
+    }
+  end
 
   # An open payment that waits for the same amount at the same address.
   defp same_deposit?(other, payment) do

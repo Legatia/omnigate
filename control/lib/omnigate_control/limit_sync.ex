@@ -11,7 +11,8 @@ defmodule OmnigateControl.LimitSync do
   reported in the meantime, which it takes out of its buckets.
 
   This process only keeps, per data plane, what it has not been told yet. It
-  holds no buckets and decides nothing. In memory only: after a restart the
+  holds no buckets and decides nothing. A data plane that stops says so
+  with its last report (`leave/4`) and is forgotten at once. In memory only: after a restart the
   data planes are simply new to it again, and whatever was waiting to be
   passed on is forgiven, like the last minute of a restarted limiter.
 
@@ -43,6 +44,17 @@ defmodule OmnigateControl.LimitSync do
       not valid_instance?(instance) -> {:error, "instance must be 1 to 64 characters of a-z, A-Z, 0-9, - or _"}
       not is_list(taken) -> {:error, "taken must be a list"}
       true -> GenServer.call(server, {:sync, instance, clean(taken), now_ms})
+    end
+  end
+
+  @doc """
+  The last report of a data plane that stops: what it allowed is passed on
+  like any report, and the data plane is forgotten at once. Returns as
+  `sync/4` does, counting the data planes that remain.
+  """
+  def leave(instance, taken, now_ms \\ System.monotonic_time(:millisecond), server \\ __MODULE__) do
+    with {:ok, others, _instances} <- sync(instance, taken, now_ms, server) do
+      {:ok, others, GenServer.call(server, {:forget, instance, now_ms})}
     end
   end
 
@@ -94,6 +106,11 @@ defmodule OmnigateControl.LimitSync do
 
       {:reply, {:ok, others, map_size(state)}, state}
     end
+  end
+
+  def handle_call({:forget, instance, now_ms}, _from, state) do
+    state = state |> Map.delete(instance) |> forget_idle(now_ms)
+    {:reply, map_size(state), state}
   end
 
   def handle_call({:instances, now_ms}, _from, state) do

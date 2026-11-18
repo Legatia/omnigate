@@ -36,3 +36,8 @@ site/dist/
 
 # Recorded demo video (not part of the source)
 demo-out/
+
+# tools/invoice.py: the invoice file names customers
+invoices.json
+invoices.json.tmp
+INV-*.html

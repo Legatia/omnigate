@@ -1,0 +1,130 @@
+# The control plane: one replica, with a volume for everything it must not
+# lose (the usage ledger, managed keys, jobs, payments, the audit log).
+#
+# It is a StatefulSet of exactly one. Two control planes would each keep a
+# ledger of their own; do not scale it.
+#
+# Its Service has no way in from outside the cluster, and should not get
+# one: this port carries the admin API and the dashboard. Reach the dashboard
+# with
+#
+#   kubectl port-forward svc/omnigate-control 4000:4000
+#
+# or put an authenticating proxy of your own in front of it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: omnigate-control
+  labels:
+    app.kubernetes.io/name: omnigate
+    app.kubernetes.io/component: control
+spec:
+  selector:
+    app.kubernetes.io/name: omnigate
+    app.kubernetes.io/component: control
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: omnigate-control
+  labels:
+    app.kubernetes.io/name: omnigate
+    app.kubernetes.io/component: control
+spec:
+  serviceName: omnigate-control
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: omnigate
+      app.kubernetes.io/component: control
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: omnigate
+        app.kubernetes.io/component: control
+    spec:
+      # A clean stop writes a ledger snapshot; give it time.
+      terminationGracePeriodSeconds: 30
+      # It talks to no cluster API.
+      automountServiceAccountToken: false
+      # Kubernetes would otherwise give every pod variables named after the
+      # Services of the namespace, and the one for this Service's port is
+      # called OMNIGATE_CONTROL_PORT: the very name the control plane reads
+      # its listening port from, set to "tcp://10.x.x.x:4000".
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: control
+          image: ghcr.io/legatia/omnigate-control:1.2.0
+          ports:
+            - name: http
+              containerPort: 4000
+          # The admin token, the internal token, media provider keys, webhook
+          # secrets and bucket credentials: the variables of
+          # .env.control.example.
+          envFrom:
+            - secretRef:
+                name: omnigate-control
+          env:
+            # Where the control plane itself reaches the data plane: only the
+            # dashboard's Private chat page uses it.
+            - name: OMNIGATE_GATEWAY_URL
+              value: http://omnigate
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+          # The port opens once the ledger has been read, which takes longer
+          # the larger it is: up to five minutes here before a restart.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: omnigate-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

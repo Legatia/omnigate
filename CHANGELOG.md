@@ -18,6 +18,14 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-18
+
+The pages got their finish: the top-up page can say whose gateway it is,
+transaction signatures are links to an explorer, signing in leads back to
+the page that was asked for, and every page has the same accent colour.
+Nothing changes on disk and no configuration is needed
+([docs/upgrading.md](docs/upgrading.md#131)).
+
 ### Added
 
 - **The top-up page can say whose gateway it is.** `"operator"` and

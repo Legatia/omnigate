@@ -609,7 +609,7 @@ point of view:
 
 ## Staying current, and upgrade notes
 
-The current stable release is 1.3.0. Fixes land on `main` first, so "current"
+The current stable release is 1.3.1. Fixes land on `main` first, so "current"
 means the newest release or a recent commit of `main`.
 
 - Read the "Security" section of [CHANGELOG.md](../CHANGELOG.md) before

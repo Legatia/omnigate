@@ -40,6 +40,7 @@ Contents:
 - [1.1.0](#110)
 - [1.2.0](#120)
 - [1.3.0](#130)
+- [1.3.1](#131)
 - [Tested upgrades](#tested-upgrades)
 - [Going back](#going-back)
 - [Coming from older commits](#coming-from-older-commits)
@@ -828,6 +829,24 @@ the data plane after 30 seconds, as it always did. An older data plane
 never says it, and a newer control plane forgets it the same way.
 
 **Going back** to 1.2.0 needs nothing.
+
+## 1.3.1
+
+Released 18 November 2026. Nothing changes on disk, and nothing between
+the two processes.
+
+| What | Before | After |
+|---|---|---|
+| The top-up page | Said "omnigate" and "the operator of this gateway". | With `"operator"` and `"contact"` in `"payments"` it names who runs the gateway and where to ask ([Payments](payments.md#the-top-up-page)). Unset, it reads as before. |
+| Transaction signatures (`solana`) | Text. | Links to Solana's explorer, or to what `"explorer_tx"` names; `false` keeps them text. `GET /v1/payments/assets` also answers `operator`, `contact` and `explorer_tx`; `GET /admin/payments` also answers `explorer_tx`. |
+| Signing in | Always ended on the dashboard. | Ends on the page that was asked for: `/payments` and `/private-chat` send a browser without a session to `/login?next=<page>`. A script that compares that `location` with `/login` sees the longer one; `/` still answers `/login`. |
+| Colours | Blue on the dashboard pages, black on the sign-in form. | The site's green everywhere; the sign-in form follows dark mode. |
+
+**Configuration.** The three new fields are optional. A 1.3.0 control plane
+refuses a config that has them (`unknown field(s)`), so take them out
+before going back.
+
+**Going back** to 1.3.0 needs nothing else.
 
 ## Tested upgrades
 

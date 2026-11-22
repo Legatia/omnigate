@@ -23,9 +23,16 @@ Special model names, on the working mocks (9002 and 9003):
                    when streaming; a tool call's arguments are {"text": <that
                    text>}. For tests of what comes back through the gateway.
   echo-err-1       (9002) 400 whose error message quotes that text
+  hold-1           (9002) waits half a second, then answers as usual: requests
+                   sent together overlap, so the gateway opens a connection
+                   for each
 
 With MOCK_WATCH=<a>,<b> in the environment, `GET /__watch` on a working mock
 says how many request bodies (on all ports) contained each of those strings.
+
+`GET /__drop_idle` on any mock closes every keep-alive connection to it that
+is waiting for its next request, without a word, as a provider's load
+balancer does after an idle timeout. It answers {"closed": <how many>}.
 
 Every working mock remembers the last request it received per model name:
 `GET /__last?model=<name>` returns its path, headers and body, so a test can
@@ -78,6 +85,7 @@ import base64
 import hashlib
 import json
 import select
+import socket
 import sys
 import os
 import struct
@@ -110,6 +118,10 @@ ECHO_PREFIX = "You said: "
 # value never reached a provider (tools/privacy_soak.py).
 WATCH_FOR = [w.encode() for w in os.environ.get("MOCK_WATCH", "").split(",") if w]
 WATCH = {"requests": 0, "seen": {w.decode(): 0 for w in WATCH_FOR}}
+# port -> {socket: "idle" | "busy"}: each open connection, and whether it is
+# waiting for its next request. See `GET /__drop_idle`.
+CONNS = {}
+CONNS_LOCK = threading.Lock()
 
 
 def echo_text(req):
@@ -139,11 +151,30 @@ class Base(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{self.server.server_port}] {fmt % args}", flush=True)
 
+    def setup(self):
+        super().setup()
+        self.mark("idle")
+
+    def parse_request(self):
+        # A request line has arrived: busy until it is answered.
+        self.mark("busy")
+        return super().parse_request()
+
     def handle_one_request(self):
         # One handler serves every request of a connection: what `sent`
         # counts belongs to one exchange.
         self._last = self._sent = None
         super().handle_one_request()
+        self.mark("idle")
+
+    def finish(self):
+        with CONNS_LOCK:
+            CONNS.get(self.server.server_port, {}).pop(self.connection, None)
+        super().finish()
+
+    def mark(self, state):
+        with CONNS_LOCK:
+            CONNS.setdefault(self.server.server_port, {})[self.connection] = state
 
     def read_json(self):
         length = int(self.headers.get("content-length", 0))
@@ -187,6 +218,15 @@ class Base(BaseHTTPRequestHandler):
         if path == "/__watch":
             with LAST_LOCK:
                 return self.send_json(200, {"requests": WATCH["requests"], "seen": dict(WATCH["seen"])})
+        if path == "/__drop_idle":
+            with CONNS_LOCK:
+                idle = [s for s, state in CONNS.get(self.server.server_port, {}).items() if state == "idle" and s is not self.connection]
+            for s in idle:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            return self.send_json(200, {"closed": len(idle)})
         if path == "/v1/attestation/report":
             return self.attestation_report(urllib.parse.parse_qs(query))
         self.send_json(404, {"error": {"message": "unknown path"}})
@@ -311,6 +351,8 @@ class OpenAIOk(Base):
                     if not tool_call.get("extra_content", {}).get("google", {}).get("thought_signature"):
                         return self.send_json(400, {"error": {"message": "Function call is missing a thought_signature in functionCall parts.",
                                                               "type": "invalid_request_error"}})
+        if req.get("model") == "hold-1":
+            time.sleep(0.5)
         if req.get("model") == "err-array-1":
             return self.send_json(400, ERR_ARRAY)
         if req.get("model") == "err-string-1":

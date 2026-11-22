@@ -18,6 +18,22 @@ only met a mock, is tracked in the README's
 
 ## [Unreleased]
 
+### Fixed
+
+- **The first request after a quiet spell no longer fails with a 502.**
+  Providers close keep-alive connections that sat idle too long, and the
+  gateway only found out when it used one. Its one retry, meant to go out
+  on a fresh connection, was handed another pooled connection to the same
+  provider, closed just the same, and the client got "every target for
+  this model failed" (`HttpConnectionClosing`), with the next request
+  going through. Seen against the real Anthropic API after about a day
+  idle. Before that retry the gateway now closes its idle connections to
+  that provider, so the retry, and the requests after it, get new ones.
+  `tools/e2e.py` checks it: the mock providers can close their idle
+  connections (`GET /__drop_idle`).
+- The data plane's unit tests now include those in `proxy.zig`, which had
+  not been run.
+
 ### Changed
 
 - The published 1.3.1 passed the release check on all five archives and

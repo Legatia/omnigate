@@ -638,4 +638,5 @@ test {
     _ = watchdog;
     _ = @import("translate.zig");
     _ = @import("usage.zig");
+    _ = proxy;
 }

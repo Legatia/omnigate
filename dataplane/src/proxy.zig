@@ -1029,8 +1029,13 @@ fn handleRequest(app: *App, request: *http.Server.Request, guard: *watchdog.Conn
                 if (guard.timedOut()) return err;
                 // A pooled keep-alive connection may have been closed by the
                 // upstream while idle: try once more before giving up on it.
+                // std's pool would hand the retry another of its connections
+                // to this upstream, idle as long and most likely closed with
+                // the rest (load balancers close them all after one timeout),
+                // so those go first and the retry gets a new connection.
                 if (tries == 0 and worthRetrying(err)) {
                     log.debug("upstream {s}: {t}, retrying on a fresh connection", .{ up.name, err });
+                    dropIdleConnections(app.client, up.base_url);
                     continue;
                 }
                 try attempts.append(arena, .{ .upstream = up.name, .outcome = @errorName(err) });
@@ -1727,6 +1732,32 @@ const ForwardMode = union(enum) {
     translate: Translation,
 };
 
+/// Closes `client`'s idle pooled connections to the host of `base_url`.
+/// Connections in use stay as they are, and so do those to other hosts.
+fn dropIdleConnections(client: *http.Client, base_url: []const u8) void {
+    const uri = std.Uri.parse(base_url) catch return;
+    const protocol = http.Client.Protocol.fromUri(uri) orelse return;
+    var host_buf: [Io.net.HostName.max_len]u8 = undefined;
+    const host = Io.net.HostName.fromUri(uri, &host_buf) catch return;
+    const port: u16 = uri.port orelse switch (protocol) {
+        .plain => 80,
+        .tls => 443,
+    };
+    const io = client.io;
+    const pool = &client.connection_pool;
+    pool.mutex.lockUncancelable(io);
+    defer pool.mutex.unlock(io);
+    var next = pool.free.first;
+    while (next) |node| {
+        next = node.next;
+        const connection: *http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", node));
+        if (connection.protocol != protocol or connection.port != port or !connection.host().eql(host)) continue;
+        pool.free.remove(node);
+        pool.free_len -= 1;
+        connection.destroy(io);
+    }
+}
+
 /// Errors after which the same upstream deserves one more try.
 fn worthRetrying(err: anyerror) bool {
     return switch (err) {
@@ -2271,6 +2302,43 @@ fn receiptId(id: []const u8) bool {
 test "receipt ids are plain tokens" {
     try std.testing.expect(receiptId("req_0123abcd-ef.4:5"));
     for ([_][]const u8{ "", "a/b", "..%2f", "a b", "a?b", &@as([129]u8, @splat('a')) }) |bad| try std.testing.expect(!receiptId(bad));
+}
+
+test "dropIdleConnections closes the idle pooled connections to one upstream, and only those" {
+    const io = std.testing.io;
+    const any_port = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var one = try any_port.listen(io, .{});
+    defer one.socket.close(io);
+    var two = try any_port.listen(io, .{});
+    defer two.socket.close(io);
+    const port_one = one.socket.address.getPort();
+    const port_two = two.socket.address.getPort();
+
+    var client: http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+    const host = try Io.net.HostName.init("127.0.0.1");
+    // Two connections to the first upstream and one to the second, all
+    // opened before any is back in the pool (or the second would reuse the
+    // first), then all idle there.
+    var opened: [3]*http.Client.Connection = undefined;
+    for (&opened, [_]u16{ port_one, port_one, port_two }) |*c, port| c.* = try client.connectTcp(host, port, .plain);
+    const in_use = try client.connectTcp(host, port_one, .plain);
+    for (opened) |c| client.connection_pool.release(c, io);
+    try std.testing.expectEqual(@as(usize, 3), client.connection_pool.free_len);
+
+    var url: [64]u8 = undefined;
+    dropIdleConnections(&client, try std.fmt.bufPrint(&url, "http://127.0.0.1:{d}/v1", .{port_one}));
+    try std.testing.expectEqual(@as(usize, 1), client.connection_pool.free_len);
+    const left: *http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", client.connection_pool.free.first.?));
+    try std.testing.expectEqual(port_two, left.port);
+    // The one in use is not touched: it goes back to the pool as usual.
+    client.connection_pool.release(in_use, io);
+    try std.testing.expectEqual(@as(usize, 2), client.connection_pool.free_len);
+
+    // Nothing to do for an address that is not a URL, or a host without idle connections.
+    dropIdleConnections(&client, "not a url");
+    dropIdleConnections(&client, "http://127.0.0.2:9");
+    try std.testing.expectEqual(@as(usize, 2), client.connection_pool.free_len);
 }
 
 /// Hand a `/v1/jobs*`, `/v1/files/*`, `/v1/payments*` or `/v1/attestations/*` request to the control plane at

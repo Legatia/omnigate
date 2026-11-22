@@ -13,6 +13,7 @@ Exit code 0 only when every check passes.
 """
 
 import argparse
+import concurrent.futures
 import csv
 import base64
 import hashlib
@@ -64,6 +65,8 @@ KEY_PLAIN = "og-e2e-plain"
 KEY_ATTESTED = "og-e2e-attested"
 # Privacy mode with `unwatermarked` only: its requests may go only to upstreams marked as not watermarking text.
 KEY_UNMARKED = "og-e2e-unmarked"
+# For the checks on upstream connections closed while idle.
+KEY_IDLE = "og-e2e-idle"
 # A second data plane, in front of a control plane played by this script
 # (see `attestation_checks`).
 # The payment provider's stand-in (tools/mock_intents.py).
@@ -304,6 +307,7 @@ def text_config():
             {"name": "plain", "key": KEY_PLAIN, "webhook_secret": WEBHOOK_SECRET},
             {"name": "attested", "key": KEY_ATTESTED, "privacy": {"attested": True}},
             {"name": "unmarked", "key": KEY_UNMARKED, "privacy": {"unwatermarked": True}},
+            {"name": "idle", "key": KEY_IDLE},
         ],
         "upstreams": [
             {"name": "mock-flaky", "kind": "openai", "base_url": "http://127.0.0.1:9001", "api_key_env": "MOCK_API_KEY"},
@@ -329,6 +333,8 @@ def text_config():
             {"model": "chat", "targets": [dict(upstream="mock-flaky", model="flaky-1", **price),
                                           dict(upstream="mock-ok", model="ok-1", **price)]},
             {"model": "direct", "targets": [dict(upstream="mock-ok", model="ok-1", **price)]},
+            # Held half a second by the mock: requests sent together overlap.
+            {"model": "hold", "targets": [dict(upstream="mock-ok", model="hold-1", **price)]},
             {"model": "compat", "targets": [dict(upstream="mock-compat", model="ok-1", **price)]},
             {"model": "signed", "targets": [dict(upstream="mock-ok", model="sig-1", **price)]},
             {"model": "cached", "cache_ttl_s": 60, "targets": [dict(upstream="mock-ok", model="ok-1", **price)]},
@@ -478,6 +484,23 @@ MOCK_TEXT = "Hello from the mock upstream."
 
 def chat(model, key=KEY_MAIN, **extra):
     return jcall("POST", GATEWAY + "/v1/chat/completions", key=key, body=dict(CHAT, model=model, **extra))
+
+
+def idle_connection_checks():
+    section("an upstream that closed its idle connections")
+    # Requests at once, each held half a second by the mock: the gateway opens
+    # a connection for each, and keeps them in its pool afterwards.
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        answers = list(pool.map(lambda _: chat("hold", key=KEY_IDLE), range(4)))
+    statuses = [status for status, _, _ in answers]
+    check("four requests at once", statuses == [200] * 4, statuses)
+    # A provider's load balancer closes connections that sat idle too long,
+    # and the gateway only finds out when it uses one.
+    status, _, closed = jcall("GET", "http://127.0.0.1:9002/__drop_idle")
+    check("the provider closes its idle connections (at least two)", status == 200 and closed.get("closed", 0) >= 2, (status, closed))
+    status, headers, body = chat("direct", key=KEY_IDLE)
+    check("the next request is answered: its retry gets a new connection, not another closed one",
+          status == 200 and headers.get("x-omnigate-upstream") == "mock-ok", (status, body))
 
 
 def main_row_with(requests):
@@ -2570,6 +2593,7 @@ def main():
         login_checks()
         key_checks()
         if run_text:
+            idle_connection_checks()
             shared_limit_checks(stack)
             build_around_checks(work)
             credit_checks()
